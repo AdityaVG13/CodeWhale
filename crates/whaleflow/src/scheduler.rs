@@ -123,11 +123,13 @@ impl Scheduler {
                 let prompt = self.build_prompt(&task);
 
                 let task_id_for_closure = task_id.clone();
-                let cwd = task.isolation.cwd_path();
+                let cwd = task.isolation.cwd_path(&task_id);
+                let timeout_secs = task.timeout_secs;
+                let max_steps = task.max_steps;
                 let handle = tokio::spawn(async move {
                     let _permit = sem.acquire().await;
                     spawner
-                        .spawn(task_id_for_closure, prompt, task.agent_type.clone(), cwd)
+                        .spawn(task_id_for_closure, prompt, task.agent_type.clone(), cwd, timeout_secs, max_steps)
                         .await
                 });
                 handles.push((task_id, handle));
@@ -148,22 +150,28 @@ impl Scheduler {
                     Ok(Err(spawn_err)) => {
                         warn!(task = %task_id, error = %spawn_err, "task failed");
                         task_results.push(TaskResult {
-                            id: task_id,
+                            id: task_id.clone(),
                             status: TaskStatus::Failed,
                             summary: None,
                             files_touched: vec![],
                             error: Some(spawn_err.to_string()),
                         });
+                        if phase.on_failure == FailurePolicy::Abort {
+                            break;
+                        }
                     }
                     Err(join_err) => {
                         warn!(task = %task_id, error = %join_err, "task panicked");
                         task_results.push(TaskResult {
-                            id: task_id,
+                            id: task_id.clone(),
                             status: TaskStatus::Failed,
                             summary: None,
                             files_touched: vec![],
                             error: Some(format!("join error: {}", join_err)),
                         });
+                        if phase.on_failure == FailurePolicy::Abort {
+                            break;
+                        }
                     }
                 }
             }
@@ -172,11 +180,11 @@ impl Scheduler {
             for task in &phase.tasks {
                 let prompt = self.build_prompt(task);
                 let _permit = self.concurrency.acquire().await;
-                let cwd = task.isolation.cwd_path();
+                let cwd = task.isolation.cwd_path(&task.id);
 
                 match self
                     .spawner
-                    .spawn(task.id.clone(), prompt, task.agent_type.clone(), cwd)
+                    .spawn(task.id.clone(), prompt, task.agent_type.clone(), cwd, task.timeout_secs, task.max_steps)
                     .await
                 {
                     Ok(agent_result) => {
@@ -391,6 +399,8 @@ mod tests {
             _prompt: String,
             _agent_type: Option<String>,
             _cwd: Option<std::path::PathBuf>,
+            _timeout_secs: Option<u64>,
+            _max_steps: Option<u32>,
         ) -> Result<AgentResult, SpawnError> {
             match self.responses.get(&task_id) {
                 Some(result) => match result {

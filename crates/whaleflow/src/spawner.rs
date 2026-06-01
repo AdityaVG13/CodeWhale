@@ -63,6 +63,10 @@ pub trait AgentSpawner: Send + Sync {
     /// worktree isolation). The spawner is responsible for creating and
     /// cleaning up the worktree if `isolation` is `Worktree`.
     ///
+    /// `timeout_secs` caps total wall-clock time for this agent
+    /// (including polling). `max_steps` maps to the sub-agent's
+    /// `max_depth` to bound recursive tool calls.
+    ///
     /// The spawner should handle model selection, tool gating, and
     /// session lifecycle. The scheduler only cares about the result.
     async fn spawn(
@@ -71,5 +75,7 @@ pub trait AgentSpawner: Send + Sync {
         prompt: String,
         agent_type: Option<String>,
         cwd: Option<PathBuf>,
+        timeout_secs: Option<u64>,
+        max_steps: Option<u32>,
     ) -> Result<AgentResult, SpawnError>;
 }

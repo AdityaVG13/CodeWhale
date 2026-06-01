@@ -60,123 +60,203 @@ impl AgentSpawner for WhaleFlowSpawner {
         prompt: String,
         agent_type: Option<String>,
         cwd: Option<PathBuf>,
+        timeout_secs: Option<u64>,
+        _max_steps: Option<u32>,
     ) -> Result<AgentResult, SpawnError> {
-        // For worktree isolation: create the worktree if cwd is set
-        // (the scheduler pre-computes the path based on isolation mode).
-        // `WorktreeManager::create` is idempotent — no-op if the worktree
-        // already exists (e.g. reused across parallel phases).
-        let actual_cwd = if cwd.is_some() {
-            let worktree_path = WorktreeManager::create(&task_id, &self.workspace)?;
-            Some(worktree_path)
-        } else {
-            None
-        };
-
-        // Determine agent type. Default to General (full tool access).
-        let subagent_type = agent_type
-            .as_deref()
-            .and_then(SubAgentType::from_str)
-            .unwrap_or_default();
-
-        // Derive a detached child runtime so the sub-agent outlives the
-        // scheduler's turn token.
-        let mut child_runtime = self.runtime.background_runtime();
-        if let Some(ref cwd_path) = actual_cwd {
-            child_runtime.context.workspace = cwd_path.clone();
-        }
-
-        // Spawn via the shared sub-agent manager.
-        let spawn_result = {
-            let mut mgr = self.manager.write().await;
-            mgr.spawn_background(
-                Arc::clone(&self.manager),
-                child_runtime,
-                subagent_type,
-                prompt,
-                None, // full tool access — same as a top-level sub-agent
-            )
-            .map_err(|e| SpawnError::SpawnFailed(format!("{e}")))?
-        };
-
-        let agent_id = spawn_result.agent_id.clone();
-
-        tracing::debug!(
-            agent_id = %agent_id,
-            task_id = %task_id,
-            "WhaleFlow spawned sub-agent"
-        );
-
-        // Poll for completion. The sub-agent manager updates the snapshot
-        // in-place when the background task finishes.
-        loop {
-            let snapshot = {
-                let mgr = self.manager.read().await;
-                mgr.get_result(&agent_id)
-                    .map_err(|e| SpawnError::Internal(format!("{e}")))?
+        // Build the future that does the real work — we'll wrap it in a
+        // timeout below.
+        let task_id_inner = task_id.clone();
+        let work = async {
+            let task_id = task_id_inner;
+            // For worktree isolation: create the worktree if cwd is set
+            // (the scheduler pre-computes the path based on isolation mode).
+            // `WorktreeManager::create` is idempotent — no-op if the worktree
+            // already exists (e.g. reused across parallel phases).
+            // Git operations are CPU-bound; run them on the blocking pool.
+            let workspace = self.workspace.clone();
+            let tid = task_id.clone();
+            let actual_cwd = if cwd.is_some() {
+                let wp = tokio::task::spawn_blocking(move || {
+                    WorktreeManager::create(&tid, &workspace)
+                })
+                .await
+                .map_err(|e| SpawnError::Internal(format!("spawn_blocking join: {e}")))??;
+                Some(wp)
+            } else {
+                None
             };
 
-            match snapshot.status {
-                SubAgentStatus::Running => {
-                    // Still running — back off before next poll.
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-                SubAgentStatus::Completed => {
-                    let summary = snapshot.result.clone().unwrap_or_default();
-                    let elapsed_ms = Some(snapshot.duration_ms);
+            // Determine agent type. Default to General (full tool access).
+            // Warn on unknown agent_type strings so typos don't silently
+            // default to a full-access agent.
+            let subagent_type = match agent_type.as_deref() {
+                Some(s) => match SubAgentType::from_str(s) {
+                    Some(t) => t,
+                    None => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            raw_type = %s,
+                            "unknown agent_type, defaulting to General"
+                        );
+                        SubAgentType::default()
+                    }
+                },
+                None => SubAgentType::default(),
+            };
 
-                    // Clean up worktree if we created one: extract the
-                    // diff patch, apply it to the main workspace, then
-                    // remove the worktree. Best-effort — we already have
-                    // the agent result, so worktree cleanup failures are
-                    // logged but don't fail the task.
-                    if cwd.is_some() {
-                        if let Ok(patch) =
-                            WorktreeManager::extract_changes(&task_id, &self.workspace)
-                        {
-                            if !patch.trim().is_empty() {
-                                if let Err(e) =
-                                    WorktreeManager::apply_patch(&self.workspace, &patch)
-                                {
-                                    tracing::warn!(
-                                        task_id = %task_id,
-                                        error = %e,
-                                        "Failed to apply worktree patch"
-                                    );
+            // Derive a detached child runtime so the sub-agent outlives the
+            // scheduler's turn token.
+            let mut child_runtime = self.runtime.background_runtime();
+            if let Some(ref cwd_path) = actual_cwd {
+                child_runtime.context.workspace = cwd_path.clone();
+            }
+
+            // Spawn via the shared sub-agent manager.
+            let spawn_result = {
+                let mut mgr = self.manager.write().await;
+                mgr.spawn_background(
+                    Arc::clone(&self.manager),
+                    child_runtime,
+                    subagent_type,
+                    prompt,
+                    None, // full tool access
+                )
+                .map_err(|e| SpawnError::SpawnFailed(format!("{e}")))?
+            };
+
+            let agent_id = spawn_result.agent_id.clone();
+
+            tracing::debug!(
+                agent_id = %agent_id,
+                task_id = %task_id,
+                "WhaleFlow spawned sub-agent"
+            );
+
+            // Poll for completion. The sub-agent manager updates the snapshot
+            // in-place when the background task finishes.
+            loop {
+                let snapshot = {
+                    let mgr = self.manager.read().await;
+                    mgr.get_result(&agent_id)
+                        .map_err(|e| SpawnError::Internal(format!("{e}")))?
+                };
+
+                match snapshot.status {
+                    SubAgentStatus::Running => {
+                        // Still running — back off before next poll.
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    SubAgentStatus::Completed => {
+                        let summary = snapshot.result.clone().unwrap_or_default();
+                        let elapsed_ms = Some(snapshot.duration_ms);
+
+                        // Clean up worktree if we created one: extract the
+                        // diff patch, apply it to the main workspace, then
+                        // remove the worktree. Best-effort — we already have
+                        // the agent result, so worktree cleanup failures are
+                        // logged but don't fail the task.
+                        if cwd.is_some() {
+                            let ws = self.workspace.clone();
+                            let tid = task_id.clone();
+                            let patch = tokio::task::spawn_blocking(move || {
+                                WorktreeManager::extract_changes(&tid, &ws)
+                            })
+                            .await
+                            .map_err(|e| {
+                                SpawnError::Internal(format!("spawn_blocking join: {e}"))
+                            });
+                            if let Ok(Ok(patch)) = patch {
+                                if !patch.trim().is_empty() {
+                                    let ws = self.workspace.clone();
+                                    let p = patch.clone();
+                                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                                        WorktreeManager::apply_patch(&ws, &p)
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        SpawnError::Internal(format!(
+                                            "spawn_blocking join: {e}"
+                                        ))
+                                    }) {
+                                        tracing::warn!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "Failed to apply worktree patch"
+                                        );
+                                    }
                                 }
                             }
+                            let ws = self.workspace.clone();
+                            let tid = task_id.clone();
+                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                WorktreeManager::remove(&tid, &ws)
+                            })
+                            .await
+                            .map_err(|e| {
+                                SpawnError::Internal(format!("spawn_blocking join: {e}"))
+                            }) {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    error = %e,
+                                    "Failed to remove worktree"
+                                );
+                            }
                         }
-                        if let Err(e) = WorktreeManager::remove(&task_id, &self.workspace) {
-                            tracing::warn!(
-                                task_id = %task_id,
-                                error = %e,
-                                "Failed to remove worktree"
-                            );
-                        }
-                    }
 
-                    return Ok(AgentResult {
-                        task_id,
-                        success: true,
-                        summary,
-                        files_touched: Vec::new(),
-                        raw_output: snapshot.result,
-                        tokens_used: None,
-                        cost_usd: None,
-                        elapsed_ms,
-                        last_checkpoint: None,
-                    });
-                }
-                SubAgentStatus::Failed(err) | SubAgentStatus::Interrupted(err) => {
-                    let _ = WorktreeManager::remove(&task_id, &self.workspace);
-                    return Err(SpawnError::SpawnFailed(err));
-                }
-                SubAgentStatus::Cancelled => {
-                    let _ = WorktreeManager::remove(&task_id, &self.workspace);
-                    return Err(SpawnError::Cancelled(
-                        "agent cancelled".to_string(),
-                    ));
+                        return Ok(AgentResult {
+                            task_id,
+                            success: true,
+                            summary,
+                            files_touched: Vec::new(),
+                            raw_output: snapshot.result,
+                            tokens_used: None,
+                            cost_usd: None,
+                            elapsed_ms,
+                            last_checkpoint: None,
+                        });
+                    }
+                    SubAgentStatus::Failed(err) | SubAgentStatus::Interrupted(err) => {
+                        let ws = self.workspace.clone();
+                        let tid = task_id.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            WorktreeManager::remove(&tid, &ws)
+                        })
+                        .await;
+                        return Err(SpawnError::SpawnFailed(err));
+                    }
+                    SubAgentStatus::Cancelled => {
+                        let ws = self.workspace.clone();
+                        let tid = task_id.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            WorktreeManager::remove(&tid, &ws)
+                        })
+                        .await;
+                        return Err(SpawnError::Cancelled(
+                            "agent cancelled".to_string(),
+                        ));
+                    }
                 }
             }
+        };
+
+        // Wrap the entire spawn+ poll in a timeout when `timeout_secs` is set.
+        if let Some(secs) = timeout_secs {
+            match tokio::time::timeout(std::time::Duration::from_secs(secs), work).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        timeout_secs = secs,
+                        "WhaleFlow sub-agent timed out"
+                    );
+                    Err(SpawnError::Timeout(format!(
+                        "task '{}' timed out after {}s",
+                        task_id, secs
+                    )))
+                }
+            }
+        } else {
+            work.await
         }
     }
 }
@@ -220,7 +300,9 @@ impl ToolSpec for WorkflowRunTool {
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
+        // workflow_run orchestrates sub-agents that may write files, so it
+        // is NOT read-only even though the tool itself doesn't write directly.
+        vec![]
     }
 
     fn supports_parallel(&self) -> bool {

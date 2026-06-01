@@ -91,12 +91,18 @@ pub enum IsolationMode {
 }
 
 impl IsolationMode {
-    /// Return the worktree path if this task should run in one.
-    /// The actual worktree creation is handled by the spawner.
-    pub fn cwd_path(&self) -> Option<std::path::PathBuf> {
+    /// Return the working directory for this isolation mode.
+    ///
+    /// `Shared` tasks run in the main workspace (None = use default).
+    /// `Worktree` tasks get a dedicated directory under `.worktrees/`.
+    /// The caller (scheduler or spawner) passes the task id so the path
+    /// is deterministic: `.worktrees/whaleflow-{task_id}`.
+    pub fn cwd_path(&self, task_id: &str) -> Option<std::path::PathBuf> {
         match self {
             IsolationMode::Shared => None,
-            IsolationMode::Worktree => None, // Path set by spawner, not here
+            IsolationMode::Worktree => {
+                Some(std::path::PathBuf::from(format!(".worktrees/whaleflow-{}", task_id)))
+            }
         }
     }
 }

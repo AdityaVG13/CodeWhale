@@ -34,6 +34,8 @@ impl AgentSpawner for MockSpawner {
         _prompt: String,
         _agent_type: Option<String>,
         _cwd: Option<std::path::PathBuf>,
+        _timeout_secs: Option<u64>,
+        _max_steps: Option<u32>,
     ) -> Result<AgentResult, SpawnError> {
         match self.responses.get(&task_id) {
             Some(Ok(r)) => Ok(AgentResult {
