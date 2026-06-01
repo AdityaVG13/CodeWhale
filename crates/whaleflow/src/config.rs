@@ -353,27 +353,44 @@ impl Conflict {
 
 /// Check if two sets of file scope patterns overlap.
 ///
-/// Uses prefix matching: strips glob suffixes (`/**`, `/*`) and checks
-/// if one prefix starts with the other. Simple but effective for the
-/// typical patterns the model generates (e.g. `src/auth/**`).
+/// Strips glob wildcards (`**`, `*`) and then checks whether the
+/// resulting directory prefixes overlap at a path-segment boundary.
+/// `src/api/**` vs `src/apiv2/**` → no overlap (different segments).
+/// `src/*/handler.rs` strips the `*` and checks prefix boundaries.
 fn scopes_overlap(a: &[String], b: &[String]) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
     }
 
-    fn strip_glob(s: &str) -> &str {
-        s.trim_end_matches('/')
-            .trim_end_matches("**")
-            .trim_end_matches('*')
-            .trim_end_matches('/')
+    /// Strip glob wildcards from the end of a pattern, stopping before
+    /// the last directory separator so path-boundary matching works.
+    fn normalize_pattern(s: &str) -> String {
+        // Remove trailing globs: /** → nothing, /* → nothing, /*.rs → nothing
+        let mut p = s.trim_end_matches('/').to_string();
+        while p.ends_with("**") || p.ends_with('*') {
+            let trimmed = p.trim_end_matches("**").trim_end_matches('*');
+            if trimmed.len() == p.len() {
+                break;
+            }
+            p = trimmed.to_string();
+        }
+        // Ensure we end at a directory boundary for correct prefix matching.
+        p = p.trim_end_matches('/').to_string();
+        p
     }
 
-    let a_prefixes: Vec<&str> = a.iter().map(|s| strip_glob(s)).collect();
-    let b_prefixes: Vec<&str> = b.iter().map(|s| strip_glob(s)).collect();
+    let a_prefixes: Vec<String> = a.iter().map(|s| normalize_pattern(s)).collect();
+    let b_prefixes: Vec<String> = b.iter().map(|s| normalize_pattern(s)).collect();
 
     for ap in &a_prefixes {
         for bp in &b_prefixes {
-            if ap.starts_with(bp) || bp.starts_with(ap) {
+            // Only flag as overlapping if one is a path-segment prefix of
+            // the other, i.e. `src/api` matches `src/api` or `src/api/...`
+            // but NOT `src/apiv2`.
+            if ap == bp
+                || ap.starts_with(&format!("{}/", bp))
+                || bp.starts_with(&format!("{}/", ap))
+            {
                 return true;
             }
         }
