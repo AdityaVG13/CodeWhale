@@ -15451,6 +15451,7 @@ async fn cancelled_subagent_result(
     }
 }
 
+>>>>>>> 8693d6451 (Allow trial stderr sink; document fork inheritance)
 /// First non-empty string among `keys`, refusing a wrong type.
 ///
 /// A key that is absent, `null`, or an empty/blank string falls through to
