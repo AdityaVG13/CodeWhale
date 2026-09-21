@@ -1499,6 +1499,32 @@ impl Engine {
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
             let stream_request = request;
+            // Fork-prefix inheritance: capture this final request's exact
+            // header for fork children (cheap clones next to a network
+            // call; skipped entirely when the trial gate is off). The
+            // pending-route block below touches billing/events only, so
+            // these bytes are what the provider caches.
+            if crate::prompt_zones::fork_inherit_enabled()
+                && let Some(tools_json) = crate::prompt_zones::ordered_tool_catalog_json(
+                    stream_request.tools.as_deref().unwrap_or(&[]),
+                )
+            {
+                *self.live_header.lock() = Some(crate::prompt_zones::LiveHeaderSnapshot {
+                    system: stream_request.system.clone(),
+                    active_names: stream_request
+                        .tools
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect(),
+                    tools_json,
+                    model: stream_request.model.clone(),
+                    provider: self.api_provider,
+                    provider_identity: self.api_provider_identity.clone(),
+                    last_hit_tokens: None,
+                });
+            }
             let _ = self
                 .tx_event
                 .send(Event::ToolRequestSnapshot {
@@ -1665,6 +1691,15 @@ impl Engine {
             // transport error is still a billed, incomplete response; it must
             // not be discarded and re-issued.
             turn.add_parent_usage(&usage);
+            // Fork-prefix inheritance: mark the snapshotted header hot or
+            // cold from this response's usage. Sequential loop order
+            // guarantees this usage answers the request captured above.
+            if crate::prompt_zones::fork_inherit_enabled() {
+                let mut guard = self.live_header.lock();
+                if let Some(cell) = guard.as_mut() {
+                    cell.last_hit_tokens = usage.prompt_cache_hit_tokens;
+                }
+            }
             turn.note_parent_prompt_len(self.session.messages.len());
             self.session.latest_parent_input_tokens = turn.latest_parent_input_tokens;
             if usage_reported {

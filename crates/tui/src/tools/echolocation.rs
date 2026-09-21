@@ -2474,7 +2474,10 @@ if (x) { y(); }
         let roots: Vec<String> = sound_import_roots(JS_SAMPLE, SoundLang::JavaScript)
             .into_iter()
             .collect();
-        assert_eq!(roots, ["@scope/pkg", "chunk", "fs", "react", "server", "setup"]);
+        assert_eq!(
+            roots,
+            ["@scope/pkg", "chunk", "fs", "react", "server", "setup"]
+        );
     }
 
     #[test]

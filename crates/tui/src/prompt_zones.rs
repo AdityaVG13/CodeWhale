@@ -182,6 +182,138 @@ impl std::fmt::Display for PrefixDrift {
     }
 }
 
+// ── LiveHeader (fork-prefix inheritance) ─────────────────────────────────
+
+/// Exact header of the parent turn's latest model request, shared with
+/// fork children so a same-route child can extend the parent's live
+/// cached prefix instead of starting cold.
+///
+/// Written once per model request by the turn loop (after the request
+/// is final), read once per fork spawn. `None` until the first request
+/// of the session goes out. The history half of the prefix rides
+/// `SubAgentForkContext.messages` (turn-start snapshot); the system and
+/// tools here must byte-match a cached request or inheritance silently
+/// costs more than a cold start — every gate below fails closed.
+#[derive(Debug, Clone)]
+pub struct LiveHeaderSnapshot {
+    /// Exact system prompt, shape-preserving (`Text` stays `Text`).
+    pub system: Option<SystemPrompt>,
+    /// Wire-order canonical tools JSON (see [`ordered_tool_catalog_json`]).
+    pub tools_json: String,
+    /// Wire-order tool names, for warming the child's activation cache
+    /// in admission order so its rebuilt wire block can byte-match.
+    pub active_names: Vec<String>,
+    /// Route the request was built for (caches are per route).
+    pub model: String,
+    pub provider: crate::config::ApiProvider,
+    pub provider_identity: String,
+    /// Cache-hit tokens on the response to the snapshotted request.
+    /// `None` until usage lands; inheritance requires `Some(>0)` — a
+    /// provably hot prefix, not a hopefully warm one.
+    pub last_hit_tokens: Option<u32>,
+}
+
+/// Cloneable handle to the turn's live-header cell. Created once per
+/// Engine (turns run strictly one at a time); fork contexts clone the
+/// `Arc` and read it at spawn.
+pub type SharedLiveHeader = Arc<parking_lot::Mutex<Option<LiveHeaderSnapshot>>>;
+
+/// Empty live-header cell: nothing cached yet, every gate reads cold.
+#[must_use]
+pub fn new_live_header_cell() -> SharedLiveHeader {
+    Arc::new(parking_lot::Mutex::new(None))
+}
+
+/// Order-sensitive canonical tools serialization: per-tool JSON in
+/// wire order, joined by `\n`. Unlike [`tool_catalog_digest`] (sorted
+/// for hashing), this must byte-match across independently built
+/// catalogs — order is part of the wire bytes. `None` if any tool
+/// fails to serialize; the inherit gate treats that as a mismatch.
+#[must_use]
+pub fn ordered_tool_catalog_json(tools: &[Tool]) -> Option<String> {
+    let mut out = String::new();
+    for (index, tool) in tools.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&serde_json::to_string(tool).ok()?);
+    }
+    Some(out)
+}
+
+/// Trial gate: `CODEWHALE_FORK_INHERIT=off` disables prefix inheritance
+/// (same-binary A/B against the default-on arm). Process-pinned.
+#[must_use]
+pub fn fork_inherit_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("CODEWHALE_FORK_INHERIT")
+            .map(|raw| raw.trim() != "off")
+            .unwrap_or(true)
+    })
+}
+
+/// Fork-inherit decision with a trial-log reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkInheritDecision {
+    pub inherit: bool,
+    pub reason: &'static str,
+}
+
+/// Pure inherit gate. `child_tools_json` is the child's own rebuilt
+/// wire block (warmed with the snapshot's names) — equality here is
+/// what makes the provider see one continuous prefix. The grant
+/// boundary enforces itself through this comparison: names outside
+/// the child's grant cannot warm, so narrowed roles fall back to
+/// cold without a role table. `gate_on` is [`fork_inherit_enabled`]
+/// read by the caller, so every arm stays unit-testable.
+#[must_use]
+pub fn resolve_fork_inherit(
+    gate_on: bool,
+    snapshot: Option<&LiveHeaderSnapshot>,
+    child_model: &str,
+    child_provider: crate::config::ApiProvider,
+    child_provider_identity: &str,
+    child_tools_json: Option<&str>,
+    history_len: usize,
+) -> ForkInheritDecision {
+    let cold = |reason: &'static str| ForkInheritDecision {
+        inherit: false,
+        reason,
+    };
+    if !gate_on {
+        return cold("gate_off");
+    }
+    let Some(snapshot) = snapshot else {
+        return cold("no_snapshot");
+    };
+    if snapshot.system.is_none() {
+        return cold("no_parent_system");
+    }
+    if snapshot.model != child_model {
+        return cold("model_mismatch");
+    }
+    if snapshot.provider != child_provider {
+        return cold("provider_mismatch");
+    }
+    if snapshot.provider_identity != child_provider_identity {
+        return cold("route_mismatch");
+    }
+    if snapshot.last_hit_tokens.unwrap_or(0) == 0 {
+        return cold("prefix_cold");
+    }
+    if history_len == 0 {
+        return cold("empty_history");
+    }
+    if child_tools_json != Some(snapshot.tools_json.as_str()) {
+        return cold("tools_mismatch");
+    }
+    ForkInheritDecision {
+        inherit: true,
+        reason: "inherited",
+    }
+}
+
 // ── AppendLog ──────────────────────────────────────────────────────────
 
 /// Append-only conversation history. Derefs to `&[Message]` via
@@ -732,5 +864,134 @@ mod tests {
         } else {
             panic!("expected Text content block");
         }
+    }
+
+    fn inherit_snapshot() -> LiveHeaderSnapshot {
+        LiveHeaderSnapshot {
+            system: Some(SystemPrompt::Text("parent system".to_string())),
+            tools_json: "{\"name\":\"read\"}".to_string(),
+            active_names: vec!["read".to_string()],
+            model: "deepseek-chat".to_string(),
+            provider: crate::config::ApiProvider::Deepseek,
+            provider_identity: "deepseek".to_string(),
+            last_hit_tokens: Some(1200),
+        }
+    }
+
+    #[test]
+    fn ordered_tool_json_is_order_sensitive_and_stable() {
+        let pair = [make_tool("a"), make_tool("b")];
+        let swapped = [make_tool("b"), make_tool("a")];
+        let forward = ordered_tool_catalog_json(&pair).expect("serializes");
+        let backward = ordered_tool_catalog_json(&swapped).expect("serializes");
+        assert_ne!(forward, backward, "wire order is part of the bytes");
+        assert_eq!(
+            forward,
+            ordered_tool_catalog_json(&pair).expect("stable"),
+            "same order serializes identically"
+        );
+        assert_eq!(ordered_tool_catalog_json(&[]).expect("empty"), "");
+    }
+
+    #[test]
+    fn fork_inherit_requires_every_gate() {
+        let snapshot = inherit_snapshot();
+        let decide = |snapshot: Option<&LiveHeaderSnapshot>, model: &str, tools: Option<&str>| {
+            resolve_fork_inherit(
+                true,
+                snapshot,
+                model,
+                crate::config::ApiProvider::Deepseek,
+                "deepseek",
+                tools,
+                4,
+            )
+        };
+        let ok = decide(
+            Some(&snapshot),
+            "deepseek-chat",
+            Some("{\"name\":\"read\"}"),
+        );
+        assert!(ok.inherit, "{ok:?}");
+        assert_eq!(ok.reason, "inherited");
+
+        assert_eq!(
+            decide(None, "deepseek-chat", Some("x")).reason,
+            "no_snapshot"
+        );
+        let mut no_system = snapshot.clone();
+        no_system.system = None;
+        assert_eq!(
+            decide(Some(&no_system), "deepseek-chat", Some("x")).reason,
+            "no_parent_system"
+        );
+        assert_eq!(
+            decide(Some(&snapshot), "other-model", Some("x")).reason,
+            "model_mismatch"
+        );
+        let provider_mismatch = resolve_fork_inherit(
+            true,
+            Some(&snapshot),
+            "deepseek-chat",
+            crate::config::ApiProvider::Openai,
+            "deepseek",
+            Some("x"),
+            4,
+        );
+        assert_eq!(provider_mismatch.reason, "provider_mismatch");
+        assert!(!provider_mismatch.inherit);
+        let route_mismatch = resolve_fork_inherit(
+            true,
+            Some(&snapshot),
+            "deepseek-chat",
+            crate::config::ApiProvider::Deepseek,
+            "custom-mirror",
+            Some("x"),
+            4,
+        );
+        assert_eq!(route_mismatch.reason, "route_mismatch");
+        for cold in [None, Some(0)] {
+            let mut snapshot = snapshot.clone();
+            snapshot.last_hit_tokens = cold;
+            assert_eq!(
+                decide(Some(&snapshot), "deepseek-chat", Some("x")).reason,
+                "prefix_cold",
+                "cold={cold:?}"
+            );
+        }
+        let empty_history = resolve_fork_inherit(
+            true,
+            Some(&snapshot),
+            "deepseek-chat",
+            crate::config::ApiProvider::Deepseek,
+            "deepseek",
+            Some("{\"name\":\"read\"}"),
+            0,
+        );
+        assert_eq!(empty_history.reason, "empty_history");
+        assert_eq!(
+            decide(
+                Some(&snapshot),
+                "deepseek-chat",
+                Some("{\"name\":\"other\"}")
+            )
+            .reason,
+            "tools_mismatch"
+        );
+        assert_eq!(
+            decide(Some(&snapshot), "deepseek-chat", None).reason,
+            "tools_mismatch"
+        );
+        let gated_off = resolve_fork_inherit(
+            false,
+            Some(&snapshot),
+            "deepseek-chat",
+            crate::config::ApiProvider::Deepseek,
+            "deepseek",
+            Some("{\"name\":\"read\"}"),
+            4,
+        );
+        assert_eq!(gated_off.reason, "gate_off");
+        assert!(!gated_off.inherit);
     }
 }

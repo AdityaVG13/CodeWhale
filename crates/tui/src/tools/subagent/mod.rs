@@ -2327,6 +2327,11 @@ fn terminal_mailbox_message(result: &SubAgentResult, report_ref: Option<&str>) -
 #[derive(Clone, Debug)]
 pub struct SubAgentForkContext {
     pub messages: Vec<Message>,
+    /// Handle to the parent turn's live-header cell (exact system, tools,
+    /// route, and hot-flag of its latest request). A same-route fork child
+    /// reads it at spawn to extend the parent's cached prefix instead of
+    /// starting cold; empty cells (resume, grandchildren) read cold.
+    pub live_header: crate::prompt_zones::SharedLiveHeader,
     /// Stable, To-do-free parent state captured once at turn start. History
     /// semantics stay exactly as they were: this text is not re-derived per
     /// spawn.
@@ -2366,6 +2371,7 @@ impl SubAgentForkContext {
 
         Self {
             messages: self.messages.clone(),
+            live_header: Arc::clone(&self.live_header),
             structured_state_block,
             work_source: self.work_source.clone(),
         }
@@ -10616,6 +10622,9 @@ async fn spawn_subagent_from_input(
                 .unwrap_or(checkpoint_messages);
             let resume_ctx = SubAgentForkContext {
                 messages,
+                // Resume forks a settled agent: nothing is live in the
+                // provider cache, so inheritance stays off by construction.
+                live_header: crate::prompt_zones::new_live_header_cell(),
                 structured_state_block: None,
                 work_source: None,
             };
@@ -12942,7 +12951,6 @@ async fn run_subagent(
     let fork_context = fork_context_enabled
         .then_some(runtime.fork_context.as_ref())
         .flatten();
-    let request_system = subagent_request_system_prompt(&system_prompt);
     // Refresh only the Work portion of the inherited state, now, at the fork
     // seam (#3983). The parent's captured transcript and its stable state text
     // are untouched.
@@ -13019,6 +13027,10 @@ async fn run_subagent(
         &agent_id,
         SubAgentForkContext {
             messages: messages.clone(),
+            // v1 is single-level: grandchildren fork cold. Recursive
+            // inheritance (propagating a child's own live header) is a
+            // follow-up once single-level trials report.
+            live_header: crate::prompt_zones::new_live_header_cell(),
             structured_state_block: None,
             // A grandchild forks *this* agent, so it inherits this agent's own
             // list, resolved when that spawn actually happens.
@@ -13051,7 +13063,92 @@ async fn run_subagent(
         ));
     }
     let tool_catalog = tool_registry.deferred_catalog_for_model(&agent_type);
-    let mut tool_surface = SubAgentToolSurface::new(tool_catalog, &[]);
+    // Fork-prefix inheritance: when this fork can extend the parent's
+    // live cached prefix (same route, hot prefix, byte-equal wire
+    // tools), the child's system is the parent's exact bytes and its
+    // first request prices the shared history as cache hits. Every
+    // fallback below keeps today's cold start byte-identical.
+    let gate_on = crate::prompt_zones::fork_inherit_enabled();
+    let snapshot = if gate_on && fork_context_enabled {
+        refreshed_fork_context
+            .as_ref()
+            .and_then(|context| context.live_header.lock().clone())
+    } else {
+        None
+    };
+    let parent_warm_names: &[String] = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.active_names.as_slice())
+        .unwrap_or(&[]);
+    let strict_tool_mode = runtime
+        .api_config
+        .as_ref()
+        .and_then(|config| config.strict_tool_mode)
+        .unwrap_or(false);
+    let mut tool_surface = SubAgentToolSurface::new(tool_catalog, parent_warm_names);
+    let first_wire_tools = tool_surface.request_tools(
+        tool_registry.deferred_catalog_for_model(&agent_type),
+        strict_tool_mode,
+    );
+    let inherit_route = runtime
+        .client
+        .effective_route_envelope(&runtime.model, chrono::Utc::now());
+    let decision = crate::prompt_zones::resolve_fork_inherit(
+        gate_on,
+        snapshot.as_ref(),
+        &inherit_route.model,
+        inherit_route.provider,
+        &inherit_route.provider_identity,
+        crate::prompt_zones::ordered_tool_catalog_json(&first_wire_tools).as_deref(),
+        messages.len(),
+    );
+    let inherited_system = if decision.inherit {
+        snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.system.clone())
+    } else {
+        None
+    };
+    let inherited = inherited_system.is_some();
+    let request_system = match inherited_system {
+        Some(system) => system,
+        None => {
+            if !parent_warm_names.is_empty() {
+                // Cold fallback keeps today's exact behavior: rebuild the
+                // surface without the parent names tried for the gate.
+                tool_surface = SubAgentToolSurface::new(
+                    tool_registry.deferred_catalog_for_model(&agent_type),
+                    &[],
+                );
+            }
+            subagent_request_system_prompt(&system_prompt)
+        }
+    };
+    if inherited && let Some(snapshot) = snapshot.as_ref() {
+        let system_bytes = serde_json::to_string(&snapshot.system)
+            .map(|json| json.len() as u64)
+            .unwrap_or(0);
+        let history_bytes = serde_json::to_string(&messages)
+            .map(|json| json.len() as u64)
+            .unwrap_or(0);
+        tracing::info!(
+            target: "subagent",
+            agent_id = agent_id.as_str(),
+            bytes = system_bytes
+                .saturating_add(snapshot.tools_json.len() as u64)
+                .saturating_add(history_bytes),
+            model = runtime.model.as_str(),
+            "fork child inheriting parent cached prefix"
+        );
+    } else if fork_context_enabled {
+        tracing::info!(
+            target: "subagent",
+            agent_id = agent_id.as_str(),
+            reason = decision.reason,
+            "fork child cold start"
+        );
+    }
+    let mut inherit_first_hit_logged = false;
     let mut steps = 0;
     let mut final_result: Option<String> = None;
     let mut pending_inputs: VecDeque<SubAgentInput> = VecDeque::new();
@@ -13228,11 +13325,7 @@ async fn run_subagent(
 
         let tools = tool_surface.request_tools(
             tool_registry.deferred_catalog_for_model(&agent_type),
-            runtime
-                .api_config
-                .as_ref()
-                .and_then(|config| config.strict_tool_mode)
-                .unwrap_or(false),
+            strict_tool_mode,
         );
         let request_active_tool_names = tool_surface.active_names.clone();
         let has_tools = !tools.is_empty();
@@ -13499,6 +13592,16 @@ async fn run_subagent(
         .await;
 
         tokens_used = tokens_used.saturating_add(usage_total_tokens(&response.usage));
+        if inherited && !inherit_first_hit_logged {
+            inherit_first_hit_logged = true;
+            tracing::info!(
+                target: "subagent",
+                agent_id = agent_id.as_str(),
+                hit_tokens = response.usage.prompt_cache_hit_tokens.unwrap_or(0),
+                input_tokens = response.usage.input_tokens,
+                "fork child first response cache hits"
+            );
+        }
 
         // #6194 item 7: one over-bound step lands the run through the normal
         // budget-death path (digest + hand-back + preservation note) instead

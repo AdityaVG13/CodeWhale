@@ -884,6 +884,13 @@ pub struct Engine {
     /// Additive exact provider id. `None` preserves the legacy root-literal
     /// custom route across snapshots and config reloads.
     api_provider_id: Option<String>,
+    /// Live header cell for fork-prefix inheritance: the turn loop writes
+    /// the latest request's exact (system, tools, route, hit-flag) here
+    /// per model call, and fork contexts clone the handle so a
+    /// same-route child can extend the parent's cached prefix. Safe as
+    /// a session-lifetime cell: turns run strictly one at a time, so it
+    /// always holds the latest request of the running turn.
+    live_header: crate::prompt_zones::SharedLiveHeader,
     active_route_limits: Option<codewhale_config::route::RouteLimits>,
     active_route_capabilities: codewhale_config::route::RouteCapabilities,
     rx_op: mpsc::Receiver<Op>,
@@ -1739,6 +1746,7 @@ impl Engine {
             api_provider,
             api_provider_identity,
             api_provider_id,
+            live_header: crate::prompt_zones::new_live_header_cell(),
             active_route_limits,
             active_route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             rx_op,
@@ -4543,6 +4551,7 @@ impl Engine {
             .await;
             Some(SubAgentForkContext {
                 messages: self.messages_with_turn_metadata(),
+                live_header: Arc::clone(&self.live_header),
                 structured_state_block: state.to_system_block(),
                 // Resolve at spawn time so a todo_write earlier in this turn
                 // reaches the child rather than freezing turn-start state.
