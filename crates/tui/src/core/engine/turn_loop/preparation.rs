@@ -661,13 +661,23 @@ impl Engine {
         // header for fork children (cheap clones next to a network
         // call; skipped entirely when the trial gate is off). The
         // pending-route block below touches billing/events only, so
-        // these bytes are what the provider caches.
+        // these bytes are what the provider caches. The hot proof
+        // carries forward while the session grows append-only: tools
+        // execute before this request's usage lands, so without the
+        // carry every mid-turn spawn would read cold.
         if crate::prompt_zones::fork_inherit_enabled()
-            && let Some(tools_json) = crate::prompt_zones::ordered_tool_catalog_json(
+            && let Some(tools_json) = crate::prompt_zones::wire_tool_catalog_json(
                 stream_request.tools.as_deref().unwrap_or(&[]),
             )
         {
-            *self.live_header.lock() = Some(crate::prompt_zones::LiveHeaderSnapshot {
+            let mut guard = self.live_header.lock();
+            let carried = crate::prompt_zones::carry_hot_forward(
+                guard.as_ref(),
+                &stream_request.system,
+                &tools_json,
+                &stream_request.messages,
+            );
+            *guard = Some(crate::prompt_zones::LiveHeaderSnapshot {
                 system: stream_request.system.clone(),
                 active_names: stream_request
                     .tools
@@ -680,7 +690,8 @@ impl Engine {
                 model: stream_request.model.clone(),
                 provider: self.api_provider,
                 provider_identity: self.image_route_provider_key(),
-                last_hit_tokens: None,
+                history: stream_request.messages.clone(),
+                last_hit_tokens: carried,
             });
         }
         // Superfast Decision Gate (shadow mode, off by default). When
