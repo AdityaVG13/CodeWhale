@@ -8121,9 +8121,8 @@ fn synthetic_eager_tool(name: &str) -> Tool {
 
 #[test]
 fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
-    // The fork-inherit gate compares the child's rebuilt wire block
-    // against the parent's snapshot: same catalog plus same warm names
-    // must serialize identically, and warming must change the bytes.
+    // Same catalog plus same warm names must serialize identically,
+    // and warming must change the wire block.
     let catalog = vec![
         synthetic_eager_tool("read"),
         synthetic_deferred_tool("agent", 8),
@@ -8134,15 +8133,14 @@ fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
     let mut second = SubAgentToolSurface::new(catalog.clone(), &warm);
     let first_wire = model_request_tools(&mut first);
     let second_wire = model_request_tools(&mut second);
-    let first_json =
-        crate::prompt_zones::ordered_tool_catalog_json(&first_wire).expect("serializes");
+    let first_json = crate::prompt_zones::wire_tool_catalog_json(&first_wire).expect("serializes");
     let second_json =
-        crate::prompt_zones::ordered_tool_catalog_json(&second_wire).expect("serializes");
+        crate::prompt_zones::wire_tool_catalog_json(&second_wire).expect("serializes");
     assert_eq!(first_json, second_json, "same catalog plus same names");
     assert!(first_wire.iter().any(|tool| tool.name == "agent"));
     let mut cold = SubAgentToolSurface::new(catalog, &[]);
     let cold_wire = model_request_tools(&mut cold);
-    let cold_json = crate::prompt_zones::ordered_tool_catalog_json(&cold_wire).expect("serializes");
+    let cold_json = crate::prompt_zones::wire_tool_catalog_json(&cold_wire).expect("serializes");
     assert_ne!(cold_json, first_json, "warming must change the wire block");
     assert!(!cold_wire.iter().any(|tool| tool.name == "agent"));
 }

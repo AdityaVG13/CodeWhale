@@ -198,7 +198,7 @@ impl std::fmt::Display for PrefixDrift {
 pub struct LiveHeaderSnapshot {
     /// Exact system prompt, shape-preserving (`Text` stays `Text`).
     pub system: Option<SystemPrompt>,
-    /// Wire-order canonical tools JSON (see [`ordered_tool_catalog_json`]).
+    /// Wire-order canonical tools JSON (see [`wire_tool_catalog_json`]).
     pub tools_json: String,
     /// Wire-order tool names, for warming the child's activation cache
     /// in admission order so its rebuilt wire block can byte-match.
@@ -207,8 +207,15 @@ pub struct LiveHeaderSnapshot {
     pub model: String,
     pub provider: crate::config::ApiProvider,
     pub provider_identity: String,
-    /// Cache-hit tokens on the response to the snapshotted request.
-    /// `None` until usage lands; inheritance requires `Some(>0)` — a
+    /// Request messages the hot proof covers. Each new request must
+    /// start with these byte-for-byte (element-wise) to keep the
+    /// proof; compaction or any rewrite resets to cold.
+    pub history: Vec<Message>,
+    /// Cache-hit tokens proving the snapshotted head hot. Set from the
+    /// response's usage, then carried forward across append-only
+    /// requests (see [`carry_hot_forward`]) so a fork mid-turn reads
+    /// the still-valid proof instead of the current request's
+    /// not-yet-known usage. Inheritance requires `Some(>0)` — a
     /// provably hot prefix, not a hopefully warm one.
     pub last_hit_tokens: Option<u32>,
 }
@@ -224,19 +231,22 @@ pub fn new_live_header_cell() -> SharedLiveHeader {
     Arc::new(parking_lot::Mutex::new(None))
 }
 
-/// Order-sensitive canonical tools serialization: per-tool JSON in
-/// wire order, joined by `\n`. Unlike [`tool_catalog_digest`] (sorted
-/// for hashing), this must byte-match across independently built
-/// catalogs — order is part of the wire bytes. `None` if any tool
-/// fails to serialize; the inherit gate treats that as a mismatch.
+/// Wire-canonical tools serialization: per-tool chat-API JSON in wire
+/// order, joined by `\n`. Each segment goes through
+/// [`codewhale_core::prefix_cache::tool_to_api_json`], so internal-only
+/// fields (`defer_loading`, `allowed_callers`, …) that never reach the
+/// provider cannot false-negative a byte comparison. Unlike
+/// [`tool_catalog_digest`] (sorted for hashing), order is part of the
+/// wire bytes. `None` if any tool fails to serialize; the inherit gate
+/// treats that as a mismatch.
 #[must_use]
-pub fn ordered_tool_catalog_json(tools: &[Tool]) -> Option<String> {
+pub fn wire_tool_catalog_json(tools: &[Tool]) -> Option<String> {
     let mut out = String::new();
     for (index, tool) in tools.iter().enumerate() {
         if index > 0 {
             out.push('\n');
         }
-        out.push_str(&serde_json::to_string(tool).ok()?);
+        out.push_str(&codewhale_core::prefix_cache::tool_to_api_json(tool)?);
     }
     Some(out)
 }
@@ -253,33 +263,97 @@ pub fn fork_inherit_enabled() -> bool {
     })
 }
 
-/// Fork-inherit decision with a trial-log reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Trial diagnostics: `CODEWHALE_FORK_TRIAL=1` mirrors fork-inherit trial
+/// events (decision + child first-response cache split) to stderr as
+/// single-line JSON. Headless `exec` installs no tracing subscriber, so
+/// the `tracing` trial logs are invisible there; this is the metered
+/// readout for same-binary A/B trials. Off unless explicitly enabled.
+#[must_use]
+pub fn fork_trial_diag_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("CODEWHALE_FORK_TRIAL")
+            .map(|raw| raw.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Hot-proof carry-over for the per-request snapshot write.
+///
+/// Tool calls (including fork spawns) execute before the current
+/// request's usage lands, so a snapshot that reset its proof on every
+/// write would read cold at every spawn. The new request keeps the old
+/// proof only when it extends the old head byte-for-byte: same system,
+/// same wire tools, messages grown append-only. Drift, compaction, or
+/// any rewrite resets to `None`. Fails closed throughout.
+#[must_use]
+pub fn carry_hot_forward(
+    old: Option<&LiveHeaderSnapshot>,
+    new_system: &Option<SystemPrompt>,
+    new_tools_json: &str,
+    new_history: &[Message],
+) -> Option<u32> {
+    let old = old?;
+    let hits = old.last_hit_tokens.filter(|hits| *hits > 0)?;
+    if &old.system != new_system {
+        return None;
+    }
+    if old.tools_json != new_tools_json {
+        return None;
+    }
+    if !new_history.starts_with(&old.history) {
+        return None;
+    }
+    Some(hits)
+}
+
+/// Fork-inherit decision with a trial-log reason and, when inheriting,
+/// the head of the parent's wire block the child reproduces byte-for-byte.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForkInheritDecision {
     pub inherit: bool,
     pub reason: &'static str,
+    /// Longest byte-equal head of the parent's wire tools, resolved from
+    /// the child's own catalog (post strict-transform). The child's first
+    /// request sends exactly these; the rest of its grant stays deferred
+    /// and activates on demand, so truncation costs cache bytes, never
+    /// capability. Empty unless `inherit` is true.
+    pub prefix_tools: Vec<Tool>,
 }
 
-/// Pure inherit gate. `child_tools_json` is the child's own rebuilt
-/// wire block (warmed with the snapshot's names) — equality here is
-/// what makes the provider see one continuous prefix. The grant
-/// boundary enforces itself through this comparison: names outside
-/// the child's grant cannot warm, so narrowed roles fall back to
-/// cold without a role table. `gate_on` is [`fork_inherit_enabled`]
-/// read by the caller, so every arm stays unit-testable.
+/// Pure inherit gate with graceful prefix tiers.
+///
+/// Full-block equality almost never holds in production: the parent's
+/// wire block grows by deferred discovery while the child's grant is
+/// fixed and usually narrower. Instead the gate resolves the longest
+/// head of the parent's wire block the child reproduces byte-for-byte
+/// (same route, hot proof, append-only history all still required):
+/// a full head (`inherited_full`) prices the shared history as hits;
+/// a partial head (`inherited_prefix`) still prices the system plus
+/// the matched tools as hits. No common head (`tools_mismatch`) and
+/// every other failure stay cold.
+///
+/// The grant boundary enforces itself through catalog lookup: names
+/// outside the child's grant end the run, so narrowed roles inherit a
+/// shorter head instead of cold-starting — no role table. `gate_on` is
+/// [`fork_inherit_enabled`] read by the caller, so every arm stays
+/// unit-testable.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_fork_inherit(
     gate_on: bool,
     snapshot: Option<&LiveHeaderSnapshot>,
     child_model: &str,
     child_provider: crate::config::ApiProvider,
     child_provider_identity: &str,
-    child_tools_json: Option<&str>,
+    child_catalog: &[Tool],
+    child_strict: bool,
     history_len: usize,
 ) -> ForkInheritDecision {
     let cold = |reason: &'static str| ForkInheritDecision {
         inherit: false,
         reason,
+        prefix_tools: Vec::new(),
     };
     if !gate_on {
         return cold("gate_off");
@@ -305,12 +379,42 @@ pub fn resolve_fork_inherit(
     if history_len == 0 {
         return cold("empty_history");
     }
-    if child_tools_json != Some(snapshot.tools_json.as_str()) {
+    if snapshot.active_names.is_empty() {
+        return cold("no_parent_tools");
+    }
+    let parent_wire: Vec<&str> = snapshot.tools_json.split('\n').collect();
+    let mut prefix = Vec::new();
+    for (index, name) in snapshot.active_names.iter().enumerate() {
+        let Some(parent_json) = parent_wire.get(index) else {
+            break;
+        };
+        let Some(tool) = child_catalog.iter().find(|tool| &tool.name == name) else {
+            break;
+        };
+        let mut tool = tool.clone();
+        if child_strict {
+            crate::tools::schema_sanitize::prepare_tools_for_strict_mode(std::slice::from_mut(
+                &mut tool,
+            ));
+        }
+        let wire = codewhale_core::prefix_cache::tool_to_api_json(&tool);
+        if wire.as_deref() != Some(*parent_json) {
+            break;
+        }
+        prefix.push(tool);
+    }
+    if prefix.is_empty() {
         return cold("tools_mismatch");
     }
+    let full = prefix.len() == snapshot.active_names.len();
     ForkInheritDecision {
         inherit: true,
-        reason: "inherited",
+        reason: if full {
+            "inherited_full"
+        } else {
+            "inherited_prefix"
+        },
+        prefix_tools: prefix,
     }
 }
 
@@ -867,66 +971,105 @@ mod tests {
     }
 
     fn inherit_snapshot() -> LiveHeaderSnapshot {
+        let tools = vec![make_tool("read"), make_tool("agent")];
         LiveHeaderSnapshot {
             system: Some(SystemPrompt::Text("parent system".to_string())),
-            tools_json: "{\"name\":\"read\"}".to_string(),
-            active_names: vec!["read".to_string()],
+            tools_json: wire_tool_catalog_json(&tools).expect("serializes"),
+            active_names: tools.iter().map(|tool| tool.name.clone()).collect(),
             model: "deepseek-chat".to_string(),
             provider: crate::config::ApiProvider::Deepseek,
             provider_identity: "deepseek".to_string(),
+            history: vec![make_message("user", "hi")],
             last_hit_tokens: Some(1200),
         }
     }
 
     #[test]
-    fn ordered_tool_json_is_order_sensitive_and_stable() {
+    fn wire_tool_json_is_order_sensitive_and_stable() {
         let pair = [make_tool("a"), make_tool("b")];
         let swapped = [make_tool("b"), make_tool("a")];
-        let forward = ordered_tool_catalog_json(&pair).expect("serializes");
-        let backward = ordered_tool_catalog_json(&swapped).expect("serializes");
+        let forward = wire_tool_catalog_json(&pair).expect("serializes");
+        let backward = wire_tool_catalog_json(&swapped).expect("serializes");
         assert_ne!(forward, backward, "wire order is part of the bytes");
         assert_eq!(
             forward,
-            ordered_tool_catalog_json(&pair).expect("stable"),
+            wire_tool_catalog_json(&pair).expect("stable"),
             "same order serializes identically"
         );
-        assert_eq!(ordered_tool_catalog_json(&[]).expect("empty"), "");
+        assert_eq!(wire_tool_catalog_json(&[]).expect("empty"), "");
+        // Internal-only flags never reach the wire bytes.
+        let mut flagged = make_tool("a");
+        flagged.defer_loading = Some(true);
+        flagged.allowed_callers = Some(vec!["x".to_string()]);
+        assert_eq!(
+            wire_tool_catalog_json(&[flagged]).expect("serializes"),
+            wire_tool_catalog_json(&[make_tool("a")]).expect("serializes"),
+        );
     }
 
     #[test]
     fn fork_inherit_requires_every_gate() {
         let snapshot = inherit_snapshot();
-        let decide = |snapshot: Option<&LiveHeaderSnapshot>, model: &str, tools: Option<&str>| {
+        let full_catalog = vec![make_tool("read"), make_tool("agent")];
+        let decide = |snapshot: Option<&LiveHeaderSnapshot>, model: &str, catalog: &[Tool]| {
             resolve_fork_inherit(
                 true,
                 snapshot,
                 model,
                 crate::config::ApiProvider::Deepseek,
                 "deepseek",
-                tools,
+                catalog,
+                false,
                 4,
             )
         };
-        let ok = decide(
-            Some(&snapshot),
-            "deepseek-chat",
-            Some("{\"name\":\"read\"}"),
-        );
+        let ok = decide(Some(&snapshot), "deepseek-chat", &full_catalog);
         assert!(ok.inherit, "{ok:?}");
-        assert_eq!(ok.reason, "inherited");
+        assert_eq!(ok.reason, "inherited_full");
+        assert_eq!(ok.prefix_tools.len(), 2);
+
+        // Narrowed grant: head matches, tail grant-gap ends the run.
+        let narrowed = vec![make_tool("read")];
+        let prefix = decide(Some(&snapshot), "deepseek-chat", &narrowed);
+        assert!(prefix.inherit, "{prefix:?}");
+        assert_eq!(prefix.reason, "inherited_prefix");
+        assert_eq!(prefix.prefix_tools.len(), 1);
+
+        // Grant gap at the head: no common head, stays cold.
+        let gap_at_head = vec![make_tool("agent")];
+        assert_eq!(
+            decide(Some(&snapshot), "deepseek-chat", &gap_at_head).reason,
+            "tools_mismatch"
+        );
+        // Schema skew on the head tool also ends the run at zero.
+        let mut skewed = make_tool("read");
+        skewed.description = "different".to_string();
+        assert_eq!(
+            decide(Some(&snapshot), "deepseek-chat", &[skewed]).reason,
+            "tools_mismatch"
+        );
+        // Internal-only flag skew must NOT end the run: those bytes
+        // never reach the provider.
+        let mut flagged = make_tool("read");
+        flagged.defer_loading = Some(true);
+        flagged.allowed_callers = Some(vec!["parent-only".to_string()]);
+        let flagged_catalog = vec![flagged, make_tool("agent")];
+        let flagged_ok = decide(Some(&snapshot), "deepseek-chat", &flagged_catalog);
+        assert!(flagged_ok.inherit, "{flagged_ok:?}");
+        assert_eq!(flagged_ok.reason, "inherited_full");
 
         assert_eq!(
-            decide(None, "deepseek-chat", Some("x")).reason,
+            decide(None, "deepseek-chat", &full_catalog).reason,
             "no_snapshot"
         );
         let mut no_system = snapshot.clone();
         no_system.system = None;
         assert_eq!(
-            decide(Some(&no_system), "deepseek-chat", Some("x")).reason,
+            decide(Some(&no_system), "deepseek-chat", &full_catalog).reason,
             "no_parent_system"
         );
         assert_eq!(
-            decide(Some(&snapshot), "other-model", Some("x")).reason,
+            decide(Some(&snapshot), "other-model", &full_catalog).reason,
             "model_mismatch"
         );
         let provider_mismatch = resolve_fork_inherit(
@@ -935,7 +1078,8 @@ mod tests {
             "deepseek-chat",
             crate::config::ApiProvider::Openai,
             "deepseek",
-            Some("x"),
+            &full_catalog,
+            false,
             4,
         );
         assert_eq!(provider_mismatch.reason, "provider_mismatch");
@@ -946,7 +1090,8 @@ mod tests {
             "deepseek-chat",
             crate::config::ApiProvider::Deepseek,
             "custom-mirror",
-            Some("x"),
+            &full_catalog,
+            false,
             4,
         );
         assert_eq!(route_mismatch.reason, "route_mismatch");
@@ -954,7 +1099,7 @@ mod tests {
             let mut snapshot = snapshot.clone();
             snapshot.last_hit_tokens = cold;
             assert_eq!(
-                decide(Some(&snapshot), "deepseek-chat", Some("x")).reason,
+                decide(Some(&snapshot), "deepseek-chat", &full_catalog).reason,
                 "prefix_cold",
                 "cold={cold:?}"
             );
@@ -965,22 +1110,16 @@ mod tests {
             "deepseek-chat",
             crate::config::ApiProvider::Deepseek,
             "deepseek",
-            Some("{\"name\":\"read\"}"),
+            &full_catalog,
+            false,
             0,
         );
         assert_eq!(empty_history.reason, "empty_history");
+        let mut no_tools = snapshot.clone();
+        no_tools.active_names.clear();
         assert_eq!(
-            decide(
-                Some(&snapshot),
-                "deepseek-chat",
-                Some("{\"name\":\"other\"}")
-            )
-            .reason,
-            "tools_mismatch"
-        );
-        assert_eq!(
-            decide(Some(&snapshot), "deepseek-chat", None).reason,
-            "tools_mismatch"
+            decide(Some(&no_tools), "deepseek-chat", &full_catalog).reason,
+            "no_parent_tools"
         );
         let gated_off = resolve_fork_inherit(
             false,
@@ -988,10 +1127,83 @@ mod tests {
             "deepseek-chat",
             crate::config::ApiProvider::Deepseek,
             "deepseek",
-            Some("{\"name\":\"read\"}"),
+            &full_catalog,
+            false,
             4,
         );
         assert_eq!(gated_off.reason, "gate_off");
         assert!(!gated_off.inherit);
+    }
+
+    #[test]
+    fn carry_hot_forward_keeps_append_only_and_resets_rewrites() {
+        let snapshot = inherit_snapshot();
+        let grown = vec![
+            make_message("user", "hi"),
+            make_message("assistant", "hello"),
+        ];
+        assert_eq!(
+            carry_hot_forward(
+                Some(&snapshot),
+                &snapshot.system,
+                &snapshot.tools_json,
+                &grown,
+            ),
+            Some(1200),
+            "append-only growth keeps the proof"
+        );
+        // Identical re-send (transparent retry) also extends.
+        assert_eq!(
+            carry_hot_forward(
+                Some(&snapshot),
+                &snapshot.system,
+                &snapshot.tools_json,
+                &snapshot.history,
+            ),
+            Some(1200)
+        );
+        let edited = vec![make_message("user", "edited")];
+        assert_eq!(
+            carry_hot_forward(
+                Some(&snapshot),
+                &snapshot.system,
+                &snapshot.tools_json,
+                &edited,
+            ),
+            None,
+            "in-place rewrite resets"
+        );
+        assert_eq!(
+            carry_hot_forward(Some(&snapshot), &snapshot.system, &snapshot.tools_json, &[]),
+            None,
+            "compaction shrink resets"
+        );
+        let other_system = Some(SystemPrompt::Text("other".to_string()));
+        assert_eq!(
+            carry_hot_forward(Some(&snapshot), &other_system, &snapshot.tools_json, &grown),
+            None,
+            "system drift resets"
+        );
+        assert_eq!(
+            carry_hot_forward(
+                Some(&snapshot),
+                &snapshot.system,
+                "{\"name\":\"other\"}",
+                &grown
+            ),
+            None,
+            "tool drift resets"
+        );
+        assert_eq!(
+            carry_hot_forward(None, &snapshot.system, &snapshot.tools_json, &grown),
+            None
+        );
+        let mut cold = snapshot.clone();
+        cold.last_hit_tokens = Some(0);
+        assert_eq!(
+            carry_hot_forward(Some(&cold), &cold.system, &cold.tools_json, &grown),
+            None,
+            "zero hits never carry"
+        );
     }
 }
