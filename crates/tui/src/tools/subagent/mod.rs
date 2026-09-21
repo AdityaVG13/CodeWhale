@@ -13160,6 +13160,10 @@ async fn run_subagent(
             "fork child cold start"
         );
     }
+    // Trial-diagnostic stderr sink: headless `exec` installs no
+    // tracing subscriber, so `eprintln!` is the A/B readout channel by
+    // design. Env-gated, JSON lines, default off.
+    #[allow(clippy::print_stderr)]
     if crate::prompt_zones::fork_trial_diag_enabled() {
         // History-divergence probe: the child's history should start
         // with the snapshotted request's messages byte-for-byte; the
@@ -13719,6 +13723,8 @@ async fn run_subagent(
                     "fork child first response cache hits"
                 );
             }
+            // Same trial sink as the decision line above.
+            #[allow(clippy::print_stderr)]
             if crate::prompt_zones::fork_trial_diag_enabled() {
                 // Component wire sizes pin down HOW FAR into the request
                 // the provider's prefix match reached: hits <= system
