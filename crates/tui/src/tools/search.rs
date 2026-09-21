@@ -95,7 +95,7 @@ impl ToolSpec for GrepFilesTool {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of results to return (default: 100)"
+                    "description": "Maximum number of results to return (default: 100, max: 1000)"
                 }
             },
             "required": ["pattern"]
@@ -122,8 +122,12 @@ impl ToolSpec for GrepFilesTool {
             .unwrap_or(usize::MAX)
             .min(1000);
         let case_insensitive = optional_bool(&input, "case_insensitive", false)?;
+        // Bounded like file_search's limit: an explicit value is the
+        // model's choice, but a runaway (or typo) must not mint an
+        // unbounded JSON array.
         let max_results = usize::try_from(optional_u64(&input, "max_results", MAX_RESULTS as u64)?)
-            .unwrap_or(MAX_RESULTS);
+            .unwrap_or(MAX_RESULTS)
+            .clamp(1, 1000);
 
         // Parse include patterns
         let include_patterns: Vec<String> = input
@@ -423,6 +427,8 @@ fn search_file_streaming(
     // lines still needed). Entries complete in FIFO order.
     let mut pending: VecDeque<(usize, usize)> = VecDeque::new();
     let mut line_idx = 0usize;
+    // True when a match exists past the collected budget, so the caller
+    // can report truncation honestly instead of inferring it.
     let mut overflowed = false;
 
     loop {
@@ -460,9 +466,11 @@ fn search_file_streaming(
             pending.pop_front();
         }
 
-        if matches.len() >= budget {
-            overflowed = overflowed || regex.is_match(line);
-        } else if regex.is_match(line) {
+        // Past the budget we keep testing but stop collecting; the
+        // first surplus match proves the cut. With nothing pending (no
+        // after-context owed) we can stop scanning immediately.
+        let is_match = regex.is_match(line);
+        if matches.len() < budget && is_match {
             matches.push(GrepMatch {
                 file: relative_path.to_string(),
                 line_number: line_idx + 1,
@@ -472,6 +480,11 @@ fn search_file_streaming(
             });
             if context_lines > 0 {
                 pending.push_back((matches.len() - 1, context_lines));
+            }
+        } else if is_match {
+            overflowed = true;
+            if pending.is_empty() {
+                break;
             }
         }
 

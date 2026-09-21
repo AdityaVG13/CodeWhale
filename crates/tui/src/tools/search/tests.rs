@@ -8,6 +8,55 @@ use crate::tools::spec::{ApprovalRequirement, ToolContext, ToolSpec};
 
 use super::{GrepFilesTool, matches_glob};
 
+#[tokio::test]
+async fn grep_max_results_is_clamped_not_trusted() {
+    let tmp = tempdir().expect("tempdir");
+    let body = "needle here\n".repeat(1_200);
+    fs::write(tmp.path().join("hay.txt"), &body).expect("write");
+    let ctx = ToolContext::new(tmp.path());
+    let result = GrepFilesTool
+        .execute(json!({"pattern": "needle", "max_results": 1_000_000}), &ctx)
+        .await
+        .expect("grep runs");
+    let payload: Value = serde_json::from_str(&result.content).expect("json");
+    assert_eq!(payload["matches"].as_array().expect("matches").len(), 1000);
+    assert_eq!(payload["truncated"], true);
+    assert_eq!(payload["total_matches"], 1000);
+}
+
+#[tokio::test]
+async fn grep_truncated_fires_only_on_a_proven_cut() {
+    let tmp = tempdir().expect("tempdir");
+    // Exactly max: the walk completes, nothing cut, flag stays false.
+    fs::write(tmp.path().join("exact.txt"), "needle\n".repeat(3)).expect("write");
+    // Over max across files: the second file proves the cut.
+    fs::write(tmp.path().join("a.txt"), "needle\n".repeat(2)).expect("write");
+    fs::write(tmp.path().join("b.txt"), "needle\n".repeat(5)).expect("write");
+    let ctx = ToolContext::new(tmp.path());
+
+    let result = GrepFilesTool
+        .execute(
+            json!({"pattern": "needle", "path": "exact.txt", "max_results": 3}),
+            &ctx,
+        )
+        .await
+        .expect("grep runs");
+    let payload: Value = serde_json::from_str(&result.content).expect("json");
+    assert_eq!(payload["matches"].as_array().expect("matches").len(), 3);
+    assert_eq!(payload["truncated"], false);
+
+    let result = GrepFilesTool
+        .execute(
+            json!({"pattern": "needle", "path": "a.txt", "max_results": 1}),
+            &ctx,
+        )
+        .await
+        .expect("grep runs");
+    let payload: Value = serde_json::from_str(&result.content).expect("json");
+    assert_eq!(payload["matches"].as_array().expect("matches").len(), 1);
+    assert_eq!(payload["truncated"], true);
+}
+
 #[test]
 fn grep_description_matches_default_exclusion_behavior() {
     let description = GrepFilesTool.description();
