@@ -1264,9 +1264,10 @@ fn parse_py_item(line: &str) -> Option<String> {
     None
 }
 
-/// Import roots of one line: every `import a, b.c` member, or the
-/// `from` module (`a.b` → `a`; pure-relative `from . import x` → `.`
-/// for depth, honest). Semicolons split statements.
+/// Import roots of one line: every `import a, b.c` member, the
+/// `from` module (`a.b` → `a`), or the import-list leaves for
+/// pure-relative modules (`from . import sib` → `sib`). Semicolons
+/// split statements.
 fn parse_py_import_roots(line: &str) -> Vec<String> {
     let line = line.trim_start();
     let mut out = Vec::new();
@@ -1283,7 +1284,26 @@ fn parse_py_import_roots(line: &str) -> Vec<String> {
         return out;
     }
     if let Some(rest) = strip_keyword(line, "from") {
-        let module = rest.split(" import ").next().unwrap_or("").trim();
+        let mut parts = rest.split(" import ");
+        let module = parts.next().unwrap_or("").trim();
+        if module.trim_start_matches('.').is_empty() {
+            // Pure-relative: the module names no package, so leaf names
+            // come from the import list (`from . import sib` → `sib`),
+            // which stem-shadowing then drops when the link resolves.
+            let list = parts.next().unwrap_or("");
+            for part in list.split(',') {
+                let name = part
+                    .split(" as ")
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(['(', ')', ' ', '\t']);
+                let leaf = name.split('.').next().unwrap_or("").trim();
+                if let Some(root) = valid_root(leaf) {
+                    out.push(root);
+                }
+            }
+            return out;
+        }
         let root = py_module_root(module);
         if !root.is_empty() {
             out.push(root);
@@ -1292,17 +1312,13 @@ fn parse_py_import_roots(line: &str) -> Vec<String> {
     out
 }
 
-/// Root of a Python module path: leading dots collapse to their depth
-/// when no named segment leads (`from . import x` → `.`). Named roots
-/// validate as identifiers; dots pass through as depth markers.
+/// Root of a Python module path: first named segment after any
+/// leading dots (`..parent.x` → `parent`). Pure-relative modules never
+/// reach here — the caller takes leaf names from the import list.
 fn py_module_root(module: &str) -> String {
     let dots = module.chars().take_while(|c| *c == '.').count();
     let named = module[dots..].split('.').next().unwrap_or("").trim();
-    if named.is_empty() {
-        ".".repeat(dots.max(1))
-    } else {
-        valid_root(named).unwrap_or_default()
-    }
+    valid_root(named).unwrap_or_default()
 }
 
 fn valid_root(root: &str) -> Option<String> {
@@ -1483,13 +1499,16 @@ fn ident_head(rest: &str) -> Option<String> {
     Some(name)
 }
 
-/// JS/TS import roots: relative → `.`; scoped `@s/n` kept whole;
-/// otherwise the first path segment. Covers `import`, `export-from`,
-/// `require`, and dynamic `import()`.
+/// JS/TS import roots: relative specs resolve to the first named
+/// segment past the dots (`./server` → `server`); scoped `@s/n` kept
+/// whole; otherwise the first path segment. Covers `import`,
+/// `export-from`, `require`, and dynamic `import()`.
 fn parse_js_import_root(line: &str) -> Option<String> {
     let spec = js_import_spec(line)?;
     if spec.starts_with('.') {
-        return Some(".".to_string());
+        let tail = spec.trim_start_matches('.').trim_start_matches('/');
+        let first = tail.split('/').next().unwrap_or("").trim();
+        return valid_root(first);
     }
     if let Some(scoped) = spec.strip_prefix('@') {
         let mut parts = scoped.split('/');
@@ -2369,7 +2388,7 @@ define_not_a_keyword = True
         let roots: Vec<String> = sound_import_roots(PY_SAMPLE, SoundLang::Python)
             .into_iter()
             .collect();
-        assert_eq!(roots, [".", "localmod", "os", "parent", "pkg", "sys"]);
+        assert_eq!(roots, ["localmod", "os", "parent", "pkg", "sibling", "sys"]);
     }
 
     #[test]
@@ -2455,7 +2474,7 @@ if (x) { y(); }
         let roots: Vec<String> = sound_import_roots(JS_SAMPLE, SoundLang::JavaScript)
             .into_iter()
             .collect();
-        assert_eq!(roots, [".", "@scope/pkg", "fs", "react"]);
+        assert_eq!(roots, ["@scope/pkg", "chunk", "fs", "react", "server", "setup"]);
     }
 
     #[test]
@@ -2768,68 +2787,6 @@ func main() {
         let raws: Vec<&str> = entries.iter().map(|(raw, _)| raw.as_str()).collect();
         assert!(raws.contains(&"app.rs"), "{raws:?}");
         assert!(!raws.contains(&"vault_link"), "{raws:?}");
-    }
-
-    #[test]
-    fn tmp_measure_footer_breakdown() {
-        // TEMPORARY squeeze probe; removed after the numbers land.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let samples = [
-            "crates/tui/src/tools/echolocation.rs",
-            "crates/tui/src/tools/file.rs",
-            "crates/tui/src/tools/search.rs",
-            "crates/tui/src/tools/diff_format.rs",
-            "crates/tui/src/tools/skill.rs",
-            "crates/tui/src/core/engine/tool_catalog.rs",
-            "crates/tui/src/skills/mod.rs",
-            "crates/workflow/src/lib.rs",
-            "web/lib/content/tools.ts",
-        ];
-        for rel in samples {
-            let path = root.join(rel);
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let chart = sound_echolocation(&root, &path, &text, true);
-            let footer = chart.render_footer();
-            let mates: usize = chart.podmates.iter().map(|m| m.len() + 2).sum();
-            let syms: usize = chart.symbols.iter().map(|m| m.len() + 2).sum();
-            let imps: usize = chart.import_roots.iter().map(|m| m.len() + 2).sum();
-            let links: usize = chart.links.iter().map(|m| m.len() + 2).sum();
-            let calls: usize = chart.callers.iter().map(|m| m.len() + 2).sum();
-            // Import roots shadowed by a resolved link (same stem).
-            let link_stems: Vec<&str> = chart
-                .links
-                .iter()
-                .filter_map(|l| l.rsplit('/').next()?.split('.').next())
-                .collect();
-            let shadowed = chart
-                .import_roots
-                .iter()
-                .filter(|r| link_stems.contains(&r.as_str()))
-                .count();
-            eprintln!(
-                "BREAKDOWN {rel} file={}B footer={}B mates={}B({}/{}) syms={}B({}/{}) imps={}B({}/{},shadow={}) links={}B({}/{}) calls={}B({}/{})",
-                text.len(),
-                footer.len(),
-                mates,
-                chart.podmates.len(),
-                chart.podmate_total,
-                syms,
-                chart.symbols.len(),
-                chart.symbol_total,
-                imps,
-                chart.import_roots.len(),
-                chart.import_total,
-                shadowed,
-                links,
-                chart.links.len(),
-                chart.link_total,
-                calls,
-                chart.callers.len(),
-                chart.caller_total,
-            );
-        }
     }
 
     #[test]
