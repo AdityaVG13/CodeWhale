@@ -17845,7 +17845,7 @@ impl SubAgentToolRegistry {
 
     fn deferred_catalog_for_model(&self, agent_type: &FleetRole) -> Vec<Tool> {
         // Every allowed tool remains searchable. Native deferral then leaves the
-        // fixed lowercase primitives plus agent/tool_search active; Web, MCP,
+        // fixed lowercase primitives plus tool_search active; agent, Web, MCP,
         // plugins, and other tools stay discoverable rather than eager.
         let mut catalog = self.tools_for_model(agent_type);
         catalog.retain(|tool| !is_tool_search_tool(&tool.name));

@@ -32,13 +32,17 @@ const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 /// tree. Mirrors the file_search tool so both blocking searches behave the same.
 const GREP_FILES_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Result of a grep match
+/// Result of a grep match. Empty context arrays are omitted on the
+/// wire (models request context in ~0% of calls); `default` keeps old
+/// payloads parsing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepMatch {
     pub file: String,
     pub line_number: usize,
     pub line: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_before: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_after: Vec<String>,
 }
 
@@ -250,6 +254,31 @@ impl ToolSpec for GrepFilesTool {
                 .map(|item| grep_match_to_json(item, context_lines))
                 .collect();
 
+            // Echolocation sounding: chart the matched dirs (sorted, capped)
+            // so the model sees each match's podmates without a follow-up
+            // list. Computed here, inside the blocking worker, with the
+            // workspace already at hand.
+            let matched_files: Vec<String> = results.iter().map(|item| item.file.clone()).collect();
+            let vis = crate::tools::echolocation::PodVisibility {
+                include: &include_patterns,
+                exclude: &exclude_patterns,
+                extensions: &[],
+                glob_root: &search_path,
+                gitignore: false,
+            };
+            let (pods, pods_omitted) =
+                crate::tools::echolocation::sound_match_pods(&workspace, &matched_files, &vis);
+            let pods_json: Vec<Value> = pods
+                .iter()
+                .map(|pod| {
+                    json!({
+                        "dir": pod.dir,
+                        "mates": pod.mates,
+                        "mate_total": pod.mate_total,
+                    })
+                })
+                .collect();
+
             // Build result. When context_lines == 1, return the single context
             // line as a string instead of a one-item array. That keeps the common
             // "show just the adjacent line" case easy for model callers to read.
@@ -258,6 +287,8 @@ impl ToolSpec for GrepFilesTool {
                 "total_matches": total_matches,
                 "files_searched": files_searched,
                 "truncated": total_matches > max_results,
+                "pods": pods_json,
+                "pods_omitted": pods_omitted,
             }))
         })
         .await?;

@@ -774,7 +774,16 @@ impl ReadFileTool {
         enforce_read_denylist(&file_path, "read")?;
         check_file_operation_cancelled(context)?;
         let bytes = tokio::fs::read(&file_path).await.map_err(|error| {
-            ToolError::execution_failed(format!("Failed to read {}: {error}", file_path.display()))
+            let mut message = format!("Failed to read {}: {error}", file_path.display());
+            // Miss echo: only for genuine NotFound — never for denylist or
+            // permission failures, where listing the parent would answer a
+            // refused probe.
+            if error.kind() == std::io::ErrorKind::NotFound
+                && let Some(echo) = crate::tools::echolocation::sound_miss_echo(&file_path)
+            {
+                message.push_str(&echo);
+            }
+            ToolError::execution_failed(message)
         })?;
         // #6283: every read response carries the file's byte size, line
         // count, and truncation flag so the caller can page deliberately
@@ -862,6 +871,24 @@ impl ReadFileTool {
                 ));
             }
         }
+
+        // Echolocation: stateless kin footer sounded fresh from source
+        // (no index, no new deps). Deterministic and hard-budgeted, so a
+        // repeated read is byte-identical. Two distinct files read in
+        // this pod put the next read there into the terminal buzz
+        // (callers included).
+        let buzz = file_path.parent().is_some_and(|parent| {
+            context.pod_visit_count(parent) >= crate::tools::echolocation::BUZZ_VISIT_THRESHOLD
+        });
+        output.push_str(
+            &crate::tools::echolocation::sound_echolocation(
+                &context.workspace,
+                &file_path,
+                &text,
+                buzz,
+            )
+            .render_footer(),
+        );
 
         // This internal observation keeps hidden legacy edit replay working,
         // but no hash or read-before-edit ceremony reaches the lowercase
