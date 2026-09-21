@@ -227,12 +227,25 @@ impl ToolSpec for GrepFilesTool {
                         return Ok(WalkControl::Continue);
                     }
 
-                    // Get relative path from workspace
+                    // Relative path from workspace. The walk root comes
+                    // back canonical while the workspace may not be
+                    // (macOS /var, Windows \\?\ verbatim paths), so
+                    // canonicalize both sides before falling back to
+                    // the absolute path.
                     let relative_path = file_path
                         .strip_prefix(&workspace)
-                        .unwrap_or(file_path)
-                        .to_string_lossy()
-                        .to_string();
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().to_string())
+                        .or_else(|| {
+                            let ws = workspace.canonicalize().ok();
+                            let fp = file_path.canonicalize().ok();
+                            ws.zip(fp).and_then(|(ws, fp)| {
+                                fp.strip_prefix(&ws)
+                                    .ok()
+                                    .map(|rel| rel.to_string_lossy().to_string())
+                            })
+                        })
+                        .unwrap_or_else(|| file_path.to_string_lossy().to_string());
 
                     let budget = max_results.saturating_sub(results.len());
                     let Some((file_matches, file_had_more)) = search_file_streaming(

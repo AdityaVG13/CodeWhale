@@ -130,10 +130,15 @@ fn pod_relative_names(workspace: &Path, file_path: &Path, links: Vec<String>) ->
     let Some(home) = file_path.parent() else {
         return links;
     };
+    // Compare in workspace-relative space: joining the workspace here
+    // breaks when it is non-canonical but the file path is canonical
+    // (macOS /var, Windows \\?\ verbatim paths).
+    let home_rel = workspace_relative(workspace, home);
     links
         .into_iter()
         .map(|link| {
-            let short = workspace.join(&link).parent() == Some(home);
+            let short =
+                Path::new(&link).parent().and_then(|parent| parent.to_str()) == home_rel.as_deref();
             if short {
                 Path::new(&link)
                     .file_name()
@@ -1196,7 +1201,16 @@ fn slash_path(path: &Path) -> String {
 }
 
 fn workspace_relative(workspace: &Path, path: &Path) -> Option<String> {
-    path.strip_prefix(workspace).ok().map(slash_path)
+    if let Some(rel) = path.strip_prefix(workspace).ok().map(slash_path) {
+        return Some(rel);
+    }
+    // The tool layer hands us canonical file paths while the workspace
+    // may be non-canonical (macOS /var -> /private/var tempdirs,
+    // Windows \\?\ verbatim paths). Canonicalize both sides before
+    // giving up, or every caller/link match silently misses there.
+    let workspace = workspace.canonicalize().ok()?;
+    let path = path.canonicalize().ok()?;
+    path.strip_prefix(&workspace).ok().map(slash_path)
 }
 
 /// Python source lines: `#` comments cut, triple-quote doc spans
