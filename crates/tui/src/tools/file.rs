@@ -623,6 +623,17 @@ async fn contract_mutation_result(
 ) -> ToolResult {
     let paths = [file_path.to_path_buf()];
     let diagnostics = lsp_diagnostics_for_paths(context, &paths).await;
+    // Echolocation: the model-facing receipt is one line while the diff
+    // rides metadata for the TUI, so the echo tells the model what its
+    // edit hit (touched symbols) and what hears it (impacted callers).
+    // Deterministic, hard-budgeted, None when there is nothing to say.
+    let mut summary = summary;
+    if let Some(echo) =
+        crate::tools::echolocation::sound_edit_echo(&context.workspace, file_path, before, after)
+    {
+        summary.push_str("\n\n");
+        summary.push_str(&echo);
+    }
     ToolResult::success(summary).with_metadata(json!({
         "event": "file.mutation",
         "lsp_diagnostics": diagnostics,
@@ -1560,7 +1571,9 @@ impl WriteFileTool {
         drop(mutation_guard);
 
         let outcome = if existed_before { "updated" } else { "created" };
-        let utf16_units = written.encode_utf16().count();
+        // Bytes are bytes: the receipt reports what was written to disk,
+        // not UTF-16 code units (which differ on non-ASCII content).
+        let bytes_written = written.len();
         Ok(contract_mutation_result(
             context,
             &file_path,
@@ -1568,7 +1581,7 @@ impl WriteFileTool {
             prior_contents.as_ref(),
             &written,
             outcome,
-            format!("Successfully wrote {utf16_units} bytes to {path_str}"),
+            format!("Successfully wrote {bytes_written} bytes to {path_str}"),
         )
         .await)
     }

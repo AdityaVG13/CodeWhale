@@ -95,7 +95,7 @@ impl ToolSpec for GrepFilesTool {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of results to return (default: 100)"
+                    "description": "Maximum number of results to return (default: 100, max: 1000)"
                 }
             },
             "required": ["pattern"]
@@ -122,8 +122,12 @@ impl ToolSpec for GrepFilesTool {
             .unwrap_or(usize::MAX)
             .min(1000);
         let case_insensitive = optional_bool(&input, "case_insensitive", false)?;
+        // Bounded like file_search's limit: an explicit value is the
+        // model's choice, but a runaway (or typo) must not mint an
+        // unbounded JSON array.
         let max_results = usize::try_from(optional_u64(&input, "max_results", MAX_RESULTS as u64)?)
-            .unwrap_or(MAX_RESULTS);
+            .unwrap_or(MAX_RESULTS)
+            .clamp(1, 1000);
 
         // Parse include patterns
         let include_patterns: Vec<String> = input
@@ -202,6 +206,10 @@ impl ToolSpec for GrepFilesTool {
             let mut results: Vec<GrepMatch> = Vec::new();
             let mut files_searched = 0;
             let mut total_matches = 0;
+            // Proven cut, not inferred: set only when a match exists past
+            // what we return (the old `total > max` could never fire —
+            // totals were budget-capped before the comparison).
+            let mut truncated = false;
 
             visit_files(
                 &search_path,
@@ -210,9 +218,6 @@ impl ToolSpec for GrepFilesTool {
                 cancel_token,
                 follow_symlinks,
                 &mut |file_path| {
-                    if results.len() >= max_results {
-                        return Ok(WalkControl::Stop);
-                    }
                     check_cancelled(cancel_token)?;
 
                     // Skip files that are too large
@@ -229,8 +234,8 @@ impl ToolSpec for GrepFilesTool {
                         .to_string_lossy()
                         .to_string();
 
-                    let budget = max_results - results.len();
-                    let Some(file_matches) = search_file_streaming(
+                    let budget = max_results.saturating_sub(results.len());
+                    let Some((file_matches, file_had_more)) = search_file_streaming(
                         file_path,
                         &relative_path,
                         &regex,
@@ -245,6 +250,12 @@ impl ToolSpec for GrepFilesTool {
                     files_searched += 1;
                     total_matches += file_matches.len();
                     results.extend(file_matches);
+                    if file_had_more {
+                        // A match exists past the returned set: stop and say
+                        // so. Exactly-max walks complete with `false`.
+                        truncated = true;
+                        return Ok(WalkControl::Stop);
+                    }
                     Ok(WalkControl::Continue)
                 },
             )?;
@@ -286,7 +297,7 @@ impl ToolSpec for GrepFilesTool {
                 "matches": matches_json,
                 "total_matches": total_matches,
                 "files_searched": files_searched,
-                "truncated": total_matches > max_results,
+                "truncated": truncated,
                 "pods": pods_json,
                 "pods_omitted": pods_omitted,
             }))
@@ -372,7 +383,7 @@ fn search_file_streaming(
     context_lines: usize,
     budget: usize,
     cancel_token: Option<&CancellationToken>,
-) -> Result<Option<Vec<GrepMatch>>, ToolError> {
+) -> Result<Option<(Vec<GrepMatch>, bool)>, ToolError> {
     let Ok(file) = fs::File::open(path) else {
         return Ok(None);
     };
@@ -380,6 +391,9 @@ fn search_file_streaming(
     let mut raw: Vec<u8> = Vec::new();
     let mut before: VecDeque<String> = VecDeque::new();
     let mut matches: Vec<GrepMatch> = Vec::new();
+    // True when a match exists past the collected budget, so the caller
+    // can report truncation honestly instead of inferring it.
+    let mut file_had_more = false;
     // Matches still waiting for after-context lines: (index into `matches`,
     // lines still needed). Entries complete in FIFO order.
     let mut pending: VecDeque<(usize, usize)> = VecDeque::new();
@@ -420,7 +434,11 @@ fn search_file_streaming(
             pending.pop_front();
         }
 
-        if matches.len() < budget && regex.is_match(line) {
+        // Past the budget we keep testing but stop collecting; the
+        // first surplus match proves the cut. With nothing pending (no
+        // after-context owed) we can stop scanning immediately.
+        let is_match = regex.is_match(line);
+        if matches.len() < budget && is_match {
             matches.push(GrepMatch {
                 file: relative_path.to_string(),
                 line_number: line_idx + 1,
@@ -430,6 +448,11 @@ fn search_file_streaming(
             });
             if context_lines > 0 {
                 pending.push_back((matches.len() - 1, context_lines));
+            }
+        } else if is_match {
+            file_had_more = true;
+            if pending.is_empty() {
+                break;
             }
         }
 
@@ -442,7 +465,7 @@ fn search_file_streaming(
         line_idx += 1;
     }
 
-    Ok(Some(matches))
+    Ok(Some((matches, file_had_more)))
 }
 
 /// Flow control for the streaming file walk.

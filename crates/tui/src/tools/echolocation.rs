@@ -68,6 +68,19 @@ const MAX_CALLERS: usize = 8;
 const MAX_CALLER_SCAN_BYTES: u64 = 256 * 1024;
 /// Tracked pod reads before the next read there enters the buzz.
 pub(crate) const BUZZ_VISIT_THRESHOLD: usize = 2;
+/// Max touched symbols named per edit echo before "+N more".
+const MAX_EDIT_TOUCHED: usize = 6;
+/// Max impacted callers named per edit echo before "+N more".
+const MAX_EDIT_CALLERS: usize = 4;
+/// Hard byte budget for one edit echo line.
+const EDIT_ECHO_MAX_BYTES: usize = 400;
+/// Changed spans attributed per edit; past this the edit is a rewrite
+/// and the first spans already name its symbols.
+const MAX_EDIT_SPANS: usize = 32;
+/// Time budget for the touched-symbol diff. Myers is quadratic in the
+/// worst case; past this `similar` approximates instead of blocking
+/// the edit path, and the echo degrades to first-span attribution.
+const EDIT_DIFF_TIMEOUT_MS: u64 = 100;
 
 /// Ablation gate: true when `CODEWHALE_ECHO` disables `section`.
 /// Parsed once per process; unset or malformed means everything on.
@@ -96,7 +109,6 @@ fn parse_echo_gates(raw: &str) -> BTreeSet<String> {
 /// with nothing to say renders as the empty string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EchoChart {
-    pod_dir: Option<String>,
     podmates: Vec<String>,
     podmate_total: usize,
     symbols: Vec<String>,
@@ -109,6 +121,31 @@ pub(crate) struct EchoChart {
     caller_total: usize,
 }
 
+/// Shorten workspace-relative links to bare names when they live in
+/// the same pod (directory) as the sounded file: the pod frame makes
+/// them unambiguous, and the mates list shows the same names.
+/// Cross-pod links keep their relative path. Never fails closed the
+/// wrong way — on any doubt the full path stays.
+fn pod_relative_names(workspace: &Path, file_path: &Path, links: Vec<String>) -> Vec<String> {
+    let Some(home) = file_path.parent() else {
+        return links;
+    };
+    links
+        .into_iter()
+        .map(|link| {
+            let short = workspace.join(&link).parent() == Some(home);
+            if short {
+                Path::new(&link)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or(link)
+            } else {
+                link
+            }
+        })
+        .collect()
+}
+
 /// Sound an echolocation chart for a file that was just read.
 /// `workspace` anchors link display (workspace-relative paths);
 /// `file_path` is the resolved path (for the sibling sounding); `text`
@@ -117,7 +154,7 @@ pub(crate) struct EchoChart {
 /// Never fails: anything unreadable is omitted from the chart rather
 /// than failing the read.
 pub fn sound_echolocation(workspace: &Path, file_path: &Path, text: &str, buzz: bool) -> EchoChart {
-    let (pod_dir, mut podmates) = sound_podmates(file_path);
+    let (_, mut podmates) = sound_podmates(file_path);
     let podmate_total = podmates.len();
     podmates.truncate(MAX_PODMATES);
     let (mut symbols, mut import_roots, mut links, link_total, mut callers, caller_total) =
@@ -143,12 +180,38 @@ pub fn sound_echolocation(workspace: &Path, file_path: &Path, text: &str, buzz: 
         };
     let symbol_total = symbols.len();
     symbols.truncate(MAX_SYMBOLS);
+    // Squeeze, all lossless: same-pod links and callers render bare
+    // (the pod frame disambiguates), and import roots a shown link
+    // already names drop — the link says the same thing with a path
+    // attached. Totals count what renders, so "+N more" stays honest.
+    // Each transform follows its section gate: an `off:links` trial
+    // measures links alone, never roots too.
+    if !echo_off("links") {
+        links = pod_relative_names(workspace, file_path, links);
+    }
+    if !echo_off("callers") {
+        callers = pod_relative_names(workspace, file_path, callers);
+    }
+    if !echo_off("links") && !echo_off("imports") {
+        let link_stems: Vec<&str> = links
+            .iter()
+            .filter_map(|link| Path::new(link).file_stem()?.to_str())
+            .collect();
+        import_roots.retain(|root| {
+            if link_stems.contains(&root.as_str()) {
+                return false;
+            }
+            // Package roots resolve under their own dir
+            // (`pkg` under `pkg/__init__.py`).
+            let prefix = format!("{root}/");
+            !links.iter().any(|link| link.starts_with(&prefix))
+        });
+    }
     let import_total = import_roots.len();
     import_roots.truncate(MAX_IMPORT_ROOTS);
     links.truncate(MAX_LINKS);
     callers.truncate(MAX_CALLERS);
     EchoChart {
-        pod_dir,
         podmates,
         podmate_total,
         symbols,
@@ -191,12 +254,13 @@ impl EchoChart {
     /// sorted entries, fixed caps, byte budget, no timestamps.
     pub fn render_footer(&self) -> String {
         let mut out = String::new();
-        if !echo_off("mates") && self.pod_dir.is_some() && self.podmate_total > 0 {
-            let dir = self.pod_dir.as_deref().unwrap_or(".");
+        // No dir: the footer trails the read of this exact file, so the
+        // pod frame is already known (miss echoes and grep pods keep
+        // theirs — those orient across paths, not within one).
+        if !echo_off("mates") && self.podmate_total > 0 {
             out.push_str(&format!(
-                "\n\n[Pod: {} ({}): {}]",
-                dir,
-                count_noun(self.podmate_total, "entry", "entries"),
+                "\n\n[Pod ({}): {}]",
+                self.podmate_total,
                 render_capped(&self.podmates, self.podmate_total)
             ));
         }
@@ -210,7 +274,7 @@ impl EchoChart {
         }
         if !echo_off("imports") && self.import_total > 0 {
             if !sounding.is_empty() {
-                sounding.push_str(" | ");
+                sounding.push_str("; ");
             }
             sounding.push_str(&format!(
                 "imports: {}",
@@ -219,7 +283,7 @@ impl EchoChart {
         }
         if !echo_off("links") && self.link_total > 0 {
             if !sounding.is_empty() {
-                sounding.push_str(" | ");
+                sounding.push_str("; ");
             }
             sounding.push_str(&format!(
                 "links: {}",
@@ -228,7 +292,7 @@ impl EchoChart {
         }
         if !echo_off("callers") && self.caller_total > 0 {
             if !sounding.is_empty() {
-                sounding.push_str(" | ");
+                sounding.push_str("; ");
             }
             sounding.push_str(&format!(
                 "heard by: {}",
@@ -236,7 +300,7 @@ impl EchoChart {
             ));
         }
         if !sounding.is_empty() {
-            out.push_str(&format!("\n\n[Sounding: {sounding}]"));
+            out.push_str(&format!("\n\n[Sound: {sounding}]"));
         }
         truncate_bytes(&out, POD_FOOTER_MAX_BYTES)
     }
@@ -490,7 +554,7 @@ fn split_match_path(file: &str) -> (String, String) {
     let dir = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map(|parent| parent.to_string_lossy().into_owned())
+        .map(slash_path)
         .unwrap_or_else(|| ".".to_string());
     (dir, name)
 }
@@ -603,21 +667,133 @@ fn sound_symbols(text: &str, lang: SoundLang) -> Vec<String> {
     // Symbols carry 1-based source lines (`fn main:12`) so the model can
     // page straight at them — the sounding already sees past truncation,
     // and now it can point there too.
-    let numbered = |n: usize, symbol: String| format!("{symbol}:{n}");
+    sound_numbered_symbols(text, lang)
+        .into_iter()
+        .map(|(n, symbol)| format!("{symbol}:{n}"))
+        .collect()
+}
+
+/// Structured symbol sounding: 1-based line + bare `kind name`, in file
+/// order. The edit echo attributes changed spans against these lines.
+fn sound_numbered_symbols(text: &str, lang: SoundLang) -> Vec<(usize, String)> {
     match lang {
         SoundLang::Rust => code_lines(text)
-            .filter_map(|(n, line)| parse_item_line(line).map(|s| numbered(n, s)))
+            .filter_map(|(n, line)| parse_item_line(line).map(|s| (n, s)))
             .collect(),
         SoundLang::Python => py_code_lines(text)
-            .filter_map(|(n, line)| parse_py_item(line).map(|s| numbered(n, s)))
+            .filter_map(|(n, line)| parse_py_item(line).map(|s| (n, s)))
             .collect(),
         SoundLang::JavaScript => code_lines(text)
-            .filter_map(|(n, line)| parse_js_item(line).map(|s| numbered(n, s)))
+            .filter_map(|(n, line)| parse_js_item(line).map(|s| (n, s)))
             .collect(),
         SoundLang::Go => code_lines(text)
-            .filter_map(|(n, line)| parse_go_item(line).map(|s| numbered(n, s)))
+            .filter_map(|(n, line)| parse_go_item(line).map(|s| (n, s)))
             .collect(),
     }
+}
+
+/// Changed new-side spans as (1-based start, new-line count). Pure
+/// deletions contribute their insertion point with length 0. Reuses
+/// the `similar` diff the unified-diff builder already depends on,
+/// under a hard timeout.
+fn changed_spans(before: &str, after: &str) -> Vec<(usize, usize)> {
+    if before == after {
+        return Vec::new();
+    }
+    similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(EDIT_DIFF_TIMEOUT_MS))
+        .diff_lines(before, after)
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            similar::DiffOp::Equal { .. } => None,
+            similar::DiffOp::Delete { new_index, .. } => Some((new_index + 1, 0)),
+            similar::DiffOp::Insert {
+                new_index, new_len, ..
+            } => Some((new_index + 1, *new_len)),
+            similar::DiffOp::Replace {
+                new_index, new_len, ..
+            } => Some((new_index + 1, *new_len)),
+        })
+        .take(MAX_EDIT_SPANS)
+        .collect()
+}
+
+/// Symbols the mutation touched, in file order: declarations born
+/// inside a changed span, else the nearest declaration above it (the
+/// edit landed inside that symbol's body). Returns the shown names
+/// plus the distinct total for the "+N more" tail.
+fn touched_symbols(file_path: &Path, before: &str, after: &str) -> (Vec<String>, usize) {
+    let empty = (Vec::new(), 0);
+    let Some(lang) = detect_lang(file_path) else {
+        return empty;
+    };
+    let symbols = sound_numbered_symbols(after, lang);
+    if symbols.is_empty() {
+        return empty;
+    }
+    let mut touched: Vec<String> = Vec::new();
+    let mut touched_lines: Vec<usize> = Vec::new();
+    for (start, len) in changed_spans(before, after) {
+        let mut born_inside = false;
+        for (line, name) in &symbols {
+            if *line >= start && line.saturating_sub(start) < len {
+                born_inside = true;
+                if !touched_lines.contains(line) {
+                    touched_lines.push(*line);
+                    touched.push(format!("{name}:{line}"));
+                }
+            }
+        }
+        if !born_inside
+            && let Some((line, name)) = symbols.iter().rev().find(|(line, _)| *line <= start)
+            && !touched_lines.contains(line)
+        {
+            touched_lines.push(*line);
+            touched.push(format!("{name}:{line}"));
+        }
+    }
+    let total = touched.len();
+    touched.truncate(MAX_EDIT_TOUCHED);
+    (touched, total)
+}
+
+/// Model-visible edit echo: which symbols the write/edit touched and
+/// which podmates link this file (impacted callers). The model-facing
+/// mutation receipt is one line and the diff rides metadata for the
+/// TUI, so without this the model never learns what its edit hit.
+/// `None` when there is nothing to say. Gated by the existing
+/// `symbols`/`callers` sections; budgeted hard.
+pub fn sound_edit_echo(
+    workspace: &Path,
+    file_path: &Path,
+    before: &str,
+    after: &str,
+) -> Option<String> {
+    if before == after {
+        return None;
+    }
+    let mut halves = Vec::new();
+    if !echo_off("symbols") {
+        let (shown, total) = touched_symbols(file_path, before, after);
+        if total > 0 {
+            halves.push(format!("touched {}", render_capped(&shown, total)));
+        }
+    }
+    if !echo_off("callers") {
+        let (callers, total) = sound_callers(workspace, file_path);
+        if total > 0 {
+            let shown = &callers[..callers.len().min(MAX_EDIT_CALLERS)];
+            halves.push(format!("heard by {}", render_capped(shown, total)));
+        }
+    }
+    if halves.is_empty() {
+        return None;
+    }
+    Some(truncate_bytes(
+        &format!("[Edit echo: {}]", halves.join("; ")),
+        EDIT_ECHO_MAX_BYTES,
+    ))
 }
 
 /// Distinct import roots, sorted, per language.
@@ -1007,10 +1183,20 @@ fn find_crate_root(workspace: &Path, file_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Render a path with `/` separators on every platform, so sounded
+/// paths are byte-identical on Windows, macOS, and Linux (portable
+/// tests, shared prompt caches). Components are re-joined rather than
+/// string-replaced so a literal `\` in a file name survives, and `.`
+/// / `..` segments pass through untouched for [`dot_clean`].
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn workspace_relative(workspace: &Path, path: &Path) -> Option<String> {
-    path.strip_prefix(workspace)
-        .ok()
-        .map(|rel| rel.to_string_lossy().into_owned())
+    path.strip_prefix(workspace).ok().map(slash_path)
 }
 
 /// Python source lines: `#` comments cut, triple-quote doc spans
@@ -1274,7 +1460,7 @@ fn parse_js_item(line: &str) -> Option<String> {
                 || strip_keyword(body, "function").is_some()
                 || body.contains("=>")
             {
-                return Some(format!("function {name}"));
+                return Some(format!("{qualifier} {name}"));
             }
             return None;
         }
@@ -1766,7 +1952,7 @@ define nothing;
         let second = sound_echolocation(dir.path(), &path, &text, false).render_footer();
         assert_eq!(first, second);
         assert!(first.len() <= POD_FOOTER_MAX_BYTES, "{}", first.len());
-        assert!(first.starts_with("\n\n[Pod:"), "{first}");
+        assert!(first.starts_with("\n\n[Pod ("), "{first}");
     }
 
     #[test]
@@ -1780,8 +1966,8 @@ define nothing;
             false,
         )
         .render_footer();
-        assert!(footer.contains("[Pod:"), "{footer}");
-        assert!(!footer.contains("[Sounding:"), "{footer}");
+        assert!(footer.contains("[Pod ("), "{footer}");
+        assert!(!footer.contains("[Sound:"), "{footer}");
     }
 
     #[test]
@@ -2030,7 +2216,26 @@ define nothing;
             false,
         )
         .render_footer();
-        assert!(footer.contains("links: src/config.rs"), "{footer}");
+        assert!(footer.contains("links: config.rs"), "{footer}");
+    }
+
+    #[test]
+    fn shadowed_import_roots_drop_by_stem_and_package_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let text = "import a\nimport pkg\n";
+        fs::write(root.join("main.py"), text).expect("fixture");
+        fs::write(root.join("a.py"), "x = 1\n").expect("fixture");
+        fs::create_dir(root.join("pkg")).expect("mkdir");
+        fs::write(root.join("pkg/__init__.py"), "y = 2\n").expect("fixture");
+        let footer = sound_echolocation(root, &root.join("main.py"), text, false).render_footer();
+        // Both roots are named by their links: file stem (`a` under
+        // `a.py`) and package path (`pkg` under `pkg/__init__.py`).
+        // Sounded paths are `/`-separated on every OS; vacuous on
+        // unix, load-bearing on Windows CI.
+        assert!(!footer.contains("imports:"), "{footer}");
+        assert!(footer.contains("links: a.py, pkg/__init__.py"), "{footer}");
+        assert!(!footer.contains('\\'), "{footer}");
     }
 
     #[test]
@@ -2111,7 +2316,7 @@ define nothing;
         let second =
             sound_echolocation(root, &root.join("src/net/server.rs"), text, true).render_footer();
         assert_eq!(first, second);
-        assert!(first.contains("heard by: src/net/mod.rs"), "{first}");
+        assert!(first.contains("heard by: mod.rs"), "{first}");
     }
 
     #[test]
@@ -2231,7 +2436,7 @@ if (x) { y(); }
             "{symbols:?}"
         );
         assert!(
-            symbols.contains(&"function dive:10".to_string()),
+            symbols.contains(&"const dive:10".to_string()),
             "{symbols:?}"
         );
         assert!(
@@ -2433,7 +2638,7 @@ func main() {
         fs::write(dir.path().join("other.py"), "x = 1\n").expect("fixture");
         let footer = sound_echolocation(dir.path(), &dir.path().join("swim.py"), PY_SAMPLE, false)
             .render_footer();
-        assert!(footer.contains("[Pod:"), "{footer}");
+        assert!(footer.contains("[Pod ("), "{footer}");
         assert!(footer.contains("def swim"), "{footer}");
         assert!(footer.contains("imports:"), "{footer}");
     }
@@ -2563,6 +2768,155 @@ func main() {
         let raws: Vec<&str> = entries.iter().map(|(raw, _)| raw.as_str()).collect();
         assert!(raws.contains(&"app.rs"), "{raws:?}");
         assert!(!raws.contains(&"vault_link"), "{raws:?}");
+    }
+
+    #[test]
+    fn tmp_measure_footer_breakdown() {
+        // TEMPORARY squeeze probe; removed after the numbers land.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let samples = [
+            "crates/tui/src/tools/echolocation.rs",
+            "crates/tui/src/tools/file.rs",
+            "crates/tui/src/tools/search.rs",
+            "crates/tui/src/tools/diff_format.rs",
+            "crates/tui/src/tools/skill.rs",
+            "crates/tui/src/core/engine/tool_catalog.rs",
+            "crates/tui/src/skills/mod.rs",
+            "crates/workflow/src/lib.rs",
+            "web/lib/content/tools.ts",
+        ];
+        for rel in samples {
+            let path = root.join(rel);
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let chart = sound_echolocation(&root, &path, &text, true);
+            let footer = chart.render_footer();
+            let mates: usize = chart.podmates.iter().map(|m| m.len() + 2).sum();
+            let syms: usize = chart.symbols.iter().map(|m| m.len() + 2).sum();
+            let imps: usize = chart.import_roots.iter().map(|m| m.len() + 2).sum();
+            let links: usize = chart.links.iter().map(|m| m.len() + 2).sum();
+            let calls: usize = chart.callers.iter().map(|m| m.len() + 2).sum();
+            // Import roots shadowed by a resolved link (same stem).
+            let link_stems: Vec<&str> = chart
+                .links
+                .iter()
+                .filter_map(|l| l.rsplit('/').next()?.split('.').next())
+                .collect();
+            let shadowed = chart
+                .import_roots
+                .iter()
+                .filter(|r| link_stems.contains(&r.as_str()))
+                .count();
+            eprintln!(
+                "BREAKDOWN {rel} file={}B footer={}B mates={}B({}/{}) syms={}B({}/{}) imps={}B({}/{},shadow={}) links={}B({}/{}) calls={}B({}/{})",
+                text.len(),
+                footer.len(),
+                mates,
+                chart.podmates.len(),
+                chart.podmate_total,
+                syms,
+                chart.symbols.len(),
+                chart.symbol_total,
+                imps,
+                chart.import_roots.len(),
+                chart.import_total,
+                shadowed,
+                links,
+                chart.links.len(),
+                chart.link_total,
+                calls,
+                chart.callers.len(),
+                chart.caller_total,
+            );
+        }
+    }
+
+    #[test]
+    fn block_comments_mute_and_release_across_lines() {
+        let text = "/*\nfn fake() {}\n*/\nfn real() {}\n";
+        let symbols = sound_symbols(text, SoundLang::Rust);
+        assert_eq!(symbols, ["fn real:4"]);
+        // A comment opener inside a string still mutes until the closer:
+        // the failure mode is a miss, never a forge.
+        let text = "let s = \"/*\";\nfn muted() {}\nlet t = \"*/\";\nfn kept() {}\n";
+        let symbols = sound_symbols(text, SoundLang::Rust);
+        assert_eq!(symbols, ["fn kept:4"]);
+    }
+
+    #[test]
+    fn py_decorators_methods_and_comment_fences() {
+        let text = "@route(\"/x\")\ndef handler():\n    pass\nclass Pod:\n    def swim(self):\n        pass\n# a \"\"\" in a comment toggles nothing\ndef after():\n";
+        let symbols = sound_symbols(text, SoundLang::Python);
+        assert!(
+            symbols.contains(&"def handler:2".to_string()),
+            "{symbols:?}"
+        );
+        assert!(symbols.contains(&"class Pod:4".to_string()), "{symbols:?}");
+        assert!(symbols.contains(&"def swim:5".to_string()), "{symbols:?}");
+        assert!(symbols.contains(&"def after:8".to_string()), "{symbols:?}");
+    }
+
+    #[test]
+    fn js_anonymous_and_arrow_shapes() {
+        // Anonymous default export: no name to sound, no phantom.
+        assert!(sound_symbols("export default function() {}\n", SoundLang::JavaScript).is_empty());
+        let symbols = sound_symbols(
+            "const swim = () => {};\nlet dive = async () => {};\nvar data = 42;\n",
+            SoundLang::JavaScript,
+        );
+        assert!(symbols.contains(&"const swim:1".to_string()), "{symbols:?}");
+        assert!(symbols.contains(&"let dive:2".to_string()), "{symbols:?}");
+        assert!(!symbols.iter().any(|s| s.contains("data")), "{symbols:?}");
+    }
+
+    #[test]
+    fn edit_echo_names_touched_symbol_and_callers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("a.py"), "import b\nprint(b.x)\n").expect("fixture");
+        let before = "x = 1\ndef swim():\n    return x\n";
+        let after = "x = 1\ndef swim():\n    return x + 1\n";
+        fs::write(dir.path().join("b.py"), after).expect("fixture");
+        let echo =
+            sound_edit_echo(dir.path(), &dir.path().join("b.py"), before, after).expect("echo");
+        assert!(echo.contains("touched def swim:2"), "{echo}");
+        assert!(echo.contains("heard by a.py"), "{echo}");
+    }
+
+    #[test]
+    fn edit_echo_attributes_body_edits_to_enclosing_symbol() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No mates: touched only, no heard-by half.
+        let before = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\nfn other() {}\n";
+        let after = "fn main() {\n    let x = 2;\n    println!(\"{x}\");\n}\nfn other() {}\n";
+        fs::write(dir.path().join("solo.rs"), after).expect("fixture");
+        let echo =
+            sound_edit_echo(dir.path(), &dir.path().join("solo.rs"), before, after).expect("echo");
+        assert_eq!(echo, "[Edit echo: touched fn main:1]");
+    }
+
+    #[test]
+    fn edit_echo_silent_when_nothing_to_say() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("note.txt"), "hi\n").expect("fixture");
+        // Identical: no mutation, no echo.
+        assert!(
+            sound_edit_echo(dir.path(), &dir.path().join("note.txt"), "hi\n", "hi\n").is_none()
+        );
+        // Unknown language, no mates: neither half can sound.
+        assert!(
+            sound_edit_echo(dir.path(), &dir.path().join("note.txt"), "hi\n", "yo\n").is_none()
+        );
+    }
+
+    #[test]
+    fn edit_echo_new_file_names_first_symbols() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after = "fn alpha() {}\nfn beta() {}\n";
+        fs::write(dir.path().join("fresh.rs"), after).expect("fixture");
+        let echo =
+            sound_edit_echo(dir.path(), &dir.path().join("fresh.rs"), "", after).expect("echo");
+        assert!(echo.contains("touched fn alpha:1, fn beta:2"), "{echo}");
     }
 
     #[test]

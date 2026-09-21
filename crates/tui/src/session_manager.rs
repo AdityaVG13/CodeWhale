@@ -3829,13 +3829,9 @@ mod tests {
         );
         let journal = unstamped.journal.as_ref().expect("journal");
         assert!(
-            journal
-                .entries
-                .iter()
-                .all(|entry| {
-                    entry.created_at >= before_save
-                        && entry.created_at <= unstamped.metadata.created_at
-                }),
+            journal.entries.iter().all(|entry| {
+                entry.created_at >= before_save && entry.created_at <= unstamped.metadata.created_at
+            }),
             "unstamped entries are created during save, before snapshot metadata"
         );
     }

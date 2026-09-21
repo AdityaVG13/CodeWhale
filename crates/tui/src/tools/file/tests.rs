@@ -102,12 +102,12 @@ async fn contract_read_appends_a_pod_footer_to_a_whole_source_file() {
         "whole file first, pod footer after"
     );
     assert!(
-        result.content.contains("[Pod:"),
+        result.content.contains("[Pod ("),
         "pod footer present: {}",
         result.content
     );
     assert!(
-        result.content.contains("[Sounding: 1 symbol: fn main:1]"),
+        result.content.contains("[Sound: 1 symbol: fn main:1]"),
         "sounded symbol present: {}",
         result.content
     );
@@ -404,7 +404,7 @@ async fn contract_read_metadata_for_ordinary_whole_read() {
         "whole file first, pod footer after"
     );
     assert!(
-        result.content.contains("[Pod:"),
+        result.content.contains("[Pod ("),
         "pod footer present: {}",
         result.content
     );
@@ -648,6 +648,56 @@ async fn queued_parallel_contract_edits_preserve_both_changes() {
 }
 
 #[tokio::test]
+async fn contract_edit_echoes_touched_symbols_and_callers() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let context = ToolContext::new(temporary.path());
+    std::fs::write(temporary.path().join("a.py"), "import b\nprint(b.swim())\n").expect("fixture");
+    std::fs::write(temporary.path().join("b.py"), "def swim():\n    return 1\n").expect("fixture");
+    let result = EditFileTool::execute_contract_edits(
+        json!({
+            "path": "b.py",
+            "edits": [{"oldText": "return 1", "newText": "return 2"}]
+        }),
+        &context,
+    )
+    .await
+    .expect("edit runs");
+    assert!(
+        result.content.contains("Successfully replaced"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result.content.contains("[Edit echo: touched def swim:1"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result.content.contains("heard by a.py"),
+        "{}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn contract_write_receipt_counts_bytes_not_utf16_units() {
+    // "héllo\n" is 7 bytes but 6 UTF-16 units; the receipt must say 7.
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let context = ToolContext::new(temporary.path());
+    let result = WriteFileTool::execute_contract_write(
+        json!({"path": "note.txt", "content": "héllo\n"}),
+        &context,
+    )
+    .await
+    .expect("write runs");
+    assert!(
+        result.content.contains("Successfully wrote 7 bytes"),
+        "{}",
+        result.content
+    );
+}
+
+#[tokio::test]
 async fn cancelled_queued_pi_write_never_starts() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let context = ToolContext::new(temporary.path());
@@ -719,7 +769,7 @@ async fn contract_read_enters_terminal_buzz_on_third_pod_visit() {
             .await
             .expect("read result");
     assert!(
-        result.content.contains("heard by: src/net/mod.rs"),
+        result.content.contains("heard by: mod.rs"),
         "{}",
         result.content
     );
