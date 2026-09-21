@@ -657,6 +657,32 @@ impl Engine {
         // first call) so we can resend it on a transparent retry below
         // when the wire dies before any content was streamed (#103).
         let stream_request = request;
+        // Fork-prefix inheritance: capture this final request's exact
+        // header for fork children (cheap clones next to a network
+        // call; skipped entirely when the trial gate is off). The
+        // pending-route block below touches billing/events only, so
+        // these bytes are what the provider caches.
+        if crate::prompt_zones::fork_inherit_enabled()
+            && let Some(tools_json) = crate::prompt_zones::ordered_tool_catalog_json(
+                stream_request.tools.as_deref().unwrap_or(&[]),
+            )
+        {
+            *self.live_header.lock() = Some(crate::prompt_zones::LiveHeaderSnapshot {
+                system: stream_request.system.clone(),
+                active_names: stream_request
+                    .tools
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect(),
+                tools_json,
+                model: stream_request.model.clone(),
+                provider: self.api_provider,
+                provider_identity: self.image_route_provider_key(),
+                last_hit_tokens: None,
+            });
+        }
         // Superfast Decision Gate (shadow mode, off by default). When
         // SUPERFAST_ENABLED is set, this spawns a detached task that asks
         // a small System One decision model about the user's turn and only

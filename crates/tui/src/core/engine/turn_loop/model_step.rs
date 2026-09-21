@@ -432,6 +432,15 @@ impl Engine {
         turn.add_parent_usage(&usage);
         turn.note_parent_prompt_len(self.session.messages.len());
         self.session.latest_parent_input_tokens = turn.latest_parent_input_tokens;
+        // Fork-prefix inheritance: mark the snapshotted header hot or
+        // cold from this response's usage. Sequential loop order
+        // guarantees this usage answers the request captured above.
+        if crate::prompt_zones::fork_inherit_enabled() {
+            let mut guard = self.live_header.lock();
+            if let Some(cell) = guard.as_mut() {
+                cell.last_hit_tokens = usage.prompt_cache_hit_tokens;
+            }
+        }
         if usage_reported {
             let _ = self
                 .send_event(Event::TurnUsage {

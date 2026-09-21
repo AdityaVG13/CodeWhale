@@ -52,14 +52,7 @@ fn default_active_contract_keeps_discovery_and_core_tools_eager() {
 fn non_yolo_mode_retains_default_defer_policy() {
     let always_load = HashSet::new();
     // Token diet: agent stays searchable even on wide surfaces.
-    for core in [
-        "read",
-        "write",
-        "edit",
-        "bash",
-        "todo_write",
-        "load_skill",
-    ] {
+    for core in ["read", "write", "edit", "bash", "todo_write", "load_skill"] {
         assert!(!should_default_defer_tool(core, &always_load));
     }
     for searchable in [
@@ -516,6 +509,7 @@ async fn measure_production_mode_tool_catalogs() -> serde_json::Value {
                 McpAccess::PassiveSnapshot,
                 route,
                 "",
+                None,
             )
             .await;
         let active = build.surface.active.clone().unwrap_or_default();

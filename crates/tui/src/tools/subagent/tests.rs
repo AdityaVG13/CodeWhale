@@ -5751,6 +5751,7 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
     };
     let fork_context = SubAgentForkContext {
         messages: vec![parent_message.clone()],
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: Some("## Fork State\n- Mode: `AGENT`".to_string()),
         work_source: None,
     };
@@ -8695,6 +8696,7 @@ fn small_surface_warms_explicitly_allowed_deferred_tools() {
 async fn small_surface_fork_context_survives_fresh_child_discovery() {
     let registry = small_surface_registry(FleetRole::Builder);
     let context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: vec![
             Message {
                 role: Role::Assistant,
@@ -8793,6 +8795,48 @@ async fn small_surface_denied_warm_tool_is_not_resurrected() {
     .expect("search remains available");
     assert!(!searched.contains("\"tool_name\":\"Web\""));
     assert!(surface.hydrate("Web", &json!({})).is_err());
+}
+
+fn synthetic_eager_tool(name: &str) -> Tool {
+    Tool {
+        tool_type: Some("function".to_string()),
+        name: name.to_string(),
+        description: "eager".to_string(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        allowed_callers: None,
+        defer_loading: Some(false),
+        input_examples: None,
+        strict: None,
+        cache_control: None,
+    }
+}
+
+#[test]
+fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
+    // The fork-inherit gate compares the child's rebuilt wire block
+    // against the parent's snapshot: same catalog plus same warm names
+    // must serialize identically, and warming must change the bytes.
+    let catalog = vec![
+        synthetic_eager_tool("read"),
+        synthetic_deferred_tool("agent", 8),
+        synthetic_eager_tool(TOOL_SEARCH_NAME),
+    ];
+    let warm = ["agent".to_string()];
+    let mut first = SubAgentToolSurface::new(catalog.clone(), &warm);
+    let mut second = SubAgentToolSurface::new(catalog.clone(), &warm);
+    let first_wire = model_request_tools(&mut first);
+    let second_wire = model_request_tools(&mut second);
+    let first_json =
+        crate::prompt_zones::ordered_tool_catalog_json(&first_wire).expect("serializes");
+    let second_json =
+        crate::prompt_zones::ordered_tool_catalog_json(&second_wire).expect("serializes");
+    assert_eq!(first_json, second_json, "same catalog plus same names");
+    assert!(first_wire.iter().any(|tool| tool.name == "agent"));
+    let mut cold = SubAgentToolSurface::new(catalog, &[]);
+    let cold_wire = model_request_tools(&mut cold);
+    let cold_json = crate::prompt_zones::ordered_tool_catalog_json(&cold_wire).expect("serializes");
+    assert_ne!(cold_json, first_json, "warming must change the wire block");
+    assert!(!cold_wire.iter().any(|tool| tool.name == "agent"));
 }
 
 fn synthetic_deferred_tool(name: &str, description_bytes: usize) -> Tool {
@@ -12653,6 +12697,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     );
 
     let fork_context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -12684,6 +12729,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         &direct_child,
         "agent_parent",
         SubAgentForkContext {
+            live_header: crate::prompt_zones::new_live_header_cell(),
             messages: Vec::new(),
             structured_state_block: None,
             work_source: None,
@@ -13457,6 +13503,7 @@ async fn parent_todo_state_still_reaches_children_as_immutable_fork_context() {
     let mut parent = stub_runtime();
     write_todos_as(&parent, &["parent step one"]).await;
     parent.fork_context = Some(SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: Vec::new(),
         structured_state_block: Some(
             "## Fork State\n\n### Work\n\nTo-do (0% settled)\n- [ ] #1 parent step one\n"
@@ -17715,6 +17762,7 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
     let direct_child_runtime = runtime_with_depth(1, Some(root_tx));
     let fork_context = SubAgentForkContext {
         messages: Vec::new(),
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: None,
         work_source: None,
     };

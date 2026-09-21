@@ -2643,6 +2643,11 @@ fn terminal_mailbox_message(result: &SubAgentResult, report_ref: Option<&str>) -
 #[derive(Clone, Debug)]
 pub struct SubAgentForkContext {
     pub messages: Vec<Message>,
+    /// Handle to the parent turn's live-header cell (exact system, tools,
+    /// route, and hot-flag of its latest request). A same-route fork child
+    /// reads it at spawn to extend the parent's cached prefix instead of
+    /// starting cold; empty cells (resume, grandchildren) read cold.
+    pub live_header: crate::prompt_zones::SharedLiveHeader,
     /// Stable, To-do-free parent state captured once at turn start. History
     /// semantics stay exactly as they were: this text is not re-derived per
     /// spawn.
@@ -2682,6 +2687,7 @@ impl SubAgentForkContext {
 
         Self {
             messages: self.messages.clone(),
+            live_header: Arc::clone(&self.live_header),
             structured_state_block,
             work_source: self.work_source.clone(),
         }
@@ -12916,6 +12922,9 @@ async fn spawn_subagent_from_input(
         .unwrap_or(checkpoint_messages);
         let resume_ctx = SubAgentForkContext {
             messages,
+            // Resume forks a settled agent: nothing is live in the
+            // provider cache, so inheritance stays off by construction.
+            live_header: crate::prompt_zones::new_live_header_cell(),
             structured_state_block: None,
             work_source: None,
         };
