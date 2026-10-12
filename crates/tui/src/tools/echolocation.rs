@@ -1,6 +1,6 @@
-//! Echolocation: stateless navigation soundings for tool results.
+//! Echolocation: bounded navigation observations for tool results.
 //!
-//! No index, no background work, no new dependencies. Like a whale sounding
+//! No repository-wide index, background work or new dependencies. Like a whale sounding
 //! its pod, every read, grep, file search, and project map echoes its
 //! surroundings fresh from source — sibling podmates, symbols, import
 //! roots, resolved file links — rendered deterministically (sorted,
@@ -12,11 +12,14 @@
 //!
 //! KV-cache effect: tool-result history only. Soundings never enter the
 //! session-pinned prefix.
+//! Lowercase Rust reads also consume bounded, revision-qualified syntax facts
+//! computed with the existing syn parser. RuntimeToolServices owns their shared
+//! physical cache; WorkingSet separately owns each conversation's deliveries.
 //!
 //! Tuning: `CODEWHALE_ECHO` gates sections for ablation trials
 //! (comma-separated `off:<name>` entries, e.g. `off:links,off:mates`;
 //! section names: mates, symbols, imports, links, callers, pods,
-//! soundings). Unset or malformed means everything on.
+//! soundings, navigation). Unset or malformed means everything on.
 //!
 //! Terminal buzz: the read footer deepens when the model is closing in.
 //! Two distinct files read in a pod (see
@@ -26,7 +29,7 @@
 //! high-resolution echoes at close range. Deterministic for a fixed
 //! history, like everything else here.
 //!
-//! Known lookalikes (line scanners, not parsers): comment markers
+//! Known lookalikes (legacy line scanners, not the Rust syntax producer): comment markers
 //! inside string literals can mute following lines until the closer
 //! (`"/*"` swallows until `"*/"`); Python doc fences toggle on every
 //! `"""`/`'''` occurrence, so mixed kinds on one line desync the
@@ -40,6 +43,278 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ignore::{Match as IgnoreMatch, gitignore::Gitignore};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+const NAVIGATION_PRODUCER: &str = "rust_syntax_v1";
+const NAVIGATION_MARKER: &str = "[Code navigation: ";
+const MAX_NAVIGATION_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_NAVIGATION_BYTES: usize = 4 * 1024;
+const MAX_NAVIGATION_PATH_BYTES: usize = 512;
+pub(crate) const MAX_DELIVERED_REFS: usize = 32;
+
+/// An actionable snapshot-qualified line window, not a permission grant or
+/// proof that its body was delivered. Coordinates are 1-based lines, not
+/// LSP UTF-16 columns or byte offsets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeReadReference {
+    pub path: String,
+    pub offset: usize,
+    pub limit: usize,
+    pub expected_revision: String,
+}
+
+impl CodeReadReference {
+    fn valid(&self) -> bool {
+        !self.path.is_empty()
+            && self.path.len() <= MAX_NAVIGATION_PATH_BYTES
+            && Path::new(&self.path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && self.offset > 0
+            && self.limit > 0
+            && self.offset.checked_add(self.limit - 1).is_some()
+            && valid_source_revision(&self.expected_revision)
+    }
+}
+
+pub(crate) fn valid_source_revision(revision: &str) -> bool {
+    revision.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NavigationSymbol {
+    name: String,
+    read: CodeReadReference,
+}
+
+/// Syntax only: no macro expansion, cfg evaluation, name/type resolution or
+/// LSP authority. V1 covers outer functions and impl methods in inline
+/// modules; ranges exclude preceding attributes/modifiers and local items.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SourceNavigation {
+    pub(crate) producer: String,
+    path: String,
+    pub(crate) source_revision: String,
+    status: String,
+    reason: Option<String>,
+    symbols: Vec<NavigationSymbol>,
+    symbols_omitted: usize,
+    unscanned_modules: usize,
+}
+
+pub(crate) fn navigation_cache_identity(workspace: &Path, path: &Path) -> Option<(String, String)> {
+    if path.extension()?.to_str()? != "rs" || path.to_str().is_none() {
+        return None;
+    }
+    let relative = workspace_relative(workspace, path)?;
+    if relative.len() > MAX_NAVIGATION_PATH_BYTES {
+        return None;
+    }
+    let root = workspace.canonicalize().ok()?;
+    // Bound keys as well as payloads; do not retain a full workspace path
+    // per record outside HandleStore's payload byte budget.
+    let namespace = format!(
+        "{NAVIGATION_PRODUCER}:{}",
+        super::file::content_hash(root.to_str()?.as_bytes())
+    );
+    Some((namespace, relative))
+}
+
+impl SourceNavigation {
+    pub(crate) fn matches(&self, path: &str, revision: &str) -> bool {
+        self.producer == NAVIGATION_PRODUCER
+            && self.path == path
+            && self.source_revision == revision
+    }
+
+    pub(crate) fn from_source(
+        path: String,
+        revision: String,
+        source: &str,
+        utf8_valid: bool,
+    ) -> Self {
+        let mut result = Self {
+            producer: NAVIGATION_PRODUCER.to_string(),
+            path,
+            source_revision: revision,
+            status: "ready".to_string(),
+            reason: None,
+            symbols: Vec::new(),
+            symbols_omitted: 0,
+            unscanned_modules: 0,
+        };
+        let unavailable = if !utf8_valid {
+            Some("invalid_utf8")
+        } else if source.len() > MAX_NAVIGATION_SOURCE_BYTES {
+            Some("source_byte_bound")
+        } else {
+            None
+        };
+        if let Some(reason) = unavailable {
+            result.status = "unavailable".to_string();
+            result.reason = Some(reason.to_string());
+            return result;
+        }
+        match syn::parse_file(source) {
+            Ok(file) => result.visit_items(&file.items, "", 0),
+            Err(_) => {
+                result.status = "unavailable".to_string();
+                result.reason = Some("syntax_error".to_string());
+            }
+        }
+        while serde_json::to_vec(&result).is_ok_and(|bytes| bytes.len() > MAX_NAVIGATION_BYTES) {
+            if result.symbols.pop().is_none() {
+                break;
+            }
+            result.symbols_omitted += 1;
+        }
+        result
+    }
+
+    fn visit_items(&mut self, items: &[syn::Item], scope: &str, depth: usize) {
+        for item in items {
+            match item {
+                syn::Item::Fn(function) => {
+                    self.note_function(scope, &function.sig, &function.block)
+                }
+                syn::Item::Impl(implementation) => {
+                    let scope = format!(
+                        "{scope}impl@{}::",
+                        implementation.impl_token.span.start().line
+                    );
+                    for item in &implementation.items {
+                        if let syn::ImplItem::Fn(function) = item {
+                            self.note_function(&scope, &function.sig, &function.block);
+                        }
+                    }
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        if depth >= 16 {
+                            self.unscanned_modules += 1;
+                        } else {
+                            self.visit_items(
+                                items,
+                                &format!("{scope}{}::", module.ident),
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn note_function(&mut self, scope: &str, signature: &syn::Signature, block: &syn::Block) {
+        let name = format!("{scope}{}", signature.ident);
+        let start = signature.fn_token.span.start().line;
+        let end = block.brace_token.span.close().end().line;
+        if self.symbols.len() >= MAX_SYMBOLS
+            || name.len() > MAX_NAME_LEN
+            || start == 0
+            || end < start
+        {
+            self.symbols_omitted += 1;
+            return;
+        }
+        self.symbols.push(NavigationSymbol {
+            name,
+            read: CodeReadReference {
+                path: self.path.clone(),
+                offset: start,
+                limit: end - start + 1,
+                expected_revision: self.source_revision.clone(),
+            },
+        });
+    }
+
+    /// Whole actionable objects under half the existing footer budget.
+    /// Metadata retains the larger bounded view.
+    fn render_footer(&self) -> String {
+        if echo_off("navigation") {
+            return String::new();
+        }
+        let mut shown = self.clone();
+        shown.symbols.clear();
+        shown.symbols_omitted += self.symbols.len();
+        for symbol in &self.symbols {
+            shown.symbols.push(symbol.clone());
+            shown.symbols_omitted -= 1;
+            if serde_json::to_string(&shown).is_ok_and(|text| {
+                text.len() + NAVIGATION_MARKER.len() + 3 > POD_FOOTER_MAX_BYTES / 2
+            }) {
+                shown.symbols.pop();
+                shown.symbols_omitted += 1;
+                break;
+            }
+        }
+        let footer = format!(
+            "\n\n{NAVIGATION_MARKER}{}]",
+            serde_json::to_string(&shown).unwrap_or_default()
+        );
+        if footer.len() <= POD_FOOTER_MAX_BYTES / 2 {
+            footer
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// Delivery bookkeeping from projected tool-result text only. JSON strings
+/// are not recursively decoded: a log/args preview is not an explicitly
+/// returned reference. None of these references authorizes a future read.
+pub(crate) fn delivered_navigation_refs(text: &str) -> Vec<CodeReadReference> {
+    fn collect(value: &Value, refs: &mut Vec<CodeReadReference>, nodes: &mut usize, depth: usize) {
+        if *nodes == 0 || depth > 16 || refs.len() >= MAX_DELIVERED_REFS {
+            return;
+        }
+        *nodes -= 1;
+        if value
+            .as_object()
+            .is_some_and(|object| object.len() == 4 && object.contains_key("expected_revision"))
+            && let Ok(reference) = serde_json::from_value::<CodeReadReference>(value.clone())
+            && reference.valid()
+        {
+            if !refs.contains(&reference) {
+                refs.push(reference);
+            }
+            return;
+        }
+        match value {
+            Value::Object(object) => {
+                for value in object.values() {
+                    collect(value, refs, nodes, depth + 1);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, refs, nodes, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut refs = Vec::new();
+    let value = serde_json::from_str::<Value>(text).ok().or_else(|| {
+        let start = text.rfind(NAVIGATION_MARKER)? + NAVIGATION_MARKER.len();
+        serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<Value>()
+            .next()?
+            .ok()
+    });
+    if let Some(value) = value {
+        collect(&value, &mut refs, &mut 2048, 0);
+    }
+    refs
+}
 
 /// Hard budget for the rendered footer, in bytes.
 pub const POD_FOOTER_MAX_BYTES: usize = 1200;
@@ -258,6 +533,31 @@ impl EchoChart {
     /// Render the footer. Deterministic for a fixed file and directory:
     /// sorted entries, fixed caps, byte budget, no timestamps.
     pub fn render_footer(&self) -> String {
+        self.render_footer_with_budget(POD_FOOTER_MAX_BYTES)
+    }
+
+    pub(crate) fn render_with_navigation(
+        &mut self,
+        navigation: Option<&SourceNavigation>,
+    ) -> String {
+        let Some(navigation) = navigation else {
+            return self.render_footer();
+        };
+        if navigation.status == "ready" {
+            // Consume the syntax producer instead of publishing conflicting
+            // line-scanner lookalikes beside its qualified observations.
+            self.symbols = navigation
+                .symbols
+                .iter()
+                .map(|symbol| format!("fn {}:{}", symbol.name, symbol.read.offset))
+                .collect();
+            self.symbol_total = self.symbols.len() + navigation.symbols_omitted;
+        }
+        let footer = navigation.render_footer();
+        self.render_footer_with_budget(POD_FOOTER_MAX_BYTES - footer.len()) + &footer
+    }
+
+    fn render_footer_with_budget(&self, budget: usize) -> String {
         let mut out = String::new();
         // No dir: the footer trails the read of this exact file, so the
         // pod frame is already known (miss echoes and grep pods keep
@@ -307,7 +607,7 @@ impl EchoChart {
         if !sounding.is_empty() {
             out.push_str(&format!("\n\n[Sound: {sounding}]"));
         }
-        truncate_bytes(&out, POD_FOOTER_MAX_BYTES)
+        truncate_bytes(&out, budget)
     }
 }
 

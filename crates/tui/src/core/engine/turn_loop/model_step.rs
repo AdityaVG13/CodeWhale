@@ -103,6 +103,11 @@ impl Engine {
             .saturating_add(transport_retries.load(std::sync::atomic::Ordering::Relaxed));
         let stream = match stream_result {
             Ok(s) => {
+                // Physical-cache population, nested execution and result
+                // projection alone do not establish model delivery.
+                self.session
+                    .working_set
+                    .observe_navigation_delivery(&stream_request.messages);
                 if let Some(job) = child_job.as_ref() {
                     job.provider_responded();
                 }

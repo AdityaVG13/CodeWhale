@@ -116,6 +116,9 @@ pub struct RuntimeToolServices {
     /// Per-session backing store for `var_handle` payloads. Cloned tool
     /// contexts share this Arc so handles survive across turns.
     pub handle_store: SharedHandleStore,
+    /// Bounded host-computed source observations, isolated from writable
+    /// var_handles. Children clone the Arc, not delivery state or authority.
+    pub code_observations: SharedHandleStore,
     /// Per-session persistent RLM kernels, keyed by caller-chosen context name.
     pub rlm_sessions: SharedRlmSessionStore,
     /// Directory for `read_media`'s content-addressed store of
@@ -139,6 +142,7 @@ impl Default for RuntimeToolServices {
             work: None,
             hook_executor: None,
             handle_store: new_shared_handle_store(),
+            code_observations: new_shared_handle_store(),
             rlm_sessions: new_shared_rlm_session_store(),
             media_originals_dir: None,
         }
@@ -162,6 +166,7 @@ impl std::fmt::Debug for RuntimeToolServices {
             .field("work", &self.work.is_some())
             .field("hook_executor", &self.hook_executor.is_some())
             .field("handle_store", &true)
+            .field("code_observations", &true)
             .field("rlm_sessions", &true)
             .field("media_originals_dir", &self.media_originals_dir)
             .finish()

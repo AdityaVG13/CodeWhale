@@ -948,8 +948,20 @@ impl ReadFileTool {
         input: Value,
         context: &ToolContext,
     ) -> Result<RichToolResult, ToolError> {
-        reject_primitive_unknown(&input, "read", &["path", "offset", "limit", "max_bytes"])?;
+        reject_primitive_unknown(
+            &input,
+            "read",
+            &["path", "offset", "limit", "max_bytes", "expected_revision"],
+        )?;
         let path_str = required_str(&input, "path")?;
+        let expected_revision = optional_str(&input, "expected_revision")?;
+        if let Some(revision) = expected_revision
+            && !crate::tools::echolocation::valid_source_revision(revision)
+        {
+            return Err(ToolError::invalid_input(
+                "expected_revision must be sha256: followed by 64 lowercase hexadecimal digits",
+            ));
+        }
         let offset = contract_nonnegative_int(&input, "offset")?;
         let limit = contract_nonnegative_int(&input, "limit")?;
         let max_bytes = effective_read_max_bytes(contract_nonnegative_int(&input, "max_bytes")?);
@@ -979,8 +991,7 @@ impl ReadFileTool {
                 // or permission failures, where listing the parent would
                 // answer a refused probe. `sound_miss_echo` carries those
                 // gates internally, so appending it here stays fail-closed.
-                let mut message =
-                    format!("Failed to read {}: file not found", file_path.display());
+                let mut message = format!("Failed to read {}: file not found", file_path.display());
                 if let Some(echo) = crate::tools::echolocation::sound_miss_echo(&file_path) {
                     message.push_str(&echo);
                 }
@@ -992,6 +1003,11 @@ impl ReadFileTool {
         let size_bytes = bytes.len();
         check_file_operation_cancelled(context)?;
         if let Some(mime_type) = primitive_image_mime(&bytes) {
+            if expected_revision.is_some() {
+                return Err(ToolError::execution_failed(
+                    "Navigation reference is stale: the target is now an image. Read the path again without the old range/reference.",
+                ));
+            }
             // Decoding and any downscale are CPU-bound; keep them off the
             // runtime worker (#6149).
             let prepared = tokio::task::spawn_blocking(move || {
@@ -1012,7 +1028,57 @@ impl ReadFileTool {
 
         // The small-contract reader decodes non-image buffers as UTF-8 text with replacement
         // characters instead of refusing the whole read on one invalid byte.
-        let text = String::from_utf8_lossy(&bytes);
+        let workspace = context.workspace.clone();
+        let observation_path = file_path.clone();
+        let guarded = expected_revision.is_some();
+        let (text, source_revision, utf8_valid, cache_identity) =
+            tokio::task::spawn_blocking(move || {
+                let cache_identity = crate::tools::echolocation::navigation_cache_identity(
+                    &workspace,
+                    &observation_path,
+                );
+                let revision = (cache_identity.is_some() || guarded).then(|| content_hash(&bytes));
+                let (text, utf8_valid) = match String::from_utf8(bytes) {
+                    Ok(text) => (text, true),
+                    Err(error) => (
+                        String::from_utf8_lossy(error.as_bytes()).into_owned(),
+                        false,
+                    ),
+                };
+                (text, revision, utf8_valid, cache_identity)
+            })
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!("Failed to decode source: {error}"))
+            })?;
+        check_file_operation_cancelled(context)?;
+        if let Some(expected) = expected_revision
+            && source_revision.as_deref() != Some(expected)
+        {
+            return Err(ToolError::execution_failed(format!(
+                "Navigation reference for {path_str} is stale. Read the path without the old range/expected_revision to obtain a new reference; do not reuse its offsets."
+            )));
+        }
+        // Admission and current-byte revision checks precede every cache hit.
+        // Shared physical knowledge does not grant access or delivery state.
+        let cached_navigation = if let Some((namespace, path)) = &cache_identity {
+            context
+                .runtime
+                .code_observations
+                .lock()
+                .await
+                .get_json_named(namespace, path)
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<crate::tools::echolocation::SourceNavigation>(value)
+                        .ok()
+                })
+                .filter(|navigation| {
+                    navigation.matches(path, source_revision.as_deref().unwrap_or_default())
+                })
+        } else {
+            None
+        };
         // Count and select with byte boundaries, without a pointer per newline.
         let line_count = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
         let requested_offset = offset.unwrap_or(1);
@@ -1100,34 +1166,80 @@ impl ReadFileTool {
         let buzz = file_path.parent().is_some_and(|parent| {
             context.pod_visit_count(parent) >= crate::tools::echolocation::BUZZ_VISIT_THRESHOLD
         });
-        output.push_str(
-            &crate::tools::echolocation::sound_echolocation(
-                &context.workspace,
-                &file_path,
-                &text,
-                buzz,
-            )
-            .render_footer(),
-        );
+        let cached_navigation = if let Some((namespace, path)) = &cache_identity {
+            context
+                .runtime
+                .code_observations
+                .lock()
+                .await
+                .get_json_named(namespace, path)
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<crate::tools::echolocation::SourceNavigation>(value)
+                        .ok()
+                })
+                .filter(|navigation| {
+                    navigation.matches(path, source_revision.as_deref().unwrap_or_default())
+                })
+        } else {
+            None
+        };
+        let workspace = context.workspace.clone();
+        let echo_path = file_path.clone();
+        let navigation_path = cache_identity.as_ref().map(|(_, path)| path.clone());
+        let (echo, navigation) = tokio::task::spawn_blocking(move || {
+            let navigation = cached_navigation.or_else(|| {
+                navigation_path
+                    .zip(source_revision)
+                    .map(|(path, revision)| {
+                        crate::tools::echolocation::SourceNavigation::from_source(
+                            path, revision, &text, utf8_valid,
+                        )
+                    })
+            });
+            let echo =
+                crate::tools::echolocation::sound_echolocation(&workspace, &echo_path, &text, buzz)
+                    .render_with_navigation(navigation.as_ref());
+            (echo, navigation)
+        })
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!("read echo worker failed: {error}"))
+        })?;
+        check_file_operation_cancelled(context)?;
+        output.push_str(&echo);
+        if let (Some((namespace, path)), Some(navigation)) = (&cache_identity, &navigation) {
+            let _ = context.runtime.code_observations.lock().await.insert_json(
+                namespace,
+                path,
+                serde_json::to_value(navigation)
+                    .map_err(|error| ToolError::execution_failed(error.to_string()))?,
+            );
+        }
 
-        // This internal observation keeps hidden legacy edit replay working,
-        // but no hash or read-before-edit ceremony reaches the lowercase
-        // schema or result.
+        // Keep hidden legacy edit replay working. Ordinary reads remain
+        // unguarded; the optional navigation revision pins a selected range,
+        // not a read-before-edit permission ceremony.
         context.note_file_read(&file_path);
+        let mut metadata = json!({
+            "evidence_routing": "inline",
+            // The budget this call actually enforced. The context
+            // compactor honors it so an already-bounded read is never
+            // truncated a second time on its way into the conversation.
+            "read_budget_bytes": max_bytes,
+            // #6283: paging contract. `size` is the whole file in bytes,
+            // `line_count` its total lines, `truncated` whether the file
+            // holds more than this response shows.
+            "size": size_bytes,
+            "truncated": truncated,
+            "line_count": line_count
+        });
+        if let Some(navigation) = navigation {
+            metadata["navigation"] = serde_json::to_value(navigation)
+                .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+        }
         Ok(RichToolResult::plain(
-            ToolResult::success(output).with_metadata(json!({
-                "evidence_routing": "inline",
-                // The budget this call actually enforced. The context
-                // compactor honors it so an already-bounded read is never
-                // truncated a second time on its way into the conversation.
-                "read_budget_bytes": max_bytes,
-                // #6283: paging contract. `size` is the whole file in bytes,
-                // `line_count` its total lines, `truncated` whether the file
-                // holds more than this response shows.
-                "size": size_bytes,
-                "truncated": truncated,
-                "line_count": line_count
-            })),
+            ToolResult::success(output).with_metadata(metadata),
         ))
     }
 }

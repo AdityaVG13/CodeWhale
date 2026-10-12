@@ -15,7 +15,8 @@ only.
   `[Sound: N symbols: …; imports: …; links: …]` (line-numbered
   symbols, import roots, cross-pod file links; same-pod links render
   bare and import roots a link already names (file stem or package
-  path) are dropped). Budget: 1200B.
+  path) are dropped). Lowercase Rust `read` also publishes bounded syntax
+  navigation as described below. Total footer budget remains 1200B.
 - **Terminal buzz**: after two distinct files are read in one pod, the
   next read there adds `heard by …` — podmates whose resolved links
   include this file. Sparse clicks while searching, high-resolution
@@ -44,14 +45,73 @@ TypeScript, and Go via deliberately small line scanners (see
 classes). Anything unresolvable is omitted, never guessed; links
 require an on-disk target.
 
+## Revision-qualified Rust navigation
+
+The lowercase `read` path uses the already-installed `syn` parser to observe
+outer Rust functions and impl methods, including inline modules. A bounded
+`metadata.navigation` object identifies its producer (`rust_syntax_v1`), the
+workspace-relative path, source-byte SHA-256 revision, availability and omission
+counts. Each symbol carries a `read` object: `path`, 1-based line `offset`, line
+`limit`, and `expected_revision`. Pass that object directly to `read` to inspect
+the captured function window. No separately named navigation tool is required.
+
+Observations come from the same byte snapshot as the read, not another filesystem
+read. Syntax is not semantic resolution: macros, active cfg, external modules,
+type/name resolution and LSP coordinates are not claimed. Ranges start on the
+`fn` keyword's line; preceding attribute/modifier lines and local items are not
+included. Invalid UTF-8, parse errors and sources above
+256 KiB report `unavailable`, never invented ranges. At most 24 symbols and 4 KiB
+of serialized navigation are retained; counts identify omitted observations.
+
+A `[Code navigation: ...]` footer renders whole reference objects under 600B,
+sharing the existing 1200B budget with the pod/sounding sections. Long paths can
+leave no room for an inline reference; the bounded metadata remains available to
+`execute_tools`. Existing scanners still serve other languages and other echo
+surfaces. The successful Rust read's symbol sounding consumes these syntax facts.
+
+### Shared facts, separate delivery
+
+`RuntimeToolServices` reuses the existing bounded `HandleStore` implementation in
+a **separate, host-owned store**, not the writable program `var_handle` namespace.
+Keys bind canonical workspace, relative path and producer; cached values are
+reused only after normal path/authority admission and matching the **current byte
+revision**. There is no watcher, persistent index, permission bypass or mtime-only
+freshness claim. Child runtime clones share the physical store, not a parent's
+delivery ledger. Cache eviction simply recomputes the observation on a later read.
+
+An optional `expected_revision` guard rejects stale source before using old
+offsets, including a same-size external edit. Without it, ordinary reads behave
+normally. A reference is evidence of a range, never authority to access that path.
+
+`WorkingSet` retains at most 32 delivered references **only after the final
+projected request is accepted by the model client**. It inspects model-facing
+tool-result text, not nested calls or the physical cache. A program can read source
+internally and return only `{done: true}` without seeding this ledger; returning a
+selected structured reference records just that reference. JSON strings inside
+logs/argument previews are not decoded as deliveries. Inspection is conservative
+and bounded to 2048 JSON nodes and 16 nesting levels per result.
+
+The session's existing tool-result log retains the same projected reference
+objects. Resume/compaction rebuilds use that conversation, requiring a subsequent
+assistant message before classifying a historical result as delivered; a trailing
+crash-boundary result alone is not proof. This ledger does not claim body readership,
+current freshness, complete historical delivery or deduplication of future reads.
+Fresh child seeds do not rebuild it from a parent's ledger.
+
+**KV-cache effect:** navigation is tool-result history only, never a volatile
+prefix contributor. The optional `read` schema field is static and session-pinned
+with the tool catalog. No new system-prompt text is inserted.
+
 ## Tuning and ablation
 
 `CODEWHALE_ECHO` gates sections for trials
 (`off:<name>`, comma-separated; names: `mates`, `symbols`, `imports`,
-`links`, `callers`, `pods`, `soundings`). Unset or malformed means
+`links`, `callers`, `pods`, `soundings`, `navigation`). Unset or malformed means
 everything on. The gates are process-pinned and read-only; there is no
 per-session or per-call control, by design. The squeeze follows the
 same gates, so an `off:links` trial measures links alone.
+`off:navigation` suppresses the inline navigation footer only; structured
+metadata remains available to programs and still uses the syntax producer.
 
 ## Non-goals
 
