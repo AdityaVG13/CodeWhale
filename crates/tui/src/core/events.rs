@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::error_taxonomy::ErrorEnvelope;
 use crate::tools::goal::GoalSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
@@ -16,8 +16,17 @@ use crate::tools::subagent::{AgentWorkerStatus, CoordinationDetailProjection, Su
 use crate::tools::user_input::UserInputRequest;
 use codewhale_models::{Message, SystemPrompt, Tool, Usage};
 
+/// Provider correlation retained only for model-history reconstruction.
+/// Event ids remain host execution ids; this is not approval authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelToolCall {
+    pub provider_id: String,
+    pub caller: Option<codewhale_models::ToolCaller>,
+    pub thought_signature: Option<String>,
+}
+
 /// Final status for a turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOutcomeStatus {
     Completed,
@@ -32,9 +41,9 @@ pub enum TurnOutcomeStatus {
 /// turns such as composer `!` shell commands use no route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRoute {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     /// Exact non-secret configured route key. Named custom providers all map
-    /// to [`ApiProvider::Custom`], so the enum alone is not provenance.
+    /// to [`ProviderKind::Custom`], so the enum alone is not provenance.
     pub provider_identity: String,
     pub model: String,
     pub auto_model: bool,
@@ -149,6 +158,11 @@ pub struct AgentProgressEventMeta {
     /// cannot tell them apart — the producer sets this instead, and UI
     /// consumers rewrite on it rather than sniffing the message (#6290).
     pub routine_wait: bool,
+    /// The child approval id this progress reports on: set while the agent
+    /// waits on a person and on the first progress after that wait ends, so
+    /// hosts can retire the matching card and pending entry by identity
+    /// (approvals C1) instead of by parsing the message.
+    pub approval_id: Option<String>,
 }
 
 impl AgentProgressEventMeta {
@@ -159,6 +173,7 @@ impl AgentProgressEventMeta {
             step: None,
             tool_name: None,
             routine_wait: false,
+            approval_id: None,
         }
     }
 
@@ -169,14 +184,14 @@ impl AgentProgressEventMeta {
     }
 
     #[must_use]
-    pub const fn routine_wait(mut self) -> Self {
-        self.routine_wait = true;
+    pub fn with_tool(mut self, tool_name: impl Into<String>) -> Self {
+        self.tool_name = Some(tool_name.into());
         self
     }
 
     #[must_use]
-    pub fn with_tool(mut self, tool_name: impl Into<String>) -> Self {
-        self.tool_name = Some(tool_name.into());
+    pub fn with_approval_id(mut self, approval_id: impl Into<String>) -> Self {
+        self.approval_id = Some(approval_id.into());
         self
     }
 }
@@ -222,6 +237,7 @@ pub enum Event {
     /// Tool call initiated
     ToolCallStarted {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         input: Value,
     },
@@ -233,11 +249,35 @@ pub enum Event {
     /// deliberately long-running tool turn stale.
     ToolCallHeartbeat,
 
+    /// Optional actual dispatch observation for a narrowed protocol host.
+    ToolExecutionStarted { id: String },
+    /// Canonical rich result after existing output/media preservation.
+    ToolResultContent {
+        id: String,
+        blocks: Vec<codewhale_tools::ToolResultContentBlock>,
+    },
+
     /// Tool call completed
     ToolCallComplete {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         result: Result<ToolResult, ToolError>,
+    },
+
+    /// Trusted operation activity emitted only after dispatch and authority
+    /// gates resolve the underlying operation. The payload deliberately
+    /// excludes arguments, commands, and results.
+    OperationActivityStarted {
+        span_id: String,
+        activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        action_id: Option<String>,
+    },
+    OperationActivityCompleted {
+        span_id: String,
+        activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome,
+        action_id: Option<String>,
     },
 
     // === Turn Lifecycle ===
@@ -248,12 +288,33 @@ pub enum Event {
         /// Legacy/non-model hosts may still attach a route at start. Model
         /// turns emit it separately at the application dispatch boundary.
         route: Option<TurnRoute>,
+        /// Correlation with the host submission that produced this turn: the
+        /// verbatim echo of the `submission_id` the host stamped on its
+        /// `SendMessage`/`EditLastTurn` op, `None` for every runtime
+        /// self-started turn (idle sub-agent completion, background shell
+        /// wake, goal continuation) and for the composer shell command turn.
+        /// Hosts use the echo to tell their own pending submission's
+        /// `TurnStarted` apart from an autonomous follow-up whose start event
+        /// overtook it in the stream, so a deferred submit-window action is
+        /// only ever consumed by the turn it targets.
+        submission_id: Option<String>,
     },
 
     /// Bounded tool-field projection from a prepared model-client request.
     /// Delivery remains unknown; this event is emitted before connection setup.
     ToolRequestSnapshot {
         snapshot: crate::tool_inspection::ToolInspectionSnapshot,
+    },
+
+    /// The engine took a workspace snapshot for the running turn: before it
+    /// (`pre_turn`), before one file-modifying tool call (`tool`), after that
+    /// call (`post_tool`, recording hosts only), or after the turn
+    /// (`post_turn`). A host that records these on its turn records owns
+    /// exactly those restore points (see `crate::snapshot::WorkspaceSnapshotRef`).
+    /// With `EngineConfig::record_restore_points` every receipt of a turn
+    /// arrives before its `TurnComplete`.
+    WorkspaceSnapshotTaken {
+        snapshot: crate::snapshot::WorkspaceSnapshotRef,
     },
 
     /// Immutable billing route captured at CodeWhale's pre-permit application
@@ -418,6 +479,10 @@ pub enum Event {
         /// `run.model`, …). `None` for spawn paths that bypass route
         /// resolution (checkpoint resume, engine-internal spawns).
         route_source: Option<String>,
+        /// The name this agent goes by on every surface: its workflow task
+        /// label, dispatch name, or role, resolved once by the engine
+        /// (`subagent_display_name`). Never the raw id.
+        display_name: Option<String>,
     },
 
     /// Sub-agent progress update
@@ -443,6 +508,8 @@ pub enum Event {
         /// Provider-reported child usage from the durable ledger (#6315).
         /// None means the worker has no usage receipt, never zero tokens.
         usage: Option<crate::tools::subagent::AgentRunUsage>,
+        /// Same resolved name as `AgentSpawned::display_name`.
+        display_name: Option<String>,
     },
 
     /// Receipt for an operator follow-up sent to a child (`Op::FollowUpSubAgent`).
@@ -565,6 +632,10 @@ pub enum Event {
         approval_force_prompt: bool,
     },
 
+    /// The engine no longer waits for this approval. Every decision surface
+    /// must retire the request by identity without sending a user decision.
+    ApprovalWithdrawn { id: String },
+
     /// Request user input for a tool call
     UserInputRequired {
         id: String,
@@ -589,6 +660,15 @@ pub enum Event {
     },
 
     /// Request user decision after sandbox denial
+    // Consumers (TUI, runtime threads, exec agent, protocol parity) handle
+    // this, but the engine never emits it. It stayed "live" only because the
+    // deleted public `rlm::run_rlm_turn` put `Event` in the crate's public
+    // API (#6511). Whether to wire the emitter or drop the elevation flow is
+    // a separate product decision.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no engine emitter yet; tests construct it")
+    )]
     ElevationRequired {
         tool_id: String,
         tool_name: String,
@@ -771,6 +851,107 @@ impl Event {
     }
 }
 
+/// Who a [`Event::Status`] line is for once it leaves the engine.
+///
+/// The TUI shows every status in its transient footer, so it needs no
+/// classification. Durable clients (the runtime thread store and anything
+/// that renders its items) do: scheduler, continuation and schema-hydration
+/// lines are engine plumbing, and rendering them as transcript rows buries
+/// the user's actual conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusVisibility {
+    /// Worth a transcript row.
+    User,
+    /// Engine plumbing: keep the receipt, but clients collapse it by default.
+    Internal,
+    /// Addressed to the model, which already receives it in a tool result.
+    /// Never persist it as a user-facing item.
+    ModelOnly,
+}
+
+impl StatusVisibility {
+    /// Wire value carried in runtime item metadata (`metadata.visibility`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Internal => "internal",
+            Self::ModelOnly => "model_only",
+        }
+    }
+}
+
+/// Engine-owned retry status wording. Retain these observations in the TUI
+/// transcript without turning unrelated scheduler/footer updates into rows.
+#[must_use]
+pub fn is_retry_status_receipt(message: &str) -> bool {
+    [
+        "Retry attempt: ",
+        "Retry recovery: ",
+        "Retry exhaustion: ",
+        "Retry interrupted: ",
+        "Retry stopped: ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
+/// Classify an engine status line for durable clients. Unknown lines stay
+/// user-visible; internal scheduler and model-only notices retain their scope.
+#[must_use]
+pub fn status_visibility(message: &str) -> StatusVisibility {
+    let message = message.trim();
+    if message.starts_with("Loaded deferred tool '")
+        && message.contains("Retry the call with its visible schema")
+    {
+        return StatusVisibility::ModelOnly;
+    }
+    let scheduler_row = message.starts_with("Executing tools sequentially")
+        || (message.starts_with("Executing ") && message.ends_with(" parallel chunk(s)"));
+    let continuation_row = message.starts_with("Continuing — ")
+        || message.starts_with("Continuing active goal (pass ");
+    // Successful agent completions already have their own durable receipts.
+    // Keep failure-bearing or unknown resumption notices visible.
+    let agent_resume_row = message
+        .strip_prefix("Resuming turn with ")
+        .and_then(|rest| rest.strip_suffix(" sub-agent completion(s)"))
+        .is_some_and(|count| {
+            let count = [" idle", " queued", " late"]
+                .iter()
+                .find_map(|suffix| count.strip_suffix(suffix))
+                .unwrap_or(count);
+            count.parse::<usize>().is_ok_and(|count| count > 0)
+        });
+    let approval_wait_row = (message.starts_with("Still waiting for tool approval on `")
+        || message.starts_with("Still waiting for user input on `"))
+        && message.ends_with("s — the turn is parked here until it is answered");
+    // #6511: a nested sub-RLM's forwarded rounds are the record of model
+    // calls the parent never saw; keep them, collapsed.
+    let nested_rlm_row = message.starts_with(crate::rlm::bridge::NESTED_RLM_STATUS_PREFIX);
+    if scheduler_row || continuation_row || agent_resume_row || approval_wait_row || nested_rlm_row
+    {
+        StatusVisibility::Internal
+    } else {
+        StatusVisibility::User
+    }
+}
+
+/// The tool call named by the engine's tool-approval wait heartbeat
+/// ("Still waiting for tool approval on `<id>` after Ns — ..."), if `message`
+/// is one. The runtime uses it to drop a heartbeat for an approval it has
+/// already settled.
+#[must_use]
+pub fn approval_wait_tool_call(message: &str) -> Option<&str> {
+    let message = message.trim();
+    if status_visibility(message) != StatusVisibility::Internal {
+        return None;
+    }
+    message
+        .strip_prefix("Still waiting for tool approval on `")?
+        .rsplit_once("` after ")
+        .map(|(call, _)| call)
+}
+
 /// Which permission gate produced a [`Event::ToolGateDecision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolGate {
@@ -833,7 +1014,7 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     out
 }
 
-fn is_bidi_format_control(c: char) -> bool {
+pub(crate) fn is_bidi_format_control(c: char) -> bool {
     matches!(
         c,
         '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
@@ -860,5 +1041,101 @@ mod tool_projection_warning_tests {
         );
         assert!(bounded.iter().all(|name| !name.contains('\n')));
         assert!(tool_projection_warning_tool_list(&bounded, names.len()).ends_with(", …"));
+    }
+}
+
+#[cfg(test)]
+mod status_visibility_tests {
+    use super::{StatusVisibility, approval_wait_tool_call, status_visibility};
+
+    #[test]
+    fn engine_plumbing_statuses_are_not_user_rows() {
+        for internal in [
+            "Executing tools sequentially (writes, approvals, or non-parallel tools detected)",
+            "Executing 3 read-only tools in 2 parallel chunk(s)",
+            "Continuing — tool results",
+            "Continuing — queued steer input",
+            "Continuing active goal (pass 2 this turn, 5 total)",
+            "Resuming turn with 1 sub-agent completion(s)",
+            "Resuming turn with 2 idle sub-agent completion(s)",
+            "Resuming turn with 3 queued sub-agent completion(s)",
+            "Resuming turn with 4 late sub-agent completion(s)",
+            "Still waiting for tool approval on `call-1` after 60s — the turn is parked here until it is answered",
+            "Still waiting for user input on `call-2` after 120s — the turn is parked here until it is answered",
+        ] {
+            assert_eq!(
+                status_visibility(internal),
+                StatusVisibility::Internal,
+                "{internal}"
+            );
+        }
+        for model_only in [
+            "Loaded deferred tool 'load_skill'. Retry the call with its visible schema.",
+            "Loaded deferred tool 'load_skill' after resolving 'skill'. Retry the call with its visible schema.",
+        ] {
+            assert_eq!(
+                status_visibility(model_only),
+                StatusVisibility::ModelOnly,
+                "{model_only}"
+            );
+        }
+        for user in [
+            "Request cancelled",
+            "Reconnecting…",
+            "Goal set; starting goal work.",
+            "Still waiting for the service to reconnect; retry in a moment.",
+            "Still waiting for tool approval on `call-1` after an unexpected failure",
+            "Resuming turn with 1 sub-agent completion(s) (1 failed)",
+            "Resuming turn with 2 idle sub-agent completion(s) (1 failed)",
+            "Resuming turn with unexpected sub-agent completion(s)",
+            "Resuming turn with 1 unknown sub-agent completion(s)",
+            "Turn ending with 1 detached sub-agent(s) still running in the background; they'll report when done.",
+        ] {
+            assert_eq!(status_visibility(user), StatusVisibility::User, "{user}");
+        }
+        assert_eq!(StatusVisibility::Internal.as_str(), "internal");
+    }
+
+    #[test]
+    fn retry_status_receipts_classify_every_closing_kind_without_footer_noise() {
+        for message in [
+            "Retry attempt: transport 1/2; upstream 503; waiting 0.00s",
+            "Retry recovery: stream recovered after 1 retries",
+            "Retry exhaustion: stream stopped after 2 retries",
+            "Retry interrupted: request cancelled",
+            "Retry stopped: transparent stream completion was not observed",
+        ] {
+            assert!(super::is_retry_status_receipt(message), "{message}");
+            assert_eq!(status_visibility(message), StatusVisibility::User);
+        }
+        for message in [
+            "Executing tools sequentially",
+            "Loaded deferred tool 'load_skill'. Retry the call with its visible schema.",
+            "Goal set; starting goal work.",
+            "Retry stopped",
+        ] {
+            assert!(!super::is_retry_status_receipt(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn approval_wait_tool_call_names_the_raw_call_id() {
+        assert_eq!(
+            approval_wait_tool_call(
+                "Still waiting for tool approval on `call_00_x|99765c30-c427` after 60s — the turn is parked here until it is answered"
+            ),
+            Some("call_00_x|99765c30-c427")
+        );
+        for not_a_heartbeat in [
+            "Still waiting for user input on `call-2` after 120s — the turn is parked here until it is answered",
+            "Still waiting for tool approval on `call-1` after an unexpected failure",
+            "Continuing — tool results",
+        ] {
+            assert_eq!(
+                approval_wait_tool_call(not_a_heartbeat),
+                None,
+                "{not_a_heartbeat}"
+            );
+        }
     }
 }

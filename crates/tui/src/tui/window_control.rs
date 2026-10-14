@@ -56,7 +56,7 @@ mod imp {
         SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
         SetWindowPos, ShowWindowAsync, WINDOWINFO, WS_EX_TOPMOST, WS_MAXIMIZE,
     };
-    use windows_core::BOOL;
+    use windows::core::BOOL;
 
     /// Pin state: remembers the pre-pin window rect so unpinning restores it,
     /// plus whether the window was maximized (unpin restores maximized then,

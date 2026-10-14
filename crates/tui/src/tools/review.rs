@@ -140,10 +140,11 @@ Rules for \"suggestions\":\n\
 - Anchor a suggestion only to lines that appear in the diff you were given, and never to a deleted line. If you are not sure of the exact line numbers, omit \"replacement\".\n\
 - A wrong replacement is worse than no replacement: it is one click from being merged. When in doubt, omit it.";
 
-/// The system prompt shared by every structured review path (`review`
-/// tool and `codewhale review --pr`). Callers parse the reply with
-/// [`ReviewOutput::from_str`], which falls back to freeform text when a
-/// model ignores the JSON contract.
+/// The one review system prompt (#6510), shared by every review path: the
+/// `review` tool, `codewhale review --pr`, and `codewhale review` of a plain
+/// diff. Callers parse the reply with [`ReviewOutput::from_str`] or
+/// [`ReviewOutput::from_structured_str`], which fall back to freeform text
+/// when a model ignores the JSON contract.
 #[must_use]
 pub fn review_system_prompt() -> &'static str {
     REVIEW_SYSTEM_PROMPT
@@ -219,7 +220,10 @@ impl ReviewOutput {
         ReviewOutput::fallback(raw)
     }
 
-    fn from_structured_str(raw: &str) -> Option<Self> {
+    /// Parse `raw` only when it is the structured review contract (all four
+    /// top-level fields present), unlike [`Self::from_str`], which falls
+    /// back to wrapping prose.
+    pub(crate) fn from_structured_str(raw: &str) -> Option<Self> {
         let candidate = serde_json::from_str::<Value>(raw)
             .ok()
             .or_else(|| extract_json_block(raw).and_then(|json| serde_json::from_str(json).ok()))?;
@@ -622,7 +626,11 @@ pub(crate) async fn build_pr_review_prompts(
     workspace: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let (view, plan, workspace) = (view.clone(), plan.clone(), workspace.to_path_buf());
+    #[cfg(test)]
+    let env_scope = crate::test_support::env_scope_ticket();
     Ok(tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _env_scope = crate::test_support::join_env_scope(env_scope);
         plan.passes
             .iter()
             .map(|pass| build_pr_pass_prompt(number, &view, &plan, pass, &workspace))
@@ -670,6 +678,25 @@ pub(crate) fn build_pr_pass_prompt(
         "repository_context": context,
         "context_limit": "Context is bounded supplementary excerpts from the exact head. Null means no source context could fit. Missing files or omitted lines are not evidence of a defect."
     }).to_string()
+}
+
+/// Exact immutable facts from the same Core source-context collector and budget projection.
+pub(crate) fn capture_pr_pass_snapshot(
+    number: u32,
+    view: &super::review_pr::GhPullRequest,
+    plan: &PrReviewPlan,
+    pass: &PrReviewPass,
+    workspace: &Path,
+) -> Value {
+    let context = super::review_pr::source_context(
+        workspace,
+        &view.head_sha,
+        &pass.diff,
+        plan.manifest
+            .max_chars_per_pass
+            .saturating_sub(pass.manifest.diff_chars),
+    );
+    json!({"number":number,"view":super::review_host::view_snapshot(view),"manifest":plan.manifest,"pass":pass.manifest,"diff":super::review_pr::model_diff(&pass.diff),"context":context,"sort_keys":super::review_host::sort_json_keys()})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1440,11 +1467,17 @@ impl ToolSpec for ReviewTool {
                 .number
                 .parse::<u32>()
                 .map_err(|_| ToolError::invalid_input("Invalid pull request number"))?;
-            build_pr_review_prompts(number, view, plan, &context.workspace)
-                .await
-                .map_err(|error| ToolError::execution_failed(error.to_string()))?
+            super::review_host::pr_prompts(number, view, plan, context).await?
         } else {
-            vec![build_review_prompt(&source, max_chars)]
+            validate_review_source_size(&source, max_chars)?;
+            vec![if context
+                .features
+                .enabled(crate::features::Feature::ReviewHost)
+            {
+                super::review_host::source_prompt(review_source_snapshot(&source), context).await?
+            } else {
+                build_review_prompt(&source)
+            }]
         };
 
         let route = client.effective_route_envelope(&self.model, chrono::Utc::now());
@@ -1479,9 +1512,12 @@ impl ToolSpec for ReviewTool {
                         &route,
                         &usage,
                         format!(
-                            "Review pass {}/{} request failed: {error}; no partial review was accepted.",
-                            index + 1,
-                            plan.as_ref().map_or(1, |plan| plan.passes.len())
+                            "{}; no partial review was accepted.",
+                            request_failure_message(
+                                index + 1,
+                                plan.as_ref().map_or(1, |plan| plan.passes.len()),
+                                &error
+                            )
                         ),
                     ));
                 }
@@ -1505,7 +1541,12 @@ impl ToolSpec for ReviewTool {
                     return Ok(review_error_with_usage(&route, &usage, error.to_string()));
                 }
             } else {
-                single_output = Some(ReviewOutput::from_str(&response_text));
+                match accept_single_review(&response_text) {
+                    Ok(output) => single_output = Some(output),
+                    Err(error) => {
+                        return Ok(review_error_with_usage(&route, &usage, error));
+                    }
+                }
             }
         }
         if let Err(error) = ensure_pr_source_current(&source, &context.workspace).await {
@@ -1547,6 +1588,28 @@ impl ToolSpec for ReviewTool {
     }
 }
 
+/// Accept one non-PR review reply (#6561 D03-m4). Prose that ignores the
+/// JSON contract is still a review (see [`ReviewOutput::from_str`]), but an
+/// empty reply, or JSON that carries no summary, issue, suggestion or
+/// assessment (`{}`, an unrelated object), used to become an empty
+/// successful review that read as clean.
+fn accept_single_review(response_text: &str) -> Result<ReviewOutput, String> {
+    let output = ReviewOutput::from_str(response_text);
+    if response_text.trim().is_empty()
+        || (output.summary.is_empty()
+            && output.issues.is_empty()
+            && output.suggestions.is_empty()
+            && output.overall_assessment.is_empty())
+    {
+        return Err(
+            "Review response carried no review content (empty, or JSON without summary, \
+             issues, suggestions or overall_assessment); no review was accepted."
+                .to_string(),
+        );
+    }
+    Ok(output)
+}
+
 fn review_error_with_usage(
     route: &crate::cost_status::EffectiveRouteEnvelope,
     usage: &Usage,
@@ -1574,6 +1637,23 @@ fn add_optional_usage(total: &mut Option<u32>, next: Option<u32>) {
     if let Some(next) = next {
         *total = Some(total.unwrap_or(0).saturating_add(next));
     }
+}
+
+/// Describe a failed review request with its whole error chain.
+///
+/// The client wraps the retry loop's `LlmError` in one outer context (the
+/// bare "Responses API request failed" / "Chat API request failed"), and
+/// `{error}` prints only that layer. The alternate format walks the chain,
+/// so the class the `LlmError` names (quota, auth, rate limit, upstream 5xx,
+/// network, timeout) and its sanitized provider body reach the log and the
+/// review workflow's non-run classifier. Both the agent-callable `ReviewTool`
+/// and the `codewhale review` CLI path go through here.
+pub(crate) fn request_failure_message(
+    pass: usize,
+    planned: usize,
+    error: &anyhow::Error,
+) -> String {
+    format!("Review pass {pass}/{planned} request failed: {error:#}")
 }
 
 pub(crate) fn add_review_usage(total: &mut Usage, next: &Usage) {
@@ -1706,11 +1786,8 @@ async fn resolve_diff_target(
         None
     };
 
-    let mut args = vec![
-        "diff".to_string(),
-        "--no-ext-diff".to_string(),
-        "--no-textconv".to_string(),
-    ];
+    let mut args = vec!["diff".to_string()];
+    args.extend(crate::dependencies::Git::REVIEW_DIFF_ARGS.map(String::from));
     if staged {
         args.push("--cached".to_string());
         if let Some(base_commit) = base_commit {
@@ -1828,23 +1905,59 @@ async fn ensure_pr_source_current(
     Ok(())
 }
 
-fn build_review_prompt(source: &ReviewSource, max_chars: usize) -> String {
+/// Refuse the complete numbered source before either formatter/provider path.
+fn validate_review_source_size(source: &ReviewSource, max_chars: usize) -> Result<(), ToolError> {
+    let chars = match source {
+        ReviewSource::File { content, .. } => {
+            let mut count = 0usize;
+            for (index, line) in content.lines().enumerate() {
+                if index > 0 {
+                    count = count.saturating_add(1);
+                }
+                let digits = (index + 1).ilog10() as usize + 1;
+                count = count
+                    .saturating_add(digits.max(4) + 3)
+                    .saturating_add(line.chars().count());
+            }
+            count
+        }
+        ReviewSource::Diff { diff, .. } => diff.chars().count(),
+        ReviewSource::PullRequest { .. } => return Ok(()), // Core pass planner owns PR bounds.
+    };
+    if chars > max_chars {
+        return Err(ToolError::invalid_input(format!(
+            "Complete review source has {chars} characters, exceeding max_chars={max_chars}; no source was truncated and no review was run"
+        )));
+    }
+    Ok(())
+}
+fn review_source_snapshot(source: &ReviewSource) -> Value {
+    match source {
+        ReviewSource::File { display, content } => {
+            json!({"kind":"file","display":display,"content":content})
+        }
+        ReviewSource::Diff { label, diff } => json!({"kind":"diff","label":label,"diff":diff}),
+        ReviewSource::PullRequest {
+            label, diff, view, ..
+        } => {
+            json!({"kind":"pr","label":label,"diff":super::review_pr::model_diff(diff),"head_sha":view.head_sha,"base_sha":view.base_sha})
+        }
+    }
+}
+
+fn build_review_prompt(source: &ReviewSource) -> String {
     match source {
         ReviewSource::File {
             display, content, ..
         } => {
             let numbered = format_with_line_numbers(content);
-            let truncated = truncate_with_ellipsis(&numbered, max_chars, "\n...[truncated]\n");
             format!(
                 "Review the following file and provide feedback.\n\
-Path: {display}\n\n{truncated}\n\nEnd of file."
+Path: {display}\n\n{numbered}\n\nEnd of file."
             )
         }
         ReviewSource::Diff { label, diff } => {
-            let truncated = truncate_with_ellipsis(diff, max_chars, "\n...[truncated]\n");
-            format!(
-                "Review the following {label} and provide feedback.\n\n{truncated}\n\nEnd of diff."
-            )
+            format!("Review the following {label} and provide feedback.\n\n{diff}\n\nEnd of diff.")
         }
         ReviewSource::PullRequest {
             label, diff, view, ..
@@ -1954,6 +2067,100 @@ fn parse_pr_url(url: &str) -> Option<PullRequestRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_failure_message_keeps_the_provider_failure_beneath_the_context() {
+        let error = anyhow::Error::new(crate::llm_client::LlmError::ServerError {
+            status: 503,
+            message: "upstream unavailable".into(),
+        })
+        .context("Responses API request failed");
+        let message = request_failure_message(1, 1, &error);
+        assert_eq!(
+            message,
+            "Review pass 1/1 request failed: Responses API request failed: Server error (503): upstream unavailable"
+        );
+    }
+
+    #[test]
+    fn complete_numbered_review_source_refuses_instead_of_truncating() {
+        for content in ["", "漢字🐋e\u{301}\r\nlast\r", "\n", "x\n"] {
+            let source = ReviewSource::File {
+                display: "x".into(),
+                content: content.into(),
+            };
+            let numbered = format_with_line_numbers(content);
+            let chars = numbered.chars().count();
+            assert!(validate_review_source_size(&source, chars).is_ok());
+            if chars > 0 {
+                assert!(matches!(
+                    validate_review_source_size(&source, chars - 1),
+                    Err(ToolError::InvalidInput { .. })
+                ));
+            }
+            assert!(build_review_prompt(&source).contains(&numbered));
+        }
+        let source = ReviewSource::Diff {
+            label: "working diff".into(),
+            diff: "漢字🐋END".into(),
+        };
+        assert!(validate_review_source_size(&source, 6).is_ok());
+        assert!(validate_review_source_size(&source, 5).is_err());
+        assert!(build_review_prompt(&source).contains("漢字🐋END"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_review_tool_refuses_complete_source_before_provider_on_both_backends() {
+        let _home = crate::test_support::SealedHome::new();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("source.rs"),
+            "unreviewed tail must not disappear",
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let client = CodewhaleClient::new(&crate::config::Config {
+            provider: Some("moonshot".into()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("local-fixture-key".into()),
+                    base_url: Some(base),
+                    model: Some("kimi-k2.5".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let tool = ReviewTool::new(Some(client), "kimi-k2.5".into());
+        for host in [false, true] {
+            let mut features = crate::features::Features::with_defaults();
+            if host {
+                features.enable(crate::features::Feature::ReviewHost);
+            }
+            let context = ToolContext::new(root.path()).with_features(features);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tool.execute(
+                    json!({"target":"source.rs","kind":"file","max_chars":8}),
+                    &context,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains("no source was truncated"));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "provider must not be called"
+            );
+        }
+    }
 
     fn pr_view(files: usize) -> super::super::review_pr::GhPullRequest {
         super::super::review_pr::GhPullRequest {
@@ -2536,7 +2743,7 @@ mod tests {
         .unwrap();
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            crate::config::ApiProvider::Custom,
+            crate::config::ProviderKind::Custom,
             "test",
             "test-model",
             None,
@@ -2745,6 +2952,23 @@ mod tests {
     }
 
     #[test]
+    fn single_review_refuses_blank_or_contractless_replies() {
+        for raw in ["", "   \n", "{}", r#"{"verdict":"ok"}"#, "```json\n{}\n```"] {
+            assert!(
+                accept_single_review(raw).is_err(),
+                "{raw:?} must not become a clean review"
+            );
+        }
+        let prose = accept_single_review("Looks good; no findings.").expect("prose review");
+        assert_eq!(prose.summary, "Looks good; no findings.");
+        let structured = accept_single_review(
+            r#"{"summary":"One risk","issues":[],"suggestions":[],"overall_assessment":"ok"}"#,
+        )
+        .expect("structured review");
+        assert_eq!(structured.summary, "One risk");
+    }
+
+    #[test]
     fn review_output_fallback_keeps_summary() {
         let output = ReviewOutput::from_str("Not JSON");
         assert!(!output.summary.is_empty());
@@ -2755,7 +2979,7 @@ mod tests {
     fn review_usage_metadata_reports_child_tokens_for_cost_accrual() {
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            crate::config::ApiProvider::Deepseek,
+            crate::config::ProviderKind::Deepseek,
             "deepseek",
             "deepseek-v4-flash",
             Some("https://api.deepseek.com/v1"),

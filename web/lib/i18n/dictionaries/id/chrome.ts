@@ -10,10 +10,6 @@ import type { ChromeDict } from "../types";
  * "penalaran" (reasoning), "repositori", "tanda terima" (receipt). The mode
  * names (Plan / Work / Operate) and permission postures (Ask / Auto-Review /
  * Full Access) stay literal there and stay literal here.
- *
- * Secondary nav labels pair the Indonesian primary with a short English
- * companion — the masthead's bilingual device, minus the Han seals, which
- * belong to the English edition.
  */
 export const chrome: ChromeDict = {
   navDocs: "Dokumentasi",
@@ -23,22 +19,12 @@ export const chrome: ChromeDict = {
   navCommunity: "Komunitas",
   navContribute: "Kontribusi",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
+  navFeatures: "Kemampuan",
   navProduct: "Produk",
   navModels: "Model",
   navPlugins: "Plugin",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Lewati ke konten utama",
-
 
   navPrimaryAria: "Navigasi utama",
   navHomeAria: "Beranda Codewhale",
@@ -46,30 +32,8 @@ export const chrome: ChromeDict = {
   installCta: "Instal →",
 
   authSignIn: "Masuk",
-  authRegister: "Daftar",
-  authGroupAria: "Akun",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "model apa pun, di mesin Anda",
-
-  issueLabel: "Edisi {date}",
   dateLocale: "id-ID",
-
-  starsAria: "Bintang GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "Langsung",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "digabungkan",
-  tickerOpened: "dibuka",
-  tickerClosed: "ditutup",
-  tickerReleased: "dirilis",
-  tickerFirstContribution: "kontribusi pertama",
-  tickerBy: "oleh {handle}",
-  tickerAria: "Aktivitas terbaru repositori",
-
-  traceLabel: "jejak penalaran",
-  traceTabsAria: "Cuplikan sesi",
 
   menuOpen: "Buka menu",
   menuClose: "Tutup menu",
@@ -77,11 +41,11 @@ export const chrome: ChromeDict = {
   themeAuto: "otomatis",
   themeLight: "terang",
   themeDark: "gelap",
-  themeAria: "Tema dokumentasi: {mode} (klik untuk mengganti)",
-  themeTitle: "Tema dokumentasi · otomatis / terang / gelap",
+  themeAria: "Tema: {mode} (klik untuk mengganti)",
+  themeTitle: "Tema · otomatis / terang / gelap",
 
   footerTagline:
-    "Ciptakan apa yang Anda inginkan dan otomatisasikan pekerjaan sehari-hari dengan model pilihan Anda.",
+    "Buat aplikasi dan otomatisasikan pekerjaan dengan modelmu sendiri dan alat terhubung.",
   footerProduct: "Produk",
   footerProject: "Proyek",
   footerDocs: "Dokumentasi",

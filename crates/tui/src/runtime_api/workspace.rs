@@ -8,7 +8,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::dependencies::{ExternalTool as _, Git};
+use crate::dependencies::Git;
+use crate::snapshot::is_git_metadata_name;
 
 use super::{ApiError, RuntimeApiState};
 
@@ -95,6 +96,8 @@ pub(super) struct WorkspaceStatusResponse {
     pub(super) untracked: usize,
     pub(super) ahead: Option<u32>,
     pub(super) behind: Option<u32>,
+    /// Whether the user has trusted this workspace in user-owned config.
+    pub(super) workspace_trusted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -104,10 +107,85 @@ pub(super) struct WorkspaceGitMetadata {
     pub(super) dirty: bool,
 }
 
+/// Status is several blocking `git` spawns, so it runs off the async workers
+/// (#6149) like every other git read on this surface. It deliberately keeps
+/// normal Git filters and untracked settings rather than the full review
+/// command, so its counts match `git status` and the operator writes (see
+/// `git.rs`), but it never runs a repository-configured helper: fsmonitor and
+/// hooks are off, as on every read-only review path (see `run_git`).
 pub(super) async fn workspace_status(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<WorkspaceStatusResponse>, ApiError> {
-    Ok(Json(collect_workspace_status(&state.workspace)))
+    let workspace = state.workspace.clone();
+    tokio::task::spawn_blocking(move || collect_workspace_status(&workspace))
+        .await
+        .map(Json)
+        .map_err(|_| ApiError::internal("workspace status failed"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkspaceTrustRequest {
+    trusted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceTrustResponse {
+    workspace: PathBuf,
+    /// The verdict as it stands *after* the write, read back through the same
+    /// gate ([`crate::config::is_workspace_trusted`]) the engine consults.
+    /// Echoing the request would report an intention; this reports the fact a
+    /// client would see on its next read, so a write that landed somewhere the
+    /// read path does not look is a `false` here rather than a lie.
+    workspace_trusted: bool,
+    /// The user-global config document the decision was written to, so a
+    /// client can name the file without ever reading or editing it.
+    config_path: PathBuf,
+    message: String,
+}
+
+/// Record — or revoke — this workspace's trust in the user-global config.
+///
+/// This route is the only writer a GUI has. A client never edits `config.toml`
+/// itself: that decision lives with the engine, which owns the same file the
+/// read path ([`crate::config::is_workspace_trusted`]) consults. The write goes
+/// through [`crate::config::set_workspace_trust`] — the very function behind the
+/// TUI's `/trust on --save` — so both front ends and the gate agree on one
+/// document, and neither can drift into a second source of truth.
+///
+/// The workspace is the server's own (`state.workspace`), never a
+/// caller-supplied path: a client may trust the project it is attached to and
+/// nothing else.
+pub(super) async fn update_workspace_trust(
+    State(state): State<RuntimeApiState>,
+    Json(request): Json<WorkspaceTrustRequest>,
+) -> Result<Json<WorkspaceTrustResponse>, ApiError> {
+    let workspace = state.workspace.clone();
+    let trusted = request.trusted;
+    let target = workspace.clone();
+    let (config_path, recorded) = tokio::task::spawn_blocking(move || {
+        let config_path = crate::config::set_workspace_trust(&target, trusted)?;
+        // Read back through the engine's own gate rather than trusting the
+        // write: the two are only ever allowed to agree.
+        Ok::<_, anyhow::Error>((config_path, crate::config::is_workspace_trusted(&target)))
+    })
+    .await
+    .map_err(|_| ApiError::internal("workspace trust update failed"))?
+    .map_err(|error| ApiError::internal(format!("Failed to update workspace trust: {error}")))?;
+    Ok(Json(WorkspaceTrustResponse {
+        workspace,
+        workspace_trusted: recorded,
+        config_path,
+        message: if recorded {
+            "Workspace trust saved in user config. Project skills and commands use it on subsequent turns; project hooks also require separate approval. Restart the engine to rebuild project MCP connections. Thread Full Access and existing project instructions are unchanged."
+        } else {
+            // Worded as the state, not as the action: this arm is reached both by
+            // a revoke and by a grant the gate did not accept, and "revoked"
+            // would be the wrong sentence for the second.
+            "Workspace trust is not recorded in user config. Project skills, commands, hooks and MCP loading use this decision; existing project instructions and MCP connections are not removed. Thread Full Access is unchanged."
+        }
+        .to_string(),
+    }))
 }
 
 pub(super) fn collect_workspace_status(workspace: &FsPath) -> WorkspaceStatusResponse {
@@ -122,6 +200,10 @@ pub(super) fn collect_workspace_status(workspace: &FsPath) -> WorkspaceStatusRes
         untracked: 0,
         ahead: None,
         behind: None,
+        // Computed before the early returns below: whether the workspace is a
+        // git repository has nothing to do with whether the user trusted it,
+        // and a non-repo project still has skills and hooks to skip.
+        workspace_trusted: crate::config::is_workspace_trusted(workspace),
     };
 
     let Some(repo_check) = run_git(workspace, &["rev-parse", "--is-inside-work-tree"]) else {
@@ -185,8 +267,12 @@ pub(super) fn collect_workspace_git_metadata(workspace: &FsPath) -> WorkspaceGit
     }
 }
 
+/// Read-only git for status and metadata. `Git::review_base` disables
+/// `core.fsmonitor`, `core.hooksPath`, lazy fetch and replace objects: a
+/// status poll must not execute a helper the repository's config names.
 fn run_git(workspace: &FsPath, args: &[&str]) -> Option<String> {
-    let output = Git::output(args, workspace).ok()?;
+    let mut command = Git::review_base(workspace).ok()?;
+    let output = command.args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -232,7 +318,7 @@ pub(super) const FILE_READ_LIMIT_DEFAULT: usize = 256 * 1024;
 pub(super) const FILE_READ_LIMIT_MAX: usize = 4 * 1024 * 1024;
 /// Files above this size are not served at all: the revision is a digest of
 /// the whole file, and a Files browser should not page through larger blobs.
-const FILE_SERVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const FILE_SERVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const FILE_WRITE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Request-body ceiling for the write route: the content cap plus headroom for
 /// base64 expansion and the JSON envelope, so an oversized `content` reaches
@@ -412,7 +498,7 @@ pub(super) fn relative_request_path(raw: &str, allow_root: bool) -> Result<PathB
     }
     if path
         .components()
-        .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
+        .any(|component| matches!(component, Component::Normal(name) if is_git_metadata_name(name)))
     {
         return Err(ApiError::forbidden("the .git directory is not served"));
     }
@@ -495,7 +581,7 @@ fn list_workspace_directory(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name == ".git" {
+        if is_git_metadata_name(std::ffi::OsStr::new(&name)) {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
@@ -548,6 +634,20 @@ pub(super) fn open_confined_file(
     create: bool,
 ) -> Result<crate::fleet::files::WorkspaceFile, ApiError> {
     crate::fleet::files::WorkspaceFile::open(root, relative, create)
+        .map_err(|error| map_fs_error(error, "file"))
+}
+
+/// [`open_confined_file`] for the application's own state root, which a user
+/// may have relocated behind a link (on Windows, a junction to another
+/// volume). The root is resolved once and every component below it is still
+/// refused when linked, so a reader follows its writer and a caller-supplied
+/// workspace root keeps the stricter [`open_confined_file`].
+pub(super) fn open_confined_file_resolved(
+    root: &FsPath,
+    relative: &FsPath,
+    create: bool,
+) -> Result<crate::fleet::files::WorkspaceFile, ApiError> {
+    crate::fleet::files::WorkspaceFile::open_resolved_root(root, relative, create)
         .map_err(|error| map_fs_error(error, "file"))
 }
 
@@ -691,6 +791,10 @@ fn write_workspace_file(
     bytes: &[u8],
     expected_revision: Option<&str>,
 ) -> Result<(StatusCode, Json<WorkspaceFileWriteResponse>), ApiError> {
+    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _write_guard = WRITES
+        .lock()
+        .map_err(|_| ApiError::internal("workspace file write lock is unavailable"))?;
     let root = canonical_workspace(workspace)?;
     let created = precheck_file_target(&root, relative)?.is_none();
     match (created, expected_revision) {
@@ -707,8 +811,11 @@ fn write_workspace_file(
         _ => {}
     }
     // Parents are created only for a new file, and only through the confined
-    // opener, which refuses links at every component.
-    let file = open_confined_file(&root, relative, created)?;
+    // opener, which refuses links at every component. This is the user's own
+    // file, not a private store: keep its mode on edit, follow the umask on
+    // creation.
+    let file = crate::fleet::files::WorkspaceFile::open_shared(&root, relative, created)
+        .map_err(|error| map_fs_error(error, "file"))?;
     if let Some(expected) = expected_revision {
         let current = read_confined_bytes(&file)?;
         if current.revision != expected {
@@ -718,8 +825,7 @@ fn write_workspace_file(
             )));
         }
     }
-    file.replace(bytes)
-        .map_err(|error| map_fs_error(error, "file"))?;
+    publish_workspace_file(&file, bytes, created)?;
     Ok((
         if created {
             StatusCode::CREATED
@@ -734,6 +840,27 @@ fn write_workspace_file(
             written_at: chrono::Utc::now().to_rfc3339(),
         }),
     ))
+}
+
+pub(super) fn publish_workspace_file(
+    file: &crate::fleet::files::WorkspaceFile,
+    bytes: &[u8],
+    created: bool,
+) -> Result<(), ApiError> {
+    // Absence was observed before opening the confined parent. Another
+    // creator can publish meanwhile; never replace that creator's file.
+    let publication = if created {
+        file.publish(bytes)
+    } else {
+        file.replace(bytes)
+    };
+    publication.map_err(|error| {
+        if created && error.kind() == std::io::ErrorKind::AlreadyExists {
+            ApiError::conflict("file was created by another writer; read it before overwriting")
+        } else {
+            map_fs_error(error, "file")
+        }
+    })
 }
 
 // ── Effective instruction sources (#6168) ────────────────────────────────
@@ -880,6 +1007,80 @@ pub(super) async fn workspace_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::dependencies::ExternalTool as _;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_status_does_not_run_the_repository_fsmonitor() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir()?;
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo)?;
+        let git = |args: &[&str]| Git::status(args, &repo).is_ok_and(|status| status.success());
+        if !git(&["init", "-q"]) {
+            return Ok(());
+        }
+        std::fs::write(repo.join("file.txt"), "hello\n")?;
+        assert!(git(&["add", "file.txt"]));
+        assert!(git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-qm",
+            "init",
+        ]));
+        std::fs::write(repo.join("file.txt"), "hello\nworld\n")?;
+        let marker = tmp.path().join("ran");
+        let hook = tmp.path().join("fsmonitor.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )?;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+        assert!(git(&["config", "core.fsmonitor", &hook.to_string_lossy()]));
+
+        let status = collect_workspace_status(&repo);
+        assert!(status.git_repo);
+        assert_eq!(status.unstaged, 1);
+        assert!(!marker.exists(), "the repository's fsmonitor hook ran");
+        Ok(())
+    }
+
+    #[test]
+    fn git_metadata_directory_is_refused_in_any_letter_case() {
+        for raw in [
+            ".git",
+            ".git/config",
+            ".GIT/config",
+            ".Git/hooks/pre-commit",
+            "sub/.gIt/HEAD",
+        ] {
+            let error = relative_request_path(raw, false).expect_err(raw);
+            assert_eq!(error.status, StatusCode::FORBIDDEN, "{raw}");
+        }
+        for raw in [".github/workflows/ci.yml", "a.git/b", ".gitignore", "git"] {
+            assert!(relative_request_path(raw, false).is_ok(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn listing_hides_git_metadata_directory_in_any_letter_case() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        std::fs::create_dir_all(tmp.path().join(".Git"))?;
+        std::fs::write(tmp.path().join("kept.txt"), "kept")?;
+        let listing = list_workspace_directory(tmp.path(), FsPath::new(""), 100)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let names: Vec<&str> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["kept.txt"]);
+        Ok(())
+    }
 
     #[test]
     fn workspace_file_search_reuses_discovery_ignores() -> anyhow::Result<()> {

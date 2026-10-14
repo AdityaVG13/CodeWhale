@@ -8,8 +8,10 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 
+pub(crate) mod activity;
 pub mod apply_patch;
 pub mod approval_cache;
+pub mod approval_summary;
 pub mod arg_repair;
 pub mod automation;
 pub mod canonical_action;
@@ -43,7 +45,7 @@ pub mod mcp_registry;
 pub mod native_memory;
 pub mod notify;
 pub mod pandoc;
-mod pdf;
+pub(crate) mod pdf;
 pub mod plan;
 pub mod plugin;
 pub mod project;
@@ -54,6 +56,7 @@ pub mod request_plugin_install;
 mod resource_admission;
 pub mod revert_turn;
 pub mod review;
+pub(crate) mod review_host;
 pub mod review_hunks;
 pub(crate) mod review_pr;
 pub mod rlm;
@@ -66,7 +69,7 @@ pub mod search;
 pub mod send_later;
 pub mod session;
 pub mod shell;
-mod shell_output;
+pub(crate) mod shell_output;
 pub mod skill;
 pub mod spec;
 pub mod speech;

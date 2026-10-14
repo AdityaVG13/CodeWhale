@@ -28,6 +28,8 @@ use self::pack::generate_bounded_project_overview;
 pub use self::pack::generate_project_context_pack;
 pub use self::types::ProjectContext;
 use self::types::ProjectContextError;
+pub(crate) use self::types::project_instructions_source_label;
+use self::types::repo_relative_source_label;
 
 /// Names of project context files to look for, in priority order.
 ///
@@ -278,7 +280,7 @@ fn rules_dir_has_loadable_content(workspace: &Path, rules_dir_name: &str) -> boo
     candidates
         .into_iter()
         .take(MAX_RULES_FILES)
-        .any(|path| load_context_file(&path).is_ok())
+        .any(|path| load_context_file(workspace, &path).is_ok())
 }
 
 /// Foreign instruction files that exist in the workspace but were not
@@ -296,7 +298,7 @@ fn unimported_foreign_warnings(
         let direct_context_present = format
             .context_files()
             .iter()
-            .any(|relative| load_context_file(&workspace.join(relative)).is_ok());
+            .any(|relative| load_context_file(workspace, &workspace.join(relative)).is_ok());
         let rules_present = format
             .rules_dirs()
             .iter()
@@ -509,6 +511,19 @@ pub(crate) fn load_project_context_with_imports(
     // Each rule file is wrapped in a <project_rule> block and appended after
     // the main instructions content. Security model: same as AGENTS.md —
     // workspace-contained content only, no absolute-path escape.
+    //
+    // The source label sits inside the pinned system prompt, so it is
+    // rendered repo-relative (forward slashes) and a checkout move or
+    // recase leaves the block byte-identical. `load_rules_from_dir`
+    // only returns paths under `workspace`, so workspace-relative is a
+    // safe fallback spelling when no git root exists; the absolute
+    // spelling remains only for a path outside the root, which is not
+    // reachable by construction. The label root does not depend on the
+    // loop below, so it is computed once up front:
+    // `repo_relative_source_label` must never render a rule before its
+    // root exists, and a `None` sentinel would silently degrade the
+    // label to the absolute spelling.
+    let rules_label_root = find_git_root(workspace).unwrap_or_else(|| workspace.to_path_buf());
     let mut rules_content = String::new();
     for rules_dir in rules_dirs_for(imports) {
         let rules = load_rules_from_dir(workspace, rules_dir);
@@ -518,7 +533,7 @@ pub(crate) fn load_project_context_with_imports(
             }
             rules_content.push_str(&format!(
                 "<project_rule source=\"{}\">\n{}\n</project_rule>",
-                path.display(),
+                repo_relative_source_label(&path, Some(rules_label_root.as_path())),
                 content.trim()
             ));
         }
@@ -553,7 +568,7 @@ fn load_dir_instructions(
         let file_path = dir.join(filename);
 
         if context_candidate_exists(&file_path) {
-            match load_context_file(&file_path) {
+            match load_context_file(dir, &file_path) {
                 Ok(content) => {
                     tracing::info!(
                         "Loaded project context from {} ({} bytes)",
@@ -617,13 +632,20 @@ fn load_project_context_with_parents_and_home_imports(
     imports: &ForeignInstructionImports,
 ) -> ProjectContext {
     let workspace_canonical = canonicalize_workspace_or_keep(workspace);
+    // Chain-segment labels sit inside the pinned system prompt, so they are
+    // rendered repo-relative: a checkout move or recase leaves the labels —
+    // and therefore the whole prompt prefix — byte-identical. The chain
+    // never leaves the checkout (`context_chain_dirs`), so every labeled
+    // path strips cleanly; without a git root the chain is a single
+    // workspace segment that never emits a label at all.
+    let git_root = find_git_root(&workspace_canonical);
     let mut ctx = load_project_context_with_imports(&workspace_canonical, imports);
 
     // Assemble the repository-root → workspace instruction chain. The chain
     // directories come from Git traversal of the containing checkout, so a
     // linked worktree contributes its own root and files above the root —
     // other checkouts, unrelated parents — stay out of scope.
-    let chain_dirs = context_chain_dirs(&workspace_canonical, home_dir);
+    let chain_dirs = context_chain_dirs(&workspace_canonical, git_root.as_deref(), home_dir);
     // `chain_dirs` is ordered root → workspace; the workspace itself is the
     // last entry and was already loaded above.
     let ancestor_dirs = &chain_dirs[..chain_dirs.len().saturating_sub(1)];
@@ -648,7 +670,7 @@ fn load_project_context_with_parents_and_home_imports(
         let mut assembled = String::new();
 
         for (path, content) in &ancestor_docs {
-            append_chain_segment(&mut assembled, path, content);
+            append_chain_segment(&mut assembled, path, content, git_root.as_deref());
         }
 
         // The workspace's own file is the most specific link: it reads last,
@@ -659,7 +681,7 @@ fn load_project_context_with_parents_and_home_imports(
                 .source_path
                 .clone()
                 .unwrap_or_else(|| workspace_canonical.clone());
-            append_chain_segment(&mut assembled, &path, &content);
+            append_chain_segment(&mut assembled, &path, &content, git_root.as_deref());
         } else if let Some((path, _)) = ancestor_docs.last() {
             // No workspace-level file: the nearest ancestor is the most
             // specific source.
@@ -742,7 +764,8 @@ pub(crate) fn project_context_cache_candidate_paths(
     // invalidate the cache too. Changing the opt-in set clears the cache
     // outright (`set_foreign_instruction_imports`), so over-enumerating here
     // only ever costs an extra reload.
-    for dir in context_chain_dirs(&workspace, home_dir) {
+    let repo_root = find_git_root(&workspace);
+    for dir in context_chain_dirs(&workspace, repo_root.as_deref(), home_dir) {
         for filename in PROJECT_CONTEXT_FILES {
             paths.push(dir.join(filename));
         }
@@ -890,12 +913,20 @@ fn is_git_metadata_entry(path: &Path) -> bool {
 /// repository root down to the workspace (inclusive).
 ///
 /// Repository identity comes from the containing checkout itself
-/// ([`find_git_root`]); the chain never crosses the repository boundary, so
-/// sibling checkouts and unrelated parents stay out of scope. Outside any
-/// repository only the workspace itself is searched. When `home_dir` is an
-/// ancestor it remains an outer boundary the walk never leaves.
-fn context_chain_dirs(workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut stop = find_git_root(workspace).unwrap_or_else(|| workspace.to_path_buf());
+/// ([`find_git_root`]), passed in as `repo_root` so the chain bounds and the
+/// chain-segment labels are derived from one and the same walk; the chain
+/// never crosses the repository boundary, so sibling checkouts and unrelated
+/// parents stay out of scope. Outside any repository (`repo_root` is `None`)
+/// only the workspace itself is searched. When `home_dir` is an ancestor it
+/// remains an outer boundary the walk never leaves.
+fn context_chain_dirs(
+    workspace: &Path,
+    repo_root: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut stop = repo_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| workspace.to_path_buf());
 
     if let Some(home) = home_dir {
         let home = canonicalize_workspace_or_keep(home);
@@ -927,12 +958,20 @@ fn context_chain_dirs(workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf>
 /// The first segment is the file's raw content (a single-file chain stays
 /// byte-identical to a plain load); every later segment is prefixed with a
 /// provenance label so the model can tell the scopes apart, wider scopes
-/// first and the workspace last.
-fn append_chain_segment(assembled: &mut String, path: &Path, content: &str) {
+/// first and the workspace last. The label is repo-relative (forward
+/// slashes) so the pinned system prompt stays stable across checkout moves
+/// and recasings; filenames alone would collide, since chain segments
+/// legitimately share the `AGENTS.md` basename.
+fn append_chain_segment(
+    assembled: &mut String,
+    path: &Path,
+    content: &str,
+    repo_root: Option<&Path>,
+) {
     if !assembled.is_empty() {
         assembled.push_str(&format!(
             "\n\n<!-- scoped instructions: {} (overrides wider scopes where they conflict) -->\n",
-            path.display()
+            repo_relative_source_label(path, repo_root)
         ));
     }
     assembled.push_str(content);
@@ -1011,69 +1050,17 @@ fn generate_ephemeral_context(workspace: &Path) -> Option<String> {
     ))
 }
 
-/// Load a context file with size checking
-fn load_context_file(path: &Path) -> Result<String, ProjectContextError> {
-    load_context_file_with_symlink_policy(path, false)
-}
-
-/// Load a user-level context file, following a symlink to its target.
-///
-/// The refusal in [`load_context_file`] protects checkouts: a link planted in
-/// an untrusted repository could point the loader at anything on the machine.
-/// The user-level layer is the operator's own file in `$HOME`, where that
-/// escape does not apply and a symlink is the ordinary way to share one
-/// instruction set between agents (`~/.deepseek/AGENTS.md` -> `~/AGENTS.md`).
-/// Refusing it there failed silently: the refusal is collected as a warning,
-/// so the whole user-level layer was dropped without any visible error.
-fn load_global_context_file(path: &Path) -> Result<String, ProjectContextError> {
-    load_context_file_with_symlink_policy(path, true)
-}
-
-/// Resolve a symlinked context file to its target.
-///
-/// `open_context_file` opens with `O_NOFOLLOW`, so the resolved target is what
-/// must be opened, never the link itself.
-fn resolve_symlinked_context_path(path: &Path) -> Result<PathBuf, ProjectContextError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| ProjectContextError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.file_type().is_symlink() {
-        return Ok(path.to_path_buf());
-    }
-    fs::canonicalize(path).map_err(|source| ProjectContextError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn load_context_file_with_symlink_policy(
-    path: &Path,
-    follow_symlinks: bool,
-) -> Result<String, ProjectContextError> {
-    let resolved = follow_symlinks
-        .then(|| resolve_symlinked_context_path(path))
-        .transpose()?;
-    let path = resolved.as_deref().unwrap_or(path);
-    let metadata = fs::symlink_metadata(path).map_err(|source| ProjectContextError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(ProjectContextError::Symlink {
+/// Load a context file with size checking and no links below its scope root.
+fn load_context_file(root: &Path, path: &Path) -> Result<String, ProjectContextError> {
+    let file =
+        crate::fs_confined::open_read(root, path).map_err(|source| ProjectContextError::Read {
             path: path.to_path_buf(),
-        });
-    }
+            source,
+        })?;
+    read_context_file(file, path)
+}
 
-    if !file_type.is_file() {
-        return Err(ProjectContextError::NotFile {
-            path: path.to_path_buf(),
-        });
-    }
-
-    let mut file = open_context_file(path)?;
+fn read_context_file(mut file: fs::File, path: &Path) -> Result<String, ProjectContextError> {
     let metadata = file
         .metadata()
         .map_err(|source| ProjectContextError::Metadata {
@@ -1168,7 +1155,7 @@ fn load_rules_from_dir(workspace: &Path, rules_dir_name: &str) -> Vec<(PathBuf, 
     }
 
     for path in file_paths {
-        match load_context_file(&path) {
+        match load_context_file(workspace, &path) {
             Ok(content) => {
                 tracing::info!(
                     "Loaded project rule from {} ({} bytes)",
@@ -1191,26 +1178,14 @@ fn load_rules_from_dir(workspace: &Path, rules_dir_name: &str) -> Vec<(PathBuf, 
     entries
 }
 
-#[cfg(unix)]
-fn open_context_file(path: &Path) -> Result<fs::File, ProjectContextError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|source| ProjectContextError::Read {
+/// User-owned global instructions may intentionally resolve through links.
+fn load_global_context_file(path: &Path) -> Result<String, ProjectContextError> {
+    let file =
+        crate::fs_confined::open_user_read(path).map_err(|source| ProjectContextError::Read {
             path: path.to_path_buf(),
             source,
-        })
-}
-
-#[cfg(not(unix))]
-fn open_context_file(path: &Path) -> Result<fs::File, ProjectContextError> {
-    fs::File::open(path).map_err(|source| ProjectContextError::Read {
-        path: path.to_path_buf(),
-        source,
-    })
+        })?;
+    read_context_file(file, path)
 }
 
 /// Check if this project is marked as trusted
@@ -1415,7 +1390,8 @@ pub fn project_instruction_sources(
 
     // Repository-root → workspace instruction chain. Same dir order the
     // loader assembles, so wider scopes list first.
-    for dir in context_chain_dirs(&workspace, home_dir) {
+    let repo_root = find_git_root(&workspace);
+    for dir in context_chain_dirs(&workspace, repo_root.as_deref(), home_dir) {
         let whale = dir.join(DEPRECATED_WHALE_FILENAME);
         if context_candidate_exists(&whale) {
             sources.push(InstructionSourceInfo {
@@ -1436,7 +1412,7 @@ pub fn project_instruction_sources(
                 &dir,
                 dir.join(filename),
                 &mut scope_loaded,
-                load_context_file,
+                |path| load_context_file(&dir, path),
             );
         }
     }
@@ -1486,7 +1462,7 @@ pub fn project_instruction_sources(
                     )),
                 )
             } else {
-                match load_context_file(&path) {
+                match load_context_file(&workspace, &path) {
                     Ok(_) => (InstructionSourceStatus::Loaded, None),
                     Err(error) => (InstructionSourceStatus::Skipped, Some(error.to_string())),
                 }
@@ -1713,6 +1689,44 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    fn confined_global_context_refuses_a_directory_target() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("AGENTS.md");
+        std::os::unix::fs::symlink("/", &path).unwrap();
+        assert!(load_global_context_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_context_refuses_linked_parent_directories() {
+        for directory in [".codewhale", ".deepseek"] {
+            let workspace = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            fs::write(
+                outside.path().join("instructions.md"),
+                "separate instructions",
+            )
+            .unwrap();
+            fs::create_dir(outside.path().join("rules")).unwrap();
+            fs::write(outside.path().join("rules/rule.md"), "separate rule").unwrap();
+            fs::write(
+                outside.path().join("constitution.json"),
+                r#"{"purpose":"separate purpose"}"#,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(outside.path(), workspace.path().join(directory)).unwrap();
+            let context = load_project_context_with_imports(
+                workspace.path(),
+                &ForeignInstructionImports::none(),
+            );
+            assert!(context.instructions.is_none());
+            assert!(context.rules_block.is_none());
+            assert!(load_repo_constitution_block(workspace.path()).0.is_none());
+        }
+    }
+
     #[test]
     fn test_load_project_context_empty() {
         let tmp = tempdir().expect("tempdir");
@@ -1815,6 +1829,221 @@ mod tests {
         assert!(block.contains("<project_instructions"));
         assert!(block.contains("Test content"));
         assert!(block.contains("</project_instructions>"));
+    }
+
+    #[test]
+    fn project_instructions_source_label_falls_back_to_project() {
+        use crate::project_context::project_instructions_source_label;
+        assert_eq!(
+            project_instructions_source_label(None),
+            "project",
+            "a missing source path keeps the historical literal label"
+        );
+        assert_eq!(
+            project_instructions_source_label(Some(std::path::Path::new("/etc/AGENTS.md"))),
+            "AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn project_instructions_source_is_file_name_not_absolute_path() {
+        // The source label sits inside the pinned system prompt: loading the
+        // same AGENTS.md from a different directory must leave the
+        // instructions block byte-identical, so a move emits no spurious
+        // `<context_update>` history append and no absolute path enters a
+        // provider-bound label. Scope note: ancestor-chain and project-rule
+        // labels are repo-relative for the same reason; this test pins the
+        // file-name spelling of the workspace-level block.
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        fs::write(dir_a.path().join("AGENTS.md"), "Pinned content").expect("write a");
+        fs::write(dir_b.path().join("AGENTS.md"), "Pinned content").expect("write b");
+
+        let block_a = load_project_context(dir_a.path())
+            .as_system_block()
+            .expect("block a");
+        let block_b = load_project_context(dir_b.path())
+            .as_system_block()
+            .expect("block b");
+        assert_eq!(
+            block_a, block_b,
+            "a directory move must not change the project instructions block"
+        );
+        assert!(block_a.contains("source=\"AGENTS.md\""));
+        assert!(
+            !block_a.contains(&dir_a.path().display().to_string()),
+            "absolute paths must not enter prompt source labels"
+        );
+    }
+
+    #[test]
+    fn repo_relative_source_label_falls_back_when_path_is_outside_root() {
+        use crate::project_context::repo_relative_source_label;
+        use std::path::Path;
+        // The absolute fallback is an escape hatch for a path the loader
+        // cannot place under the checkout — unreachable by construction —
+        // so it must degrade to a displayable spelling, never panic or
+        // invent a wrong relative label.
+        assert_eq!(
+            repo_relative_source_label(
+                Path::new("/repo/crates/tui/AGENTS.md"),
+                Some(Path::new("/repo"))
+            ),
+            "crates/tui/AGENTS.md"
+        );
+        // On unix the backslashes are literal filename bytes, on Windows they
+        // are separators — either way the label must come out forward-slashed,
+        // and this assertion is the only check that can see it off Windows.
+        assert_eq!(
+            repo_relative_source_label(
+                Path::new("/repo/crates\\tui\\AGENTS.md"),
+                Some(Path::new("/repo"))
+            ),
+            "crates/tui/AGENTS.md",
+            "backslash separators are normalized to forward slashes"
+        );
+        assert_eq!(
+            repo_relative_source_label(Path::new("/elsewhere/AGENTS.md"), Some(Path::new("/repo"))),
+            "/elsewhere/AGENTS.md",
+            "a path outside the root falls back to the absolute spelling"
+        );
+        assert_eq!(
+            repo_relative_source_label(Path::new("/repo/AGENTS.md"), None),
+            "/repo/AGENTS.md",
+            "a missing root falls back to the absolute spelling"
+        );
+    }
+
+    #[test]
+    fn chain_segment_labels_are_repo_relative_not_absolute() {
+        let tmp = tempdir().expect("tempdir");
+        let home = tempdir().expect("home tempdir");
+
+        // A two-level chain inside one checkout: the repo root carries the
+        // wide scope, `crates/tui` the workspace scope.
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+        fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+        fs::write(repo.join("AGENTS.md"), "ROOT-SCOPE instructions").expect("write root agents");
+
+        let workspace = repo.join("crates").join("tui");
+        fs::create_dir_all(&workspace).expect("mkdir workspace");
+        fs::write(workspace.join("AGENTS.md"), "WORKSPACE-SCOPE instructions")
+            .expect("write workspace agents");
+
+        let ctx = load_project_context_with_parents_and_home(&workspace, Some(home.path()));
+        let instructions = ctx.instructions.as_ref().expect("chain instructions");
+
+        assert!(instructions.contains("ROOT-SCOPE instructions"));
+        assert!(instructions.contains("WORKSPACE-SCOPE instructions"));
+        assert!(
+            instructions.contains("<!-- scoped instructions: crates/tui/AGENTS.md"),
+            "the chain segment label must be repo-relative, got: {instructions}"
+        );
+        assert!(
+            !instructions.contains(&tmp.path().display().to_string()),
+            "absolute paths must not enter chain segment labels: {instructions}"
+        );
+    }
+
+    #[test]
+    fn project_rule_labels_are_repo_relative_not_absolute() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+        fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+        let rules_dir = repo.join(".codewhale/rules");
+        fs::create_dir_all(&rules_dir).expect("mkdir rules");
+        fs::write(
+            rules_dir.join("security.md"),
+            "# Security\nNo hardcoded secrets.",
+        )
+        .expect("write rule");
+
+        let ctx = load_project_context(&repo);
+        let rules = ctx.rules_block.as_ref().expect("rules block");
+
+        assert!(
+            rules.contains("<project_rule source=\".codewhale/rules/security.md\">"),
+            "the rule label must be repo-relative, got: {rules}"
+        );
+        assert!(
+            !rules.contains(&tmp.path().display().to_string()),
+            "absolute paths must not enter rule source labels: {rules}"
+        );
+    }
+
+    #[test]
+    fn prompt_block_is_pinned_across_checkout_moves() {
+        // The whole reason for repo-relative labels: the same repository
+        // tree checked out at two different absolute locations must render
+        // byte-identical system blocks (chain segment + rules included), so
+        // a move or recase neither appends a spurious `<context_update>`
+        // history entry nor invalidates the provider's prompt KV prefix.
+        let mut moved_block: Option<String> = None;
+        for location in ["checkout-a", "checkout-b"] {
+            let root = tempdir().expect(location);
+            let repo = root.path().join("repo");
+            fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+            fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+                .expect("write HEAD");
+            fs::write(repo.join("AGENTS.md"), "ROOT-SCOPE instructions").expect("write root");
+
+            let workspace = repo.join("nested");
+            fs::create_dir_all(&workspace).expect("mkdir nested");
+            fs::write(workspace.join("AGENTS.md"), "NESTED-SCOPE instructions")
+                .expect("write nested");
+            // Rules are discovered at workspace level, so the checkout tree
+            // must carry them under the session's workspace too.
+            let rules_dir = workspace.join(".codewhale/rules");
+            fs::create_dir_all(&rules_dir).expect("mkdir rules");
+            fs::write(rules_dir.join("security.md"), "No hardcoded secrets.").expect("write rule");
+
+            let ctx = load_project_context_with_parents_and_home(&workspace, None);
+            let block = ctx.as_system_block().expect("system block");
+
+            assert!(block.contains("<!-- scoped instructions: nested/AGENTS.md"));
+            assert!(
+                block.contains("<project_rule source=\"nested/.codewhale/rules/security.md\">"),
+                "rule label must be repo-relative, got: {block}"
+            );
+            assert!(
+                !block.contains(&root.path().display().to_string()),
+                "absolute paths must not enter the pinned prompt block: {block}"
+            );
+            if location == "checkout-a" {
+                moved_block = Some(block);
+            } else {
+                assert_eq!(
+                    moved_block.as_deref(),
+                    Some(block.as_str()),
+                    "the same tree at two locations must render byte-identical blocks"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn project_rule_labels_fall_back_to_workspace_relative_without_git_root() {
+        // Outside any repository there is no root to relativize against;
+        // the label falls back to workspace-relative spelling, which stays
+        // stable as long as the workspace tree itself is unchanged.
+        let tmp = tempdir().expect("tempdir");
+        let rules_dir = tmp.path().join(".codewhale/rules");
+        fs::create_dir_all(&rules_dir).expect("mkdir rules");
+        fs::write(rules_dir.join("security.md"), "No hardcoded secrets.").expect("write rule");
+
+        let ctx = load_project_context(tmp.path());
+        let rules = ctx.rules_block.as_ref().expect("rules block");
+
+        assert!(
+            rules.contains("<project_rule source=\".codewhale/rules/security.md\">"),
+            "the rule label must fall back to workspace-relative, got: {rules}"
+        );
+        assert!(
+            !rules.contains(&tmp.path().display().to_string()),
+            "absolute paths must not enter rule source labels: {rules}"
+        );
     }
 
     #[test]
@@ -2083,6 +2312,14 @@ mod tests {
             .as_deref()
             .expect("constitution block rendered");
         assert!(block.contains("<codewhale_repo_constitution"));
+        // Same origin-label convention as project_instructions: file name
+        // only, no absolute path in the provider-bound label (the locator
+        // stays available via constitution_source_path and /constitution).
+        assert!(block.contains("source=\"constitution.json\""));
+        assert!(
+            !block.contains(&tmp.path().display().to_string()),
+            "the constitution prompt label must not carry the absolute path"
+        );
         assert!(block.contains("current user request"));
         assert!(block.contains("run focused tests"));
         assert!(block.contains("keep the tool-catalog head byte-stable"));
@@ -2456,6 +2693,8 @@ mod tests {
         let home = tempdir().expect("home tempdir");
         let shared = home.path().join("AGENTS.md");
         fs::write(&shared, "Shared global instructions").expect("write shared agents");
+        fs::hard_link(&shared, home.path().join("shared-copy.md"))
+            .expect("hard link global agents");
         let global_dir = home.path().join(".deepseek");
         fs::create_dir(&global_dir).expect("mkdir .deepseek");
         let link = global_dir.join("AGENTS.md");

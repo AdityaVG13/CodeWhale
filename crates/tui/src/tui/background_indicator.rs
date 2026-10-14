@@ -171,15 +171,16 @@ fn collect_pending_work(app: &App) -> PendingWork {
             .unwrap_or_else(|| agent.agent_type.as_str());
         // The name this lane was dispatched under is what the operator
         // thinks in; the whale nickname only names an unnamed one (#5287).
-        let name = crate::tui::sidebar::dispatched_agent_name(agent)
+        let name = app
+            .agent_given_name(&agent.agent_id)
             .or_else(|| {
                 agent
                     .nickname
-                    .as_deref()
+                    .clone()
                     .filter(|name| !name.trim().is_empty() && *name != agent.agent_id)
             })
-            .or_else(|| app.agent_label_map.get(&agent.agent_id).map(String::as_str));
-        let label = match name {
+            .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned());
+        let label = match name.as_deref() {
             Some(name) if name != role => format!("{name}·{role}"),
             _ => role.to_string(),
         };
@@ -209,9 +210,6 @@ fn collect_pending_work(app: &App) -> PendingWork {
 /// comparing these wire values in their render paths.
 #[must_use]
 pub(crate) fn pending_item_state(entry: &TaskPanelEntry) -> Option<PendingItemState> {
-    if entry.kind != TaskPanelEntryKind::Background {
-        return None;
-    }
     match entry.status.as_str() {
         "queued" => Some(PendingItemState::Queued),
         "running" => Some(PendingItemState::Running),
@@ -224,8 +222,7 @@ pub(crate) fn pending_item_state(entry: &TaskPanelEntry) -> Option<PendingItemSt
 /// cannot be omitted or classified differently between surfaces.
 #[must_use]
 pub(crate) fn is_live_shell_entry(entry: &TaskPanelEntry) -> bool {
-    pending_item_state(entry).is_some()
-        && (entry.prompt_summary.starts_with("shell: ") || entry.id.starts_with("shell_"))
+    pending_item_state(entry).is_some() && entry.kind == TaskPanelEntryKind::Shell
 }
 
 #[cfg(test)]
@@ -320,8 +317,8 @@ mod tests {
 
     #[test]
     fn pending_work_from_app_skips_non_background_entries() {
-        let options = crate::test_support::test_tui_options(std::path::PathBuf::from("."));
-        let app = crate::test_support::test_app_with_options(options);
+        let options = crate::tui::test_support::test_tui_options(std::path::PathBuf::from("."));
+        let app = crate::tui::test_support::test_app_with_options(options);
         assert!(
             pending_work_from_app(&app).items.is_empty(),
             "bare app has no pending background work"
@@ -331,14 +328,15 @@ mod tests {
     #[test]
     fn pending_work_from_app_picks_up_shell_and_agent_entries() {
         use crate::tui::app::TaskPanelEntry;
-        let options = crate::test_support::test_tui_options(std::path::PathBuf::from("."));
-        let mut app = crate::test_support::test_app_with_options(options);
+        let options = crate::tui::test_support::test_tui_options(std::path::PathBuf::from("."));
+        let mut app = crate::tui::test_support::test_app_with_options(options);
         app.task_panel.push(TaskPanelEntry {
+            exit_code: None,
             id: "shell_a1b2c3d4".to_string(),
             status: "running".to_string(),
             prompt_summary: "shell: cargo test -p codewhale-tui".to_string(),
             duration_ms: Some(42_000),
-            kind: TaskPanelEntryKind::Background,
+            kind: TaskPanelEntryKind::Shell,
             stale: true,
             elapsed_since_output_ms: Some(99_000),
             owner_agent_id: None,
@@ -348,6 +346,7 @@ mod tests {
             files_touched: 0,
         });
         app.task_panel.push(TaskPanelEntry {
+            exit_code: None,
             id: "run".to_string(),
             status: "running".to_string(),
             prompt_summary: "background confirmation test".to_string(),
@@ -403,10 +402,11 @@ mod tests {
     #[test]
     fn durable_work_projection_keeps_queued_and_running_states() {
         use crate::tui::app::TaskPanelEntry;
-        let options = crate::test_support::test_tui_options(std::path::PathBuf::from("."));
-        let mut app = crate::test_support::test_app_with_options(options);
+        let options = crate::tui::test_support::test_tui_options(std::path::PathBuf::from("."));
+        let mut app = crate::tui::test_support::test_app_with_options(options);
         app.task_panel.extend([
             TaskPanelEntry {
+                exit_code: None,
                 id: "durable-running".to_string(),
                 status: "running".to_string(),
                 prompt_summary: "durable work".to_string(),
@@ -421,6 +421,7 @@ mod tests {
                 files_touched: 0,
             },
             TaskPanelEntry {
+                exit_code: None,
                 id: "durable-queued".to_string(),
                 status: "queued".to_string(),
                 prompt_summary: "durable work".to_string(),
@@ -460,8 +461,8 @@ mod tests {
         use crate::tools::subagent::{
             FleetRole, SubAgentAssignment, SubAgentResult, SubAgentStatus,
         };
-        let options = crate::test_support::test_tui_options(std::path::PathBuf::from("."));
-        let mut app = crate::test_support::test_app_with_options(options);
+        let options = crate::tui::test_support::test_tui_options(std::path::PathBuf::from("."));
+        let mut app = crate::tui::test_support::test_app_with_options(options);
         let running = |agent_id: &str, name: &str| SubAgentResult {
             usage: None,
             name: name.to_string(),
@@ -472,11 +473,14 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Worker,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "sweep the lane".to_string(),
                 role: Some("builder".to_string()),
             },
             model: "test-model".to_string(),
-            nickname: Some("Blue Whale".to_string()),
+            nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                agent_id, "en",
+            )),
             status: SubAgentStatus::Running,
             worker_status: None,
             runtime_permissions: None,
@@ -490,6 +494,8 @@ mod tests {
             duration_ms: 100,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         };
         app.subagent_cache
             .push(running("agent_named_lane", "triage"));
@@ -500,6 +506,10 @@ mod tests {
 
         let work = pending_work_from_app(&app);
         let labels: Vec<&str> = work.items.iter().map(|item| item.label.as_str()).collect();
-        assert_eq!(labels, ["triage·builder", "Blue Whale·builder"]);
+        let whale = crate::tools::subagent::whale_name_for_id_in_locale("agent_plain_lane", "en");
+        assert_eq!(
+            labels,
+            ["triage·builder".to_string(), format!("{whale}·builder")]
+        );
     }
 }

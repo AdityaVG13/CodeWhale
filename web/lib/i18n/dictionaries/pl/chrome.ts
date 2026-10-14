@@ -22,19 +22,10 @@ export const chrome: ChromeDict = {
   navCommunity: "Społeczność",
   navContribute: "Współtwórz",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
+  navFeatures: "Możliwości",
   navProduct: "Produkt",
   navModels: "Modele",
   navPlugins: "Wtyczki",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Przejdź do treści głównej",
 
@@ -44,30 +35,8 @@ export const chrome: ChromeDict = {
   installCta: "Instaluj →",
 
   authSignIn: "Zaloguj się",
-  authRegister: "Zarejestruj się",
-  authGroupAria: "Konto",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "dowolny model, na twojej maszynie",
-
-  issueLabel: "Wydanie z {date}",
   dateLocale: "pl-PL",
-
-  starsAria: "Gwiazdki na GitHubie",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "Na żywo",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "scalono",
-  tickerOpened: "otwarto",
-  tickerClosed: "zamknięto",
-  tickerReleased: "wydano",
-  tickerFirstContribution: "pierwszy wkład",
-  tickerBy: "autor: {handle}",
-  tickerAria: "Ostatnia aktywność w repozytorium",
-
-  traceLabel: "ślad rozumowania",
-  traceTabsAria: "Fragmenty sesji",
 
   menuOpen: "Otwórz menu",
   menuClose: "Zamknij menu",
@@ -75,11 +44,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "jasny",
   themeDark: "ciemny",
-  themeAria: "Motyw dokumentacji: {mode} (kliknij, aby przełączyć)",
-  themeTitle: "Motyw dokumentacji · auto / jasny / ciemny",
+  themeAria: "Motyw: {mode} (kliknij, aby przełączyć)",
+  themeTitle: "Motyw · auto / jasny / ciemny",
 
   footerTagline:
-    "Twórz to, co chcesz, i automatyzuj codzienną pracę z wybranymi przez siebie modelami.",
+    "Twórz aplikacje i automatyzuj pracę z własnymi modelami i połączonymi narzędziami.",
   footerProduct: "Produkt",
   footerProject: "Projekt",
   footerDocs: "Dokumentacja",

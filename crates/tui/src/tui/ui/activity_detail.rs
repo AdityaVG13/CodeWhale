@@ -10,7 +10,7 @@
 use crate::snapshot::SnapshotRepo;
 use crate::tui::app::App;
 use crate::tui::footer_ui::one_line_summary;
-use crate::tui::history::{HistoryCell, ToolCell, ToolStatus};
+use crate::tui::history::{HistoryCell, ToolCell, ToolStatus, tool_status_label};
 use crate::tui::pager::{PagerPage, PagerView};
 use crate::tui::ui_text::{
     history_cell_to_clipboard_text, history_cell_to_text, truncate_line_to_width,
@@ -18,6 +18,9 @@ use crate::tui::ui_text::{
 use codewhale_localization::{MessageId, tr};
 
 fn selected_transcript_cell_index(app: &App) -> Option<usize> {
+    if let Some(owner) = app.selection_owner_cell() {
+        return Some(owner);
+    }
     app.viewport
         .transcript_selection
         .ordered_endpoints()
@@ -186,7 +189,7 @@ pub(super) fn reasoning_timeline_text(
         };
         if let Some(duration_secs) = duration_secs {
             status.push_str(" · ");
-            status.push_str(&crate::elapsed::format_elapsed_ms(
+            status.push_str(&codewhale_command_contract::elapsed::format_elapsed_ms(
                 (duration_secs * 1000.0) as u64,
             ));
         }
@@ -250,16 +253,6 @@ fn tool_duration_for_activity(tool: &ToolCell) -> Option<u64> {
     }
 }
 
-fn activity_status_label(status: ToolStatus) -> &'static str {
-    match status {
-        ToolStatus::Running => "running",
-        ToolStatus::Success => "done",
-        ToolStatus::Hydrated => "tool loaded - retry required",
-        ToolStatus::Warning => "issue",
-        ToolStatus::Failed => "failed",
-    }
-}
-
 /// Empty-state hint shown when the selection has no raw leaf detail to open.
 /// `v` / `Alt+V` only ever surface the raw detail of the ONE selected
 /// tool/card/leaf, so when there is nothing leaf-level to show we point the
@@ -275,9 +268,7 @@ const RAW_DETAIL_PAGER_INTRO: &str =
     "Raw detail for the selected item — press Ctrl+Alt+O for the whole-turn overview.";
 
 pub(super) fn open_tool_details_pager(app: &mut App) -> bool {
-    let target_cell = detail_target_cell_index(app);
-
-    let Some(cell_index) = target_cell else {
+    let Some(cell_index) = detail_target_cell_index(app) else {
         app.status_message = Some(NO_RAW_DETAIL_HINT.to_string());
         return false;
     };
@@ -325,20 +316,35 @@ pub(super) fn spillover_pager_section(app: &App, cell_index: usize) -> Option<St
     Some(format!("── Full output ──\n\n{body}"))
 }
 
+// Pager reads are bounded; larger artifacts remain on disk and the existing
+// unavailable-output state is shown. This is not a persistence size limit.
+const MAX_SESSION_ARTIFACT_DISPLAY_BYTES: u64 = 64 * 1024 * 1024;
+
 fn read_owned_session_artifact(artifact: &crate::artifacts::ArtifactRecord) -> Option<String> {
-    if artifact.storage_path.is_absolute() {
+    use std::io::Read;
+
+    if !artifact
+        .storage_path
+        .starts_with(crate::artifacts::ARTIFACTS_DIR_NAME)
+    {
         return None;
     }
-    let root = crate::artifacts::session_artifact_absolute_path(
-        &artifact.session_id,
-        std::path::Path::new(crate::artifacts::ARTIFACTS_DIR_NAME),
-    )?;
-    let candidate = crate::artifacts::session_artifact_absolute_path(
+    let file = crate::artifacts::open_session_relative(
         &artifact.session_id,
         &artifact.storage_path,
-    )?;
-    let path = canonical_owned_file(&candidate, &root)?;
-    std::fs::read_to_string(path).ok()
+        false,
+    )
+    .ok()?
+    .open_file()
+    .ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_ARTIFACT_DISPLAY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_SESSION_ARTIFACT_DISPLAY_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn read_owned_legacy_spillover(path: &std::path::Path, session_id: &str) -> Option<String> {
@@ -374,6 +380,16 @@ fn canonical_owned_file(
 }
 
 pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> bool {
+    if app.cell_at_virtual_index(cell_index).is_some_and(|cell| {
+        matches!(
+            cell,
+            HistoryCell::Tool(ToolCell::Exec(exec)) if exec.status == ToolStatus::Running
+        )
+    }) && let Some(detail) = crate::tui::shell_job_routing::shell_job_for_cell(app, cell_index)
+    {
+        crate::tui::shell_job_routing::open_shell_job_pager(app, &detail);
+        return true;
+    }
     if let Some(detail) = app.tool_detail_record_for_cell(cell_index) {
         let input = serde_json::to_string_pretty(&detail.input)
             .unwrap_or_else(|_| detail.input.to_string());
@@ -522,8 +538,12 @@ pub(crate) fn copy_cell_to_clipboard(app: &mut App, cell_index: usize) -> bool {
         app.status_message = Some("Message is empty".to_string());
         return false;
     }
-    if app.clipboard.write_text(&text).is_ok() {
-        app.status_message = Some("Message copied".to_string());
+    if let Ok(transport) = app.clipboard.write_text_status(&text) {
+        app.status_message = Some(crate::tui::mouse_ui::copy_receipt(
+            app,
+            transport,
+            "Message copied",
+        ));
         true
     } else {
         app.status_message = Some("Copy failed".to_string());
@@ -555,6 +575,9 @@ fn turn_answer_payload(app: &App, start: usize, end: usize, width: u16) -> Optio
 }
 
 pub(super) fn detail_target_cell_index(app: &App) -> Option<usize> {
+    if let Some(owner) = app.selection_owner_cell() {
+        return Some(owner);
+    }
     if let Some((start, _)) = app.viewport.transcript_selection.ordered_endpoints() {
         return app
             .viewport
@@ -1141,8 +1164,9 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             } => {
                 let summary = one_line_summary(content, 88);
                 let status = streaming.then_some("running").unwrap_or("done");
-                let duration = duration_secs
-                    .map(|secs| crate::elapsed::format_elapsed_ms((secs * 1000.0) as u64));
+                let duration = duration_secs.map(|secs| {
+                    codewhale_command_contract::elapsed::format_elapsed_ms((secs * 1000.0) as u64)
+                });
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
                     "reasoning",
@@ -1154,9 +1178,9 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             }
             HistoryCell::Tool(tool) => {
                 let (kind, summary) = timeline_tool_summary(app, idx, tool);
-                let duration =
-                    tool_duration_for_activity(tool).map(crate::elapsed::format_elapsed_ms);
-                let status = tool.status().map(activity_status_label);
+                let duration = tool_duration_for_activity(tool)
+                    .map(codewhale_command_contract::elapsed::format_elapsed_ms);
+                let status = tool.status().map(tool_status_label);
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
                     kind,
@@ -1410,7 +1434,7 @@ fn turn_files_changed(app: &App, start: usize, end: usize) -> Vec<String> {
                 lines.push(format!(
                     "• {} — {}",
                     truncate_line_to_width(&patch.path, 60),
-                    activity_status_label(patch.status)
+                    tool_status_label(patch.status)
                 ));
             }
             _ => {}
@@ -1479,7 +1503,7 @@ fn turn_verifier_lines(app: &App, start: usize, end: usize) -> Vec<String> {
                 lines.push(format!(
                     "• {} — {}",
                     truncate_line_to_width(&exec.command, 56),
-                    activity_status_label(exec.status)
+                    tool_status_label(exec.status)
                 ));
             }
             ToolCell::Review(review) => {
@@ -1489,10 +1513,7 @@ fn turn_verifier_lines(app: &App, start: usize, end: usize) -> Vec<String> {
                 } else {
                     format!("review {target}")
                 };
-                lines.push(format!(
-                    "• {target} — {}",
-                    activity_status_label(review.status)
-                ));
+                lines.push(format!("• {target} — {}", tool_status_label(review.status)));
             }
             _ => {}
         }
@@ -1517,8 +1538,9 @@ fn command_looks_like_verifier(command: &str) -> bool {
 
 /// Section 7 — approvals / denials.
 ///
-/// The approval allow/deny sets are session-scoped (not per-turn), so the
-/// counts are labelled `(session)` to avoid implying turn precision.
+/// "Approve for session" grants last the conversation; a Deny lasts only
+/// the user turn it answered (cleared on `TurnStarted`), so each count names
+/// its own scope.
 fn turn_approvals_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
     let approved = app.approval_session_approved.len();
@@ -1527,7 +1549,7 @@ fn turn_approvals_lines(app: &App) -> Vec<String> {
         lines.push(format!("Approved (session): {approved}"));
     }
     if denied > 0 {
-        lines.push(format!("Denied (session): {denied}"));
+        lines.push(format!("Denied (this turn): {denied}"));
     }
     lines
 }
@@ -1541,10 +1563,10 @@ fn turn_route_lines(app: &App) -> Vec<String> {
         .as_ref()
         .and_then(|turn| turn.route.as_ref())
     {
-        let provider = if route.provider == crate::config::ApiProvider::Custom {
+        let provider = if route.provider == crate::config::ProviderKind::Custom {
             route.provider_identity.clone()
         } else {
-            route.provider.display_name().to_string()
+            route.provider.provider().display_name().to_string()
         };
         (provider, route.model.clone())
     } else {
@@ -1584,6 +1606,7 @@ fn turn_route_lines(app: &App) -> Vec<String> {
         lines.push(format!("Auto pair: {pair}"));
         lines.push(format!("Auto scope: {}", receipt.scope.label()));
         lines.push(format!("Auto data: {}", receipt.data_path.label()));
+        lines.extend(auto_router_receipt_lines(receipt));
     }
 
     let session = &app.session;
@@ -1640,6 +1663,55 @@ enum ResultDetail {
     Full,
     /// The exported handoff is intentionally a compact overview.
     Compact,
+}
+
+/// `/status` lines for the router behind an Auto receipt (#6525): the
+/// decision-model answer, its cost and latency, and a failing router.
+fn auto_router_receipt_lines(receipt: &crate::model_routing::AutoRouteReceipt) -> Vec<String> {
+    let percent = |bp: u16| format!("{}%", (u32::from(bp) + 50) / 100);
+    let mut lines = Vec::new();
+    if let Some(decision) = receipt.decision.as_ref() {
+        let cost = decision.provider_reported_cost_usd.as_deref().map_or_else(
+            || "cost not reported".to_string(),
+            |cost| format!("${cost} (provider-reported)"),
+        );
+        let model = decision
+            .response_model
+            .as_deref()
+            .map(|model| format!(" · {model}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "Auto router: decision model{model} · {} ms · {cost}",
+            decision.latency_ms
+        ));
+        let mut probabilities: Vec<(&String, &u16)> = decision.probabilities_bp.iter().collect();
+        probabilities.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let probabilities = probabilities
+            .into_iter()
+            .map(|(option, bp)| format!("{option} {}", percent(*bp)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut choice = format!(
+            "Auto choice: {} ({probabilities}) · confidence {} (min {})",
+            decision.choice,
+            percent(decision.confidence_bp),
+            percent(decision.min_confidence_bp)
+        );
+        if decision.cost_saving_kept_fast {
+            choice.push_str(" · cost-saving kept fast");
+        }
+        if let Some(thinking) = decision.thinking.as_deref() {
+            choice.push_str(&format!(" · thinking {thinking}"));
+        }
+        lines.push(choice);
+    }
+    if let Some(failure) = receipt.router_failure {
+        lines.push(format!(
+            "Auto router: failing — {} (used the local fallback)",
+            failure.label()
+        ));
+    }
+    lines
 }
 
 fn cleaned_turn_text(text: &str, detail: ResultDetail, max_width: usize) -> String {
@@ -1707,7 +1779,7 @@ mod tests {
         let options = TuiOptions {
             model: "deepseek-v4-flash".to_string(),
             start_in_agent_mode: true,
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
     }
@@ -1743,10 +1815,70 @@ mod tests {
     }
 
     #[test]
+    fn turn_route_lines_show_decision_evidence_and_a_failing_router() {
+        let mut app = test_app();
+        app.auto_model = true;
+        app.last_effective_provider = Some(crate::config::ProviderKind::Deepseek);
+        app.last_effective_model = Some("deepseek-v4-pro".to_string());
+        let decision = crate::model_routing::AutoRouteDecisionEvidence {
+            choice: "strong".to_string(),
+            probabilities_bp: [("fast".to_string(), 1800), ("strong".to_string(), 8200)]
+                .into_iter()
+                .collect(),
+            confidence_bp: 6400,
+            min_confidence_bp: 5000,
+            cost_saving_kept_fast: false,
+            thinking: Some("max".to_string()),
+            provider_reported_cost_usd: Some("0.000019992".to_string()),
+            latency_ms: 180,
+            response_model: Some("typesafe/jev-1.13-20260917".to_string()),
+        };
+        let receipt = crate::model_routing::AutoRouteReceipt {
+            tier: crate::model_routing::AutoRouteTier::Strong,
+            pair: crate::model_routing::AutoRoutePair {
+                strong: "deepseek-v4-pro".to_string(),
+                fast: Some("deepseek-v4-flash".to_string()),
+            },
+            scope: crate::model_routing::AutoRouteScope::ActiveProvider,
+            data_path: crate::model_routing::AutoRouteDataPath::Decision {
+                route: crate::client::system_one::DecisionRouterRoute::Openrouter,
+                model: "typesafe/jev-1.13".to_string(),
+            },
+            reason: crate::model_routing::AutoRouteReason::ClassifierRecommendation,
+            decision: Some(decision),
+            router_failure: None,
+        };
+        app.last_auto_route_receipt = Some(receipt.clone());
+        let joined = turn_route_lines(&app).join("\n");
+        assert!(joined.contains("-> OpenRouter / typesafe/jev-1.13 (decision model)"));
+        assert!(joined.contains(
+            "Auto router: decision model · typesafe/jev-1.13-20260917 · 180 ms · $0.000019992 (provider-reported)"
+        ));
+        assert!(joined.contains(
+            "Auto choice: strong (strong 82% · fast 18%) · confidence 64% (min 50%) · thinking max"
+        ));
+        assert!(!joined.contains("failing"));
+
+        app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
+            reason: crate::model_routing::AutoRouteReason::ClassifierFallback(
+                crate::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
+            ),
+            decision: None,
+            router_failure: Some(crate::model_routing::AutoRouterFailure::Http { status: 402 }),
+            ..receipt
+        });
+        let joined = turn_route_lines(&app).join("\n");
+        assert!(
+            joined.contains("Auto router: failing — HTTP 402 (used the local fallback)"),
+            "{joined}"
+        );
+    }
+
+    #[test]
     fn turn_route_lines_include_truthful_auto_receipt() {
         let mut app = test_app();
         app.auto_model = true;
-        app.last_effective_provider = Some(crate::config::ApiProvider::Zai);
+        app.last_effective_provider = Some(crate::config::ProviderKind::Zai);
         app.last_effective_model = Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string());
         app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
             tier: crate::model_routing::AutoRouteTier::Fast,
@@ -1756,10 +1888,13 @@ mod tests {
             },
             scope: crate::model_routing::AutoRouteScope::RunnableProviders,
             data_path: crate::model_routing::AutoRouteDataPath::Classifier {
-                provider: crate::config::ApiProvider::Deepseek,
+                provider: "deepseek".into(),
+                provider_kind: crate::config::ProviderKind::Deepseek,
                 model: "deepseek-v4-flash".to_string(),
             },
             reason: crate::model_routing::AutoRouteReason::ClassifierRecommendation,
+            decision: None,
+            router_failure: None,
         });
 
         let joined = turn_route_lines(&app).join("\n");
@@ -2028,5 +2163,112 @@ mod tests {
                 "answer copy leaked {excluded:?}"
             );
         }
+    }
+    struct PrivateArtifactRoot(Option<PathBuf>);
+    impl PrivateArtifactRoot {
+        fn set(path: PathBuf) -> Self {
+            Self(crate::artifacts::set_test_artifact_sessions_root(Some(
+                path,
+            )))
+        }
+    }
+    impl Drop for PrivateArtifactRoot {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    fn owned_artifact_fixture() -> crate::artifacts::ArtifactRecord {
+        crate::artifacts::record_tool_output_artifact(
+            "session-a",
+            "call-fixture",
+            "bash",
+            PathBuf::from("artifacts/mutable.txt"),
+            "fixture",
+        )
+    }
+
+    #[test]
+    fn owned_artifact_pager_reads_regular_exact_session_output() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let _root = PrivateArtifactRoot::set(temp.path().join("sessions"));
+        crate::artifacts::write_session_artifact("session-a", "mutable", "exact pager output")
+            .unwrap();
+        assert_eq!(
+            read_owned_session_artifact(&owned_artifact_fixture()).as_deref(),
+            Some("exact pager output")
+        );
+        let mut malformed = owned_artifact_fixture();
+        malformed.storage_path = PathBuf::from("other/mutable.txt");
+        assert!(read_owned_session_artifact(&malformed).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_artifact_pager_refuses_linked_session_parent() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let _root = PrivateArtifactRoot::set(sessions.clone());
+        std::fs::create_dir(&sessions).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(outside.join("artifacts")).unwrap();
+        std::fs::write(
+            outside.join("artifacts/mutable.txt"),
+            b"outside-pager-synthetic",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join("session-a")).unwrap();
+        assert!(
+            read_owned_session_artifact(&owned_artifact_fixture()).is_none(),
+            "pager accepted output from a linked outside session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_artifact_pager_refuses_hardlinked_outside_bytes() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let _root = PrivateArtifactRoot::set(sessions.clone());
+        std::fs::create_dir_all(sessions.join("session-a/artifacts")).unwrap();
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside-hardlink-synthetic").unwrap();
+        std::fs::hard_link(&outside, sessions.join("session-a/artifacts/mutable.txt")).unwrap();
+        assert!(
+            read_owned_session_artifact(&owned_artifact_fixture()).is_none(),
+            "pager exposed outside hardlinked bytes"
+        );
+    }
+
+    #[test]
+    fn owned_artifact_pager_refuses_oversized_output_without_deleting_it() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let _root = PrivateArtifactRoot::set(sessions.clone());
+        let directory = sessions.join("session-a/artifacts");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("mutable.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_ARTIFACT_DISPLAY_BYTES + 1)
+            .unwrap();
+        assert!(
+            read_owned_session_artifact(&owned_artifact_fixture()).is_none(),
+            "pager allocated oversized session output"
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_SESSION_ARTIFACT_DISPLAY_BYTES + 1
+        );
     }
 }

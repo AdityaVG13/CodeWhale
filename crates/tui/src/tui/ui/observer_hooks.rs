@@ -496,7 +496,7 @@ mv "$receipt" "$receipt.done"
         )
         .expect("receipt command");
         let mut app = App::new(
-            crate::test_support::test_tui_options(dir.path()),
+            crate::tui::test_support::test_tui_options(dir.path()),
             &crate::config::Config::default(),
         );
         app.hooks = HookExecutor::new(
@@ -633,7 +633,7 @@ mv "$receipt" "$receipt.done"
     fn test_app() -> App {
         let config = crate::config::Config::default();
         App::new(
-            crate::test_support::test_tui_options(std::env::current_dir().unwrap()),
+            crate::tui::test_support::test_tui_options(std::env::current_dir().unwrap()),
             &config,
         )
     }

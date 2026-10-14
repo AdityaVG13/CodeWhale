@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { FACTS } from "./facts.generated";
 import { RELEASE_CONTRIBUTORS, RELEASE_HELPERS } from "./release-credits";
-import { EN_CHROME, EN_DOCS_SHELL, EN_HOME, getChrome } from "./i18n/dictionaries";
+import { EN_CHROME, EN_COMMUNITY, EN_DOCS_SHELL, EN_HOME, getChrome } from "./i18n/dictionaries";
 
 function pageSource(path: string): string {
   return readFileSync(new URL(`../app/[locale]/${path}`, import.meta.url), "utf8");
@@ -16,7 +16,7 @@ describe("public website copy contracts", () => {
     expect(layout).toContain("docs-portal-band");
     // The hero copy is dictionary-driven now (#5337), so assert it where the
     // string actually lives rather than in the TSX.
-    expect(EN_DOCS_SHELL.heroTitle).toBe("Find the guidance you need.");
+    expect(EN_DOCS_SHELL.heroTitle).toBe("Install and use Codewhale");
     expect(layout).not.toContain("Section 02");
     expect(layout).not.toContain("How Codewhale works: ego");
     expect(layout).not.toContain("<Seal");
@@ -53,7 +53,7 @@ describe("public website copy contracts", () => {
   });
 
   it("describes ACP and the VS Code extension at their implemented capability level", () => {
-    const runtime = pageSource("runtime/page.tsx");
+    const runtime = readFileSync(new URL("./content/runtime-integrations.ts", import.meta.url), "utf8") + pageSource("runtime/page.tsx");
     const sourceDocTargets = [
       ...new Set(
         [...runtime.matchAll(/REPO_BLOB_BASE}\/([^`]+)`/g)].map((match) => match[1]),
@@ -61,8 +61,8 @@ describe("public website copy contracts", () => {
     ];
 
     expect(runtime).toContain("ACP (Agent Client Protocol)");
-    expect(runtime).toContain("Baseline JSON-RPC adapter over stdio");
-    expect(runtime).toContain("Phase 0 companion for the local runtime");
+    expect(runtime).toContain("ACP stdio connects compatible editors to the existing Engine");
+    expect(runtime).toContain("Early companion for the local runtime");
     expect(runtime).not.toContain("Agent Communication Protocol");
     expect(runtime).not.toContain("IETF-standard");
     expect(runtime).not.toContain("embeds Codewhale as a side-panel agent");
@@ -98,26 +98,36 @@ describe("public website copy contracts", () => {
     expect(homepage).not.toContain("<span>{providerRoutes}</span>");
     expect(homepage).not.toContain("releases/tag/v${version}");
     expect(homepage).not.toMatch(/Codewhale v0\.9\.1|\"v0\.9\.1 \u00b7/);
-    expect(install).toContain("publishedRelease.tag");
+    // Installation examples come from the verified guide, never the candidate version.
+    expect(install).toContain('from "@/lib/install-guide.generated"');
+    expect(install).not.toContain("facts.version");
     expect(install).not.toContain('"v0.8.x"');
     expect(install).not.toContain("cnbInstall(facts.version");
-    expect(community).toContain("credit (unreleased)");
+    // The community credit wording moved into its dictionary (#5337) the same
+    // way: the page picks the unreleased label, and the EN reference says so.
+    expect(community).toContain("t.creditLabelUnreleased");
+    expect(EN_COMMUNITY.creditLabelUnreleased).toBe("v{version} credit (unreleased)");
   });
 
   it("presents providers as peers and puts contributor actions near the top", () => {
     const providerCopy = `${pageSource("models/page.tsx")}\n${pageSource("faq/page.tsx")}`;
     const community = pageSource("community/page.tsx");
+    // The page's own wording lives in its dictionary (#5337); the paths and
+    // links stay in the page.
+    const communityCopy = `${community}\n${Object.values(EN_COMMUNITY).join("\n")}`;
 
     expect(providerCopy).not.toMatch(/first-class|一级支持|一级模型/);
-    expect(community).toContain("International open-source community");
+    expect(community).toContain("t.kicker");
+    expect(EN_COMMUNITY.kicker).toBe("International open-source community");
     expect(community).toContain("issues/new/choose");
     expect(community).toContain("docs/LOCALIZATION.md");
-    expect(community).toContain("Hmbown/CodeWhale/pulls");
-    expect(community).toContain("keeps the weekly archive of repository activity");
-    expect(community).not.toContain("latest one sits near the top");
+    expect(community).toContain("codewhale-hq/CodeWhale/pulls");
+    expect(community).toContain("t.recordScope");
+    expect(EN_COMMUNITY.recordScope).toContain("keeps the weekly archive of repository activity");
+    expect(communityCopy).not.toContain("latest one sits near the top");
     expect(community).not.toContain("<Ticker");
     expect(community).not.toContain("<StatGrid");
-    expect(community).not.toContain("Today's dispatch");
+    expect(communityCopy).not.toContain("Today's dispatch");
   });
 
   it("keeps current-release website credits in exact changelog parity", () => {

@@ -8,7 +8,7 @@ import type { ComputerUseDict } from "../types";
  * guillemets, in line with the other French dictionaries.
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Computer Use pour Mac · Codewhale",
+  metaTitle: "Computer Use · Aperçu · Codewhale",
   metaDescription: "Téléchargez et configurez Codewhale Computer Use pour Mac : contrôle des apps en arrière-plan, configuration des autorisations et commandes Pause et Stop à portée de main.",
   title: "Computer Use",
   lead: "Laissez Codewhale agir dans vos apps pendant que vous continuez à travailler. L’assistant Mac regroupe dans votre barre des menus les autorisations, le contrôle des apps en arrière-plan et de quoi mettre en pause ou arrêter la saisie.",
@@ -30,7 +30,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Lancer la vérification en arrière-plan", body: "L’assistant ouvre une fenêtre d’essai temporaire, y saisit du texte et la capture. Il vérifie si le pointeur ou l’app active a changé pendant l’opération." },
     { title: "Connecter à Codewhale", body: "Examinez, approuvez et activez Computer Use dans le marketplace de plugins de Codewhale. Utilisez la version 0.3.1 ou ultérieure du plugin pour que les actions locales passent par les commandes Pause et Stop de l’assistant." },
   ],
-  controlsTitle: "Continuez à travailler. Gardez le contrôle.",
+  controlsTitle: "Mettre en pause ou arrêter le contrôle des applications",
   controlsBody: "Les actions prises en charge s’exécutent en arrière-plan dans l’app sélectionnée. Les apps et les gestes qui exigent le premier plan demandent votre autorisation. Le menu affiche la cible et le mode de saisie ; Pause suspend la saisie de l’assistant et Stop met fin à ses sessions en cours.",
   updateTitle: "Des mises à jour quand vous le décidez",
   updateBody: "Choisissez Check for updates (rechercher les mises à jour) dans l’app. Avant d’installer une mise à jour, l’assistant vérifie le téléchargement, la signature Codewhale et la notarisation Apple, et conserve la version précédente pour pouvoir la restaurer.",
@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Voir la vérification en arrière-plan",
   source: "Code source et autres plateformes",
   platforms: "Ce téléchargement est destiné au Mac. Sous Windows et Linux, on utilise pour l’instant le plugin depuis les sources et la configuration côté hôte.",
-  installTitle: "Computer Use pour Mac",
-  installLead: "Ajoutez le contrôle des apps en arrière-plan avec l’assistant Computer Use. Configurez les autorisations du Mac, lancez une vérification en arrière-plan, puis mettez en pause ou arrêtez la saisie de l’assistant depuis votre barre des menus.",
-  installLink: "Téléchargement et configuration de Computer Use",
 };

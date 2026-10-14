@@ -127,7 +127,7 @@ pub struct SessionObjectSnapshot {
     pub model: String,
     pub workspace: PathBuf,
     pub system_prompt: Option<SystemPrompt>,
-    pub messages: Vec<Message>,
+    pub messages: Arc<Vec<Message>>,
 }
 
 impl SessionObjectSnapshot {
@@ -137,14 +137,14 @@ impl SessionObjectSnapshot {
         model: String,
         workspace: PathBuf,
         system_prompt: Option<SystemPrompt>,
-        messages: Vec<Message>,
+        messages: impl Into<Arc<Vec<Message>>>,
     ) -> Self {
         Self {
             session_id,
             model,
             workspace,
             system_prompt,
-            messages,
+            messages: messages.into(),
         }
     }
 
@@ -370,6 +370,7 @@ fn compact_content_block(block: &ContentBlock) -> Value {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             let chars = content.chars().count();
             let large = chars > 2_000;
@@ -525,6 +526,7 @@ mod tests {
             vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_1".to_string(),
                     content: large.clone(),
                     is_error: None,

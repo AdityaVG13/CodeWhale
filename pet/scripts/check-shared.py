@@ -56,7 +56,15 @@ try:
     request(d,'/v1/action',select);a=frame_when(d,lambda f:f['source']=='contract-source')
     producer={'identity':d['identity'],'epoch':a['epoch'],'client':str(uuid.uuid4()),'source':a['source'],'source_revision':a['sourceRevision'],'seq':0,'waiting':False,'events':[]}
     request(d,'/v1/producer',producer)
+    # The macOS/Unix owner may miss a 250 ms clock deadline under CI load.
+    # Coverage becomes unknown, but a delay shorter than the 2 s producer
+    # lease must not discard its sequence and reject the next valid packet.
+    child.send_signal(signal.SIGSTOP)
+    try: time.sleep(.4)
+    finally: child.send_signal(signal.SIGCONT)
     packet=dict(producer,seq=1,events=[{'event':'thinking_started','index':1}]);r=request(d,'/v1/producer',packet)
+    assert not r.get('duplicate',False) and r['seq']==1
+    passed('a scheduling pause inside the lease preserves the producer sequence')
     assert request(d,'/v1/producer',packet)['duplicate']
     reject(d,'/v1/producer',dict(producer,seq=3));request(d,'/v1/producer',producer)
     reject(d,'/v1/producer',dict(producer,seq=1,events=[{'event':'thinking_started','index':2},{'event':'response_delta','index':2,'content':'PRIVATE'}]))
@@ -70,11 +78,19 @@ try:
     passed('source changes reject old producers and actions; clock continues without a view')
     audio_a=str(uuid.uuid4());audio_b=str(uuid.uuid4())
     assert request(d,'/v1/audio',{'client':audio_a,'enabled':True})['granted']
-    assert not request(d,'/v1/audio',{'client':audio_b,'enabled':True})['granted']
+    competitor=request(d,'/v1/audio',{'client':audio_b,'enabled':True})
+    if competitor['granted']:
+        # Headless hosts can lose the sink and release the first lease before
+        # this request. A second grant is valid only if the owner reports the
+        # failed device and also releases that lease; it is no audio proof.
+        frame_when(d,lambda f:f['audioUnavailable'] and not f['audioOwner'])
+        passed('unavailable audio releases its lease and reports device failure (no live audio proof)')
+    else:
+        passed('only one view can lease the companion audio device')
     request(d,'/v1/audio',{'client':audio_a,'enabled':False})
-    passed('only one view can lease the companion audio device')
+    request(d,'/v1/audio',{'client':audio_b,'enabled':False})
     before_style=request(d,'/v1/export')
-    appearance={'background':[238,239,235],'backgroundTop':[255,255,250],'particle':[32,79,83],'eventColors':False,'brightness':1.4,'dotScale':1.2,'glow':.25,'environment':False}
+    appearance={'background':[238,239,235],'backgroundTop':[255,255,250],'particle':[32,79,83],'eventColors':False,'brightness':1.4,'dotScale':1.2,'glow':.25,'environment':False,'bodyStyle':'pixel','textLanguage':'ja'}
     style_action={'identity':d['identity'],'client':str(uuid.uuid4()),'seq':1,'source_revision':b['sourceRevision'],'action':{'kind':'appearance','appearance':appearance}}
     reject(d,'/v1/action',dict(style_action,action={'kind':'appearance','appearance':dict(appearance,brightness=999)}))
     request(d,'/v1/action',style_action)

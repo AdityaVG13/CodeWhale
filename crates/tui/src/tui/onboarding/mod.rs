@@ -109,7 +109,7 @@ fn required_progress(app: &App) -> Option<(usize, usize)> {
 }
 
 fn trust_decision_required(app: &App) -> bool {
-    !app.trust_mode && needs_trust(&app.workspace)
+    !app.trust_mode && crate::config::needs_trust(&app.workspace)
 }
 
 fn action_hints(app: &App) -> Vec<ActionHint> {
@@ -146,11 +146,9 @@ fn action_hints(app: &App) -> Vec<ActionHint> {
             ActionHint::new("3/N", app.tr(MessageId::OnboardTrustActionQuit).to_string()),
         ],
         OnboardingState::Ready => vec![
+            // Only keys this screen handles: a `/rc` hint here could not be
+            // typed, because the Ready screen owns the keyboard.
             ActionHint::new("Enter", app.tr(MessageId::OnboardReadyStart).to_string()),
-            ActionHint::new(
-                "/rc",
-                app.tr(MessageId::CmdRemoteControlDescription).to_string(),
-            ),
             ActionHint::new("C", app.tr(MessageId::OnboardReadyCustomize).to_string()),
         ],
         OnboardingState::None => Vec::new(),
@@ -172,6 +170,15 @@ fn provider_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     heading(&mut lines, app, MessageId::OnboardProviderTitle, width);
     lines.push(Line::from(""));
+    if let Some(notice) = app.onboarding_key_rejected.as_deref() {
+        for segment in wrap_words(notice, width) {
+            lines.push(Line::from(Span::styled(
+                segment,
+                Style::default().fg(palette::STATUS_ERROR),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
     wrap_body(&mut lines, app, MessageId::OnboardProviderBlurb, width);
     lines
 }
@@ -385,18 +392,6 @@ fn mark_onboarded_at_path(path: PathBuf) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-pub fn needs_trust(workspace: &Path) -> bool {
-    if crate::config::is_workspace_trusted(workspace) {
-        return false;
-    }
-
-    let markers = [
-        workspace.join(".deepseek").join("trusted"),
-        workspace.join(".deepseek").join("trust.json"),
-    ];
-    !markers.iter().any(|path| path.exists())
-}
-
 pub fn mark_trusted(workspace: &Path) -> anyhow::Result<PathBuf> {
     crate::config::save_workspace_trust(workspace)
 }
@@ -469,11 +464,14 @@ pub fn advance_onboarding_after_language(app: &mut App) {
 }
 
 /// Provider setup → trust when a decision is required, otherwise the ready
-/// screen.
+/// screen. A message already typed skips the ready screen and returns to the
+/// composer with the draft intact.
 pub fn advance_onboarding_after_provider(app: &mut App) {
     app.status_message = None;
     if trust_decision_required(app) {
         app.onboarding = OnboardingState::TrustDirectory;
+    } else if !app.composer.input.trim().is_empty() && !app.onboarding_explore_offline {
+        app.finish_onboarding_without_feature_intro();
     } else {
         app.onboarding = OnboardingState::Ready;
     }
@@ -546,7 +544,7 @@ mod tests {
     /// different in CI. Every test below opts in to the steps it is about.
     fn test_app_with_locale(locale: Locale) -> App {
         let options = TuiOptions {
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = locale;
@@ -950,6 +948,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ready_screen_advertises_only_keys_it_handles() {
+        use crate::tui::views::action_footer_lines;
+
+        let mut app = test_app_with_locale(Locale::En);
+        app.onboarding = OnboardingState::Ready;
+        let rail = flattened(action_footer_lines(&action_hints(&app), 80));
+        assert!(rail.contains("Enter"), "{rail}");
+        assert!(rail.contains("change the look"), "{rail}");
+        assert!(
+            !rail.contains("/rc"),
+            "the Ready screen owns the keyboard, so /rc cannot be typed: {rail}"
+        );
     }
 
     #[test]

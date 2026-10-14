@@ -7,7 +7,7 @@ import type { ComputerUseDict } from "../types";
  * the app shows them.
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Mac için Computer Use · Codewhale",
+  metaTitle: "Computer Use · Önizleme · Codewhale",
   metaDescription: "Mac için Codewhale Computer Use'u indir ve kur. Arka planda uygulama denetimi, izin kurulumu ve senin elindeki Pause ve Stop denetimleri.",
   title: "Computer Use",
   lead: "Sen çalışmaya devam ederken Codewhale uygulamalarında iş yapsın. Mac yardımcısı izinleri, arka planda uygulama denetimini ve girişi duraklatma ya da durdurma yolunu menü çubuğuna taşır.",
@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Arka plan kontrolünü çalıştır", body: "Yardımcı geçici bir deneme penceresi açar, metin girer ve o pencerenin görüntüsünü alır. Çalışma sırasında imlecin veya etkin uygulamanın değişip değişmediğini kontrol eder." },
     { title: "Codewhale'e bağla", body: "Codewhale eklenti mağazasında Computer Use'u incele, güvenilir olarak işaretle ve etkinleştir. Yerel eylemlerin yardımcının Pause ve Stop denetimlerinden geçmesi için eklentinin 0.3.1 veya üzeri sürümünü kullan." },
   ],
-  controlsTitle: "Çalışmaya devam et. Denetim sende kalsın.",
+  controlsTitle: "Uygulama denetimini duraklat veya durdur",
   controlsBody: "Desteklenen eylemler seçili uygulamada arka planda çalışır. Ön planda denetim gerektiren uygulamalar ve hareketler için senin onayın gerekir. Menü hedefi ve giriş modunu gösterir; Pause (Duraklat) yardımcının girişini askıya alır, Stop (Durdur) ise mevcut oturumlarını sonlandırır.",
   updateTitle: "Güncellemeler sen istediğinde",
   updateBody: "Uygulamadan Check for updates'i (Güncellemeleri denetle) seç. Bir güncellemeyi kurmadan önce indirmeyi, Codewhale imzasını ve Apple noter onayını doğrular; kurtarma için önceki uygulamayı saklar.",
@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Arka plan kontrolünü izle",
   source: "Kaynak kodu ve diğer platformlar",
   platforms: "Bu indirme Mac içindir. Windows ve Linux şu anda kaynak eklentisini ve ana makine tarafındaki kurulumu kullanır.",
-  installTitle: "Mac için Computer Use",
-  installLead: "Computer Use yardımcısıyla arka planda uygulama denetimi ekle. Mac izinlerini ayarla, bir arka plan kontrolü çalıştır ve yardımcının girişini menü çubuğundan duraklat ya da durdur.",
-  installLink: "Computer Use indirme ve kurulum",
 };

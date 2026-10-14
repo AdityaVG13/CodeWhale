@@ -1,8 +1,14 @@
 import Link from "next/link";
+import { Icon, type IconName } from "@/components/icon";
+import { PageHeader, Section } from "@/components/page-header";
+import { Status, type StatusTone } from "@/components/status-badge";
+import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
 import { getFacts } from "@/lib/facts";
 import { PRODUCT_COPY } from "@/lib/content/product";
-import { fill, getHome, pickText } from "@/lib/i18n/dictionaries";
+import { fill, getChrome, getHome, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
+import { getNativeTerminalCopy } from "@/lib/content/native-terminal";
+import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 
 export const revalidate = 300;
 
@@ -16,6 +22,14 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   });
 }
 
+// Row order is fixed by PRODUCT_COPY and the home dictionary, so marks and
+// states follow the row, not a translated word.
+const GAIN_ICONS: IconName[] = ["layers", "users", "shield"];
+// Terminal released · local browser ships with it · CodeWhale GUI
+// available · hosted web preview · desktop development build · cloud
+// computers in development.
+const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "ready", "attention", "idle", "idle"];
+
 /**
  * /product — what Codewhale is and what a person gains, with availability
  * stated per surface. Copy is the `PRODUCT_COPY` content module; counts come
@@ -27,52 +41,77 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
   const t = (text: { en: string; zh: string }) => pickText(text, locale);
   const facts = await getFacts();
   const home = getHome(locale);
+  const terminal = getNativeTerminalCopy(locale);
   const providerCount = facts.providers.length;
 
   return (
-    <div className="portal-home product-page">
-      <section className="hero">
-        <div className="portal-container community-welcome-inner">
-          <h1>{t(PRODUCT_COPY.title)}</h1>
-          <p>{t(PRODUCT_COPY.lede)}</p>
-          <div className="portal-actions">
-            <Link href={`/${locale}/install`} className="portal-button portal-button-primary">
+    <>
+      <PageHeader
+        title={t(PRODUCT_COPY.title)}
+        lede={t(PRODUCT_COPY.lede)}
+        pose="think"
+        actions={
+          <>
+            <Link href={`/${locale}/install`} className="btn btn-primary btn-lg">
               {t(PRODUCT_COPY.actions.install)}
             </Link>
-            <Link href={`/${locale}/docs`} className="portal-button portal-button-secondary">
+            <Link href={`/${locale}/docs`} className="btn btn-secondary btn-lg">
               {t(PRODUCT_COPY.actions.docs)}
             </Link>
-          </div>
-        </div>
-      </section>
+            <Link href={`/${locale}/features`} className="btn btn-secondary btn-lg">{getChrome(locale).navFeatures}</Link>
+          </>
+        }
+      />
 
-      <section className="folio-section">
-        <div className="product-container">
-          <h2>{t(PRODUCT_COPY.gainHeading)}</h2>
-          <div className="folio-gain-grid">
-            {PRODUCT_COPY.gain.map((row) => (
+      <div className="page-body">
+        <Section id="product-terminal" title={terminal.title} scope={terminal.description}>
+          <div className="figure-frame">
+            <NativeTerminalGallery
+              locale={locale}
+              defaultFrame="composer"
+              regionLabel={home.shotPreview}
+              label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+            />
+          </div>
+        </Section>
+
+        <Section
+          id="product-gain"
+          title={t(PRODUCT_COPY.gainHeading)}
+          link={
+            <Link href={`/${locale}/models`} className="section-link">
+              {t(PRODUCT_COPY.actions.models)}
+              <Icon name="arrow-right" className="icon icon-flip" />
+            </Link>
+          }
+        >
+          <div className="ruled-cols">
+            {PRODUCT_COPY.gain.map((row, index) => (
               <div key={row.title.en}>
+                <span className="ruled-icon" aria-hidden="true">
+                  <Icon name={GAIN_ICONS[index] ?? "layers"} />
+                </span>
                 <h3>{t(row.title)}</h3>
                 <p>{fill(t(row.body), { count: providerCount })}</p>
+                <Link className="section-link" href={`/${locale}/docs/${["tools", "mcp", "fleet"][index]}`}>{getChrome(locale).navDocs}</Link>
               </div>
             ))}
           </div>
-          <Link href={`/${locale}/models`} className="folio-link">
-            {t(PRODUCT_COPY.actions.models)}
-          </Link>
-        </div>
-      </section>
+        </Section>
 
-      <section className="folio-section product-page-surfaces">
-        <div className="product-container folio-chapter-grid">
-          <div>
-            <h2>{t(PRODUCT_COPY.surfacesHeading)}</h2>
-            <p className="folio-section-lede">{t(PRODUCT_COPY.surfacesLede)}</p>
-            <Link href={`/${locale}/runtime`} className="folio-link">
+        <Section
+          id="product-surfaces"
+          layout="split"
+          title={t(PRODUCT_COPY.surfacesHeading)}
+          scope={t(PRODUCT_COPY.surfacesLede)}
+          link={
+            <Link href={`/${locale}/runtime`} className="section-link">
               {t(PRODUCT_COPY.surfacesLink)}
+              <Icon name="arrow-right" className="icon icon-flip" />
             </Link>
-          </div>
-          <dl className="folio-fact-list">
+          }
+        >
+          <dl className="ruled-list">
             {home.surfaces.map(([name, description]) => (
               <div key={name}>
                 <dt>{name}</dt>
@@ -80,17 +119,16 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
               </div>
             ))}
           </dl>
-        </div>
-      </section>
+        </Section>
 
-      <section className="folio-section">
-        <div className="product-container folio-chapter-grid">
-          <div>
-            <h2>{t(PRODUCT_COPY.controlHeading)}</h2>
-            <p className="folio-section-lede">{t(PRODUCT_COPY.controlLede)}</p>
-          </div>
-          <div>
-            <dl className="folio-fact-list">
+        <Section
+          id="product-control"
+          layout="split"
+          title={t(PRODUCT_COPY.controlHeading)}
+          scope={t(PRODUCT_COPY.controlLede)}
+        >
+          <div className="stack">
+            <dl className="ruled-list">
               {PRODUCT_COPY.modes.map((row) => (
                 <div key={row.title.en}>
                   <dt>{t(row.title)}</dt>
@@ -98,7 +136,7 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
                 </div>
               ))}
             </dl>
-            <dl className="folio-fact-list mt-8">
+            <dl className="ruled-list">
               {PRODUCT_COPY.permissions.map((row) => (
                 <div key={row.title.en}>
                   <dt>{t(row.title)}</dt>
@@ -107,34 +145,46 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
               ))}
             </dl>
           </div>
-        </div>
-      </section>
+        </Section>
 
-      <section className="folio-section">
-        <div className="product-container">
-          <h2>{t(PRODUCT_COPY.availabilityHeading)}</h2>
-          <p className="folio-section-lede">{t(PRODUCT_COPY.availabilityLede)}</p>
-          <dl className="folio-availability-list product-availability-paper">
-            {PRODUCT_COPY.availability.map((row) => (
+        <Section
+          id="product-availability"
+          layout="split"
+          title={t(PRODUCT_COPY.availabilityHeading)}
+          scope={t(PRODUCT_COPY.availabilityLede)}
+        >
+          <dl className="ruled-list">
+            {PRODUCT_COPY.availability.map((row, index) => (
               <div key={row.surface.en}>
                 <dt>{t(row.surface)}</dt>
                 <dd>
-                  <strong>{t(row.status)}</strong>
+                  <Status tone={AVAILABILITY_TONES[index] ?? "idle"}>{t(row.status)}</Status>
                   {t(row.detail)}
                   {row.href && row.linkLabel && (
                     <>
                       {" "}
-                      <Link href={`/${locale}${row.href}`} className="body-link">
-                        {t(row.linkLabel)}
-                      </Link>
+                      {row.href.startsWith("http") ? (
+                        <a
+                          href={row.href}
+                          className="link"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          {t(row.linkLabel)}
+                        </a>
+                      ) : (
+                        <Link href={`/${locale}${row.href}`} className="link">
+                          {t(row.linkLabel)}
+                        </Link>
+                      )}
                     </>
                   )}
                 </dd>
               </div>
             ))}
           </dl>
-        </div>
-      </section>
-    </div>
+        </Section>
+      </div>
+    </>
   );
 }

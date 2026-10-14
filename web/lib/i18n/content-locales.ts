@@ -1,9 +1,20 @@
 import { defaultLocale, locales } from "./config";
+import { hasComputerUseTranslation } from "./dictionaries";
 
-/** Routes whose page bodies are genuinely localized beyond English/Chinese. */
+/**
+ * Routes whose page-body translation coverage differs from English/Chinese.
+ *
+ * `/docs/guide` is not listed: its French/German/Catalan/Hindi/Turkish/
+ * Italian/Polish/Arabic dictionaries translate only the overview and headings,
+ * while the getting-started steps that make up the body ship in English and
+ * Chinese, so those variants canonicalize to English like any other partial
+ * page.
+ */
 const ROUTE_CONTENT_LOCALES: Readonly<Record<string, readonly string[]>> = {
   "/": locales,
-  "/docs/guide": ["en", "zh", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"],
+  "/install": ["en"],
+  "/features": ["en"],
+  "/computer-use": locales.filter(hasComputerUseTranslation),
 };
 
 /** Most first-party page bodies currently ship in English and Chinese. */
@@ -16,7 +27,9 @@ function normalizedPath(path: string): string {
 
 /** Locales with a genuine page-body translation for an indexable route. */
 export function contentLocalesForPath(path: string): readonly string[] {
-  return ROUTE_CONTENT_LOCALES[normalizedPath(path)] ?? DEFAULT_CONTENT_LOCALES;
+  const normalized = normalizedPath(path);
+  if (normalized.startsWith("/ratatui/")) return ["en"];
+  return ROUTE_CONTENT_LOCALES[normalized] ?? DEFAULT_CONTENT_LOCALES;
 }
 
 /**

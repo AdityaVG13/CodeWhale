@@ -30,12 +30,14 @@ fn create_dispatch_app(tmpdir: &TempDir) -> App {
         memory_path: tmpdir.path().join("memory.md"),
         notes_path: tmpdir.path().join("notes.txt"),
         mcp_config_path: tmpdir.path().join("mcp.json"),
-        ..crate::test_support::test_tui_options(tmpdir.path())
+        ..crate::tui::test_support::test_tui_options(tmpdir.path())
     };
     App::new(options, &Config::default())
 }
 
 fn write_user_command(tmpdir: &TempDir, name: &str, content: &str) {
+    // Workspace commands load only in a trusted workspace.
+    crate::test_support::trust_workspace(tmpdir.path());
     let commands_dir = tmpdir.path().join(".codewhale").join("commands");
     std::fs::create_dir_all(commands_dir).expect("create commands dir");
     let path = tmpdir

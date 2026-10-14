@@ -28,18 +28,19 @@ pub(super) fn render_bundle_detail(
     let unsupported = if detail.unsupported_labels.is_empty() {
         "none".to_string()
     } else {
-        detail.unsupported_labels.join(", ")
+        display_component_labels(&detail.unsupported_labels)
     };
     let active_components = if detail.active {
         let labels = &detail.supported_labels;
         if labels.is_empty() {
             "none".to_string()
         } else {
-            labels.join(", ")
+            display_component_labels(labels)
         }
     } else {
         "none".to_string()
     };
+    let extension_host = crate::plugins::activation::extension_host_policy_enabled();
     let (content_hash, capability_hash) = if include_hashes {
         (
             detail.content_hash.as_str(),
@@ -76,16 +77,37 @@ pub(super) fn render_bundle_detail(
         .collect::<Vec<_>>();
     let _ = write!(
         output,
-        "\nCompatibility: {}\nActive components: [{active_components}]\nInactive components: [{unsupported}]\nQualified skills: [{}]\nActivation boundary: trust stages the exact reviewed content but does not activate it; enable rebuilds this workspace's Skills, MCP, Commands, Agents, and Hooks immediately. Every plugin command dispatch, Agent spawn, Hook process start, Skill use, and MCP call rechecks current authority. LSP, native, filesystem-roots, and lifecycle-mutation stay inventoried and inactive.",
+        "\nCompatibility: {}\nActive components: [{active_components}]\nInactive components: [{unsupported}]\nQualified skills: [{}]\nActivation boundary: trust stages the exact reviewed content but does not activate it; enable rebuilds this workspace's Skills, MCP, Commands, Agents, and Hooks immediately. Every plugin command dispatch, Agent spawn, Hook process start, Skill use, and MCP call rechecks current authority. {}",
         detail.compatibility,
         if skills.is_empty() {
             "none".to_string()
         } else {
             skills.join(", ")
+        },
+        if extension_host {
+            "Native host code (JavaScript) runs in the experimental extension host with your user permissions (sandboxed where the OS sandbox is available); extension tools are never auto-approved by the plugin itself, and each call needs approval under your approval mode. LSP, filesystem-roots, and lifecycle-mutation stay inventoried and inactive."
+        } else {
+            "LSP, native, filesystem-roots, and lifecycle-mutation stay inventoried and inactive."
         }
     );
     append_diagnostics(presentation, &mut output, &detail.diagnostics);
     output
+}
+
+/// Component labels for review text. With the experimental extension host
+/// on, `native` is shown by what it is; with it off the text is unchanged.
+/// The hashed label itself (`PluginActivationCapability::as_str`) never
+/// changes.
+fn display_component_labels(labels: &[String]) -> String {
+    let extension_host = crate::plugins::activation::extension_host_policy_enabled();
+    labels
+        .iter()
+        .map(|label| match label.as_str() {
+            "native" if extension_host => "native (host code: JavaScript)",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_permissions(detail: &PluginDetail) -> String {
@@ -351,4 +373,90 @@ fn _diagnostic_path(diagnostic: &PluginDiagnostic) -> Option<String> {
         .path
         .as_ref()
         .map(|path| path.display().to_string())
+}
+
+/// `/plugin doctor` output: what is superseded, what was kept and why, and
+/// the state-file effect. Every dynamic string is escaped; paths and ids come
+/// from the filesystem and from plugin state, which a bundle can influence.
+pub(super) fn render_gc_report(
+    report: &crate::plugins::registry::gc::GcReport,
+    fixed: bool,
+) -> String {
+    use crate::plugins::registry::gc::format_bytes;
+
+    const SHOWN: usize = 40;
+    let mut out = String::new();
+    let title = if fixed {
+        "Plugin doctor: applied"
+    } else {
+        "Plugin doctor: report (nothing was changed)"
+    };
+    let _ = writeln!(out, "{title}\n");
+    if report.items.is_empty() {
+        let _ = writeln!(
+            out,
+            "Nothing to retire. {} state records, {}.",
+            report.records_before,
+            format_bytes(report.state_bytes_before)
+        );
+    } else {
+        let verb = if fixed { "Retired" } else { "Would retire" };
+        let records = report
+            .items
+            .iter()
+            .filter(|item| item.kind == crate::plugins::registry::gc::GcKind::Record)
+            .count();
+        let _ = writeln!(
+            out,
+            "{verb} {records} records and {} directories ({} on disk). state.json: {} -> {} records, {} -> {}.\n",
+            report.items.len() - records,
+            format_bytes(report.reclaimable_bytes()),
+            report.records_before,
+            report.records_after,
+            format_bytes(report.state_bytes_before),
+            format_bytes(report.state_bytes_after),
+        );
+        for item in report.items.iter().take(SHOWN) {
+            let gate = if item.explicit && !fixed {
+                " [--fix only]"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "  {}{gate} {}: {}",
+                item.kind.label(),
+                escape_review_text(&item.target),
+                escape_review_text(&item.reason)
+            );
+        }
+        if report.items.len() > SHOWN {
+            let _ = writeln!(out, "  ... and {} more", report.items.len() - SHOWN);
+        }
+    }
+    if !report.kept.is_empty() {
+        let _ = writeln!(out, "\nKept ({}):", report.kept.len());
+        for line in report.kept.iter().take(10) {
+            let _ = writeln!(out, "  {}", escape_review_text(line));
+        }
+        if report.kept.len() > 10 {
+            let _ = writeln!(out, "  ... and {} more", report.kept.len() - 10);
+        }
+    }
+    for note in &report.notes {
+        let _ = writeln!(out, "\nNote: {}", escape_review_text(note));
+    }
+    for failure in &report.failures {
+        let _ = writeln!(out, "\nCould not remove {}", escape_review_text(failure));
+    }
+    if fixed {
+        if !report.items.is_empty() {
+            out.push_str("\nThe previous state.json is kept as state.json.pre-gc.");
+        }
+    } else if !report.items.is_empty() {
+        out.push_str(
+            "\nRun /plugin doctor --fix to apply. Items not marked [--fix only] are also retired automatically at startup.",
+        );
+    }
+    out
 }

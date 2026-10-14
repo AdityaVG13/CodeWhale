@@ -1,4 +1,4 @@
-//! Unified `/skills` manager — audit inventory + mutation actions.
+//! Dedicated `/skills manage` manager — audit inventory + mutation actions.
 //!
 //! This view never writes files. Keys emit [`ViewEvent::SkillMutationRequested`];
 //! the host runs [`crate::skills::mutation`] and rebuilds the view.
@@ -825,7 +825,7 @@ mod tests {
             memory_path: tmp.path().join("memory.md"),
             notes_path: tmp.path().join("notes.txt"),
             mcp_config_path: tmp.path().join("mcp.json"),
-            ..crate::test_support::test_tui_options(workspace)
+            ..crate::tui::test_support::test_tui_options(workspace)
         };
         App::new(options, &Config::default())
     }

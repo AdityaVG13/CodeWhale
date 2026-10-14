@@ -1,6 +1,7 @@
 // Spawned computers: registry shape, executor wiring, docker lifecycle, and
 // the MCP spawn/remove path. Docker tests are integration tests — they run
 // real containers when a daemon is present and skip otherwise.
+import { hostKeysLine, attest, attestParams } from "./fixtures/host-decision.mjs";
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -127,7 +128,7 @@ function rpc(method, params) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => { pending.delete(id); reject(new Error(`timeout: ${method}`)); }, 90_000);
     pending.set(id, (msg) => { clearTimeout(t); resolve(msg); });
-    server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: attestParams(method, params) }) + "\n");
   });
 }
 const call = async (name, args = {}) => JSON.parse((await rpc("tools/call", { name, arguments: args })).result.content[0].text);
@@ -137,6 +138,7 @@ test("computer spawn registers an owned docker computer, acts on it, and remove 
     env: { ...process.env, CODEWHALE_CU_STATE_DIR: tmp },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  server.stdin.write(hostKeysLine());
   server.stdout.on("data", (c) => {
     buf += c.toString();
     let i;
@@ -198,4 +200,51 @@ test('disposable desktops require a live Linux Docker engine, including on Windo
   for (const [response, expected] of [[{code:0,stdout:'linux\n'},true],[{code:0,stdout:'windows\n'},false],[{code:1,stdout:'linux'},false],[{code:0,stdout:'linux',timedOut:true},false],[{code:0,stdout:'linux',aborted:true},false]]) {
     assert.equal(await spawnMod.dockerAvailable(async args => { assert.deepEqual(args,['info','--format','{{.OSType}}']); return response; }),expected);
   }
+});
+
+
+test("Docker desktop entrypoint survives repeated orderly restarts", { ...NEED_DOCKER, timeout: 90_000 }, async t => {
+  const name = `cu-restart-${process.pid}-${Date.now()}`;
+  containers.add(name);
+  t.after(() => rmContainer(name));
+  const started = await run("docker", [
+    "run", "-d", "--name", name, "--init", "--network", "none", "--pull", "never",
+    // Exercise the current entrypoint even if this developer has an older
+    // cached desktop image. Passing its source through argv also works when
+    // the Docker daemon cannot mount this host's checkout (e.g. a Colima VM).
+    "--entrypoint", "/bin/sh", spawnMod.DEFAULT_IMAGE,
+    "-c", fs.readFileSync(path.join(ROOT, "docker", "entrypoint.sh"), "utf8"), "sh", "sleep", "infinity",
+  ], { timeoutMs: 30_000 });
+  assert.equal(started.code, 0, started.stderr);
+  const request = Buffer.from(JSON.stringify({ tool: "list_windows", args: {} })).toString("base64");
+  for (let cycle = 0; cycle <= 3; cycle++) {
+    if (cycle) {
+      const restarted = await run("docker", ["restart", name], { timeoutMs: 15_000 });
+      assert.equal(restarted.code, 0, restarted.stderr);
+    }
+    const deadline = Date.now() + 20_000;
+    let observed = false, last = "";
+    while (Date.now() < deadline) {
+      const probe = await run("docker", ["exec", name, "/bin/sh", "/app/docker/agent-exec.sh", request], { timeoutMs: 5_000 });
+      last = probe.stdout || probe.stderr;
+      try { observed = probe.code === 0 && JSON.parse(probe.stdout).ok === true; } catch {}
+      if (observed) break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    assert.equal(observed, true, `desktop unavailable after restart ${cycle}: ${last}`);
+  }
+});
+
+test("destroyDockerComputer never removes a desktop another session spawned", async () => {
+  const issued = [];
+  const labels = (value) => async (args) => {
+    issued.push(args);
+    return args[0] === "container" ? { code: 0, stdout: `${value}\n`, stderr: "" } : { code: 0, stdout: "", stderr: "" };
+  };
+  const computer = { container: "cu-spawn-other-ab12cd" };
+  assert.deepEqual(await spawnMod.destroyDockerComputer(computer, labels("1|another-session")), { destroyed: false, reason: "other_session" });
+  assert.deepEqual(await spawnMod.destroyDockerComputer(computer, labels("|")), { destroyed: false, reason: "not_spawned" });
+  assert.equal(issued.filter((args) => args[0] === "rm").length, 0, "no docker rm for a container this session does not own");
+  assert.deepEqual(await spawnMod.destroyDockerComputer(computer, labels(`1|${SESSION_ID}`)), { destroyed: true });
+  assert.deepEqual(issued.at(-1), ["rm", "-f", "cu-spawn-other-ab12cd"]);
 });

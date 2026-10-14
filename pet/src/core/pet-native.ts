@@ -2,17 +2,22 @@ import { PetWorld, type PetInteraction, type PetSegment } from './pet-world.js';
 import { compilePetTelemetry, decodePetJSONL, PetLiveTape } from './pet-telemetry.js';
 import { ARCH_OF, digest, layout, PetSim } from './pet-sim.js';
 import { renderPetPCM, type PetVoice } from './pet-audio.js';
-import { PetEngineTelemetry } from './pet-engine.js';
+import { PetEngineTelemetry, type EngineOwnerProjection } from './pet-engine.js';
+import { blendDotFields, dotFieldKey, projectDotField, textLanguage, type DotField, type DotOptions } from './dot-field.js';
+import { DOT_LABELS, type GlyphLanguage } from './dot-glyphs.js';
 
 /** Synchronous native boundary: JSON state and directly transferable PCM.
  * Native hosts share the actual world / score implementation, not a rewrite. */
 export class PetNative {
   private world: PetWorld;
   private engine = new PetEngineTelemetry();
+  private expressionActivity = this.engine.activity(0);
+  private expressionTransition?: { at: number; from: DotField };
+  private expressionOptions: Required<DotOptions> = { bodyStyle: 'smooth', textLanguage: 'en' };
   private engineTick = 0;
   private segment?: PetSegment;
   private liveTape = new PetLiveTape();
-  private stillProjection?: { key: string; points: number[][]; style: PetSim['frame'] };
+  private stillProjection?: { key: string; style: PetSim['frame'] };
   constructor(pointsJSON: string, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion: 1 | 2 = 2) {
     const points = JSON.parse(pointsJSON) as [number, number][];
     if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
@@ -21,25 +26,56 @@ export class PetNative {
   }
   step(dt: number, motion: boolean): string { this.world.step(dt, { motion, sensitivity: 1 }); return this.snapshot(); }
   snapshot(): string { return JSON.stringify({ ...this.world.frame, voices: this.world.voices, digest: digest(this.world.sim) }); }
+  private expression(): DotField {
+    const { frame } = this.world;
+    const target = projectDotField(this.expressionActivity, frame.timeMs, false, this.expressionTransition?.at ?? 0, this.expressionOptions);
+    return this.expressionTransition
+      ? blendDotFields(this.expressionTransition.from, target, (frame.timeMs - this.expressionTransition.at) / 560)
+      : target;
+  }
+  private prepareExpression(activity: EngineOwnerProjection): void {
+    if (dotFieldKey(activity) !== dotFieldKey(this.expressionActivity))
+      this.expressionTransition = { at: this.world.frame.timeMs, from: this.expression() };
+    this.expressionActivity = activity;
+  }
   /** View-only projection. Display cadence and accessibility preferences never
    * advance the owner, consume randomness, or change its score/checkpoint. */
-  presentation(): string {
+  presentation(options: DotOptions = {}, interfaceLanguage = 'en'): string {
+    if (!['smooth', 'pixel'].includes(options.bodyStyle ?? 'smooth')
+      || !['auto', 'en', 'zh-Hans', 'zh-Hant', 'ja'].includes(options.textLanguage ?? 'auto'))
+      throw new Error('Invalid pet presentation preferences.');
+    const next = { bodyStyle: options.bodyStyle ?? 'smooth', textLanguage: textLanguage(options.textLanguage, interfaceLanguage) };
+    if (next.bodyStyle !== this.expressionOptions.bodyStyle || next.textLanguage !== this.expressionOptions.textLanguage) {
+      const from = this.expression(); this.expressionOptions = next;
+      this.expressionTransition = { at: this.world.frame.timeMs, from };
+    }
     const { sim, frame } = this.world;
-    const state = { ...frame.state, roamX: 0, roamY: 0, flip: 1, lit: frame.behaviour === 'doze' ? .18 : 1 };
+    const activity = this.engine.activity(frame.timeMs);
+    const observed = activity.observed && activity.freshness === 'fresh';
+    const state = { ...frame.state, observed: observed ? 1 : 0, roamX: 0, roamY: 0, flip: 1,
+      lit: observed ? 1 : frame.behaviour === 'doze' ? .18 : 1 };
     const key = JSON.stringify([state, frame.pod]);
     if (this.stillProjection?.key !== key) {
       const still = new PetSim(sim.p.map(p => [p.hx, p.hy]), 0xC0FFEE, sim.expressionVersion);
       const peers = frame.pod.filter(p => p.present);
       still.step(1 / 30, state, { motion: false, sensitivity: 1,
         podSlots: peers.length >= 3 ? peers.map(p => [[0, 2, 4, 1, 3, 5][p.slot], p.phase] as const) : undefined });
-      this.stillProjection = { key, points: still.p.map(p => [p.x, p.y]), style: still.frame };
+      this.stillProjection = { key, style: still.frame };
     }
-    return JSON.stringify({ ...frame, digest: digest(sim), style: sim.frame, activity: this.engine.activity(frame.timeMs),
-      points: sim.p.map(p => [p.x, p.y]),
-      still: { points: this.stillProjection.points, style: this.stillProjection.style, state } });
+    const still = projectDotField(activity, frame.timeMs, true, 0, this.expressionOptions);
+    const language = this.expressionOptions.textLanguage as GlyphLanguage;
+    const label = activity.authoritativePresence === 'needs_you' ? 'waiting'
+      : activity.authoritativePresence === 'done' ? 'done' : activity.activityKind;
+    return JSON.stringify({ ...frame, digest: digest(sim), state, style: { ...sim.frame, hollow: !observed }, activity,
+      ...this.expression(), displayLanguage: language,
+      displayPhrase: observed && label ? DOT_LABELS[language][label] : '',
+      still: { ...still, style: { ...this.stillProjection.style, hollow: !observed }, state } });
   }
   /** Losing a producer invalidates outstanding coverage, never the creature. */
-  disconnectEngine(): void { this.engine = new PetEngineTelemetry(); this.world.voices = []; }
+  disconnectEngine(): void {
+    this.engine = new PetEngineTelemetry(); this.world.voices = [];
+    this.expressionActivity = this.engine.activity(this.world.frame.timeMs); this.expressionTransition = undefined;
+  }
   interact(kind: PetInteraction['kind'], x: number, y: number): void { this.world.interact(kind, x, y); }
   interactions(): string { return JSON.stringify(this.world.interactions); }
   accept(packet: string): void { this.world.acceptTelemetry(JSON.parse(packet)); }
@@ -64,6 +100,7 @@ export class PetNative {
     this.world = PetWorld.fromRecording(points, JSON.parse(text));
     this.liveTape.reset();
     this.segment = undefined; this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000); this.engine = new PetEngineTelemetry();
+    this.expressionActivity = this.engine.activity(this.world.frame.timeMs); this.expressionTransition = undefined;
   }
   /** Resume a live host at the first unrecorded bucket. Keep every accepted
    * interval, but never present its last observed frame as current evidence. */
@@ -71,15 +108,21 @@ export class PetNative {
     this.world.resumeObservation();
     this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
     this.engine = new PetEngineTelemetry();
+    this.expressionActivity = this.engine.activity(this.world.frame.timeMs); this.expressionTransition = undefined;
     this.world.voices = [];
     return this.world.frame.timeMs;
   }
-  observeEngine(metadataJSON: string, timeMs: number): void { this.engine.observe(JSON.parse(metadataJSON), timeMs); }
+  /** A rejected observation leaves the reducer exactly as it was, like a batch. */
+  observeEngine(metadataJSON: string, timeMs: number): void {
+    const next = this.engine.clone(); next.observe(JSON.parse(metadataJSON), timeMs);
+    this.prepareExpression(next.activity(this.world.frame.timeMs)); this.engine = next;
+  }
   observeEngineBatch(metadataJSON: string, timeMs: number): void {
     const events: unknown = JSON.parse(metadataJSON);
     if (!Array.isArray(events) || events.length > 64) throw new Error('Invalid Engine batch.');
     const next = this.engine.clone();
     for (const event of events) next.observe(event, timeMs);
+    this.prepareExpression(next.activity(this.world.frame.timeMs));
     this.engine = next;
   }
   advanceEngine(timeMs: number, motion: boolean, waiting: boolean): void {
@@ -90,10 +133,12 @@ export class PetNative {
     while (this.engineTick < target) {
       if ((this.engineTick + 1) % 12 === 0) this.world.acceptTelemetry(this.engine.bucket(Math.floor(this.engineTick / 12)));
       this.world.step(1 / 30, { motion, sensitivity: 1 });
+      this.prepareExpression(this.engine.activity(this.world.frame.timeMs));
       voices.push(...this.world.voices);
       this.engineTick++;
     }
     this.world.voices = voices;
+    this.prepareExpression(this.engine.activity(this.world.frame.timeMs));
   }
   terminal(width: number, height: number): string {
     if (![width, height].every(n => Number.isSafeInteger(n) && n >= 1 && n <= 512)) throw new Error('Invalid pet raster size.');

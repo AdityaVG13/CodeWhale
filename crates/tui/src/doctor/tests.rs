@@ -1,5 +1,4 @@
 use super::*;
-use clap::Parser as _;
 
 #[test]
 fn default_probe_request_is_fully_offline() {
@@ -72,8 +71,8 @@ fn update_renderer_omits_untrusted_release_tags_and_errors() {
     let metadata = doctor_update_report("0.9.3", Ok::<String, ()>(release_sentinel.to_string()));
     let transport = doctor_update_report("0.9.3", Err(error_sentinel.to_string()));
     let rendered = [
-        doctor_update_report_lines(&metadata).join("\n"),
-        doctor_update_report_lines(&transport).join("\n"),
+        doctor_update_report_lines(&metadata, "codewhale update").join("\n"),
+        doctor_update_report_lines(&transport, "codewhale update").join("\n"),
     ]
     .join("\n");
 
@@ -88,11 +87,26 @@ fn update_renderer_omits_untrusted_release_tags_and_errors() {
 fn update_renderer_canonicalizes_safe_release_tags() {
     let report = doctor_update_report("0.9.3", Ok::<String, ()>(" v0.9.4 ".to_string()));
     assert_eq!(
-        doctor_update_report_lines(&report),
+        doctor_update_report_lines(&report, "codewhale update"),
         vec![
             "latest: v0.9.4".to_string(),
             "Update available. Run `codewhale update` to install.".to_string(),
         ]
+    );
+}
+
+#[test]
+fn update_renderer_names_the_package_manager_for_managed_installs() {
+    let report = doctor_update_report("0.9.3", Ok::<String, ()>("v0.9.4".to_string()));
+    let npm = codewhale_release::InstallMethod::Npm.update_command();
+    let lines = doctor_update_report_lines(&report, npm);
+    assert_eq!(
+        lines[1],
+        "Update available. Run `npm install -g codewhale@latest` to install."
+    );
+    assert!(
+        !lines.join("\n").contains("`codewhale update`"),
+        "an npm-owned binary must not be told to self-update: {lines:?}"
     );
 }
 
@@ -130,46 +144,6 @@ fn live_probe_flags_open_only_their_owned_boundary() {
     assert!(!search.should_probe_mcp());
 }
 
-#[test]
-fn cli_defaults_doctor_offline_and_keeps_json_incompatible_with_live_flags() {
-    let cli =
-        crate::Cli::try_parse_from(["codewhale-tui", "doctor"]).expect("parse default doctor");
-    let Some(crate::Commands::Doctor(args)) = cli.command else {
-        panic!("expected doctor command");
-    };
-    assert!(!args.check_updates);
-    assert!(!args.probe_api);
-    assert!(!args.probe_local);
-    assert!(!args.probe_mcp);
-    assert!(!args.probe_search);
-
-    let cli = crate::Cli::try_parse_from(["codewhale-tui", "doctor", "--probe-search"])
-        .expect("parse search probe");
-    let Some(crate::Commands::Doctor(args)) = cli.command else {
-        panic!("expected doctor command");
-    };
-    assert!(args.probe_search);
-    assert!(!args.probe_api);
-    assert!(!args.probe_local);
-    assert!(!args.probe_mcp);
-
-    for output_flag in ["--json", "--context-json"] {
-        for live_flag in [
-            "--check-updates",
-            "--probe-api",
-            "--probe-local",
-            "--probe-mcp",
-            "--probe-search",
-        ] {
-            assert!(
-                crate::Cli::try_parse_from(["codewhale-tui", "doctor", output_flag, live_flag,])
-                    .is_err(),
-                "{output_flag} unexpectedly accepted live flag {live_flag}"
-            );
-        }
-    }
-}
-
 #[tokio::test]
 async fn search_probe_counts_any_http_response_as_transport_only() {
     use wiremock::matchers::{method, path};
@@ -187,6 +161,7 @@ async fn search_probe_counts_any_http_response_as_transport_only() {
             provider: Some(crate::config::SearchProvider::DuckDuckGo),
             base_url: Some(server.uri()),
             api_key: None,
+            native: None,
         }),
         ..Default::default()
     };
@@ -241,6 +216,7 @@ async fn search_probe_does_not_follow_redirects() {
             provider: Some(crate::config::SearchProvider::Searxng),
             base_url: Some(server.uri()),
             api_key: None,
+            native: None,
         }),
         ..Default::default()
     };
@@ -267,6 +243,7 @@ async fn search_probe_respects_network_policy_without_contacting_the_authority()
             provider: Some(crate::config::SearchProvider::Searxng),
             base_url: Some("https://search.example/private?token=secret".to_string()),
             api_key: None,
+            native: None,
         }),
         network: Some(crate::config::NetworkPolicyToml {
             default: "allow".to_string(),

@@ -13,9 +13,11 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { FACTS } from "./facts.generated";
 import { SNIPPETS, VERIFY } from "./install-binary-snippets";
+import { INSTALL_GUIDE } from "./install-guide.generated";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
+import { PRODUCT_COPY } from "./content/product";
 
 const root = new URL("../../", import.meta.url);
 
@@ -263,7 +265,8 @@ describe("public surface contracts", () => {
     expect(installDoc).toContain("One Cargo package is required");
     expect(installDoc).toContain("`codewhale-cli` installs the `codewhale` command");
     expect(installDoc).toContain("Cargo does\nnot create that alias");
-    expect(installPage).toContain("# Install the compiled runtime as codewhale");
+    expect(installPage).toContain('from "@/lib/install-guide.generated"');
+    expect(INSTALL_GUIDE.chunks.some((chunk) => chunk.kind === "code" && chunk.text.includes("cargo install --path crates/cli --locked"))).toBe(true);
     expect(installPage).not.toContain("codewhale-tui");
     expect(npmReadme).toContain("installs `codewhale` plus the `codew` convenience name");
     expect(npmReadme).not.toContain("codewhale-tui");
@@ -401,8 +404,9 @@ done
     });
     for (const label of [...matrix.control.modes, ...matrix.control.permissionPostures]) {
       expect(modes).toContain(label);
-      expect(homepage).toContain(label);
     }
+    expect(PRODUCT_COPY.modes.map(({ title }) => title.en)).toEqual(matrix.control.modes);
+    expect(PRODUCT_COPY.permissions.map(({ title }) => title.en)).toEqual(matrix.control.permissionPostures);
     expect(modes).toContain("when the composer is empty");
     expect(keys).toContain("When the composer is empty, cycle TUI mode");
     expect(keys).toContain("`Shift+Tab`");
@@ -440,7 +444,7 @@ done
     });
     expect(matrix.toolSurface.activationCache).toEqual({
       maximumNames: 8,
-      maximumSchemaBytes: 24_576,
+      maximumSchemaBytes: 16_384,
       scope: "per conversation; each subagent owns an independent policy-filtered cache",
     });
     expect(matrix.toolSurface.agentConcurrency).toEqual({
@@ -455,7 +459,7 @@ done
     expect(roadmap.indexOf('{ title: "Local web client"')).toBeLessThan(
       roadmap.indexOf('title: "Underway"'),
     );
-    expect(roadmap).toContain("Implemented in the v0.9.1 source candidate");
+    expect(roadmap).toContain("In published releases: `codewhale web`");
     for (const name of matrix.toolSurface.defaultActive) {
       expect(toolDoc, name).toContain(`\`${name}\``);
       expect(toolsPage, name).toContain(name);
@@ -469,7 +473,7 @@ done
     expect(registry).toContain("Arc::new(LowercaseBashTool)");
     expect(registry).toContain('FileTool::new("File")');
     expect(registry).toContain('BashTool::new("Bash")');
-    expect(toolsPage).toContain("8 names / 24 KiB");
+    expect(toolsPage).toContain("8 names / 16 KiB");
     expect(toolsPage).toContain("Web search/fetch");
     expect(toolsPage).not.toContain("docs/TOOL_LIFECYCLE.md");
   });
@@ -547,112 +551,60 @@ done
     // English and Chinese editions — same guarantee, one source.
     expect(footerProjectLinks("en", getChrome("en")).at(-1)).toEqual({
       label: "MIT license",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footerProjectLinks("zh", getChrome("zh")).at(-1)).toEqual({
       label: "MIT 许可证",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footer).toContain("href={REPO_RELEASES_URL}");
     expect(text("web/lib/i18n/links.ts")).toContain(
       'export const REPO_RELEASES_URL = `${REPO_URL}/releases`',
     );
     expect(text("web/lib/i18n/links.ts")).toContain(
-      'export const REPO_URL = "https://github.com/Hmbown/CodeWhale"',
+      'export const REPO_URL = "https://github.com/codewhale-hq/CodeWhale"',
     );
     expect(footer).toContain("GITEE_ENABLED &&");
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // Website and README share the founder-supplied PNG without alteration.
+    // The site and README use the same measured native capture. Demo route
+    // and development-source provenance remain explicit in capture metadata.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
-    expect(imageDimensions(websiteImage)).toEqual([1078, 466]);
+    expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
     expect(readmeImage).toEqual(websiteImage);
     expect(statSync(new URL(matrix.screenshot.readme, root)).size).toBeLessThan(500_000);
     expect(statSync(new URL(matrix.screenshot.website, root)).size).toBeLessThan(500_000);
-    expect(matrix.screenshot.terminal).toBe("unrecorded");
+    expect(matrix.screenshot.terminal).toContain("real PTY cell capture");
     // A development-build capture, never a release claim.
     expect(matrix.screenshot.capture).toContain("development build");
-    expect(matrix.screenshot.capture).toContain("not a default");
+    const capture = JSON.parse(text("web/lib/terminal-captures/manifest.json"));
+    expect(capture.baseCommit).toBe(matrix.screenshot.sourceCommit);
+    expect(capture.binarySha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.sourceDiffSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.sourceDirty).toBe(true);
+    expect(capture.conditions.provider).toContain("loopback");
+    expect(capture.conditions.model).toBe("website-demo");
+    expect(capture.conditions.submittedPrompts).toBeGreaterThan(0);
+    expect(capture.conditions.fixtureHistory).toBe(false);
 
     const readme = text("README.md");
-    const homepage = text("web/app/[locale]/page.tsx");
+    const productPage = text("web/app/[locale]/product/page.tsx");
     expect(readme).toContain(matrix.screenshot.readme);
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
-    expect(homepage).toContain("src={TERMINAL_SCREENSHOT.src}");
-    // Alt text and caption are dictionary-backed; every routed locale must
-    // describe the capture as what it is — a v0.9.12 development build in
-    // Operate mode with Full Access, not a release and not a default.
-    expect(homepage).toContain("alt={d.screenshotAlt}");
-    expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
-    expect(getHome("en").shotBuild).toBe("v{version} development build");
-    expect(getHome("en").screenshotAlt).toContain("171acee689aa");
-    expect(getHome("en").screenshotAlt).toContain("Full Access");
-    expect(getHome("en").screenshotAlt).toContain("Operate mode");
-    for (const locale of ["zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
+    expect(productPage).toContain("<NativeTerminalGallery");
+    expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
+    expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
+    // Every locale describes the actual capture; build identity comes from
+    // the media manifest instead of a stale version embedded in translations.
+    expect(productPage).toContain("label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
+    for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
       const home = getHome(locale);
-      expect(home.shotBuild, `${locale} shotBuild`).toContain("{version}");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Full Access");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Operate");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("0.9.12");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("{version}");
     }
-  });
-
-  it("keeps the standalone wire strip a record of GitHub, not a summary of it", () => {
-    const ticker = text("web/components/ticker.tsx");
-    const github = text("web/lib/github.ts");
-
-    // An empty or unreachable feed removes the strip. No skeleton, no
-    // placeholder row, no invented item.
-    expect(ticker).toContain("if (!ordered.length) return null;");
-
-    // Drafts are the author's own not-ready marker, not an event.
-    expect(ticker).toContain("EVENT_STATES.includes(item.state)");
-    expect(ticker).not.toContain('"draft"');
-
-    // Every verb resolves through the caller's dictionary — the strip never
-    // hardcodes an English event word next to a translated page.
-    for (const key of [
-      "tickerMerged",
-      "tickerOpened",
-      "tickerClosed",
-      "tickerReleased",
-      "tickerFirstContribution",
-      "tickerBy",
-      "tickerAria",
-    ] as const) {
-      for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id"]) {
-        expect(getChrome(locale)[key].trim().length, `${locale} ${key}`).toBeGreaterThan(0);
-      }
-    }
-    expect(getChrome("en").tickerBy).toContain("{handle}");
-
-    // The first-contribution mark is GitHub's verdict, copied, never ours.
-    expect(github).toContain('association === "FIRST_TIME_CONTRIBUTOR"');
-    expect(ticker).toContain("item.firstTimeContributor");
-
-    // A verb is dated by its own event, so a merge is never dated by a later
-    // comment on the thread.
-    expect(github).toContain("eventAt");
-    expect(ticker).toContain("item.eventAt ?? item.updatedAt");
-
-    // Merged pull requests, issues, and releases — the whole life of the repo,
-    // within the existing three-call budget.
-    expect(github).toContain("/releases?per_page=");
-    expect(github).toContain('kind: "release"');
-  });
-
-  it("keeps reduced motion static without hiding the reasoning trace", () => {
-    const css = text("web/app/globals.css");
-
-    expect(css).toMatch(
-      /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.ticker-track\s*\{\s*animation:\s*none;\s*\}[\s\S]*?\}/,
-    );
-    // Freezing the track must not also hide the entries it stopped scrolling.
-    expect(css).toMatch(/\.ticker-viewport\s*\{\s*overflow-x:\s*auto;\s*\}/);
   });
 
   it("keeps the homepage free of fabricated demo panels", () => {

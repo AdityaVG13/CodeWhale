@@ -31,7 +31,7 @@ const EDITOR_LEGEND: &str = "or click choose";
 const CHOICE_CURSOR: char = '▸';
 
 fn spawn(workspace: &SealedWorkspace) -> Harness {
-    Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -91,7 +91,7 @@ fn theme_editor_survives_every_arrow_key() {
     let mut tui = spawn(&workspace);
     let timeout = Duration::from_secs(15);
 
-    tui.wait_for_text("Type a message", timeout).unwrap();
+    tui.wait_for_composer(timeout).unwrap();
 
     // F2 is the advertised bind for the config shell.
     tui.send(keys::key::f2()).unwrap();

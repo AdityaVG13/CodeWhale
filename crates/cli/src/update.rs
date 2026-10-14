@@ -1,7 +1,7 @@
 //! Self-update for the `codewhale` binary.
 //!
 //! The `update` subcommand fetches the latest release from
-//! `github.com/Hmbown/CodeWhale/releases/latest`, downloads the
+//! `github.com/codewhale-hq/CodeWhale/releases/latest`, downloads the
 //! platform-correct binary, verifies its SHA256 checksum, and atomically
 //! replaces the currently running binary.
 
@@ -26,9 +26,12 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-const GITHUB_LATEST_RELEASE_PAGE_URL: &str = "https://github.com/Hmbown/CodeWhale/releases/latest";
+mod compiled_host;
+
+const GITHUB_LATEST_RELEASE_PAGE_URL: &str =
+    "https://github.com/codewhale-hq/CodeWhale/releases/latest";
 const GITHUB_RELEASE_DOWNLOAD_BASE_URL: &str =
-    "https://github.com/Hmbown/CodeWhale/releases/download";
+    "https://github.com/codewhale-hq/CodeWhale/releases/download";
 const UPDATE_HTTP_ATTEMPTS: usize = 3;
 const UPDATE_HTTP_RETRY_DELAY_MS: u64 = 100;
 /// Ceiling for one asset download. Generous, because release binaries are tens
@@ -151,7 +154,12 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
 
     // Step 2: Prefer GitHub, then a supported mirror if its manifest is
     // unavailable. Keep the manifest and binary locked to the same source.
-    let download = resolve_download_plan(&fetched, &plan.asset_stem, proxy.as_ref())?;
+    let download = resolve_download_plan(
+        &fetched,
+        &plan.asset_stem,
+        proxy.as_ref(),
+        compiled_host::required_for(&current_exe)?,
+    )?;
     println!("Release source: {}", download.source.describe());
 
     // Step 3: Download and verify the sole implementation binary once. The
@@ -179,10 +187,38 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
     // Step 4: Replace command paths only after the download and the running
     // executable identity verify. The preflight happens before a colocated
     // compatibility path can change, then the identity is checked just in time.
-    replace_verified_downloads(&plan.target_paths, &bytes, |target| {
+    let mut host_update = compiled_host::prepare(
+        &download,
+        latest_tag,
+        plan.asset_stem.trim_start_matches("codewhale-"),
+        &current_exe,
+        proxy.as_ref(),
+    )?;
+    let replaced = (|| {
         validate_primary_update_identity(&executable_identity)?;
-        validate_update_target(target, &executable_identity)
-    })?;
+        if let Some(host) = &mut host_update {
+            host.publish()?;
+        }
+        replace_verified_downloads(&plan.target_paths, &bytes, |target| {
+            validate_primary_update_identity(&executable_identity)?;
+            validate_update_target(target, &executable_identity)
+        })
+    })();
+    if let Err(error) = replaced {
+        if let Some(host) = &mut host_update {
+            host.rollback()
+                .context("compiled-host rollback failed; retained backup path is reported below")?;
+        }
+        return Err(error);
+    }
+    if let Some(host) = &host_update {
+        println!(
+            "Updated the qualified compiled image, notices and relink source beside this CLI; Node remains default."
+        );
+        for path in host.recovery_paths() {
+            println!("Previous companion bytes retained at {}", path.display());
+        }
+    }
 
     println!(
         "\n✅ Successfully updated to {latest_tag}!\n\
@@ -207,21 +243,20 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
 /// never a reason to retry against the source that lost the probe: the two
 /// build their own artifacts, so their checksums are not interchangeable.
 fn verify_downloaded_asset(download: &DownloadPlan, bytes: &[u8]) -> Result<()> {
-    let expected = download
-        .checksums
-        .get(&download.binary_name)
-        .with_context(|| {
-            format!(
-                "{CHECKSUM_MANIFEST_ASSET} from {} is missing {}",
-                download.source.describe(),
-                download.binary_name
-            )
-        })?;
+    verify_manifest_asset(download, &download.binary_name, bytes)
+}
+
+fn verify_manifest_asset(download: &DownloadPlan, name: &str, bytes: &[u8]) -> Result<()> {
+    let expected = download.checksums.get(name).with_context(|| {
+        format!(
+            "{CHECKSUM_MANIFEST_ASSET} from {} is missing {name}",
+            download.source.describe()
+        )
+    })?;
     let actual = sha256_hex(bytes);
     if !actual.eq_ignore_ascii_case(expected) {
         bail!(
-            "SHA256 mismatch for {} from {}!\n  expected: {expected}\n  actual:   {actual}",
-            download.binary_name,
+            "SHA256 mismatch for {name} from {}!\n  expected: {expected}\n  actual:   {actual}",
             download.source.describe()
         );
     }
@@ -838,6 +873,7 @@ fn resolve_download_plan(
     fetched: &FetchedRelease,
     asset_stem: &str,
     proxy: Option<&Proxy>,
+    require_compiled_host: bool,
 ) -> Result<DownloadPlan> {
     match proactive_source_candidates(
         fetched,
@@ -851,10 +887,29 @@ fn resolve_download_plan(
                 fetched.release.tag_name,
                 candidate_labels(&candidates)
             );
-            select_release_source(candidates, manifest_probe_fetcher(proxy))
-                .with_context(update_network_fallback_hint)
+            let fetch = manifest_probe_fetcher(proxy);
+            let qualified: Arc<ManifestFetcher> = Arc::new(move |candidate| {
+                let bytes = fetch(candidate)?;
+                if require_compiled_host {
+                    compiled_host::require_catalog_manifest(&bytes)?;
+                }
+                Ok(bytes)
+            });
+            select_release_source(candidates, qualified).with_context(update_network_fallback_hint)
         }
-        None => single_source_download_plan(fetched, asset_stem, proxy),
+        None => {
+            let plan = single_source_download_plan(fetched, asset_stem, proxy)?;
+            if require_compiled_host
+                && !plan
+                    .checksums
+                    .contains_key("codewhale-extension-hosts.json")
+            {
+                bail!(
+                    "selected release source has no qualified compiled-host catalog; no files changed"
+                );
+            }
+            Ok(plan)
+        }
     }
 }
 
@@ -1108,8 +1163,14 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 fn push_update_path(paths: &mut Vec<PathBuf>, path: PathBuf, current_exe: &Path) {
     // Keep a same-target symlink as a symlink. Replacing its target refreshes
     // the alias too. Foreign/broken links stay in the plan and fail validation.
+    // Compare canonical paths on both sides: `current_exe()` is not
+    // canonicalized on macOS, so an install dir reached through a symlinked
+    // directory would otherwise never match its own alias.
     let same_target_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink())
-        && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved == current_exe);
+        && match [path.as_path(), current_exe].map(std::fs::canonicalize) {
+            [Ok(resolved), exe] => resolved == current_exe || exe.is_ok_and(|exe| resolved == exe),
+            _ => false,
+        };
     if !same_target_link {
         push_unique_path(paths, path);
     }
@@ -1183,30 +1244,22 @@ fn release_asset_stem_for(current_exe: &Path, os: &str, rust_arch: &str) -> Stri
     release_asset_stem_for_prefix("codewhale", os, rust_arch)
 }
 
-pub(crate) fn asset_matches_platform(asset_name: &str, binary_name: &str) -> bool {
-    if asset_name.ends_with(".sha256") {
-        return false;
-    }
-    asset_name == binary_name
-        || asset_name == format!("{binary_name}.exe")
-        || asset_name.starts_with(&format!("{binary_name}."))
-}
-
 fn asset_is_exact_platform_binary(asset_name: &str, binary_name: &str) -> bool {
     asset_name == binary_name || asset_name == format!("{binary_name}.exe")
 }
 
+/// The raw platform executable, and nothing else.
+///
+/// The updater writes the downloaded bytes straight over the running binary;
+/// it never unpacks. An archive, signature, or sidecar that merely shares the
+/// stem (`codewhale-macos-arm64.tar.gz`) would pass the checksum — the manifest
+/// lists it too — and then replace the executable with a non-executable. A
+/// release without the raw binary has no asset for this platform.
 fn select_platform_asset<'a>(release: &'a Release, binary_name: &str) -> Option<&'a Asset> {
     release
         .assets
         .iter()
         .find(|asset| asset_is_exact_platform_binary(&asset.name, binary_name))
-        .or_else(|| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset_matches_platform(&asset.name, binary_name))
-        })
 }
 
 fn select_checksum_manifest_asset(release: &Release) -> Option<&Asset> {
@@ -1287,13 +1340,10 @@ pub(crate) fn validate_and_build_proxy(proxy_str: &str) -> Result<Proxy> {
     Proxy::all(proxy_url).context("failed to configure update proxy")
 }
 
-fn update_http_client(proxy: Option<&Proxy>) -> Result<reqwest::blocking::Client> {
-    update_http_client_with_timeout(proxy, UPDATE_DOWNLOAD_TIMEOUT)
-}
-
-fn update_http_client_with_timeout(
+fn update_http_client_with_policy(
     proxy: Option<&Proxy>,
     timeout: Duration,
+    policy: &UpdateTransportPolicy,
 ) -> Result<reqwest::blocking::Client> {
     let mut builder = codewhale_release::platform_blocking_http_client_builder();
     if let Some(proxy) = proxy {
@@ -1302,22 +1352,161 @@ fn update_http_client_with_timeout(
     builder
         .user_agent(UPDATE_USER_AGENT)
         .timeout(timeout)
+        .redirect(update_redirect_policy(policy.clone()))
         .build()
         .context("failed to build update HTTP client")
+}
+
+/// Most redirects an update request follows.
+const UPDATE_MAX_REDIRECTS: usize = 10;
+
+/// Largest update response held in memory. Release archives are tens of
+/// megabytes; a server that keeps sending is cut off instead of exhausting
+/// memory before the checksum is ever compared.
+const UPDATE_MAX_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Hosts an update may contact without any operator configuration: GitHub's
+/// API and release pages, and the three hosts GitHub has served release
+/// assets from.
+const UPDATE_GITHUB_HOSTS: &[&str] = &[
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
+
+/// The first-party CNB mirror, which `CODEWHALE_USE_CNB_MIRROR=1` and the
+/// proactive Linux x64 probe select.
+const UPDATE_CNB_HOST: &str = "cnb.cool";
+
+/// Extra hosts the operator trusts for updates, comma separated. A mirror set
+/// with `CODEWHALE_RELEASE_BASE_URL` already allows its own host; this is for
+/// a mirror that redirects asset downloads to a separate download host.
+const UPDATE_ALLOWED_HOSTS_ENV: &str = "CODEWHALE_UPDATE_ALLOWED_HOSTS";
+
+/// Where an update request may go. Every request and every redirect hop must
+/// be HTTPS and must name an allowed host, so a redirect or a poisoned asset
+/// URL cannot move a download to a host nobody chose.
+#[derive(Debug, Clone)]
+struct UpdateTransportPolicy {
+    extra_hosts: Vec<String>,
+    /// Unit tests serve fixtures from loopback over plain HTTP; the tests that
+    /// prove the policy build `strict()` and never set this.
+    #[cfg(test)]
+    allow_loopback_http: bool,
+}
+
+impl UpdateTransportPolicy {
+    /// The built-in hosts plus what the operator configured: the host of an
+    /// explicit release mirror, and `CODEWHALE_UPDATE_ALLOWED_HOSTS`.
+    fn from_env() -> Self {
+        let mut policy = Self::strict();
+        if let Some(base_url) = codewhale_release::explicit_release_base_url_from_env()
+            && let Ok(url) = reqwest::Url::parse(&base_url)
+            && let Some(host) = url.host_str()
+        {
+            policy.extra_hosts.push(host.to_ascii_lowercase());
+        }
+        if let Ok(hosts) = std::env::var(UPDATE_ALLOWED_HOSTS_ENV) {
+            policy.extra_hosts.extend(
+                hosts
+                    .split(',')
+                    .map(|host| host.trim().to_ascii_lowercase())
+                    .filter(|host| !host.is_empty()),
+            );
+        }
+        #[cfg(test)]
+        {
+            policy.allow_loopback_http = true;
+        }
+        policy
+    }
+
+    fn strict() -> Self {
+        Self {
+            extra_hosts: Vec::new(),
+            #[cfg(test)]
+            allow_loopback_http: false,
+        }
+    }
+
+    fn host_is_allowed(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        UPDATE_GITHUB_HOSTS.contains(&host.as_str())
+            || host == UPDATE_CNB_HOST
+            || host
+                .strip_suffix(UPDATE_CNB_HOST)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+            || self.extra_hosts.contains(&host)
+    }
+
+    /// Refuse anything that is not HTTPS to an allowed host.
+    fn check_url(&self, url: &reqwest::Url) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if self.allow_loopback_http
+            && url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
+        {
+            return Ok(());
+        }
+        if url.scheme() != "https" {
+            return Err(format!(
+                "update URL must use HTTPS, not {}: {url}",
+                url.scheme()
+            ));
+        }
+        let host = url.host_str().unwrap_or_default();
+        if !self.host_is_allowed(host) {
+            return Err(format!(
+                "update host {host:?} is not an allowed release host. A private mirror's host \
+                 is allowed when it is the {} HTTPS base URL; any other host can be added with \
+                 {UPDATE_ALLOWED_HOSTS_ENV}=host1,host2",
+                codewhale_release::RELEASE_BASE_URL_ENV
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_str(&self, url: &str) -> Result<()> {
+        let parsed =
+            reqwest::Url::parse(url).with_context(|| format!("invalid update URL {url}"))?;
+        self.check_url(&parsed).map_err(|message| anyhow!(message))
+    }
+}
+
+/// Follow redirects, but only over HTTPS and only to an allowed host: a
+/// request that started encrypted must not finish over a channel anyone on the
+/// path can rewrite, or on a host nobody chose.
+fn update_redirect_policy(policy: UpdateTransportPolicy) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > UPDATE_MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match policy.check_url(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(message) => attempt.error(format!("update redirect refused: {message}")),
+        }
+    })
 }
 
 /// Fetch the latest release metadata from GitHub.
 fn fetch_latest_release(channel: ReleaseChannel, proxy: Option<&Proxy>) -> Result<FetchedRelease> {
     match resolve_release_query(channel) {
-        ReleaseQuery::Mirror { base_url, version } => Ok(FetchedRelease {
-            release: release_from_mirror_base_url(
-                &base_url,
-                &version,
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-            ),
-            source: pinned_mirror_source(base_url),
-        }),
+        ReleaseQuery::Mirror { base_url, version } => {
+            UpdateTransportPolicy::from_env()
+                .check_str(&base_url)
+                .with_context(|| format!("release mirror {base_url} cannot be used"))?;
+            Ok(FetchedRelease {
+                release: release_from_mirror_base_url(
+                    &base_url,
+                    &version,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                ),
+                source: pinned_mirror_source(base_url),
+            })
+        }
         ReleaseQuery::GitHubLatest { url } => match fetch_latest_release_from_url(url, proxy) {
             Ok(release) => Ok(FetchedRelease {
                 release,
@@ -1400,7 +1589,9 @@ fn fetch_release_json_once(
     description: &str,
     proxy: Option<&Proxy>,
 ) -> Result<(reqwest::StatusCode, String)> {
-    let client = update_http_client(proxy)?;
+    let policy = UpdateTransportPolicy::from_env();
+    policy.check_str(url)?;
+    let client = update_http_client_with_policy(proxy, UPDATE_DOWNLOAD_TIMEOUT, &policy)?;
     let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -1470,10 +1661,12 @@ fn fetch_latest_stable_release_from_redirect(proxy: Option<&Proxy>) -> Result<Re
 }
 
 fn fetch_latest_stable_tag_from_redirect_url(url: &str, proxy: Option<&Proxy>) -> Result<String> {
-    let client = update_http_client(proxy)?;
+    let policy = UpdateTransportPolicy::from_env();
+    policy.check_str(url)?;
+    let client = update_http_client_with_policy(proxy, UPDATE_DOWNLOAD_TIMEOUT, &policy)?;
     let mut last_error = None;
     for attempt in 1..=UPDATE_HTTP_ATTEMPTS {
-        match fetch_latest_stable_tag_from_redirect_url_once(&client, url) {
+        match fetch_latest_stable_tag_from_redirect_url_once(&client, &policy, url) {
             Ok(tag_name) => return Ok(tag_name),
             Err(error) if attempt < UPDATE_HTTP_ATTEMPTS => {
                 last_error = Some(error);
@@ -1487,6 +1680,7 @@ fn fetch_latest_stable_tag_from_redirect_url(url: &str, proxy: Option<&Proxy>) -
 
 fn fetch_latest_stable_tag_from_redirect_url_once(
     client: &reqwest::blocking::Client,
+    policy: &UpdateTransportPolicy,
     url: &str,
 ) -> Result<String> {
     let response = client
@@ -1495,6 +1689,11 @@ fn fetch_latest_stable_tag_from_redirect_url_once(
         .with_context(|| format!("failed to fetch release redirect from {url}"))?;
     let status = response.status();
     let final_url = response.url().clone();
+    // Every hop was already checked; the page that names the tag must still be
+    // an allowed host before its URL or body is trusted for a tag.
+    policy
+        .check_url(&final_url)
+        .map_err(|message| anyhow!(message))?;
     if status.is_success() {
         if let Some(tag_name) = release_tag_from_github_release_url(&final_url) {
             return Ok(tag_name);
@@ -1520,13 +1719,22 @@ fn release_tag_from_github_release_url(url: &reqwest::Url) -> Option<String> {
         .windows(3)
         .find(|window| window[0] == "releases" && window[1] == "tag")
         .map(|window| window[2].to_string())
-        .filter(|tag| !tag.is_empty())
+        .filter(|tag| is_plausible_release_tag(tag))
+}
+
+/// A release tag becomes a URL path segment; only version-tag characters pass.
+fn is_plausible_release_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+'))
 }
 
 fn release_tag_from_github_release_html(body: &str) -> Option<String> {
     const MARKERS: &[&str] = &[
-        "/Hmbown/CodeWhale/releases/tag/",
-        "/hmbown/CodeWhale/releases/tag/",
+        "/codewhale-hq/CodeWhale/releases/tag/",
+        "/codewhale-hq/CodeWhale/releases/tag/",
         "/releases/tag/",
     ];
     for marker in MARKERS {
@@ -1536,7 +1744,7 @@ fn release_tag_from_github_release_html(body: &str) -> Option<String> {
                 .next()
                 .unwrap_or("")
                 .trim();
-            if !tag.is_empty() {
+            if is_plausible_release_tag(tag) {
                 return Some(tag.to_string());
             }
         }
@@ -1597,21 +1805,44 @@ fn download_url_once(
     proxy: Option<&Proxy>,
     timeout: Duration,
 ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-    let client = update_http_client_with_timeout(proxy, timeout)?;
+    download_url_once_with(
+        &UpdateTransportPolicy::from_env(),
+        UPDATE_MAX_RESPONSE_BYTES,
+        url,
+        proxy,
+        timeout,
+    )
+}
+
+fn download_url_once_with(
+    policy: &UpdateTransportPolicy,
+    max_bytes: u64,
+    url: &str,
+    proxy: Option<&Proxy>,
+    timeout: Duration,
+) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    policy.check_str(url)?;
+    let client = update_http_client_with_policy(proxy, timeout, policy)?;
     let response = client
         .get(url)
         .send()
         .with_context(|| format!("failed to download {url}"))?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .with_context(|| format!("failed to read response body from {url}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(response, max_bytes + 1),
+        &mut bytes,
+    )
+    .with_context(|| format!("failed to read response body from {url}"))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("response from {url} exceeds the {max_bytes}-byte update limit");
+    }
 
-    Ok((status, bytes.to_vec()))
+    Ok((status, bytes))
 }
 
 /// Compute the SHA256 hex digest of data.
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
     let hash = sha2::Sha256::digest(data);
     hex_bytes(hash)
@@ -1710,7 +1941,7 @@ fn glibc_check_disabled() -> bool {
 }
 
 fn preflight_downloaded_binary(asset_name: &str, bytes: &[u8]) -> Result<()> {
-    // GNU libc preflight is Linux-only (#4241). Rust treats `target_os = "android"`
+    // glibc preflight is Linux-only (#4241). Rust treats `target_os = "android"`
     // as distinct from `"linux"`, so Termux/Android builds skip this check entirely
     // — Android uses Bionic libc, not glibc.
     if !cfg!(target_os = "linux") || glibc_check_disabled() {
@@ -1767,22 +1998,19 @@ fn glibc_compatibility_message(
             "this system has glibc {}, which is too old for that asset.",
             host.display()
         ),
-        None => "this system does not appear to provide GNU libc.".to_string(),
+        None => "this system does not appear to provide glibc.".to_string(),
     };
     format!(
         "\
 Prebuilt Codewhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
 
-Official Linux release binaries are GNU libc builds. Ubuntu 22.04 ships glibc
-2.35, so it cannot run a binary that was built against Ubuntu 24.04/glibc 2.39.
-
-Install from source on this host instead:
+Official Codewhale Linux release assets (x64 and arm64) are static musl builds
+with no glibc dependency, so this binary is not an official release asset. Check
+the download source, or install from source on this host instead:
 
   cargo install codewhale-cli --locked
 
-Release engineering follow-up: build Linux GNU assets against an older glibc
-baseline, or add a musl/static Linux asset. Set CODEWHALE_SKIP_GLIBC_CHECK=1 to
-bypass this preflight at your own risk.",
+Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this preflight at your own risk.",
         required = required.display(),
     )
 }
@@ -1978,6 +2206,7 @@ mod tests {
         codewhale_release::LEGACY_TUI_UPDATE_VERSION_ENV,
         codewhale_release::LEGACY_UPDATE_VERSION_ENV,
         codewhale_release::install::INSTALL_METHOD_ENV,
+        UPDATE_ALLOWED_HOSTS_ENV,
     ];
 
     struct UpdateEnvGuard {
@@ -2690,6 +2919,24 @@ mod tests {
         }
     }
 
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn same_target_symlink_is_kept_when_the_install_dir_is_reached_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real_dir = root.join("real-bin");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = root.join("linked-bin");
+        symlink(&real_dir, &linked_dir).unwrap();
+        // `current_exe()` on macOS reports the path as reached, not resolved.
+        let primary = linked_dir.join("codewhale");
+        write_installed_binary(&primary, b"running bytes");
+        symlink("codewhale", linked_dir.join("codew")).unwrap();
+        let plan = update_plan_for_exe(&primary);
+        assert_eq!(plan.target_paths.as_slice(), std::slice::from_ref(&primary));
+    }
+
     #[test]
     fn legacy_binary_message_gives_copy_pasteable_migration_steps() {
         let message = legacy_binary_message(Path::new("/usr/local/bin/deepseek-tui"));
@@ -2703,7 +2950,7 @@ mod tests {
         assert!(message.contains("command -v codewhale codew"));
         assert!(message.contains("package manager"));
         assert!(!message.contains("uninstall"));
-        assert!(message.contains("https://github.com/Hmbown/CodeWhale/releases/latest"));
+        assert!(message.contains("https://github.com/codewhale-hq/CodeWhale/releases/latest"));
     }
 
     #[test]
@@ -2881,27 +3128,34 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_matching_accepts_binary_assets_and_rejects_checksums() {
-        assert!(asset_matches_platform(
-            "codewhale-macos-arm64",
-            "codewhale-macos-arm64"
-        ));
-        assert!(asset_matches_platform(
-            "codewhale-macos-arm64.tar.gz",
-            "codewhale-macos-arm64"
-        ));
-        assert!(asset_matches_platform(
-            "codewhale-tui-windows-x64.exe",
-            "codewhale-tui-windows-x64"
-        ));
-        assert!(!asset_matches_platform(
-            "codewhale-tui-windows-x64.exe.sha256",
-            "codewhale-tui-windows-x64"
-        ));
-        assert!(!asset_matches_platform(
-            "codewhale-macos-aarch64.tar.gz",
-            "codewhale-macos-arm64"
-        ));
+    fn test_asset_matching_accepts_only_the_raw_binary() {
+        for (asset, binary, expected) in [
+            ("codewhale-macos-arm64", "codewhale-macos-arm64", true),
+            (
+                "codewhale-tui-windows-x64.exe",
+                "codewhale-tui-windows-x64",
+                true,
+            ),
+            (
+                "codewhale-macos-arm64.tar.gz",
+                "codewhale-macos-arm64",
+                false,
+            ),
+            ("codewhale-macos-arm64.zip", "codewhale-macos-arm64", false),
+            ("codewhale-macos-arm64.sig", "codewhale-macos-arm64", false),
+            (
+                "codewhale-tui-windows-x64.exe.sha256",
+                "codewhale-tui-windows-x64",
+                false,
+            ),
+            ("codewhale-macos-aarch64", "codewhale-macos-arm64", false),
+        ] {
+            assert_eq!(
+                asset_is_exact_platform_binary(asset, binary),
+                expected,
+                "{asset} vs {binary}"
+            );
+        }
     }
 
     #[test]
@@ -2929,22 +3183,26 @@ mod tests {
         assert_eq!(asset.name, "codewhale-macos-arm64");
     }
 
+    /// Audit R02-04: the updater installs the downloaded bytes verbatim, so a
+    /// release that ships only an archive/signature/sidecar for this platform
+    /// has no installable asset rather than one that bricks the binary.
     #[test]
-    fn select_platform_asset_falls_back_to_archive_when_bare_binary_is_missing() {
+    fn select_platform_asset_never_substitutes_an_archive_or_sidecar() {
         let release = Release {
             tag_name: "v0.8.8".to_string(),
             prerelease: false,
-            assets: vec![Asset {
-                name: "codewhale-macos-arm64.tar.gz".to_string(),
-                browser_download_url: "https://example.invalid/codewhale-macos-arm64.tar.gz"
-                    .to_string(),
-            }],
+            assets: ["tar.gz", "zip", "sig", "sbom.json"]
+                .into_iter()
+                .map(|ext| Asset {
+                    name: format!("codewhale-macos-arm64.{ext}"),
+                    browser_download_url: format!(
+                        "https://example.invalid/codewhale-macos-arm64.{ext}"
+                    ),
+                })
+                .collect(),
         };
 
-        let asset =
-            select_platform_asset(&release, "codewhale-macos-arm64").expect("platform asset");
-
-        assert_eq!(asset.name, "codewhale-macos-arm64.tar.gz");
+        assert!(select_platform_asset(&release, "codewhale-macos-arm64").is_none());
     }
 
     #[test]
@@ -3001,7 +3259,8 @@ mod tests {
         assert!(message.contains("requires GLIBC_2.39"));
         assert!(message.contains("this system has glibc 2.35"));
         assert!(message.contains("cargo install codewhale-cli --locked"));
-        assert!(message.contains("build Linux GNU assets against an older glibc"));
+        assert!(message.contains("(x64 and arm64) are static musl builds"));
+        assert!(!message.contains("GNU "), "no stale GNU-build claim");
     }
 
     #[test]
@@ -3323,8 +3582,9 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
 
     #[test]
     fn github_release_url_parser_extracts_tag() {
-        let url = reqwest::Url::parse("https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.61")
-            .unwrap();
+        let url =
+            reqwest::Url::parse("https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.61")
+                .unwrap();
 
         assert_eq!(
             release_tag_from_github_release_url(&url).as_deref(),
@@ -3339,13 +3599,13 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert_eq!(release.tag_name, "v0.8.61");
         assert_eq!(
             release.assets[0].browser_download_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-artifacts-sha256.txt"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v0.8.61/codewhale-artifacts-sha256.txt"
         );
         let dispatcher =
             select_platform_asset(&release, "codewhale-macos-arm64").expect("dispatcher asset");
         assert_eq!(
             dispatcher.browser_download_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-macos-arm64"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v0.8.61/codewhale-macos-arm64"
         );
         assert_eq!(release.assets.len(), 2);
         assert!(select_platform_asset(&release, "codewhale-tui-macos-arm64").is_none());
@@ -3354,7 +3614,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     #[test]
     fn latest_stable_redirect_fallback_reads_tag_url() {
         let (url, request_rx, handle) = serve_http_once("200 OK", "text/html", b"<html></html>");
-        let tag_url = url.replace("/release", "/Hmbown/CodeWhale/releases/tag/v9.9.9");
+        let tag_url = url.replace("/release", "/codewhale-hq/CodeWhale/releases/tag/v9.9.9");
 
         let tag = fetch_latest_stable_tag_from_redirect_url(&tag_url, None)
             .expect("tag should parse from final URL");
@@ -3362,7 +3622,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert_eq!(tag, "v9.9.9");
         let request = request_rx.recv().expect("captured request");
         assert!(
-            request.starts_with("GET /Hmbown/CodeWhale/releases/tag/v9.9.9 "),
+            request.starts_with("GET /codewhale-hq/CodeWhale/releases/tag/v9.9.9 "),
             "got {request:?}"
         );
         handle.join().expect("test server thread");
@@ -3371,8 +3631,8 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     #[test]
     fn github_release_html_parser_skips_empty_first_marker() {
         let body = r#"
-            <a href="/Hmbown/CodeWhale/releases/tag/?expanded=true">generic</a>
-            <a href="/Hmbown/CodeWhale/releases/tag/v9.9.9">latest</a>
+            <a href="/codewhale-hq/CodeWhale/releases/tag/?expanded=true">generic</a>
+            <a href="/codewhale-hq/CodeWhale/releases/tag/v9.9.9">latest</a>
         "#;
 
         assert_eq!(
@@ -3551,13 +3811,13 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
                     Asset {
                         name: "codewhale-linux-x64".to_string(),
                         browser_download_url: format!(
-                            "https://github.com/Hmbown/CodeWhale/releases/download/{tag_name}/codewhale-linux-x64"
+                            "https://github.com/codewhale-hq/CodeWhale/releases/download/{tag_name}/codewhale-linux-x64"
                         ),
                     },
                     Asset {
                         name: CHECKSUM_MANIFEST_ASSET.to_string(),
                         browser_download_url: format!(
-                            "https://github.com/Hmbown/CodeWhale/releases/download/{tag_name}/{CHECKSUM_MANIFEST_ASSET}"
+                            "https://github.com/codewhale-hq/CodeWhale/releases/download/{tag_name}/{CHECKSUM_MANIFEST_ASSET}"
                         ),
                     },
                 ],
@@ -3592,7 +3852,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert_eq!(*requested.lock().unwrap(), ["GitHub Releases"]);
         assert_eq!(
             plan.binary_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v9.9.9/codewhale-linux-x64"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v9.9.9/codewhale-linux-x64"
         );
     }
 
@@ -3727,7 +3987,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
 
         assert_eq!(
             candidate.manifest_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v0.9.9/codewhale-artifacts-sha256.txt"
+            "https://github.com/codewhale-hq/CodeWhale/releases/download/v0.9.9/codewhale-artifacts-sha256.txt"
         );
         assert_eq!(
             candidate.binary_url,
@@ -4232,5 +4492,221 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             "got {request:?}"
         );
         handle.join().expect("test server thread");
+    }
+
+    fn url(text: &str) -> reqwest::Url {
+        reqwest::Url::parse(text).expect("url")
+    }
+
+    #[test]
+    fn update_hosts_are_an_allow_list_over_https() {
+        let strict = UpdateTransportPolicy::strict();
+        for allowed in [
+            "https://github.com/codewhale-hq/CodeWhale/releases/latest",
+            "https://api.github.com/repos/codewhale-hq/CodeWhale/releases/latest",
+            "https://release-assets.githubusercontent.com/x",
+            "https://objects.githubusercontent.com/x",
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v1/a",
+        ] {
+            strict.check_url(&url(allowed)).expect(allowed);
+        }
+        for refused in [
+            "http://github.com/codewhale-hq/CodeWhale",
+            "https://github.com.evil.example/a",
+            "https://evilgithub.com/a",
+            "https://notcnb.cool/a",
+            "https://raw.githubusercontent.com/a",
+            "https://203.0.113.9/a",
+            "ftp://github.com/a",
+            "http://127.0.0.1:9/a",
+        ] {
+            assert!(strict.check_url(&url(refused)).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_configured_mirror_host_is_allowed_and_must_be_https() {
+        let _guard = UpdateEnvGuard::clear();
+        set_update_env(
+            codewhale_release::RELEASE_BASE_URL_ENV,
+            "https://Mirror.Internal.example:8443/CodeWhale/",
+        );
+        let policy = UpdateTransportPolicy::from_env();
+        policy
+            .check_url(&url("https://mirror.internal.example:8443/CodeWhale/v1/a"))
+            .expect("the configured mirror host is allowed");
+        assert!(
+            policy
+                .check_url(&url("https://other.internal.example/a"))
+                .is_err()
+        );
+        assert!(
+            policy
+                .check_url(&url("http://mirror.internal.example/a"))
+                .is_err(),
+            "a mirror is never reached over plain HTTP"
+        );
+    }
+
+    #[test]
+    fn extra_update_hosts_come_only_from_the_operator_environment() {
+        let _guard = UpdateEnvGuard::clear();
+        set_update_env(
+            UPDATE_ALLOWED_HOSTS_ENV,
+            "cdn.one.example, CDN.two.example ,",
+        );
+        let policy = UpdateTransportPolicy::from_env();
+        for host in ["cdn.one.example", "cdn.two.example"] {
+            policy
+                .check_url(&url(&format!("https://{host}/a")))
+                .expect(host);
+        }
+        assert!(
+            policy
+                .check_url(&url("https://cdn.three.example/a"))
+                .is_err()
+        );
+        assert!(policy.check_url(&url("http://cdn.one.example/a")).is_err());
+    }
+
+    #[test]
+    fn a_plain_http_mirror_is_refused_before_any_request() {
+        let _guard = UpdateEnvGuard::clear();
+        set_update_env(
+            codewhale_release::RELEASE_BASE_URL_ENV,
+            "http://mirror.example/assets",
+        );
+        let error = fetch_latest_release(ReleaseChannel::Stable, None)
+            .expect_err("an HTTP mirror must be refused");
+        assert!(format!("{error:#}").contains("HTTPS"), "{error:#}");
+    }
+
+    /// A listener that records whether anything connected to it.
+    fn silent_listener() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        (listener, format!("http://{addr}/asset"))
+    }
+
+    #[test]
+    fn the_request_path_refuses_plain_http_and_unlisted_hosts_without_connecting() {
+        let (listener, plain_url) = silent_listener();
+        let strict = UpdateTransportPolicy::strict();
+        let error = download_url_once_with(
+            &strict,
+            UPDATE_MAX_RESPONSE_BYTES,
+            &plain_url,
+            None,
+            Duration::from_secs(5),
+        )
+        .expect_err("plain HTTP is refused");
+        assert!(format!("{error:#}").contains("HTTPS"), "{error:#}");
+        assert!(
+            listener.accept().is_err(),
+            "no connection may be opened for a refused URL"
+        );
+        let error = download_url_once_with(
+            &strict,
+            UPDATE_MAX_RESPONSE_BYTES,
+            "https://download.evil.example/codewhale",
+            None,
+            Duration::from_secs(5),
+        )
+        .expect_err("an unlisted host is refused");
+        assert!(
+            format!("{error:#}").contains("not an allowed release host"),
+            "{error:#}"
+        );
+    }
+
+    /// The redirect policy is exercised through the real built client against
+    /// a live fixture. The fixture cannot speak TLS, so the request starts on
+    /// plain HTTP (a start URL is the caller's check, covered above); the point
+    /// is that the client then refuses to follow a hop that is not HTTPS to an
+    /// allowed host, and never contacts it.
+    #[test]
+    fn the_built_client_refuses_to_follow_a_redirect_off_https_or_off_the_allow_list() {
+        let (target, target_listener) = {
+            let (listener, url) = silent_listener();
+            (url, listener)
+        };
+        for location in [target.as_str(), "https://download.evil.example/next"] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let location = location.to_string();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0_u8; 2048];
+                let _ = stream.read(&mut buf).expect("read");
+                write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write");
+            });
+            let client = update_http_client_with_policy(
+                None,
+                Duration::from_secs(5),
+                &UpdateTransportPolicy::strict(),
+            )
+            .expect("client");
+            let error = client
+                .get(format!("http://{addr}/start"))
+                .send()
+                .expect_err("the redirect must not be followed");
+            // reqwest keeps the policy's message in the error's source chain.
+            let mut text = error.to_string();
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                text.push_str(&format!(": {cause}"));
+                source = cause.source();
+            }
+            assert!(text.contains("update redirect refused"), "{text}");
+            server.join().expect("fixture thread");
+        }
+        assert!(
+            target_listener.accept().is_err(),
+            "the refused redirect target must never be contacted"
+        );
+    }
+
+    #[test]
+    fn a_response_past_the_size_cap_is_refused_and_one_at_the_cap_is_kept() {
+        let mut policy = UpdateTransportPolicy::strict();
+        policy.allow_loopback_http = true;
+        let (url, _rx, handle) = serve_http_once("200 OK", "application/octet-stream", &[7_u8; 64]);
+        let error = download_url_once_with(&policy, 63, &url, None, Duration::from_secs(5))
+            .expect_err("one byte over the cap is refused");
+        assert!(format!("{error:#}").contains("update limit"), "{error:#}");
+        handle.join().expect("fixture thread");
+
+        let (url, _rx, handle) = serve_http_once("200 OK", "application/octet-stream", &[7_u8; 64]);
+        let (_, bytes) = download_url_once_with(&policy, 64, &url, None, Duration::from_secs(5))
+            .expect("a body exactly at the cap is kept");
+        assert_eq!(bytes.len(), 64);
+        handle.join().expect("fixture thread");
+    }
+
+    #[test]
+    fn release_tags_taken_from_a_page_must_look_like_tags() {
+        let page = |tag: &str| {
+            url(&format!(
+                "https://github.com/codewhale-hq/CodeWhale/releases/tag/{tag}"
+            ))
+        };
+        assert_eq!(
+            release_tag_from_github_release_url(&page("v0.10.1")).as_deref(),
+            Some("v0.10.1")
+        );
+        assert_eq!(release_tag_from_github_release_url(&page("%2e%2e")), None);
+        assert_eq!(
+            release_tag_from_github_release_html("<a href=\"/releases/tag/v1.2.3\">"),
+            Some("v1.2.3".to_string())
+        );
+        assert_eq!(
+            release_tag_from_github_release_html("<a href=\"/releases/tag/a%2Fb\">"),
+            None
+        );
     }
 }

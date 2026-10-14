@@ -77,7 +77,7 @@ mod tests {
 
     fn test_app_with_locale(locale: Locale) -> App {
         let options = TuiOptions {
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = locale;
@@ -123,7 +123,7 @@ mod narrow_locale_tests {
     fn probe_app() -> App {
         let options = TuiOptions {
             model: "test-model".to_string(),
-            ..crate::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
         };
         App::new(options, &Config::default())
     }

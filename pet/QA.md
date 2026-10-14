@@ -352,3 +352,30 @@ Source and build instructions are published on PR #6110. Commit-specific
 Grokbot review and GitHub checks are recorded there. Shipping, signing for public
 distribution and subjective audiovisual acceptance are not implied by these
 local builds or by a prior commit's green CI.
+
+## 0.10.2 real-terminal and shared-owner run sheet — 2026-10-12
+
+Founder decision F6: these human checks carry to the next milestone and do not
+block the 0.10.2 tag. Items 3–5 are source requirements; #6155 remains open.
+No terminal or shared-owner result is asserted by this blank run sheet.
+
+| Receipt | Result |
+| --- | --- |
+| Candidate source SHA and binary SHA-256 | Not recorded |
+| OS and terminal versions | Not recorded |
+| Ghostty/Kitty live `whale` view, resize and F5 → Esc image cleanup | Not run |
+| Still/reduced motion; Terminal.app fallback and Ctrl+] | Not run |
+| tmux and SSH transport | Not run |
+| 60-second `/pet status` frame rate, bandwidth, render and write timing | Not measured |
+| 60 samples of TUI/companion CPU and RSS | Not measured |
+| Same retained identity/tick/digest in TUI and desktop/browser | Not run |
+| Interactions from both views, TUI close/reopen and second TUI as a view | Not run |
+| One audio lease; source change; competing owner refusal | Not run |
+| Owner restart preserves identity; storage failure refuses action | Not run |
+| Desktop/app-server turn follows idle companion; active TUI retains source | Human check not run |
+
+Item 5 is implemented: `pet/src/core/pet-engine.ts` and the bundled
+`crates/tui/src/tui/pet_watch/pet-native.js` grant Done and its effect ID only
+when `turnOutcome === 'completed'`. Failed and interrupted turns cannot claim
+Done. Existing Rust owner projection coverage includes completed/interrupted;
+this code inspection does not claim a new failed-turn terminal qualification.

@@ -7,7 +7,7 @@ import type { ComputerUseDict } from "../types";
  * the app shows them.
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Computer Use na Maca · Codewhale",
+  metaTitle: "Computer Use · Wersja poglądowa · Codewhale",
   metaDescription: "Pobierz i skonfiguruj Codewhale Computer Use na Maca. Sterowanie aplikacjami w tle, konfiguracja uprawnień oraz przyciski Pause i Stop pod Twoją kontrolą.",
   title: "Computer Use",
   lead: "Pozwól Codewhale działać w Twoich aplikacjach, a sam pracuj dalej. Pomocnik na Maca zbiera w pasku menu uprawnienia, sterowanie aplikacjami w tle oraz możliwość wstrzymania lub zatrzymania wprowadzania danych.",
@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Uruchom test w tle", body: "Pomocnik otwiera jednorazowe okno testowe, wpisuje w nim tekst i zapisuje jego zrzut. Sprawdza przy tym, czy w trakcie testu zmienił się wskaźnik lub aktywna aplikacja." },
     { title: "Połącz z Codewhale", body: "Przejrzyj, zatwierdź jako zaufaną i włącz wtyczkę Computer Use w sklepie z wtyczkami Codewhale. Używaj wtyczki w wersji 0.3.1 lub nowszej, aby lokalne działania przechodziły przez przyciski Pause i Stop pomocnika." },
   ],
-  controlsTitle: "Pracuj dalej. Zachowaj kontrolę.",
+  controlsTitle: "Wstrzymaj lub zatrzymaj sterowanie aplikacjami",
   controlsBody: "Obsługiwane działania są wykonywane w tle w wybranej aplikacji. Aplikacje i gesty wymagające przejęcia pierwszego planu potrzebują Twojej zgody. Menu pokazuje docelową aplikację i tryb wprowadzania danych; Pause (wstrzymaj) zawiesza wprowadzanie danych przez pomocnika, a Stop (zatrzymaj) kończy jego bieżące sesje.",
   updateTitle: "Aktualizacje wtedy, gdy chcesz",
   updateBody: "Wybierz w aplikacji Check for updates (sprawdź aktualizacje). Przed instalacją aktualizacji pomocnik sprawdza pobrany plik, podpis Codewhale i notaryzację Apple, a poprzednią wersję zachowuje na wypadek konieczności przywrócenia.",
@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Zobacz test w tle",
   source: "Kod źródłowy i inne platformy",
   platforms: "Ten plik jest przeznaczony na Maca. Windows i Linux korzystają obecnie z wtyczki źródłowej i konfiguracji po stronie hosta.",
-  installTitle: "Computer Use na Maca",
-  installLead: "Dodaj sterowanie aplikacjami w tle dzięki pomocnikowi Computer Use. Skonfiguruj uprawnienia na Macu, uruchom test w tle i wstrzymuj lub zatrzymuj wprowadzanie danych przez pomocnika z paska menu.",
-  installLink: "Pobieranie i konfiguracja Computer Use",
 };

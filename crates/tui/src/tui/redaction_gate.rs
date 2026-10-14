@@ -27,15 +27,6 @@ use crate::tui::views::{ActionHint, render_modal_footer, render_underwater_surfa
 use codewhale_localization::MessageId;
 use codewhale_palette as palette;
 
-/// Whether the startup gate must ask before the current config's
-/// `[redaction] model_bound` request can take effect.
-pub fn confirmation_required(config: &crate::config::Config) -> bool {
-    codewhale_config::redaction::confirmation_required(
-        config.model_bound_redaction(),
-        config.loaded_config_path.as_deref(),
-    )
-}
-
 /// Render the gate. Callers (the frame compositor) invoke this only while
 /// `app.redaction_gate` is set. The gate has two stages: the first stage
 /// explains the opt-out and its risk; pressing the confirm key moves to the
@@ -182,17 +173,6 @@ fn wrap_body_muted(lines: &mut Vec<Line<'static>>, app: &App, id: MessageId, wid
     }
 }
 
-/// Persist the confirmation and return the written receipt path. Called after
-/// the user picks the explicit "confirm" action.
-pub fn record_confirmation(config: &crate::config::Config) -> anyhow::Result<std::path::PathBuf> {
-    let path = config
-        .loaded_config_path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("No loaded config file can receive this confirmation"))?;
-    codewhale_config::redaction::record_model_bound_disabled_confirmation(path)
-        .map_err(anyhow::Error::from)
-}
-
 // The "keep masking" answer persists nothing and rewrites no file: the
 // current launch stays on the safe default, and because the config field
 // still requests `"disabled"`, the gate asks again on the next launch until
@@ -211,7 +191,7 @@ mod tests {
     fn app_fixture() -> App {
         let options = TuiOptions {
             model: "test-model".to_string(),
-            ..crate::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = codewhale_localization::Locale::En;
@@ -368,8 +348,8 @@ mod tests {
         let config = Config::load(Some(path.clone()), None).unwrap();
         // An existing directory makes the write fail on every supported OS.
         std::fs::create_dir(codewhale_config::redaction::model_bound_state_path(&path)).unwrap();
-        assert!(record_confirmation(&config).is_err());
-        assert!(confirmation_required(&config));
+        assert!(config.record_redaction_confirmation().is_err());
+        assert!(config.redaction_confirmation_required());
         let mut app = app_fixture();
         let notice = app.tr(MessageId::RedactionGateSaveFailed).into_owned();
         app.push_status_toast_record(

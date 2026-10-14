@@ -12,7 +12,9 @@ pub(crate) struct ComposerClickTrace {
     count: u8,
 }
 
-const COMPOSER_DOUBLE_CLICK_MS: u128 = 400;
+/// Two clicks closer than this are one double-click (composer word select,
+/// and the context menu's guard against confirming a destructive row).
+pub(crate) const DOUBLE_CLICK_MS: u64 = 400;
 const COMPOSER_CLICK_SLOP_CELLS: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +32,7 @@ fn classify_composer_click(
     let at = Instant::now();
     let next = match trace.as_ref() {
         Some(prev)
-            if at.duration_since(prev.at).as_millis() <= COMPOSER_DOUBLE_CLICK_MS
+            if at.duration_since(prev.at).as_millis() <= u128::from(DOUBLE_CLICK_MS)
                 && prev.row.abs_diff(row) <= COMPOSER_CLICK_SLOP_CELLS
                 && prev.column.abs_diff(column) <= COMPOSER_CLICK_SLOP_CELLS =>
         {
@@ -57,55 +59,55 @@ fn classify_composer_click(
     }
 }
 
-/// Byte bounds of the word (or CJK run) containing `pos`.
+/// Char-index bounds of the word (or CJK run) containing char `pos`.
+///
+/// Takes and returns char indices, the unit of `App::cursor_position` and
+/// `App::selection_anchor`, so a multi-byte composer never mixes the two.
 fn composer_word_bounds(text: &str, pos: usize) -> (usize, usize) {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return (0, 0);
     }
     let is_word = |ch: char| ch.is_alphanumeric() || (ch as u32) >= 0x80;
-    let idx = chars.partition_point(|(byte, _)| *byte < pos);
-    let idx = idx.min(chars.len().saturating_sub(1));
-    if !is_word(chars[idx].1) {
-        return (chars[idx].0, chars[idx].0 + chars[idx].1.len_utf8());
+    let idx = pos.min(chars.len() - 1);
+    if !is_word(chars[idx]) {
+        return (idx, idx + 1);
     }
     let mut start = idx;
-    while start > 0 && is_word(chars[start - 1].1) {
+    while start > 0 && is_word(chars[start - 1]) {
         start -= 1;
     }
     let mut end = idx + 1;
-    while end < chars.len() && is_word(chars[end].1) {
+    while end < chars.len() && is_word(chars[end]) {
         end += 1;
     }
-    let start_byte = chars[start].0;
-    let end_byte = if end < chars.len() {
-        chars[end].0
-    } else {
-        text.len()
-    };
-    (start_byte, end_byte)
+    (start, end)
 }
 
-/// Byte bounds of the logical line containing `pos` (excluding the newline).
+/// Char-index bounds of the logical line containing char `pos` (excluding
+/// the newline).
 fn composer_line_bounds(text: &str, pos: usize) -> (usize, usize) {
-    let pos = pos.min(text.len());
-    let start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[pos..]
-        .find('\n')
-        .map_or(text.len(), |offset| pos + offset);
+    let chars: Vec<char> = text.chars().collect();
+    let pos = pos.min(chars.len());
+    let start = chars[..pos]
+        .iter()
+        .rposition(|&ch| ch == '\n')
+        .map_or(0, |i| i + 1);
+    let end = chars[pos..]
+        .iter()
+        .position(|&ch| ch == '\n')
+        .map_or(chars.len(), |offset| pos + offset);
     (start, end)
 }
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::tui::app::{App, SidebarRowAction, StatusToastLevel};
 use crate::tui::command_palette::{
-    CommandPaletteView, build_entries as build_command_palette_entries,
+    CommandPaletteView, build_entries_with_plugins as build_command_palette_entries,
 };
 use crate::tui::context_menu::{ContextMenuEntry, ContextMenuView};
-use crate::tui::history::HistoryCell;
 use crate::tui::scrolling::{ScrollDirection, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use crate::tui::tideline::InteractionAction;
@@ -164,156 +166,44 @@ fn toggle_tool_run_expand(app: &mut App, mouse: MouseEvent) -> bool {
 /// in the composer input string. Uses the canonical prompt-adjusted text rect
 /// for coordinate mapping, and accounts for vertical padding and scroll offset.
 fn mouse_pos_to_char_index(app: &App, col: u16, row: u16, text_area: Rect) -> Option<usize> {
-    let rel_col = col.saturating_sub(text_area.x) as usize;
-    let rel_row = row.saturating_sub(text_area.y) as usize;
-
-    if app.input.is_empty() {
-        return Some(0);
-    }
-
-    let width = text_area.width.max(1) as usize;
-    let wrapped = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
-
-    // Subtract the vertical top-padding (centering of short inputs).
-    let text_row = rel_row.saturating_sub(app.viewport.last_composer_top_padding);
-
-    // Add the scroll offset (lines scrolled out of view).
-    let absolute_row = text_row + app.viewport.last_composer_scroll_offset;
-
-    if absolute_row >= wrapped.len() {
-        return Some(app.input.chars().count());
-    }
-
-    let (line_start, line_text) = &wrapped[absolute_row];
-
-    let mut char_offset = 0usize;
-    let mut col_used = 0usize;
-    for g in line_text.graphemes(true) {
-        // Painted cells: ratatui strips control characters, so a tab takes
-        // no column here, matching the wrap and caret math.
-        let gw = crate::tui::widgets::visible_grapheme_width(g);
-        if col_used + gw > rel_col {
-            break;
-        }
-        col_used += gw;
-        char_offset += g.chars().count();
-    }
-    Some(line_start + char_offset)
+    Some(codewhale_ratatui::native_composer_source_at(
+        &app.input,
+        usize::from(text_area.width.max(1)),
+        usize::from(col.saturating_sub(text_area.x)),
+        usize::from(row.saturating_sub(text_area.y)),
+        app.viewport.last_composer_scroll_offset,
+        app.viewport.last_composer_top_padding,
+    ))
 }
 
-fn composer_wrapped_cursor_row_col(
-    input: &str,
-    cursor: usize,
-    wrapped: &[(usize, String)],
-) -> (usize, usize) {
-    let total = input.chars().count();
-    let cursor = cursor.min(total);
-
-    for (idx, (line_start, line_text)) in wrapped.iter().enumerate() {
-        let next_start = wrapped
-            .get(idx + 1)
-            .map(|(start, _)| *start)
-            .unwrap_or_else(|| total.saturating_add(1));
-
-        if cursor >= *line_start && cursor < next_start {
-            let line_len = line_text.chars().count();
-            return (idx, cursor.saturating_sub(*line_start).min(line_len));
-        }
-    }
-
-    let row = wrapped.len().saturating_sub(1);
-    let col = wrapped
-        .get(row)
-        .map(|(_, line_text)| line_text.chars().count())
-        .unwrap_or(0);
-    (row, col)
-}
-
-/// Move the composer caret by wrapped rows. Returns whether the caret actually
-/// moved: a draft that is empty, unwrapped, or already at the boundary in this
-/// direction reports `false` so the wheel can reach the transcript instead of
-/// dying in the composer (#5223).
+/// Wheel dispatch stays with the existing editor; row projection is shared
+/// with painting and caret geometry, preserving its scalar-column policy.
 fn move_composer_cursor_by_wrapped_rows(app: &mut App, text_area: Rect, rows: isize) -> bool {
-    if app.input.is_empty() || rows == 0 {
+    let Some(cursor) = codewhale_ratatui::native_composer_step_row(
+        &app.input,
+        app.cursor_position,
+        usize::from(text_area.width.max(1)),
+        rows,
+        codewhale_ratatui::NativeComposerRowColumn::SourceScalars,
+    ) else {
         return false;
-    }
-
-    let width = text_area.width.max(1) as usize;
-    let wrapped = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
-    if wrapped.len() <= 1 {
-        return false;
-    }
-
-    let (current_row, current_col) =
-        composer_wrapped_cursor_row_col(&app.input, app.cursor_position, &wrapped);
-    let max_row = wrapped.len().saturating_sub(1);
-    let target_row = if rows.is_negative() {
-        current_row.saturating_sub(rows.unsigned_abs())
-    } else {
-        current_row.saturating_add(rows as usize).min(max_row)
     };
-
-    if target_row == current_row {
-        return false;
-    }
-
-    let (target_start, target_text) = &wrapped[target_row];
-    let target_len = target_text.chars().count();
-    let total = app.input.chars().count();
     app.clear_selection();
-    app.cursor_position = target_start
-        .saturating_add(current_col.min(target_len))
-        .min(total);
+    app.cursor_position = cursor;
     app.needs_redraw = true;
     true
 }
 
-/// Click the WorkflowPanel header to toggle expand/collapse, or the trailing
-/// cancel affordance while a run is active (#4121).
-fn handle_workflow_panel_mouse(app: &mut App, mouse: MouseEvent) -> bool {
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+/// A click on the workbar opens `/workflows`, the view that lists every run
+/// with its agents and cancels one.
+fn handle_workbar_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        || !mouse_hits_rect(mouse, app.viewport.last_workbar_area)
+        || app.workflow_runs.is_empty()
+    {
         return false;
     }
-    let Some(area) = app.viewport.last_workflow_panel_area else {
-        return false;
-    };
-    if !mouse_hits_rect(mouse, Some(area)) {
-        return false;
-    }
-    if app.workflow_panel.is_none() {
-        return false;
-    }
-
-    if let Some(panel) = app.workflow_panel.as_mut() {
-        panel.keyboard_focus = true;
-    }
-
-    let on_header_row = mouse.row == area.y;
-    let in_cancel_zone =
-        on_header_row && mouse_hits_rect(mouse, app.viewport.last_workflow_cancel_area);
-    let running = app
-        .workflow_panel
-        .as_ref()
-        .is_some_and(|panel| panel.lifecycle.is_running());
-
-    if in_cancel_zone && running {
-        let run_id = app
-            .workflow_panel
-            .as_ref()
-            .map(|panel| panel.run_id.clone())
-            .expect("running panel has an id");
-        app.input = format!("/workflow cancel {run_id}");
-        app.cursor_position = app.input.chars().count();
-        app.status_message = Some(app.tr(MessageId::SidebarDestructiveArmed).into_owned());
-        if let Some(panel) = app.workflow_panel.as_mut() {
-            panel.keyboard_focus = false;
-        }
-        app.needs_redraw = true;
-        return true;
-    }
-
-    // Any other click on the panel toggles expand/collapse.
-    app.toggle_workflow_panel();
+    crate::tui::views::workflows_manager::open(app);
     true
 }
 
@@ -325,16 +215,18 @@ fn handle_plugin_cta_mouse(app: &mut App, mouse: MouseEvent) -> Option<Vec<ViewE
         return None;
     }
     if mouse_hits_rect(mouse, app.viewport.last_plugin_cta_dismiss_area) {
+        // "Don't suggest again": the explicit, persisted dismissal.
         let _ = app.dismiss_plugin_cta();
         return Some(Vec::new());
     }
-    // Review button, or the rest of the CTA line, runs the existing review
-    // command. Never auto-installs: the slash command is the human path.
-    if let Some(command) = app.accept_plugin_cta_command() {
-        return Some(apply_sidebar_row_action(
-            app,
-            crate::tui::app::SidebarRowAction::Command(command),
-        ));
+    // Only the labelled Review button opens the existing inventory. A click
+    // elsewhere is consumed; no suggested command or mutation is dispatched.
+    if mouse_hits_rect(mouse, app.viewport.last_plugin_cta_review_area)
+        && let Some(tab) = app.accept_plugin_cta_review()
+        && app.view_stack.top_kind() != Some(crate::tui::views::ModalKind::Extensions)
+    {
+        app.view_stack
+            .push(crate::tui::views::extensions::ExtensionsView::new(app, tab));
     }
     Some(Vec::new())
 }
@@ -440,7 +332,7 @@ pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     }
     // Resolve the border- and submit-aware input plane through the same
     // persistent prompt geometry used by rendering, cursor placement, and
-    // viewport bookkeeping. The frame records it after reserving `[↑]`.
+    // viewport bookkeeping. The frame records it after reserving `[↵]`.
     let input_plane = app.viewport.last_composer_content.unwrap_or(area);
     let text_area =
         crate::tui::widgets::composer_content_geometry(input_plane, app.is_history_search_active())
@@ -547,6 +439,12 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
     if app.view_stack.top_kind() == Some(ModalKind::ContextMenu) {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
             app.view_stack.pop();
+            // A menu opened over a modal (the Extensions row menu) hands the
+            // new right-click back to that modal, not to the transcript.
+            if !app.view_stack.is_empty() {
+                app.needs_redraw = true;
+                return app.view_stack.handle_mouse(mouse);
+            }
             open_context_menu(app, mouse);
             return Vec::new();
         }
@@ -583,6 +481,25 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
     if !app.view_stack.is_empty() {
         app.needs_redraw = true;
         return app.view_stack.handle_mouse(mouse);
+    }
+
+    if crate::tui::pet_watch::main_view(app) {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse_hits_rect(mouse, app.pet_watch.inspect_area)
+        {
+            crate::tui::pet_watch::open_habitat(app);
+            return Vec::new();
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse_hits_rect(mouse, app.pet_watch.view_area)
+        {
+            crate::tui::pet_watch::cycle_view(app, true);
+            return Vec::new();
+        }
+        if mouse_hits_rect(mouse, app.pet_watch.area) {
+            crate::tui::pet_watch::command(app, crate::tui::pet_watch::Control::Mouse(mouse));
+            return Vec::new();
+        }
     }
 
     // A drag can finish outside the composer/transcript that started it.
@@ -710,9 +627,7 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
         return Vec::new();
     }
 
-    // WorkflowPanel toggle / cancel (#4121) before composer so the strip
-    // above the input remains clickable.
-    if handle_workflow_panel_mouse(app, mouse) {
+    if handle_workbar_mouse(app, mouse) {
         return Vec::new();
     }
 
@@ -821,6 +736,17 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
                 return Vec::new();
             }
 
+            // The pinned prompt header names the user message scrolled just
+            // above the viewport; a click returns to it. Resolve the message
+            // against the current layout so a rewrite between paint and click
+            // cannot jump to a stale line offset.
+            if mouse_hits_rect(mouse, app.viewport.pinned_prompt_area) {
+                if let Some(line) = app.pinned_prompt_target_line() {
+                    app.scroll_to_transcript_line(line);
+                }
+                return Vec::new();
+            }
+
             if toggle_tool_run_expand(app, mouse) {
                 return Vec::new();
             }
@@ -829,6 +755,8 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
                 app.viewport.transcript_selection.anchor = Some(point);
                 app.viewport.transcript_selection.head = Some(point);
                 app.viewport.transcript_selection.dragging = true;
+                app.viewport.transcript_selection.owner =
+                    app.transcript_owner_at_line(point.line_index);
                 app.needs_redraw = true;
 
                 if app.is_loading
@@ -919,6 +847,21 @@ fn first_line(text: &str) -> &str {
 /// Resolve a left-click in the sidebar to a typed row action, if the clicked
 /// row has a click action assigned (#3028, #4009).
 fn sidebar_click_action(app: &App, mouse: MouseEvent) -> Option<SidebarRowAction> {
+    let row = sidebar_row_at(app, mouse)?;
+    if let (Some(action), Some(start), Some(end)) = (
+        row.stop_action.as_ref(),
+        row.stop_zone_start_col,
+        row.stop_zone_end_col,
+    ) && mouse.column >= start
+        && mouse.column < end
+    {
+        return Some(action.clone());
+    }
+    row.click_action.clone()
+}
+
+/// The work-surface row under the pointer, if any.
+fn sidebar_row_at(app: &App, mouse: MouseEvent) -> Option<&crate::tui::app::SidebarHoverRow> {
     for section in &app.sidebar_hover.sections {
         if mouse.column >= section.content_area.x
             && mouse.column
@@ -934,16 +877,7 @@ fn sidebar_click_action(app: &App, mouse: MouseEvent) -> Option<SidebarRowAction
                     .saturating_add(section.content_area.height)
             && let Some(row) = section.rows.iter().find(|row| row.row_y == mouse.row)
         {
-            if let (Some(action), Some(start), Some(end)) = (
-                row.stop_action.as_ref(),
-                row.stop_zone_start_col,
-                row.stop_zone_end_col,
-            ) && mouse.column >= start
-                && mouse.column < end
-            {
-                return Some(action.clone());
-            }
-            return row.click_action.clone();
+            return Some(row);
         }
     }
     None
@@ -1371,49 +1305,31 @@ pub(crate) fn open_context_menu(app: &mut App, mouse: MouseEvent) {
         return;
     }
     let title = app.tr(MessageId::CtxMenuTitle).to_string();
+    push_context_menu(app, entries, mouse.column, mouse.row, title);
+}
+
+/// Open a context menu at a screen position. Shared by the transcript/work
+/// surface menu and by modal views that ask for one over themselves.
+pub(crate) fn push_context_menu(
+    app: &mut App,
+    entries: Vec<ContextMenuEntry>,
+    column: u16,
+    row: u16,
+    title: String,
+) {
     let reduced = app.motion_policy().as_low_motion();
     app.view_stack.push(ContextMenuView::new_with_motion(
-        entries,
-        mouse.column,
-        mouse.row,
-        title,
-        reduced,
+        entries, column, row, title, reduced,
     ));
     app.needs_redraw = true;
 }
 
 pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<ContextMenuEntry> {
     let mut entries = Vec::new();
-    let mut git_path = None;
-    let on_sidebar = mouse_hits_rect(mouse, app.work_surface.last_area);
+    let on_work_surface = mouse_hits_rect(mouse, app.work_surface.last_area);
 
-    if on_sidebar {
-        if let Some(command) = sidebar_click_action(app, mouse)
-            .and_then(|action| action.as_command().map(str::to_string))
-        {
-            entries.push(
-                ContextMenuEntry::new(
-                    "Run",
-                    command.clone(),
-                    ContextMenuAction::ExecuteCommand { command },
-                )
-                .with_glyph("▶")
-                .primary(),
-            );
-        }
-        // Copy the hovered row's full text (sidebar rows can't be
-        // mouse-selected, so the menu is the only copy path).
-        if let Some(text) = sidebar_row_copy_text(app, mouse) {
-            entries.push(
-                ContextMenuEntry::new(
-                    "Copy",
-                    truncate_line_to_width(first_line(&text), 28),
-                    ContextMenuAction::CopyText { text },
-                )
-                .with_glyph("⎘")
-                .with_hint("y"),
-            );
-        }
+    if on_work_surface {
+        push_work_row_entries(app, mouse, &mut entries);
     } else {
         // Paste first — the most common action when right-clicking in the
         // composer or transcript after copying text from the output area.
@@ -1428,8 +1344,10 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
             .primary(),
         );
     }
+    let mut targeted = !entries.is_empty() && on_work_surface;
 
     if selection_has_content(app) {
+        targeted = true;
         entries.push(
             ContextMenuEntry::new(
                 app.tr(MessageId::CtxMenuCopySelection),
@@ -1458,10 +1376,11 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
         );
     }
 
-    if !on_sidebar && let Some(filtered_cell_index) = transcript_cell_index_from_mouse(app, mouse) {
+    if !on_work_surface
+        && let Some(filtered_cell_index) = transcript_cell_index_from_mouse(app, mouse)
+    {
+        targeted = true;
         let cell_index = app.original_cell_index_for_rendered(filtered_cell_index);
-        git_path = context_menu_git_path(app, cell_index);
-
         let target = detail_target_label(app, cell_index)
             .map(|label| truncate_line_to_width(label.as_str(), 28))
             .unwrap_or_else(|| "message".to_string());
@@ -1482,15 +1401,25 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
             )
             .with_glyph("⎘"),
         );
-        entries.push(
-            ContextMenuEntry::new(
-                app.tr(MessageId::CtxMenuOpenInEditor),
-                app.tr(MessageId::CtxMenuOpenInEditorDesc),
-                ContextMenuAction::OpenFileAtLine { cell_index },
-            )
-            .with_glyph("↗")
-            .with_hint("e"),
-        );
+        // Offered only when a `path:line` on the clicked line (or, failing
+        // that, in the cell) resolves to a file inside the workspace. Model
+        // output is not trusted to name files outside it.
+        if let Some((path, line)) = context_menu_file_reference(app, mouse, cell_index) {
+            let shown = path
+                .strip_prefix(&app.workspace)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuOpenInEditor),
+                    format!("{shown}:{line}"),
+                    ContextMenuAction::OpenFileAtLine { path, line },
+                )
+                .with_glyph("↗")
+                .with_hint("e"),
+            );
+        }
         // Hide/show cell toggle.
         if app.collapsed_cells.contains(&cell_index) {
             entries.push(
@@ -1528,6 +1457,15 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
         );
     }
 
+    // App chrome belongs to empty space. On a message, a row or a selection
+    // it only pushed the target's own actions off the bottom of the menu.
+    if !targeted {
+        push_chrome_entries(app, &mut entries);
+    }
+    entries
+}
+
+fn push_chrome_entries(app: &App, entries: &mut Vec<ContextMenuEntry>) {
     entries.push(
         ContextMenuEntry::new(
             app.tr(MessageId::CtxMenuCmdPalette),
@@ -1555,9 +1493,9 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
     );
 
     // Host window control (Windows only): pin/unpin the terminal window into
-    // an always-on-top mini window. Global action, listed after the app
-    // chrome entries. The label flips while pinned ("还原窗口" instead of
-    // "弹出置顶小窗") so the entry always describes what the click will do.
+    // an always-on-top mini window. The label flips while pinned ("还原窗口"
+    // instead of "弹出置顶小窗") so the entry always describes what the click
+    // will do.
     if crate::tui::window_control::available() {
         let pinned = crate::tui::window_control::pinned();
         entries.push(
@@ -1573,23 +1511,189 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
             .with_glyph(if pinned { "↩" } else { "📌" }),
         );
     }
-
-    let branch = git_path
-        .as_deref()
-        .and_then(|_| crate::tui::workspace_context::branch(&app.workspace));
-    crate::tui::context_menu::with_git_actions(entries, git_path.as_deref(), branch.as_deref())
 }
 
-fn context_menu_git_path(app: &App, cell_index: usize) -> Option<String> {
-    use crate::tui::history::ToolCell;
-
-    match app.cell_at_virtual_index(cell_index)? {
-        HistoryCell::Tool(ToolCell::PatchSummary(patch)) => Some(patch.path.clone()),
-        HistoryCell::Tool(ToolCell::ViewImage(image)) => {
-            Some(image.path.to_string_lossy().into_owned())
+/// A work-surface row's menu: the row's own action first (what a left click
+/// does), then the agent or work item's other doors, then Copy, and any stop
+/// last behind an in-menu confirm. Each entry carries a typed row action, so
+/// the menu runs exactly what the row runs; nothing is a free-form command.
+///
+/// Focus is the one agent destination: focusing shows the agent's chat and
+/// addresses the composer to it, so "Message agent" and "Open transcript"
+/// would be the same action under three names.
+fn push_work_row_entries(app: &App, mouse: MouseEvent, entries: &mut Vec<ContextMenuEntry>) {
+    let confirm = || app.tr(MessageId::CtxMenuConfirmArmed).into_owned();
+    let row = |label: String, action: SidebarRowAction| {
+        ContextMenuEntry::new(label, "", ContextMenuAction::Row(action))
+    };
+    // The menu is built from the row's own action, never from its inline
+    // stop zone: a right-click there must not make an unconfirmed stop the
+    // primary entry. The row's stop, if any, goes last behind the confirm.
+    let hovered = sidebar_row_at(app, mouse);
+    let mut stop = hovered
+        .and_then(|hovered| hovered.stop_action.clone())
+        .map(|action| {
+            let label = match action {
+                SidebarRowAction::CancelAgent { .. } => MessageId::CtxMenuStopAgent,
+                _ => MessageId::CtxMenuStopWork,
+            };
+            row(app.tr(label).into_owned(), action).confirm(confirm())
+        });
+    match hovered.and_then(|hovered| hovered.click_action.clone()) {
+        Some(SidebarRowAction::OpenAgentTranscript { agent_id }) => {
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuFocusAgent),
+                    app.tr(MessageId::CtxMenuFocusAgentDesc),
+                    ContextMenuAction::Row(SidebarRowAction::OpenAgentTranscript {
+                        agent_id: agent_id.clone(),
+                    }),
+                )
+                .with_glyph("▶")
+                .primary(),
+            );
+            entries.push(row(
+                app.tr(MessageId::CtxMenuOpenDetails).into_owned(),
+                SidebarRowAction::OpenAgentDetail {
+                    agent_id: agent_id.clone(),
+                },
+            ));
+            entries.push(ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopyId),
+                agent_id.clone(),
+                ContextMenuAction::CopyText {
+                    text: agent_id.clone(),
+                },
+            ));
+            let running = app.subagent_cache.iter().any(|agent| {
+                agent.agent_id == agent_id
+                    && matches!(
+                        agent.status,
+                        crate::tools::subagent::SubAgentStatus::Running
+                    )
+            });
+            if running {
+                stop = Some(
+                    row(
+                        app.tr(MessageId::CtxMenuStopAgent).into_owned(),
+                        SidebarRowAction::CancelAgent { agent_id },
+                    )
+                    .confirm(confirm()),
+                );
+            }
         }
-        _ => None,
+        Some(SidebarRowAction::CancelAgent { agent_id }) => {
+            stop = Some(
+                row(
+                    app.tr(MessageId::CtxMenuStopAgent).into_owned(),
+                    SidebarRowAction::CancelAgent { agent_id },
+                )
+                .confirm(confirm()),
+            );
+        }
+        Some(action @ SidebarRowAction::InspectWork { .. }) => {
+            if let SidebarRowAction::InspectWork {
+                stop_action: Some(stop_action),
+                ..
+            } = &action
+            {
+                stop = Some(
+                    row(
+                        app.tr(MessageId::CtxMenuStopWork).into_owned(),
+                        (**stop_action).clone(),
+                    )
+                    .confirm(confirm()),
+                );
+            }
+            entries.push(row(app.tr(MessageId::CtxMenuOpenDetails).into_owned(), action).primary());
+        }
+        Some(action @ SidebarRowAction::OpenAgentDetail { .. }) => {
+            entries.push(row(app.tr(MessageId::CtxMenuOpenDetails).into_owned(), action).primary());
+        }
+        Some(action @ SidebarRowAction::ShowSubagentsPanel) => {
+            entries.push(row(app.tr(MessageId::CtxMenuOpen).into_owned(), action).primary());
+        }
+        Some(SidebarRowAction::Command(command)) => {
+            if let Some(id) = command.strip_prefix("/jobs show ")
+                && app.task_panel.iter().any(|entry| {
+                    entry.id == id && crate::tui::background_indicator::is_live_shell_entry(entry)
+                })
+            {
+                stop = Some(
+                    row(
+                        app.tr(MessageId::CtxMenuStopWork).into_owned(),
+                        SidebarRowAction::Command(format!("/jobs cancel {id}")),
+                    )
+                    .confirm(confirm()),
+                );
+            }
+            let label = app
+                .tr(MessageId::CtxMenuRunCommand)
+                .replace("{command}", &command);
+            entries.push(row(label, SidebarRowAction::Command(command)).primary());
+        }
+        // Stages a destructive command in the composer; Enter there runs it.
+        Some(SidebarRowAction::PrefillCommand(command)) => {
+            let label = app
+                .tr(MessageId::CtxMenuRunCommand)
+                .replace("{command}", &command);
+            entries.push(
+                row(
+                    format!("{label}…"),
+                    SidebarRowAction::PrefillCommand(command),
+                )
+                .primary(),
+            );
+        }
+        None => {}
     }
+    // Copy the row's full text (rows can't be mouse-selected, so the menu is
+    // the only copy path).
+    if let Some(text) = sidebar_row_copy_text(app, mouse) {
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopyRow),
+                truncate_line_to_width(first_line(&text), 28),
+                ContextMenuAction::CopyText { text },
+            )
+            .with_glyph("⎘")
+            .with_hint("y"),
+        );
+    }
+    if let Some(stop) = stop {
+        entries.push(stop.with_glyph("■").section_start());
+    }
+}
+
+/// The workspace file a right-click on a transcript cell points at: the first
+/// `path:line` on the clicked line, else the first in the cell. Both must be
+/// regular files inside the workspace, reached without links
+/// (`history::workspace_file`); `open_file_in_editor` checks again.
+fn context_menu_file_reference(
+    app: &App,
+    mouse: MouseEvent,
+    cell_index: usize,
+) -> Option<(std::path::PathBuf, u32)> {
+    let clicked_line = selection_point_from_mouse(app, mouse).and_then(|point| {
+        app.viewport
+            .transcript_cache
+            .lines()
+            .get(point.line_index)
+            .map(line_to_plain)
+    });
+    if let Some(found) = clicked_line
+        .as_deref()
+        .and_then(|line| crate::tui::history::file_line_reference(line, &app.workspace))
+    {
+        return Some(found);
+    }
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    let text = history_cell_to_text(app.cell_at_virtual_index(cell_index)?, width);
+    crate::tui::history::first_file_line_reference(&text, &app.workspace)
 }
 
 pub(crate) fn transcript_cell_index_from_mouse(app: &App, mouse: MouseEvent) -> Option<usize> {
@@ -1602,23 +1706,46 @@ pub(crate) fn transcript_cell_index_from_mouse(app: &App, mouse: MouseEvent) -> 
         .map(|(cell_index, _)| cell_index)
 }
 
-pub(crate) fn handle_context_menu_action(
-    terminal: &mut ratatui::Terminal<crate::tui::color_compat::ColorCompatBackend<std::io::Stdout>>,
+/// What a context-menu action needs from the host after `App` state changed.
+#[derive(Debug)]
+pub(crate) enum ContextMenuOutcome {
+    Done,
+    /// Row actions produce the same view events a left click on the row does;
+    /// the host runs them through its view-event dispatcher.
+    Events(Vec<ViewEvent>),
+    /// Open a workspace file in `$EDITOR`. That needs the terminal (the TUI
+    /// suspends while the editor owns it), so the host does it.
+    OpenInEditor {
+        path: std::path::PathBuf,
+        line: u32,
+    },
+}
+
+/// Apply a context-menu action to `App`. Terminal work comes back as an
+/// outcome for the caller, so every action path is testable without one.
+pub(crate) fn apply_context_menu_action(
     app: &mut App,
     action: ContextMenuAction,
-) {
+) -> ContextMenuOutcome {
+    let mut outcome = ContextMenuOutcome::Done;
     match action {
         ContextMenuAction::CopySelection => {
             copy_active_selection(app);
         }
         ContextMenuAction::OpenSelection => {
-            if !open_pager_for_selection(app) {
+            if !open_active_selection(app) {
                 app.status_message = Some("No selection to open".to_string());
             }
         }
         ContextMenuAction::ClearSelection => {
-            clear_transcript_selection(app);
-            app.status_message = Some("Selection cleared".to_string());
+            app.status_message = Some(
+                if clear_active_selection(app) {
+                    "Selection cleared"
+                } else {
+                    "No selection to clear"
+                }
+                .to_string(),
+            );
         }
         ContextMenuAction::CopyCell { cell_index } => {
             copy_cell_to_clipboard(app, cell_index);
@@ -1631,18 +1758,27 @@ pub(crate) fn handle_context_menu_action(
         ContextMenuAction::Paste => {
             app.paste_from_clipboard();
         }
-        ContextMenuAction::ExecuteCommand { command } => {
-            app.input = command;
-            app.status_message = Some("Command staged in composer".to_string());
-            app.needs_redraw = true;
+        ContextMenuAction::Row(action) => {
+            outcome = ContextMenuOutcome::Events(apply_sidebar_row_action(app, action));
         }
-        ContextMenuAction::CopyText { text } => {
-            if app.clipboard.write_text(&text).is_ok() {
-                app.status_message = Some("Copied".to_string());
-            } else {
-                app.status_message = Some("Copy failed".to_string());
+        ContextMenuAction::Extension { item_id, verb } => {
+            match app.view_stack.extensions_menu_action(&item_id, verb) {
+                Some(events) => outcome = ContextMenuOutcome::Events(events),
+                None => {
+                    app.status_message = Some("That extension is no longer listed".to_string());
+                }
             }
         }
+        ContextMenuAction::CopyText { text } => match app.clipboard.write_text_status(&text) {
+            Ok(transport) => {
+                let receipt = copy_receipt(app, transport, app.tr(MessageId::ClipboardCopied));
+                app.push_status_toast(receipt, StatusToastLevel::Info, None);
+            }
+            Err(error) => {
+                let receipt = copy_failed_receipt(app, error);
+                app.push_status_toast(receipt, StatusToastLevel::Error, None);
+            }
+        },
         ContextMenuAction::ToggleWindowPin => {
             crate::tui::window_control::toggle_pin(app);
         }
@@ -1654,10 +1790,11 @@ pub(crate) fn handle_context_menu_action(
                 build_command_palette_entries(
                     app.ui_locale,
                     &app.skills_dir,
-                    app.skills_scan_codewhale_only,
+                    app.skills_discovery_mode,
                     &app.workspace,
                     &app.mcp_config_path,
                     app.mcp_snapshot.as_ref(),
+                    app.extension_plugin_view().as_ref(),
                 ),
             ));
         }
@@ -1666,51 +1803,11 @@ pub(crate) fn handle_context_menu_action(
         }
         ContextMenuAction::OpenHelp => {
             let help =
-                HelpView::new_for_workspace(app.ui_locale, &app.workspace, &app.cached_skills)
-                    .with_groups_expanded(app.help_expand_groups);
+                HelpView::new_for_app(app, false).with_groups_expanded(app.help_expand_groups);
             app.view_stack.push(help);
         }
-        ContextMenuAction::OpenFileAtLine { cell_index } => {
-            let width = app
-                .viewport
-                .last_transcript_area
-                .map(|area| area.width)
-                .unwrap_or(80);
-            let text = history_cell_to_text(
-                app.cell_at_virtual_index(cell_index)
-                    .unwrap_or(&HistoryCell::System {
-                        content: String::new(),
-                    }),
-                width,
-            );
-            match crate::tui::history::first_file_line_reference(&text, &app.workspace) {
-                // The editor gets the terminal through the same suspend path
-                // the composer and `/hooks edit` use, one at a time, and we
-                // wait for it. It used to be spawned detached while the TUI
-                // still held raw mode, the alt screen and mouse capture (#6235).
-                Some((path, line)) => {
-                    let outcome = crate::tui::external_editor::spawn_editor_for_path(
-                        terminal,
-                        app.use_alt_screen(),
-                        app.use_mouse_capture,
-                        app.use_bracketed_paste,
-                        &path,
-                        Some(line),
-                    );
-                    app.needs_redraw = true;
-                    app.status_message = Some(match outcome {
-                        Ok(crate::tui::external_editor::EditorOutcome::Cancelled) => {
-                            format!("Editor exited without opening {}", path.display())
-                        }
-                        Ok(_) => format!("Closed editor for {}:{line}", path.display()),
-                        Err(error) => format!("Could not open the editor: {error}"),
-                    });
-                }
-                None => {
-                    app.status_message =
-                        Some("No file:line pattern found in selection".to_string());
-                }
-            }
+        ContextMenuAction::OpenFileAtLine { path, line } => {
+            outcome = ContextMenuOutcome::OpenInEditor { path, line };
         }
         ContextMenuAction::HideCell { cell_index } => {
             app.collapsed_cells.insert(cell_index);
@@ -1727,6 +1824,56 @@ pub(crate) fn handle_context_menu_action(
         }
     }
     app.needs_redraw = true;
+    outcome
+}
+
+/// Open a workspace file at a line in `$EDITOR`. The editor gets the terminal
+/// through the same suspend path the composer and `/hooks edit` use, one at a
+/// time, and we wait for it. It used to be spawned detached while the TUI
+/// still held raw mode, the alt screen and mouse capture (#6235).
+/// The path `open_file_in_editor` may hand to the editor: `path` only while it
+/// is still a regular file inside `workspace` reached without links
+/// (`history::workspace_file`), else `None`.
+fn editor_target(
+    workspace: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    path.to_str()
+        .and_then(|raw| crate::tui::history::workspace_file(workspace, raw))
+}
+
+pub(crate) fn open_file_in_editor(
+    terminal: &mut ratatui::Terminal<crate::tui::color_compat::ColorCompatBackend<std::io::Stdout>>,
+    app: &mut App,
+    path: &std::path::Path,
+    line: u32,
+) {
+    // The menu checked this path when it was built; a link can be swapped in
+    // before the click, so check again right before the editor gets it.
+    let Some(path) = editor_target(&app.workspace, path) else {
+        app.status_message = Some(
+            app.tr(MessageId::CtxMenuEditorRefused)
+                .replace("{path}", &path.display().to_string()),
+        );
+        return;
+    };
+    let path = path.as_path();
+    let outcome = crate::tui::external_editor::spawn_editor_for_path(
+        terminal,
+        app.use_alt_screen(),
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+        path,
+        Some(line),
+    );
+    app.needs_redraw = true;
+    app.status_message = Some(match outcome {
+        Ok(crate::tui::external_editor::EditorOutcome::Cancelled) => {
+            format!("Editor exited without opening {}", path.display())
+        }
+        Ok(_) => format!("Closed editor for {}:{line}", path.display()),
+        Err(error) => format!("Could not open the editor: {error}"),
+    });
 }
 
 pub(crate) fn selection_point_from_mouse(
@@ -1780,12 +1927,114 @@ pub(crate) fn selection_point_from_position(
     })
 }
 
-pub(crate) fn selection_has_content(app: &App) -> bool {
-    // Composer selection takes priority (same as Cmd+C handler above).
-    if !app.selected_text().is_empty() {
-        return true;
+/// The one selection Copy, Open and Clear act on: the composer's when it has
+/// one, else the transcript's. The menu entries and Ctrl+C all read it here,
+/// so Copy cannot take the composer's text while Clear clears the
+/// transcript's and reports "Selection cleared".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActiveSelection {
+    Composer(String),
+    Transcript,
+}
+
+pub(crate) fn active_selection(app: &App) -> Option<ActiveSelection> {
+    let composer = app.selected_text();
+    if !composer.is_empty() {
+        return Some(ActiveSelection::Composer(composer));
     }
-    selection_to_text(app).is_some_and(|text| !text.is_empty())
+    selection_to_text(app)
+        .is_some_and(|text| !text.is_empty())
+        .then_some(ActiveSelection::Transcript)
+}
+
+pub(crate) fn selection_has_content(app: &App) -> bool {
+    active_selection(app).is_some()
+}
+
+/// The receipt for a clipboard write. `native` is said only when a native
+/// clipboard took the text; a terminal (OSC 52 / tmux) write is never
+/// acknowledged, so its receipt says where the text went, not that it
+/// arrived. An asynchronous failure still replaces either receipt through
+/// the event loop's `poll_write_completion` drain.
+pub(crate) fn copy_receipt(
+    app: &App,
+    transport: crate::tui::clipboard::CopyTransport,
+    native: impl Into<String>,
+) -> String {
+    match transport {
+        crate::tui::clipboard::CopyTransport::Native => native.into(),
+        crate::tui::clipboard::CopyTransport::Terminal => {
+            app.tr(MessageId::ClipboardSentToTerminal).into_owned()
+        }
+    }
+}
+
+pub(crate) fn copy_failed_receipt(app: &App, error: impl std::fmt::Display) -> String {
+    app.tr(MessageId::ClipboardCopyFailed)
+        .replace("{error}", &error.to_string())
+}
+
+/// Ctrl+X on a composer selection. The text is deleted only after a native
+/// clipboard confirmed the copy; an OSC 52 / tmux copy is never confirmed,
+/// so the text stays and the receipt says why.
+pub(crate) fn cut_selection(app: &mut App) {
+    let sel = app.selected_text();
+    if sel.is_empty() {
+        return;
+    }
+    match app.clipboard.write_text_status(&sel) {
+        Ok(crate::tui::clipboard::CopyTransport::Native) => {
+            app.push_status_toast(
+                app.tr(MessageId::ClipboardCopied),
+                StatusToastLevel::Info,
+                None,
+            );
+            app.delete_selection();
+        }
+        Ok(crate::tui::clipboard::CopyTransport::Terminal) => {
+            let receipt = app.tr(MessageId::ClipboardCutKeptText).into_owned();
+            app.push_status_toast(receipt, StatusToastLevel::Info, None);
+        }
+        Err(error) => {
+            let receipt = copy_failed_receipt(app, error);
+            app.push_status_toast(receipt, StatusToastLevel::Error, None);
+        }
+    }
+}
+
+fn open_active_selection(app: &mut App) -> bool {
+    match active_selection(app) {
+        Some(ActiveSelection::Composer(text)) => {
+            let width = app
+                .viewport
+                .last_transcript_area
+                .map(|area| area.width)
+                .unwrap_or(80);
+            app.view_stack.push(crate::tui::pager::PagerView::from_text(
+                "Selection",
+                &text,
+                width.saturating_sub(2),
+            ));
+            true
+        }
+        Some(ActiveSelection::Transcript) => open_pager_for_selection(app),
+        None => false,
+    }
+}
+
+fn clear_active_selection(app: &mut App) -> bool {
+    match active_selection(app) {
+        Some(ActiveSelection::Composer(_)) => {
+            app.clear_selection();
+            app.needs_redraw = true;
+            true
+        }
+        Some(ActiveSelection::Transcript) => {
+            clear_transcript_selection(app);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Branches taken by the Ctrl+C key handler. The order encodes priority and is
@@ -1837,11 +2086,16 @@ pub(crate) fn copy_active_selection(app: &mut App) {
     // Composer selection takes priority.
     let sel = app.selected_text();
     if !sel.is_empty() {
-        if app.clipboard.write_text(&sel).is_ok() {
-            app.status_message = Some("Selection copied".to_string());
-            app.clear_selection();
-        } else {
-            app.status_message = Some("Copy failed".to_string());
+        match app.clipboard.write_text_status(&sel) {
+            Ok(transport) => {
+                let receipt = copy_receipt(app, transport, app.tr(MessageId::ClipboardCopied));
+                app.push_status_toast(receipt, StatusToastLevel::Info, None);
+                app.clear_selection();
+            }
+            Err(error) => {
+                let receipt = copy_failed_receipt(app, error);
+                app.push_status_toast(receipt, StatusToastLevel::Error, None);
+            }
         }
         return;
     }
@@ -1863,18 +2117,22 @@ pub(crate) fn copy_active_selection(app: &mut App) {
             .map(|text| (text, None))
     });
     if let Some((text, markdown_cells)) = payload {
-        if app.clipboard.write_text(&text).is_ok() {
-            match markdown_cells {
-                Some(cells) => {
-                    let toast = app
+        match app.clipboard.write_text_status(&text) {
+            Ok(transport) => {
+                let receipt = match (transport, markdown_cells) {
+                    (crate::tui::clipboard::CopyTransport::Native, Some(cells)) => app
                         .tr(MessageId::SelectionCopiedAsMarkdown)
-                        .replace("{count}", &cells.to_string());
-                    app.push_status_toast(toast, StatusToastLevel::Info, None);
-                }
-                None => app.status_message = Some("Selection copied".to_string()),
+                        .replace("{count}", &cells.to_string()),
+                    (transport, _) => {
+                        copy_receipt(app, transport, app.tr(MessageId::ClipboardCopied))
+                    }
+                };
+                app.push_status_toast(receipt, StatusToastLevel::Info, None);
             }
-        } else {
-            app.status_message = Some("Copy failed".to_string());
+            Err(error) => {
+                let receipt = copy_failed_receipt(app, error);
+                app.push_status_toast(receipt, StatusToastLevel::Error, None);
+            }
         }
     } else {
         clear_transcript_selection(app);
@@ -2133,12 +2391,67 @@ mod tests {
 
     pub(super) fn create_test_app() -> App {
         let options = TuiOptions {
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
         // Legacy strip geometry (see ui.rs); Bottom default has its own tests.
         app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::Top;
         app
+    }
+
+    #[test]
+    fn plugin_review_click_opens_inventory_and_emits_no_install_or_trust_command() {
+        let _lock = crate::test_support::lock_test_env();
+        let root = tempdir().unwrap();
+        let _home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+        let mut app = App::new(
+            crate::tui::test_support::test_tui_options(root.path()),
+            &Config::default(),
+        );
+        app.surface_plugin_review_request("catalog-only", "/plugin install arbitrary-source");
+        assert!(app.plugin_cta.phase.is_visible());
+        let before = app.plugin_registry.list().len();
+        let area = Rect::new(0, 0, 140, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        crate::tui::plugin_suggestions::draw_plugin_cta(&mut app, area, &mut buffer);
+        assert!(
+            super::handle_plugin_cta_mouse(&mut app, left_click(0, 0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.view_stack.is_empty());
+        assert!(app.plugin_cta.phase.is_visible());
+        let button = app.viewport.last_plugin_cta_review_area.unwrap();
+        let events =
+            super::handle_plugin_cta_mouse(&mut app, left_click(button.x, button.y)).unwrap();
+        assert!(
+            events.is_empty(),
+            "review navigation must not dispatch commands"
+        );
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Extensions));
+        assert!(!app.plugin_cta.phase.is_visible());
+        assert_eq!(app.plugin_registry.list().len(), before);
+        assert!(app.plugin_registry.get("catalog-only").is_none());
+    }
+
+    #[test]
+    fn workbar_click_opens_the_workflows_view() {
+        let mut app = create_test_app();
+        app.workflow_runs
+            .push(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
+                "workflow_1",
+                "audit",
+                1,
+            ));
+        app.viewport.last_workbar_area = Some(Rect::new(0, 20, 80, 1));
+        assert!(!super::handle_workbar_mouse(&mut app, left_click(10, 5)));
+        assert!(app.view_stack.is_empty());
+        assert!(super::handle_workbar_mouse(&mut app, left_click(10, 20)));
+        assert_eq!(
+            app.view_stack.top_kind(),
+            Some(crate::tui::views::ModalKind::WorkflowsManager)
+        );
     }
 
     #[test]
@@ -2182,10 +2495,10 @@ mod tests {
     }
 
     fn action_command(action: Option<SidebarRowAction>) -> Option<String> {
-        action
-            .as_ref()
-            .and_then(SidebarRowAction::as_command)
-            .map(str::to_string)
+        match action? {
+            SidebarRowAction::Command(command) => Some(command),
+            _ => None,
+        }
     }
 
     fn left_click(column: u16, row: u16) -> MouseEvent {
@@ -2279,6 +2592,7 @@ mod tests {
             title: "refactor the parser".to_string(),
             updated_at: chrono::Utc::now(),
             message_count: 12,
+            interrupted: false,
         }];
         app.launch.row_hitboxes = vec![(
             crate::tui::app::LaunchRowId::Recent("sess-1".to_string()),
@@ -2439,7 +2753,7 @@ mod tests {
         let area = Rect::new(0, 20, 80, 4);
         app.viewport.last_composer_area = Some(area);
         // Match the frame's submit-aware input plane: x=74 stays blank,
-        // then the shared `[↑]` target begins at x=75.
+        // then the shared `[↵]` target begins at x=75.
         app.viewport.last_composer_content = Some(Rect::new(1, 21, 73, 2));
         let submit = crate::tui::widgets::active_composer_submit_rect(&app, area)
             .expect("enclosed composer submit");
@@ -2565,13 +2879,14 @@ mod tests {
 
         let entries = build_context_menu_entries(&app, right_click(65, 4));
 
+        // The row's own command, named, and run as the same typed row action
+        // a left click runs — not a free-form command string.
         let first = entries.first().expect("sidebar row should have menu");
-        assert_eq!(first.label, "Run");
-        assert_eq!(first.description, "/jobs show shell_x");
-        assert!(matches!(
-            &first.action,
-            ContextMenuAction::ExecuteCommand { command } if command == "/jobs show shell_x"
-        ));
+        assert_eq!(first.label, "Run /jobs show shell_x");
+        assert_eq!(
+            first.action,
+            ContextMenuAction::Row(SidebarRowAction::Command("/jobs show shell_x".to_string()))
+        );
         assert!(
             !entries
                 .iter()
@@ -2720,7 +3035,7 @@ mod tests {
             .iter()
             .find(|entry| matches!(entry.action, ContextMenuAction::CopyText { .. }))
             .expect("sidebar row should offer Copy");
-        assert_eq!(copy.label, "Copy");
+        assert_eq!(copy.label, "Copy row");
         assert!(matches!(
             &copy.action,
             ContextMenuAction::CopyText { text }
@@ -2743,6 +3058,532 @@ mod tests {
         assert_eq!(sidebar_click_action(&app, left_click(65, 30)), None);
         // Inside the section but on an empty row without metadata.
         assert_eq!(sidebar_click_action(&app, left_click(65, 8)), None);
+    }
+
+    fn work_row_section(app: &mut App, action: SidebarRowAction) {
+        app.work_surface.last_area = Some(Rect::new(60, 4, 20, 6));
+        app.sidebar_hover.sections.push(SidebarHoverSection {
+            content_area: Rect::new(60, 4, 20, 6),
+            lines: vec!["row".to_string()],
+            rows: vec![SidebarHoverRow {
+                row_y: 4,
+                display_text: "row".to_string(),
+                full_text: "row text".to_string(),
+                detail: None,
+                is_truncated: false,
+                click_action: Some(action),
+                stop_action: None,
+                stop_zone_start_col: None,
+                stop_zone_end_col: None,
+            }],
+        });
+    }
+
+    /// N14: focusing an agent shows its chat and addresses the composer to
+    /// it, so Focus, Message and Open transcript are one action. The menu
+    /// offers it once, and every other entry does something different.
+    #[test]
+    fn agent_row_menu_offers_focus_once() {
+        let mut app = create_test_app();
+        work_row_section(
+            &mut app,
+            SidebarRowAction::OpenAgentTranscript {
+                agent_id: "agent_1".to_string(),
+            },
+        );
+
+        let entries = build_context_menu_entries(&app, right_click(65, 4));
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Focus agent", "Open details", "Copy id", "Copy row"]
+        );
+        assert!(entries[0].primary);
+        assert_eq!(
+            entries[0].action,
+            ContextMenuAction::Row(SidebarRowAction::OpenAgentTranscript {
+                agent_id: "agent_1".to_string()
+            })
+        );
+        for (index, entry) in entries.iter().enumerate() {
+            assert!(
+                entries[index + 1..]
+                    .iter()
+                    .all(|e| e.action != entry.action),
+                "two rows do the same thing: {labels:?}"
+            );
+        }
+    }
+
+    /// A work item with a stop carries it last, behind the menu's confirm,
+    /// as the same typed action the inspector's stop runs.
+    #[test]
+    fn work_item_menu_puts_a_confirmed_stop_last() {
+        let mut app = create_test_app();
+        work_row_section(
+            &mut app,
+            SidebarRowAction::InspectWork {
+                title: "job".to_string(),
+                body: "body".to_string(),
+                stop_action: Some(Box::new(SidebarRowAction::Command(
+                    "/jobs cancel shell_x".to_string(),
+                ))),
+            },
+        );
+
+        let entries = build_context_menu_entries(&app, right_click(65, 4));
+        assert_eq!(entries[0].label, "Open details");
+        let stop = entries.last().expect("stop entry");
+        assert_eq!(stop.label, "Stop…");
+        assert!(stop.confirm_label.is_some());
+        assert_eq!(
+            stop.action,
+            ContextMenuAction::Row(SidebarRowAction::Command(
+                "/jobs cancel shell_x".to_string()
+            ))
+        );
+    }
+
+    /// T8: "Run" used to run through a dedicated arm while a dead arm's
+    /// status claimed the command was "staged in composer". A row action now
+    /// returns exactly the events a left click on the row produces.
+    #[test]
+    fn row_action_returns_what_a_left_click_runs() {
+        let mut app = create_test_app();
+        let outcome = super::apply_context_menu_action(
+            &mut app,
+            ContextMenuAction::Row(SidebarRowAction::Command("/cost".to_string())),
+        );
+        let super::ContextMenuOutcome::Events(events) = outcome else {
+            panic!("row actions hand their events to the host: {outcome:?}");
+        };
+        assert!(matches!(
+            events.as_slice(),
+            [ViewEvent::CommandPaletteSelected {
+                action: crate::tui::views::CommandPaletteAction::ExecuteCommand { command },
+            }] if command == "/cost"
+        ));
+        assert!(app.input.is_empty(), "nothing is staged in the composer");
+
+        let outcome = super::apply_context_menu_action(
+            &mut app,
+            ContextMenuAction::Row(SidebarRowAction::CancelAgent {
+                agent_id: "agent_1".to_string(),
+            }),
+        );
+        assert!(matches!(
+            outcome,
+            super::ContextMenuOutcome::Events(ref events)
+                if matches!(events.as_slice(), [ViewEvent::SidebarAgentCancel { agent_id }] if agent_id == "agent_1")
+        ));
+    }
+
+    #[test]
+    fn open_file_hands_the_editor_to_the_host() {
+        let mut app = create_test_app();
+        let path = PathBuf::from("/ws/src/a.rs");
+        let outcome = super::apply_context_menu_action(
+            &mut app,
+            ContextMenuAction::OpenFileAtLine {
+                path: path.clone(),
+                line: 12,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            super::ContextMenuOutcome::OpenInEditor { path: ref p, line: 12 } if *p == path
+        ));
+    }
+
+    #[test]
+    fn hide_and_restore_cells_report_what_changed() {
+        let mut app = create_test_app();
+        super::apply_context_menu_action(&mut app, ContextMenuAction::HideCell { cell_index: 3 });
+        assert!(app.collapsed_cells.contains(&3));
+        assert_eq!(app.status_message.as_deref(), Some("Cell hidden"));
+        super::apply_context_menu_action(&mut app, ContextMenuAction::ShowAllHidden);
+        assert!(app.collapsed_cells.is_empty());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("1 hidden cell(s) restored")
+        );
+    }
+
+    #[test]
+    fn extension_action_without_the_panel_says_so() {
+        let mut app = create_test_app();
+        let outcome = super::apply_context_menu_action(
+            &mut app,
+            ContextMenuAction::Extension {
+                item_id: "gone".to_string(),
+                verb: crate::tui::views::ExtensionMenuVerb::Remove,
+            },
+        );
+        assert!(matches!(outcome, super::ContextMenuOutcome::Done));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("That extension is no longer listed")
+        );
+    }
+
+    fn app_with_answer(workspace: &std::path::Path, content: &str) -> App {
+        let mut app = create_test_app();
+        app.workspace = workspace.to_path_buf();
+        app.history = vec![crate::tui::history::HistoryCell::Assistant {
+            content: content.to_string(),
+            streaming: false,
+        }];
+        app.resync_history_revisions();
+        app.viewport.transcript_cache.ensure(
+            &app.history,
+            &app.history_revisions,
+            80,
+            app.transcript_render_options(),
+        );
+        app.viewport.last_transcript_area = Some(Rect::new(0, 0, 80, 8));
+        app.viewport.last_transcript_top = 0;
+        app.viewport.last_transcript_total = app.viewport.transcript_cache.total_lines();
+        app
+    }
+
+    fn line_of(app: &App, needle: &str) -> u16 {
+        let index = app
+            .viewport
+            .transcript_cache
+            .lines()
+            .iter()
+            .position(|line| crate::tui::ui_text::line_to_plain(line).contains(needle))
+            .expect("rendered line");
+        u16::try_from(index).unwrap()
+    }
+
+    /// T4: Open in editor used to follow any absolute path in model output,
+    /// and `..` escaped through `workspace.join`. It is offered only for a
+    /// file inside the workspace, and the clicked line wins over the cell.
+    #[test]
+    fn open_in_editor_is_offered_only_inside_the_workspace() {
+        let root = tempdir().expect("tempdir");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(workspace.join("src/b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(root.path().join("secret.rs"), "outside\n").unwrap();
+        let outside = root.path().join("secret.rs");
+
+        let app = app_with_answer(
+            &workspace,
+            &format!(
+                "first `src/a.rs:3`\n\nthen --> src/b.rs:7:2\n\nand {}:1",
+                outside.display()
+            ),
+        );
+        let open = |app: &App, row: u16| {
+            build_context_menu_entries(app, right_click(4, row))
+                .into_iter()
+                .find_map(|entry| match entry.action {
+                    ContextMenuAction::OpenFileAtLine { path, line } => Some((path, line)),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            open(&app, line_of(&app, "src/b.rs")),
+            Some((workspace.join("src/b.rs"), 7)),
+            "the clicked line wins"
+        );
+        assert_eq!(
+            open(&app, line_of(&app, "secret.rs")),
+            Some((workspace.join("src/a.rs"), 3)),
+            "an outside path on the clicked line falls back to the cell's own"
+        );
+
+        let app = app_with_answer(
+            &workspace,
+            &format!("{}:1 and ../secret.rs:2", outside.display()),
+        );
+        assert_eq!(open(&app, line_of(&app, "secret.rs")), None);
+    }
+
+    /// App chrome (palette, inspector, help) belongs to empty space; on a
+    /// message it only pushed the message's own actions down.
+    #[test]
+    fn chrome_entries_only_on_empty_space() {
+        let root = tempdir().expect("tempdir");
+        let app = app_with_answer(root.path(), "alpha beta");
+        let has_palette = |entries: &[crate::tui::context_menu::ContextMenuEntry]| {
+            entries
+                .iter()
+                .any(|e| e.action == ContextMenuAction::OpenCommandPalette)
+        };
+        assert!(!has_palette(&build_context_menu_entries(
+            &app,
+            right_click(4, line_of(&app, "alpha"))
+        )));
+        let empty = create_test_app();
+        let entries = build_context_menu_entries(&empty, right_click(4, 4));
+        assert!(has_palette(&entries));
+        assert_eq!(entries[0].action, ContextMenuAction::Paste);
+    }
+
+    /// T6: Copy took the composer selection while Clear cleared only the
+    /// transcript's and still said "Selection cleared", and Open ignored the
+    /// composer. All three now act on the same selection.
+    #[test]
+    fn copy_open_and_clear_act_on_the_composer_selection() {
+        let root = tempdir().expect("tempdir");
+        let mut app = app_with_answer(root.path(), "alpha beta");
+        // A transcript selection too: the composer's must still win.
+        app.viewport.transcript_selection.anchor =
+            Some(crate::tui::selection::TranscriptSelectionPoint {
+                line_index: 0,
+                column: 0,
+            });
+        app.viewport.transcript_selection.head =
+            Some(crate::tui::selection::TranscriptSelectionPoint {
+                line_index: 0,
+                column: 6,
+            });
+        let select = |app: &mut App| {
+            app.input = "hello world".to_string();
+            app.selection_anchor = Some(0);
+            app.cursor_position = 5;
+        };
+
+        select(&mut app);
+        super::apply_context_menu_action(&mut app, ContextMenuAction::CopySelection);
+        assert_eq!(app.clipboard.last_written_text(), Some("hello"));
+        assert_eq!(
+            app.status_toasts.back().map(|toast| toast.text.as_str()),
+            Some("Copied to the clipboard")
+        );
+
+        select(&mut app);
+        super::apply_context_menu_action(&mut app, ContextMenuAction::OpenSelection);
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Pager));
+        app.view_stack.pop();
+
+        super::apply_context_menu_action(&mut app, ContextMenuAction::ClearSelection);
+        assert!(
+            app.selected_text().is_empty(),
+            "the composer selection cleared"
+        );
+        assert_eq!(app.status_message.as_deref(), Some("Selection cleared"));
+        assert!(
+            app.viewport.transcript_selection.is_active(),
+            "Clear acts on the selection Copy would take, not both"
+        );
+
+        super::clear_transcript_selection(&mut app);
+        super::apply_context_menu_action(&mut app, ContextMenuAction::ClearSelection);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No selection to clear"),
+            "nothing cleared is not reported as cleared"
+        );
+    }
+
+    /// The menu resolved the file when it opened; a link swapped in before
+    /// the click (to a real key file outside the workspace, or to `/`) must
+    /// be refused at launch. The key is one the test creates, so the check
+    /// does not depend on what the host has in `~/.ssh`.
+    #[cfg(unix)]
+    #[test]
+    fn editor_target_rechecks_links_swapped_in_after_the_menu_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = &dir.path().join("ws");
+        let key = dir.path().join("home/.ssh/id_ed25519");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "PRIVATE KEY\n").unwrap();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        let file = workspace.join("src/a.rs");
+        std::fs::write(&file, "fn a() {}\n").unwrap();
+        assert!(super::editor_target(workspace, &file).is_some());
+
+        // The file becomes a link to the key.
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&key, &file).unwrap();
+        assert!(file.is_file(), "the link resolves to a real file");
+        assert_eq!(super::editor_target(workspace, &file), None);
+
+        // The directory becomes a link to /.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(workspace.join("src")).unwrap();
+        std::os::unix::fs::symlink("/", workspace.join("src")).unwrap();
+        assert_eq!(
+            super::editor_target(workspace, &workspace.join("src/etc/hosts")),
+            None
+        );
+        assert_eq!(
+            super::editor_target(workspace, std::path::Path::new("/etc/hosts")),
+            None
+        );
+
+        // The refusal the user sees names the file and why.
+        let refusal = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::CtxMenuEditorRefused,
+        )
+        .replace("{path}", "src/a.rs");
+        assert_eq!(
+            refusal,
+            "Did not open src/a.rs: it is no longer a file inside the workspace"
+        );
+    }
+
+    /// Ctrl+X deletes the selection only when a native clipboard confirmed
+    /// the copy. A terminal (OSC 52 / tmux) copy keeps the text and says why;
+    /// a failed copy keeps it and says the copy failed.
+    #[test]
+    fn cut_deletes_only_after_a_native_copy() {
+        fn select_all(app: &mut App, text: &str) {
+            app.input = text.to_string();
+            app.selection_anchor = Some(0);
+            app.cursor_position = text.chars().count();
+        }
+        fn last_toast(app: &App) -> Option<&str> {
+            app.status_toasts.back().map(|toast| toast.text.as_str())
+        }
+
+        let mut app = create_test_app();
+        select_all(&mut app, "hello");
+        super::cut_selection(&mut app);
+        assert_eq!(app.clipboard.last_written_text(), Some("hello"));
+        assert_eq!(app.input, "", "a native copy cuts");
+        assert_eq!(last_toast(&app), Some("Copied to the clipboard"));
+
+        app.clipboard = crate::tui::clipboard::ClipboardHandler::terminal_only_for_test();
+        select_all(&mut app, "kept");
+        super::cut_selection(&mut app);
+        assert_eq!(
+            app.input, "kept",
+            "an unconfirmed terminal copy keeps the text"
+        );
+        assert_eq!(
+            last_toast(&app),
+            Some(
+                "Sent to the terminal clipboard; the text stays because terminals do not confirm copies"
+            )
+        );
+
+        app.clipboard = crate::tui::clipboard::ClipboardHandler::unavailable_for_test(false);
+        select_all(&mut app, "also kept");
+        super::cut_selection(&mut app);
+        assert_eq!(app.input, "also kept", "a failed copy keeps the text");
+        assert!(
+            last_toast(&app).is_some_and(|toast| toast.starts_with("Clipboard copy failed: ")),
+            "{:?}",
+            last_toast(&app)
+        );
+    }
+
+    /// A right-click on a row's inline stop zone opens the row's own menu;
+    /// the stop is offered last behind the confirm, never as the primary
+    /// entry that one click would run.
+    #[test]
+    fn right_click_on_a_stop_zone_keeps_the_stop_confirmed() {
+        let mut app = create_test_app();
+        work_row_section(
+            &mut app,
+            SidebarRowAction::Command("/jobs show shell_x".to_string()),
+        );
+        let row = &mut app.sidebar_hover.sections[0].rows[0];
+        row.stop_action = Some(SidebarRowAction::Command(
+            "/jobs cancel shell_x".to_string(),
+        ));
+        row.stop_zone_start_col = Some(76);
+        row.stop_zone_end_col = Some(79);
+
+        let entries = build_context_menu_entries(&app, right_click(77, 4));
+        let primary = entries.iter().find(|entry| entry.primary).expect("primary");
+        assert_eq!(
+            primary.action,
+            ContextMenuAction::Row(SidebarRowAction::Command("/jobs show shell_x".to_string()))
+        );
+        assert!(primary.confirm_label.is_none());
+        let stop = entries.last().expect("stop entry");
+        assert_eq!(stop.label, "Stop…");
+        assert_eq!(
+            stop.action,
+            ContextMenuAction::Row(SidebarRowAction::Command(
+                "/jobs cancel shell_x".to_string()
+            ))
+        );
+        assert!(stop.confirm_label.is_some(), "the stop needs the confirm");
+    }
+
+    /// N9: an OSC 52 / tmux write is never acknowledged, so its receipt says
+    /// the text was sent to the terminal, not that it was copied.
+    #[test]
+    fn copy_receipts_name_the_transport() {
+        fn last_toast(app: &App) -> Option<&str> {
+            app.status_toasts.back().map(|toast| toast.text.as_str())
+        }
+
+        let mut app = create_test_app();
+        super::apply_context_menu_action(
+            &mut app,
+            ContextMenuAction::CopyText {
+                text: "agent_1".to_string(),
+            },
+        );
+        assert_eq!(app.clipboard.last_written_text(), Some("agent_1"));
+        assert_eq!(last_toast(&app), Some("Copied to the clipboard"));
+
+        app.clipboard = crate::tui::clipboard::ClipboardHandler::terminal_only_for_test();
+        super::apply_context_menu_action(
+            &mut app,
+            ContextMenuAction::CopyText {
+                text: "agent_1".to_string(),
+            },
+        );
+        assert_eq!(
+            last_toast(&app),
+            Some("Sent to the terminal clipboard (terminals do not confirm it)")
+        );
+
+        // The terminal lane holds one write at a time; let the first land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.clipboard.poll_write_completion().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal write landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        app.input = "hello".to_string();
+        app.selection_anchor = Some(0);
+        app.cursor_position = 5;
+        super::apply_context_menu_action(&mut app, ContextMenuAction::CopySelection);
+        assert_eq!(
+            last_toast(&app),
+            Some("Sent to the terminal clipboard (terminals do not confirm it)")
+        );
+
+        app.clipboard = crate::tui::clipboard::ClipboardHandler::unavailable_for_test(false);
+        super::apply_context_menu_action(
+            &mut app,
+            ContextMenuAction::CopyText {
+                text: "agent_1".to_string(),
+            },
+        );
+        assert!(
+            last_toast(&app).is_some_and(|toast| toast.starts_with("Clipboard copy failed: ")),
+            "{:?}",
+            last_toast(&app)
+        );
+    }
+
+    /// T11: Paste with nothing to paste used to do nothing and say nothing.
+    #[test]
+    fn paste_with_nothing_to_paste_says_so() {
+        let mut app = create_test_app();
+        app.clipboard = crate::tui::clipboard::ClipboardHandler::unavailable_for_test(false);
+        app.input = "draft".to_string();
+        super::apply_context_menu_action(&mut app, ContextMenuAction::Paste);
+        assert_eq!(app.input, "draft");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Nothing to paste: the clipboard is empty or could not be read")
+        );
     }
 
     #[test]
@@ -2844,14 +3685,28 @@ mod tests {
 
         #[test]
         fn word_bounds_select_words_and_respect_cjk() {
-            // Bytes: fix(0-2) sp(3) the(4-6) sp(7) 深=3B(8-10) 海=3B(11-13) sp(14) test.rs(15-21)
+            // Chars: fix(0-2) sp(3) the(4-6) sp(7) 深(8) 海(9) sp(10) test.rs(11-17)
             let text = "fix the 深海 test.rs";
             assert_eq!(composer_word_bounds(text, 2), (0, 3)); // 'fix'
             assert_eq!(composer_word_bounds(text, 5), (4, 7)); // 'the'
-            assert_eq!(composer_word_bounds(text, 10), (8, 14)); // '深海' (space at 14)
-            assert_eq!(composer_word_bounds(text, 15), (15, 19)); // 'test' (stops at '.')
-            assert_eq!(composer_word_bounds(text, 19), (19, 20)); // '.'
-            assert_eq!(composer_word_bounds(text, 20), (20, 22)); // 'rs'
+            assert_eq!(composer_word_bounds(text, 9), (8, 10)); // '深海' (space at 10)
+            assert_eq!(composer_word_bounds(text, 11), (11, 15)); // 'test' (stops at '.')
+            assert_eq!(composer_word_bounds(text, 15), (15, 16)); // '.'
+            assert_eq!(composer_word_bounds(text, 16), (16, 18)); // 'rs'
+        }
+
+        #[test]
+        fn click_bounds_are_char_indices_on_multibyte_text() {
+            // The click maps to a char index and the result becomes the
+            // char-indexed cursor/anchor. Byte math here panicked on a
+            // triple-click inside CJK text and skewed double-click spans.
+            let text = "你好\n世界 ok";
+            assert_eq!(composer_line_bounds(text, 1), (0, 2));
+            assert_eq!(composer_line_bounds(text, 4), (3, 8));
+            assert_eq!(composer_word_bounds(text, 3), (3, 5)); // '世界'
+            assert_eq!(composer_word_bounds(text, 6), (6, 8)); // 'ok'
+            let mixed = "fix 深海 test";
+            assert_eq!(composer_word_bounds(mixed, 8), (7, 11)); // 'test'
         }
 
         #[test]

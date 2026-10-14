@@ -24,11 +24,40 @@ use codewhale_config::route::{ProviderModelOffering, RouteResolver, bundled_offe
 
 use crate::codex_model_cache;
 use crate::config::{
-    ApiProvider, Config, ProviderIdentity, model_completion_names_for_provider,
+    Config, ProviderIdentity, ProviderKind, model_completion_names_for_provider,
     opencode_go_model_id, provider_is_configured_for_active,
 };
 
-static BUNDLED_SNAPSHOT: std::sync::OnceLock<CatalogSnapshot> = std::sync::OnceLock::new();
+static BUNDLED_SNAPSHOT: std::sync::OnceLock<SharedSnapshot> = std::sync::OnceLock::new();
+
+/// A catalog layer whose rows are reference-counted so the merged view can
+/// share them instead of deep-cloning every offering.
+///
+/// The Models.dev layer is several thousand rows. Holding the merge as owned
+/// `CatalogOffering`s kept a second full copy of that layer (and of the
+/// bundled layer) resident for the life of the process; sharing rows means
+/// only the rows a merge actually changes (cutlines, signed-facts patches,
+/// provider-roster completion) are materialized again.
+#[derive(Debug, Default)]
+struct SharedSnapshot {
+    offerings: Vec<Arc<CatalogOffering>>,
+}
+
+impl SharedSnapshot {
+    fn from_owned(snapshot: CatalogSnapshot) -> Self {
+        Self {
+            offerings: snapshot.offerings.into_iter().map(Arc::new).collect(),
+        }
+    }
+
+    fn offerings_for_provider(&self, provider: &str) -> Vec<&CatalogOffering> {
+        self.offerings
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|row| row.provider == provider)
+            .collect()
+    }
+}
 
 /// Source tag for live-catalog rows. Models.dev is a cross-provider catalog
 /// that serves as the primary live layer; per-provider refreshes (e.g.
@@ -58,7 +87,7 @@ static LIVE_SNAPSHOT: RwLock<LiveSnapshotPartitions> = RwLock::new(LiveSnapshotP
 /// provider-specific live fetch.
 #[derive(Default)]
 struct LiveSnapshotPartitions {
-    models_dev: Option<CatalogSnapshot>,
+    models_dev: Option<SharedSnapshot>,
     per_provider: BTreeMap<LivePartitionOwner, CatalogSnapshot>,
 }
 
@@ -83,11 +112,11 @@ impl LivePartitionOwner {
 }
 
 fn live_partition_owner_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
 ) -> LivePartitionOwner {
     let identity = catalog_provider_id_for_identity(provider, provider_identity);
-    if provider == ApiProvider::Custom {
+    if provider == ProviderKind::Custom {
         LivePartitionOwner::Custom(catalog_partition_key(identity.as_ref()))
     } else {
         LivePartitionOwner::BuiltIn(catalog_partition_key(identity.as_ref()))
@@ -96,7 +125,7 @@ fn live_partition_owner_for_route(
 
 fn inferred_live_partition_owner(provider: &str) -> LivePartitionOwner {
     let identity = catalog_partition_key(provider);
-    ApiProvider::parse(&identity).map_or_else(
+    ProviderKind::parse(&identity).map_or_else(
         || LivePartitionOwner::Custom(identity),
         |provider| {
             LivePartitionOwner::BuiltIn(catalog_partition_key(catalog_provider_id(provider)))
@@ -122,7 +151,7 @@ fn offerings_by_provider(
 /// staleness without re-merging.
 static LIVE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-type MergedCacheEntry = ((u64, u64), Arc<CatalogSnapshot>);
+type MergedCacheEntry = ((u64, u64), Arc<SharedSnapshot>);
 
 /// Memoized result of [`merged_snapshot`], tagged with the `LIVE_GENERATION`
 /// it was computed from. Re-merging ~5,700 offerings per call made every
@@ -136,6 +165,10 @@ static MERGED_CACHE: RwLock<Option<MergedCacheEntry>> = RwLock::new(None);
 /// 600+ row OpenRouter catalog for every route candidate.
 static RUNTIME_RESOLVER_CACHE: RwLock<BTreeMap<String, RuntimeResolverCacheEntry>> =
     RwLock::new(BTreeMap::new());
+/// Most distinct endpoints the resolver cache holds at once. Entries from an
+/// older catalog generation can never hit again and are dropped on insert;
+/// this caps the endpoints of the current generation.
+const MAX_RUNTIME_RESOLVER_CACHE_ENTRIES: usize = 64;
 
 #[derive(Clone)]
 struct RuntimeResolverCacheEntry {
@@ -152,9 +185,11 @@ pub(crate) struct RuntimeCatalogResolver {
     pub(crate) endpoint_catalog_authoritative: bool,
 }
 
-fn bundled_snapshot() -> &'static CatalogSnapshot {
-    BUNDLED_SNAPSHOT.get_or_init(|| CatalogSnapshot {
-        offerings: bundled_catalog_offerings(),
+fn bundled_snapshot() -> &'static SharedSnapshot {
+    BUNDLED_SNAPSHOT.get_or_init(|| {
+        SharedSnapshot::from_owned(CatalogSnapshot {
+            offerings: bundled_catalog_offerings(),
+        })
     })
 }
 
@@ -164,30 +199,61 @@ fn bundled_snapshot() -> &'static CatalogSnapshot {
 /// Anthropic Messages and Responses. Keep saved and live Go rows on the same
 /// documented protocol roster, correcting stale endpoint metadata.
 fn apply_provider_model_cutlines(mut snapshot: CatalogSnapshot) -> CatalogSnapshot {
-    // `ApiProvider::parse` scans every provider and alias list per call; the
-    // distinct provider strings in a catalog are few, so resolve each distinct
-    // string once instead of once per offering (boot-path profiles showed
-    // this loop as the largest post-parse compute block).
-    let mut resolved: std::collections::HashMap<String, Option<ApiProvider>> =
-        std::collections::HashMap::new();
+    let mut is_opencode_go = provider_parse_memo();
     snapshot.offerings = snapshot
         .offerings
         .into_iter()
         .filter_map(|mut offering| {
-            let parsed = *resolved
-                .entry(offering.provider.clone())
-                .or_insert_with(|| ApiProvider::parse(&offering.provider));
-            if parsed == Some(ApiProvider::OpencodeGo) {
-                let canonical = opencode_go_model_id(&offering.wire_model_id)?;
-                offering.provider = ApiProvider::OpencodeGo.as_str().to_string();
-                offering.wire_model_id = canonical.to_string();
-                offering.endpoint_key =
-                    codewhale_config::opencode_go_endpoint_key(canonical)?.to_string();
+            if is_opencode_go(&offering.provider) {
+                canonicalize_opencode_go_row(&mut offering)?;
             }
             Some(offering)
         })
         .collect();
     snapshot
+}
+
+/// [`apply_provider_model_cutlines`] over shared rows: only the rows the
+/// cutline rewrites are copied; every other row stays shared with its layer.
+fn apply_provider_model_cutlines_shared(rows: Vec<Arc<CatalogOffering>>) -> SharedSnapshot {
+    let mut is_opencode_go = provider_parse_memo();
+    let offerings = rows
+        .into_iter()
+        .filter_map(|mut offering| {
+            if is_opencode_go(&offering.provider) {
+                canonicalize_opencode_go_row(Arc::make_mut(&mut offering))?;
+            }
+            Some(offering)
+        })
+        .collect();
+    SharedSnapshot { offerings }
+}
+
+/// `ProviderKind::parse` scans every provider and alias list per call; the
+/// distinct provider strings in a catalog are few, so resolve each distinct
+/// string once instead of once per offering (boot-path profiles showed this
+/// loop as the largest post-parse compute block).
+fn provider_parse_memo() -> impl FnMut(&str) -> bool {
+    let mut resolved: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    move |provider: &str| {
+        if let Some(hit) = resolved.get(provider) {
+            return *hit;
+        }
+        let hit = ProviderKind::parse(provider) == Some(ProviderKind::OpencodeGo);
+        resolved.insert(provider.to_string(), hit);
+        hit
+    }
+}
+
+/// Canonicalize one OpenCode Go row onto its documented protocol roster.
+/// `None` means the row is not on that roster and must be dropped.
+fn canonicalize_opencode_go_row(offering: &mut CatalogOffering) -> Option<()> {
+    let canonical = opencode_go_model_id(&offering.wire_model_id)?;
+    let endpoint_key = codewhale_config::opencode_go_endpoint_key(canonical)?;
+    offering.provider = ProviderKind::OpencodeGo.as_str().to_string();
+    offering.wire_model_id = canonical.to_string();
+    offering.endpoint_key = endpoint_key.to_string();
+    Some(())
 }
 
 /// Set the live-catalog snapshot for a given source (#4188 race fix).
@@ -202,7 +268,7 @@ pub fn set_live_snapshot(snapshot: CatalogSnapshot, source: LiveSource) {
         let snapshot = apply_provider_model_cutlines(snapshot);
         let changed = match source {
             LiveSource::ModelsDev => {
-                guard.models_dev = Some(snapshot);
+                guard.models_dev = Some(SharedSnapshot::from_owned(snapshot));
                 true
             }
             LiveSource::PerProvider => {
@@ -232,6 +298,7 @@ pub fn set_live_snapshot(snapshot: CatalogSnapshot, source: LiveSource) {
 /// scoped persistent caches need that distinction: switching Baseten to a new
 /// base URL with no matching cache must remove the old URL's Baseten rows
 /// immediately instead of presenting them as if they belonged to the new host.
+#[cfg(test)]
 pub fn replace_provider_live_snapshot(provider: &str, snapshot: CatalogSnapshot) {
     let provider = provider.trim();
     if provider.is_empty() {
@@ -247,7 +314,7 @@ pub fn replace_provider_live_snapshot(provider: &str, snapshot: CatalogSnapshot)
 /// string-only wrapper above remains for built-in publishers and older generic
 /// tests, where a built-in-looking string necessarily denotes the built-in.
 pub(crate) fn replace_provider_live_snapshot_for_identity(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: &str,
     snapshot: CatalogSnapshot,
 ) {
@@ -301,9 +368,10 @@ pub fn clear_live_snapshot() {
 /// Unlike [`set_live_snapshot`] for `LiveSource::PerProvider` (which replaces
 /// each represented provider's partition), this merges new rows by
 /// `(provider, wire_model_id)` identity within that provider's partition,
-/// preserving every other provider and the Models.dev partition. This is used
-/// by provider catalog refreshes (e.g. TelecomJS `/v1/models`) that need to
-/// coexist with the cross-provider Models.dev live layer.
+/// preserving every other provider and the Models.dev partition. Production
+/// rosters publish through `provider_catalog_live` (the guided-setup key probe
+/// included), so this remains a fixture seam for lake tests.
+#[cfg(test)]
 pub fn merge_live_offerings(new_offerings: Vec<CatalogOffering>) {
     if new_offerings.is_empty() {
         return;
@@ -335,7 +403,7 @@ pub fn merge_live_offerings(new_offerings: Vec<CatalogOffering>) {
 /// Pricing uses this so a Models.dev capabilities overlay is never treated as
 /// a rate source (#5241).
 #[must_use]
-pub fn live_catalog_origin(provider: ApiProvider, wire_model_id: &str) -> Option<LiveSource> {
+pub fn live_catalog_origin(provider: ProviderKind, wire_model_id: &str) -> Option<LiveSource> {
     let catalog_id = catalog_provider_id(provider);
     let owner = LivePartitionOwner::BuiltIn(catalog_partition_key(catalog_id));
     let needle = wire_model_id.trim();
@@ -345,25 +413,59 @@ pub fn live_catalog_origin(provider: ApiProvider, wire_model_id: &str) -> Option
     let Ok(guard) = LIVE_SNAPSHOT.read() else {
         return None;
     };
-    let matches = |row: &CatalogOffering| {
-        row.provider.eq_ignore_ascii_case(catalog_id)
-            && row.wire_model_id.eq_ignore_ascii_case(needle)
-    };
-    if guard
-        .per_provider
-        .get(&owner)
-        .is_some_and(|snap| snap.offerings.iter().any(matches))
-    {
-        return Some(LiveSource::PerProvider);
-    }
-    if guard
-        .models_dev
-        .as_ref()
-        .is_some_and(|snap| snap.offerings.iter().any(matches))
-    {
-        return Some(LiveSource::ModelsDev);
+    // Wire ids are opaque and case-sensitive: an exact row in either
+    // partition decides before a case-folded one does.
+    for exact in [true, false] {
+        let matches = |row: &CatalogOffering| {
+            row.provider.eq_ignore_ascii_case(catalog_id)
+                && if exact {
+                    row.wire_model_id == needle
+                } else {
+                    row.wire_model_id.eq_ignore_ascii_case(needle)
+                }
+        };
+        if guard
+            .per_provider
+            .get(&owner)
+            .is_some_and(|snap| snap.offerings.iter().any(matches))
+        {
+            return Some(LiveSource::PerProvider);
+        }
+        if guard
+            .models_dev
+            .as_ref()
+            .is_some_and(|snap| snap.offerings.iter().any(|row| matches(row)))
+        {
+            return Some(LiveSource::ModelsDev);
+        }
     }
     None
+}
+
+/// The row whose wire id is exactly `needle`, else the one wire id equal to
+/// it ignoring ASCII case. Wire ids are opaque and case-sensitive, so the
+/// fallback only forgives a case slip when it cannot choose between two
+/// distinct ids; otherwise it answers nothing rather than another model's
+/// metadata.
+fn find_wire_model<'a>(
+    rows: impl IntoIterator<Item = &'a CatalogOffering>,
+    needle: &str,
+) -> Option<&'a CatalogOffering> {
+    let mut folded: Option<&'a CatalogOffering> = None;
+    let mut ambiguous = false;
+    for row in rows {
+        if row.wire_model_id == needle {
+            return Some(row);
+        }
+        if row.wire_model_id.eq_ignore_ascii_case(needle) {
+            match folded {
+                None => folded = Some(row),
+                Some(first) if first.wire_model_id != row.wire_model_id => ambiguous = true,
+                Some(_) => {}
+            }
+        }
+    }
+    folded.filter(|_| !ambiguous)
 }
 
 /// Serialize tests that mutate the process-wide live snapshot.
@@ -415,7 +517,7 @@ pub(crate) fn lock_live_snapshot() -> LiveSnapshotLock {
 /// Memoized: the merge is recomputed only after a live-layer mutation bumps
 /// `LIVE_GENERATION`; every other call returns the cached `Arc` (the picker
 /// calls this per row, so it must be cheap).
-fn merged_snapshot() -> Arc<CatalogSnapshot> {
+fn merged_snapshot() -> Arc<SharedSnapshot> {
     let generation = (
         LIVE_GENERATION.load(Ordering::SeqCst),
         codewhale_config::cloud_facts::overlay::snapshot().generation,
@@ -437,13 +539,13 @@ fn merged_snapshot() -> Arc<CatalogSnapshot> {
 }
 
 /// Uncached merge (see [`merged_snapshot`] for the caching seam).
-fn compute_merged_snapshot() -> CatalogSnapshot {
+fn compute_merged_snapshot() -> SharedSnapshot {
     let cloud = codewhale_config::cloud_facts::overlay::snapshot();
     let Ok(live) = LIVE_SNAPSHOT.read() else {
-        return apply_provider_model_cutlines(bundled_snapshot().clone());
+        return apply_provider_model_cutlines_shared(bundled_snapshot().offerings.clone());
     };
     if live.models_dev.is_none() && live.per_provider.is_empty() && cloud.facts.is_none() {
-        return apply_provider_model_cutlines(bundled_snapshot().clone());
+        return apply_provider_model_cutlines_shared(bundled_snapshot().offerings.clone());
     }
 
     let authoritative_providers: std::collections::BTreeSet<&str> = live
@@ -458,76 +560,75 @@ fn compute_merged_snapshot() -> CatalogSnapshot {
         let key = catalog_partition_key(provider);
         authoritative_providers.contains(key.as_str())
     };
-    let mut merged: BTreeMap<(String, String), CatalogOffering> = BTreeMap::new();
+    let mut merged: BTreeMap<(String, String), Arc<CatalogOffering>> = BTreeMap::new();
     for row in &bundled_snapshot().offerings {
-        if !is_authoritative(&row.provider) {
-            merged.insert(
-                (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
-            );
-        }
+        merged.insert(
+            (row.provider.clone(), row.wire_model_id.clone()),
+            Arc::clone(row),
+        );
     }
     if let Some(models_dev) = &live.models_dev {
         for row in &models_dev.offerings {
-            if !is_authoritative(&row.provider) {
-                merged.insert(
-                    (row.provider.clone(), row.wire_model_id.clone()),
-                    row.clone(),
-                );
-            }
+            merged.insert(
+                (row.provider.clone(), row.wire_model_id.clone()),
+                Arc::clone(row),
+            );
         }
     }
     if let Some(facts) = &cloud.facts {
+        // The patcher only reads, writes, or removes the keys a signed fact
+        // names, so materialize just those rows as owned values and share the
+        // rest untouched.
+        let mut patched: BTreeMap<(String, String), CatalogOffering> = BTreeMap::new();
+        for fact in &facts.models {
+            let key = (fact.provider.clone(), fact.id.clone());
+            if let Some(row) = merged.remove(&key) {
+                patched.insert(key, Arc::unwrap_or_clone(row));
+            }
+        }
         codewhale_config::cloud_facts::catalog_patch::apply_model_patches(
-            &mut merged,
+            &mut patched,
             facts,
             cloud.fetched_at.unwrap_or(0),
         );
-        // A provider roster owns its omissions as well as the ids it lists, and
-        // the loops above already withheld the lower layers for such a provider
-        // — so a signed row surviving here would be one this client cannot
-        // otherwise justify. Only an explicit `allow_unlisted` assertion keeps
-        // it; without one the roster stands. The partition loop below still
-        // owns every id the roster does list.
-        merged.retain(|(provider, model), row| {
-            if !is_authoritative(provider) {
-                return true;
-            }
-            matches!(row.source, CatalogSource::CloudFacts { .. })
-                && codewhale_config::cloud_facts::catalog_patch::is_unlisted_attested(
-                    facts, provider, model,
-                )
-        });
+        merged.extend(patched.into_iter().map(|(key, row)| (key, Arc::new(row))));
     }
-    for provider_snapshot in live
-        .per_provider
-        .iter()
-        .filter_map(|(owner, snapshot)| match owner {
-            LivePartitionOwner::BuiltIn(_) => Some(snapshot),
-            LivePartitionOwner::Custom(identity) if ApiProvider::parse(identity).is_none() => {
-                Some(snapshot)
-            }
-            LivePartitionOwner::Custom(_) => None,
-        })
+    let lower_rows = merged.clone();
+    merged.retain(|(provider, model), row| {
+        !is_authoritative(provider)
+            || (matches!(row.source, CatalogSource::CloudFacts { .. })
+                && cloud.facts.as_ref().is_some_and(|facts| {
+                    codewhale_config::cloud_facts::catalog_patch::is_unlisted_attested(
+                        facts, provider, model,
+                    )
+                }))
+    });
+    for (owner, provider_snapshot) in
+        live.per_provider
+            .iter()
+            .filter_map(|(owner, snapshot)| match owner {
+                LivePartitionOwner::BuiltIn(_) => Some((owner, snapshot)),
+                LivePartitionOwner::Custom(identity) if ProviderKind::parse(identity).is_none() => {
+                    Some((owner, snapshot))
+                }
+                LivePartitionOwner::Custom(_) => None,
+            })
     {
         for row in &provider_snapshot.offerings {
             let mut row = row.clone();
-            // The roster owns this id. Where it stated a fact, that fact wins;
-            // where it said nothing, the signed layer may still complete the
-            // row instead of leaving the picker and the executor with an
-            // unknown it does not have to have.
-            if let Some(facts) = &cloud.facts {
-                codewhale_config::cloud_facts::catalog_patch::complete_provider_live_row(
-                    &mut row, facts,
-                );
+            if matches!(owner, LivePartitionOwner::BuiltIn(_))
+                && let Some(lower) =
+                    lower_rows.get(&(row.provider.clone(), row.wire_model_id.clone()))
+            {
+                row.complete_from(lower, None);
             }
-            merged.insert((row.provider.clone(), row.wire_model_id.clone()), row);
+            merged.insert(
+                (row.provider.clone(), row.wire_model_id.clone()),
+                Arc::new(row),
+            );
         }
     }
-    let merged = CatalogSnapshot {
-        offerings: merged.into_values().collect(),
-    };
-    apply_provider_model_cutlines(merged)
+    apply_provider_model_cutlines_shared(merged.into_values().collect())
 }
 
 fn apply_cloud_facts_for_provider(
@@ -546,11 +647,36 @@ fn apply_cloud_facts_for_provider(
     }
 }
 
+fn source_rows_for_provider(
+    provider: &str,
+    models_dev: Option<&SharedSnapshot>,
+    cloud: Option<&codewhale_config::cloud_facts::overlay::OverlaySnapshot>,
+) -> BTreeMap<(String, String), CatalogOffering> {
+    let mut rows: BTreeMap<_, _> = bundled_snapshot()
+        .offerings_for_provider(provider)
+        .into_iter()
+        .cloned()
+        .map(|row| ((row.provider.clone(), row.wire_model_id.clone()), row))
+        .collect();
+    if let Some(models_dev) = models_dev {
+        for row in models_dev.offerings_for_provider(provider) {
+            rows.insert(
+                (row.provider.clone(), row.wire_model_id.clone()),
+                row.clone(),
+            );
+        }
+    }
+    if let Some(cloud) = cloud {
+        apply_cloud_facts_for_provider(&mut rows, provider, cloud);
+    }
+    rows
+}
+
 /// Does the signed cloud layer describe this exact route?
 ///
 /// Every condition is load-bearing:
-/// - the route resolves to a canonical provider kind. The TUI-only legacy
-///   `deepseek-cn` alias has none, so it inherits nothing;
+/// - the captured route identity is canonical; `deepseek-cn` remains a
+///   separate identity even though its transport shares the DeepSeek kind;
 /// - the identity the signer names is this route's own. Catalog rows collapse
 ///   regional and dual-wire aliases onto a vendor primary
 ///   ([`catalog_provider_id`]), so SiliconFlow China and DeepSeek's
@@ -564,11 +690,14 @@ fn apply_cloud_facts_for_provider(
 /// `cloud_facts::scope` stays the single authority for which providers and
 /// hosts are in scope at all (it is what excludes custom/local routes and the
 /// Codex account roster); this must not grow a second copy of that table.
-pub(crate) fn cloud_facts_apply_to_route(provider: ApiProvider, base_url: &str) -> bool {
-    provider.kind().is_some_and(|kind| {
-        kind.as_str() == catalog_provider_id(provider)
-            && codewhale_config::cloud_facts::scope::base_url_allowed(kind.as_str(), base_url)
-    })
+pub(crate) fn cloud_facts_apply_to_route(
+    provider: ProviderKind,
+    identity: &str,
+    base_url: &str,
+) -> bool {
+    identity == provider.as_str()
+        && provider.as_str() == catalog_provider_id(provider)
+        && codewhale_config::cloud_facts::scope::base_url_allowed(provider.as_str(), base_url)
 }
 
 /// Signed rows for `provider` on this endpoint that the payload explicitly
@@ -588,11 +717,12 @@ pub(crate) fn cloud_facts_apply_to_route(provider: ApiProvider, base_url: &str) 
 /// not touch account entitlement (an OAuth/account roster provider is outside
 /// the signed scope entirely).
 fn cloud_unlisted_offerings_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
+    identity: &str,
     base_url: &str,
 ) -> BTreeMap<(String, String), CatalogOffering> {
     let mut rows = BTreeMap::new();
-    if !cloud_facts_apply_to_route(provider, base_url) {
+    if !cloud_facts_apply_to_route(provider, identity, base_url) {
         return rows;
     }
     let cloud = codewhale_config::cloud_facts::overlay::snapshot();
@@ -611,11 +741,11 @@ fn cloud_unlisted_offerings_for_route(
     rows
 }
 
-/// Maps an [`ApiProvider`] to its bundled-catalog provider id.
-fn catalog_provider_id(provider: ApiProvider) -> &'static str {
+/// Maps an [`ProviderKind`] to its bundled-catalog provider id.
+fn catalog_provider_id(provider: ProviderKind) -> &'static str {
     match provider {
-        ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic => "deepseek",
-        ApiProvider::SiliconflowCn => "siliconflow",
+        ProviderKind::DeepseekAnthropic => "deepseek",
+        ProviderKind::SiliconflowCN => "siliconflow",
         _ => provider.as_str(),
     }
 }
@@ -633,14 +763,14 @@ pub(crate) fn catalog_partition_key(provider: &str) -> String {
 
 /// Resolve the catalog partition for a concrete route.
 ///
-/// `ApiProvider::Custom` is only the wire family. Named compatible providers
+/// `ProviderKind::Custom` is only the wire family. Named compatible providers
 /// such as Baseten own independent catalogs and must keep their exact config
 /// identity instead of collapsing into a shared `custom` bucket.
 fn catalog_provider_id_for_identity<'a>(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&'a str>,
 ) -> Cow<'a, str> {
-    if provider == ApiProvider::Custom
+    if provider == ProviderKind::Custom
         && let Some(identity) = provider_identity.map(str::trim).filter(|id| !id.is_empty())
     {
         return Cow::Owned(catalog_partition_key(identity));
@@ -653,6 +783,51 @@ fn offering_key(offering: &ProviderModelOffering) -> (String, String) {
         offering.provider.as_str().trim().to_ascii_lowercase(),
         offering.wire_model_id.as_str().to_string(),
     )
+}
+
+fn offering_with_absent_facts_filled(
+    mut offering: ProviderModelOffering,
+    lower: &ProviderModelOffering,
+) -> ProviderModelOffering {
+    if offering.canonical_model.is_none() {
+        offering.canonical_model.clone_from(&lower.canonical_model);
+    }
+    if offering.limits.context_tokens.is_none() {
+        offering.limits.context_tokens = lower.limits.context_tokens;
+    }
+    if offering.limits.input_tokens.is_none() {
+        offering.limits.input_tokens = lower.limits.input_tokens;
+    }
+    if offering.limits.output_tokens.is_none() {
+        offering.limits.output_tokens = lower.limits.output_tokens;
+    }
+    for (target, source) in [
+        (
+            &mut offering.capabilities.attachments,
+            lower.capabilities.attachments,
+        ),
+        (
+            &mut offering.capabilities.image_input,
+            lower.capabilities.image_input,
+        ),
+        (
+            &mut offering.capabilities.reasoning,
+            lower.capabilities.reasoning,
+        ),
+        (
+            &mut offering.capabilities.native_tool_calls,
+            lower.capabilities.native_tool_calls,
+        ),
+        (
+            &mut offering.capabilities.structured_output,
+            lower.capabilities.structured_output,
+        ),
+    ] {
+        if *target == codewhale_config::route::CapabilityState::Unknown {
+            *target = source;
+        }
+    }
+    offering
 }
 
 fn row_matches_endpoint_fingerprint(row: &CatalogOffering, fingerprint: &str) -> bool {
@@ -675,7 +850,7 @@ fn row_matches_endpoint_fingerprint(row: &CatalogOffering, fingerprint: &str) ->
 /// Baseten are remapped from their exact catalog identity to the resolver's
 /// `custom` transport scope only after this check.
 pub(crate) fn runtime_catalog_resolver_for_identity(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     base_url: &str,
     status: CatalogStatus,
@@ -707,39 +882,44 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
     }
 
     let partition_owner = live_partition_owner_for_route(provider, provider_identity);
-    let (endpoint_catalog_authoritative, selected_rows) = if let Ok(live) = LIVE_SNAPSHOT.read() {
-        let exact_partition = live.per_provider.get(&partition_owner);
-        let exact_matches = status_is_fresh
-            && exact_partition.is_some_and(|partition| {
-                !partition.offerings.is_empty()
-                    && partition.offerings.iter().all(|row| {
-                        catalog_partition_key(&row.provider) == catalog_key
-                            && row_matches_endpoint_fingerprint(row, &fingerprint)
-                    })
-            });
-        let rows = if exact_matches {
-            exact_partition
-                .map(|partition| partition.offerings.clone())
-                .unwrap_or_default()
-        } else if provider != ApiProvider::Custom {
-            live.models_dev
-                .as_ref()
-                .map(|snapshot| {
-                    snapshot
-                        .offerings
-                        .iter()
-                        .filter(|row| catalog_partition_key(&row.provider) == catalog_key)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default()
+    let route_cloud = cloud_facts_apply_to_route(
+        provider,
+        provider_identity.unwrap_or(provider.as_str()),
+        base_url,
+    )
+    .then_some(&cloud);
+    let (endpoint_catalog_authoritative, selected_rows, lower_rows) =
+        if let Ok(live) = LIVE_SNAPSHOT.read() {
+            let exact_partition = live.per_provider.get(&partition_owner);
+            let exact_matches = status_is_fresh
+                && exact_partition.is_some_and(|partition| {
+                    !partition.offerings.is_empty()
+                        && partition.offerings.iter().all(|row| {
+                            catalog_partition_key(&row.provider) == catalog_key
+                                && row_matches_endpoint_fingerprint(row, &fingerprint)
+                        })
+                });
+            let rows = if exact_matches {
+                exact_partition
+                    .map(|partition| partition.offerings.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let lower = if !matches!(provider, ProviderKind::Custom | ProviderKind::OpenaiCodex) {
+                source_rows_for_provider(catalog_id.as_ref(), live.models_dev.as_ref(), route_cloud)
+            } else {
+                BTreeMap::new()
+            };
+            (exact_matches, rows, lower)
         } else {
-            Vec::new()
+            let lower = if !matches!(provider, ProviderKind::Custom | ProviderKind::OpenaiCodex) {
+                source_rows_for_provider(catalog_id.as_ref(), None, route_cloud)
+            } else {
+                BTreeMap::new()
+            };
+            (false, Vec::new(), lower)
         };
-        (exact_matches, rows)
-    } else {
-        (false, Vec::new())
-    };
 
     // Nonselected providers retain the bundled/curated resolver baseline.
     // Another endpoint's live roster must not alter this route's ownership
@@ -747,21 +927,18 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
     let mut source_rows: BTreeMap<(String, String), CatalogOffering> = bundled_snapshot()
         .offerings
         .iter()
-        .cloned()
+        .map(|row| CatalogOffering::clone(row))
         .map(|row| ((row.provider.clone(), row.wire_model_id.clone()), row))
         .collect();
-    let cloud_applies =
-        !endpoint_catalog_authoritative && cloud_facts_apply_to_route(provider, base_url);
+    let cloud_applies = !endpoint_catalog_authoritative
+        && cloud_facts_apply_to_route(
+            provider,
+            provider_identity.unwrap_or(provider.as_str()),
+            base_url,
+        );
     if !endpoint_catalog_authoritative {
-        for row in &selected_rows {
-            source_rows.insert(
-                (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
-            );
-        }
-        if cloud_applies {
-            apply_cloud_facts_for_provider(&mut source_rows, catalog_id.as_ref(), &cloud);
-        }
+        source_rows.retain(|(row_provider, _), _| row_provider != catalog_id.as_ref());
+        source_rows.extend(lower_rows.clone());
     }
     let mut route_offerings: BTreeMap<(String, String), ProviderModelOffering> = source_rows
         .values()
@@ -771,7 +948,12 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
     // Curated transport facts win ordinary Models.dev collisions, exactly as
     // in RouteResolver::new(). A fresh exact roster replaces its whole scope.
     for offering in bundled_offerings() {
-        route_offerings.insert(offering_key(&offering), offering);
+        let key = offering_key(&offering);
+        let enriched = match route_offerings.get(&key) {
+            Some(lower) => offering_with_absent_facts_filled(offering, lower),
+            None => offering,
+        };
+        route_offerings.insert(key, enriched);
     }
     // Keep curated transport identity, applying only fields explicitly signed
     // at the lower cloud layer. Hidden rows must not be resurrected here.
@@ -812,25 +994,18 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
         }
     }
     if endpoint_catalog_authoritative {
-        let transport_provider = if provider == ApiProvider::Custom {
-            ApiProvider::Custom.as_str()
+        let transport_provider = if provider == ProviderKind::Custom {
+            ProviderKind::Custom.as_str()
         } else {
             catalog_id.as_ref()
         };
         route_offerings.retain(|_, offering| offering.provider.as_str() != transport_provider);
-        let route_facts = cloud_facts_apply_to_route(provider, base_url)
-            .then_some(cloud.facts.as_ref())
-            .flatten();
         for mut row in selected_rows {
-            row.provider = transport_provider.to_string();
-            // Same completion the picker applies, from the same helper: the
-            // executor must not resolve with an unknown the signed layer has
-            // already stated, nor with anything the provider itself contradicts.
-            if let Some(facts) = route_facts {
-                codewhale_config::cloud_facts::catalog_patch::complete_provider_live_row(
-                    &mut row, facts,
-                );
+            if let Some(lower) = lower_rows.get(&(row.provider.clone(), row.wire_model_id.clone()))
+            {
+                row.complete_from(lower, Some(base_url));
             }
+            row.provider = transport_provider.to_string();
             let offering = row.to_offering();
             route_offerings.insert(offering_key(&offering), offering);
         }
@@ -839,7 +1014,13 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
         // beside the roster, carrying only the facts the payload stated —
         // otherwise the picker would offer a model the executor cannot resolve
         // with the same metadata.
-        for row in cloud_unlisted_offerings_for_route(provider, base_url).into_values() {
+        for row in cloud_unlisted_offerings_for_route(
+            provider,
+            provider_identity.unwrap_or(provider.as_str()),
+            base_url,
+        )
+        .into_values()
+        {
             let offering = row.to_offering();
             route_offerings
                 .entry(offering_key(&offering))
@@ -850,7 +1031,7 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
     // Ollama's tag list does not mark a provider default. In the absence of
     // an explicit tag, elect a stable row only from this fresh exact endpoint.
     // Other providers retain their reported or curated default semantics.
-    if provider == ApiProvider::Ollama
+    if provider == ProviderKind::Ollama
         && endpoint_catalog_authoritative
         && !route_offerings.values().any(|offering| {
             offering.provider.as_str() == catalog_id.as_ref() && offering.default_for_provider
@@ -864,6 +1045,12 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
 
     let resolver = RouteResolver::from_offerings(route_offerings.into_values().collect());
     if let Ok(mut cache) = RUNTIME_RESOLVER_CACHE.write() {
+        cache.retain(|_, entry| {
+            entry.generation == generation && entry.cloud_generation == cloud_generation
+        });
+        if cache.len() >= MAX_RUNTIME_RESOLVER_CACHE_ENTRIES && !cache.contains_key(&cache_key) {
+            cache.pop_first();
+        }
         cache.insert(
             cache_key,
             RuntimeResolverCacheEntry {
@@ -882,13 +1069,14 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
 }
 
 fn offerings_for_provider_identity<'a>(
-    snapshot: &'a CatalogSnapshot,
+    snapshot: &'a SharedSnapshot,
     provider_id: &str,
 ) -> Vec<&'a CatalogOffering> {
     let provider_key = catalog_partition_key(provider_id);
     snapshot
         .offerings
         .iter()
+        .map(Arc::as_ref)
         .filter(|row| catalog_partition_key(&row.provider) == provider_key)
         .collect()
 }
@@ -907,15 +1095,16 @@ fn exact_custom_offerings(provider_identity: &str) -> Vec<CatalogOffering> {
         .unwrap_or_default()
 }
 
+/// Wire model ids are opaque and case-sensitive (`org/Model-A` and
+/// `org/model-a` may be two models), so dedup compares them exactly; folding
+/// case here would hide a real row. Only lookup forgives a case slip, and only
+/// when it is unambiguous (see `find_wire_model`).
 fn push_unique_model(models: &mut Vec<String>, model: &str) {
     let model = model.trim();
     if model.is_empty() {
         return;
     }
-    if !models
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(model))
-    {
+    if !models.iter().any(|existing| existing == model) {
         models.push(model.to_string());
     }
 }
@@ -944,7 +1133,7 @@ fn catalog_models_from_offerings<'a>(
 /// machine that has not answered with its own tags.
 #[cfg(test)]
 #[must_use]
-pub fn live_per_provider_models(provider: ApiProvider) -> Vec<String> {
+pub fn live_per_provider_models(provider: ProviderKind) -> Vec<String> {
     let catalog_id = catalog_provider_id(provider).to_ascii_lowercase();
     let Ok(guard) = LIVE_SNAPSHOT.read() else {
         return Vec::new();
@@ -964,7 +1153,7 @@ pub fn live_per_provider_models(provider: ApiProvider) -> Vec<String> {
 /// [`crate::config::model_completion_names_for_provider`] so CodeWhale-only /
 /// local providers (and gateways not yet in the offline seed) keep defaults.
 #[must_use]
-pub fn all_catalog_models_for_provider(provider: ApiProvider) -> Vec<String> {
+pub fn all_catalog_models_for_provider(provider: ProviderKind) -> Vec<String> {
     all_catalog_models_for_provider_identity(provider, None)
 }
 
@@ -976,19 +1165,19 @@ pub fn all_catalog_models_for_provider(provider: ApiProvider) -> Vec<String> {
 /// route with no live, bundled, or configured rows offers nothing (#6289).
 #[must_use]
 pub fn all_catalog_models_for_provider_identity(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
 ) -> Vec<String> {
     // ChatGPT OAuth availability is account-scoped. A generic OpenAI or
     // Models.dev catalog is not evidence that a model can be routed through
-    // the Codex backend, so this provider owns a separate secret-free source.
-    if provider == ApiProvider::OpenaiCodex {
+    // a ChatGPT plan, so this provider owns a registration-scoped source.
+    if provider == ProviderKind::OpenaiCodex {
         return codex_model_cache::model_roster().model_ids();
     }
 
     let catalog_id = catalog_provider_id_for_identity(provider, provider_identity);
     let custom_offerings =
-        (provider == ApiProvider::Custom).then(|| exact_custom_offerings(catalog_id.as_ref()));
+        (provider == ProviderKind::Custom).then(|| exact_custom_offerings(catalog_id.as_ref()));
     let merged = merged_snapshot();
     let mut models = match custom_offerings.as_ref() {
         Some(rows) => catalog_models_from_offerings(rows.iter()),
@@ -1013,7 +1202,7 @@ pub fn all_catalog_models_for_provider_identity(
 /// Models.dev row.
 #[must_use]
 pub fn catalog_offering_for_model(
-    provider: ApiProvider,
+    provider: ProviderKind,
     wire_model_id: &str,
 ) -> Option<CatalogOffering> {
     catalog_offering_for_model_identity(provider, None, wire_model_id)
@@ -1022,11 +1211,11 @@ pub fn catalog_offering_for_model(
 /// Look up a merged-catalog offering for one exact provider route.
 #[must_use]
 pub fn catalog_offering_for_model_identity(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     wire_model_id: &str,
 ) -> Option<CatalogOffering> {
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ProviderKind::OpenaiCodex {
         return None;
     }
     let catalog_id = catalog_provider_id_for_identity(provider, provider_identity);
@@ -1034,20 +1223,20 @@ pub fn catalog_offering_for_model_identity(
     if needle.is_empty() {
         return None;
     }
-    if provider == ApiProvider::Custom {
-        return exact_custom_offerings(catalog_id.as_ref())
-            .into_iter()
-            .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle));
+    if provider == ProviderKind::Custom {
+        let rows = exact_custom_offerings(catalog_id.as_ref());
+        return find_wire_model(&rows, needle).cloned();
     }
-    offerings_for_provider_identity(&merged_snapshot(), catalog_id.as_ref())
-        .into_iter()
-        .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle))
-        .cloned()
+    find_wire_model(
+        offerings_for_provider_identity(&merged_snapshot(), catalog_id.as_ref()),
+        needle,
+    )
+    .cloned()
 }
 
 /// Metadata from the exact route, without borrowing another endpoint's live facts.
 pub(crate) fn catalog_offering_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
     model: &str,
@@ -1061,16 +1250,23 @@ pub(crate) fn catalog_offering_for_route(
             .into_iter()
             .find(|row| row.wire_model_id == model)
         {
-            // An id-only roster row states existence, not that its limits and
-            // capabilities are unknown. Complete it from the signed layer for
-            // this exact route; anything the provider did state stays.
-            let cloud = codewhale_config::cloud_facts::overlay::snapshot();
-            if cloud_facts_apply_to_route(provider, base_url)
-                && let Some(facts) = &cloud.facts
-            {
-                codewhale_config::cloud_facts::catalog_patch::complete_provider_live_row(
-                    &mut row, facts,
-                );
+            if !matches!(provider, ProviderKind::Custom | ProviderKind::OpenaiCodex) {
+                let cloud = codewhale_config::cloud_facts::overlay::snapshot();
+                let route_cloud =
+                    cloud_facts_apply_to_route(provider, identity, base_url).then_some(&cloud);
+                let catalog_id = catalog_provider_id_for_identity(provider, Some(identity));
+                let mut lower_rows = if let Ok(live) = LIVE_SNAPSHOT.read() {
+                    source_rows_for_provider(
+                        catalog_id.as_ref(),
+                        live.models_dev.as_ref(),
+                        route_cloud,
+                    )
+                } else {
+                    source_rows_for_provider(catalog_id.as_ref(), None, route_cloud)
+                };
+                if let Some(lower) = lower_rows.remove(&(row.provider.clone(), model.to_string())) {
+                    row.complete_from(&lower, Some(base_url));
+                }
             }
             return Some(row);
         }
@@ -1078,18 +1274,16 @@ pub(crate) fn catalog_offering_for_route(
         // attested unlisted row may still name it here: falling through to the
         // bundled/Models.dev merge would hand back facts for a model the roster
         // has retired.
-        return cloud_unlisted_offerings_for_route(provider, base_url)
+        return cloud_unlisted_offerings_for_route(provider, identity, base_url)
             .into_values()
             .find(|row| row.wire_model_id == model);
     }
-    if provider.kind().is_none_or(|kind| {
-        codewhale_config::provider_preserves_custom_base_url_model(kind, base_url)
-    }) {
+    if codewhale_config::provider_preserves_custom_base_url_model(provider, base_url) {
         return None;
     }
     let offering = catalog_offering_for_model_identity(provider, Some(identity), model)?;
     if matches!(offering.source, CatalogSource::CloudFacts { .. })
-        && !cloud_facts_apply_to_route(provider, base_url)
+        && !cloud_facts_apply_to_route(provider, identity, base_url)
     {
         return bundled_catalog_offering_for_model(provider, model);
     }
@@ -1103,13 +1297,13 @@ pub(crate) fn catalog_offering_for_route(
 
 pub(crate) fn configured_model_for_route<'a>(
     config: &'a Config,
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
     model: &str,
 ) -> Option<&'a codewhale_config::catalog::configured::ConfiguredModel> {
     // Account-owned OAuth rosters retain their separate authority.
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ProviderKind::OpenaiCodex {
         return None;
     }
     let models = config.custom_models.as_deref()?;
@@ -1122,7 +1316,7 @@ pub(crate) fn configured_model_for_route<'a>(
 /// Config declarations take precedence only for the exact selected route.
 pub(crate) fn configured_catalog_offering_for_route(
     config: &Config,
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
     model: &str,
@@ -1134,12 +1328,15 @@ pub(crate) fn configured_catalog_offering_for_route(
 
 pub(crate) fn configured_catalog_models_for_route(
     config: &Config,
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
 ) -> Vec<String> {
+    if provider == ProviderKind::OpenaiCodex {
+        return codex_model_cache::model_roster_for(config).model_ids();
+    }
     let mut ids = catalog_models_for_route(provider, identity, base_url);
-    if provider != ApiProvider::OpenaiCodex {
+    if provider != ProviderKind::OpenaiCodex {
         let models = config.custom_models.as_deref().unwrap_or_default();
         if codewhale_config::catalog::configured::validate_configured_models(models).is_ok() {
             for model in models
@@ -1166,10 +1363,10 @@ pub(crate) fn configured_catalog_models_for_route(
 /// against an unverified live rate (#4318).
 #[must_use]
 pub fn bundled_catalog_offering_for_model(
-    provider: ApiProvider,
+    provider: ProviderKind,
     wire_model_id: &str,
 ) -> Option<CatalogOffering> {
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ProviderKind::OpenaiCodex {
         return None;
     }
     let catalog_id = catalog_provider_id(provider);
@@ -1177,42 +1374,45 @@ pub fn bundled_catalog_offering_for_model(
     if needle.is_empty() {
         return None;
     }
-    bundled_snapshot()
-        .offerings_for_provider(catalog_id)
-        .into_iter()
-        .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle))
-        .cloned()
+    find_wire_model(
+        bundled_snapshot().offerings_for_provider(catalog_id),
+        needle,
+    )
+    .cloned()
 }
 
 /// Count of merged-catalog models for one provider (catalog view / dashboard).
 #[must_use]
-pub fn catalog_model_count_for_provider(provider: ApiProvider) -> usize {
+pub fn catalog_model_count_for_provider(provider: ProviderKind) -> usize {
     all_catalog_models_for_provider(provider).len()
 }
 
 /// Providers the user has set up — active provider, working credentials/OAuth,
 /// or an explicit `[providers.<name>]` entry (#3830).
 #[must_use]
-pub fn configured_providers(config: &Config, active: ApiProvider) -> Vec<ApiProvider> {
-    ApiProvider::sorted_for_display()
+pub fn configured_providers(config: &Config) -> Vec<ProviderIdentity> {
+    let Ok(active) = config.active_provider_identity() else {
+        return Vec::new();
+    };
+    config
+        .provider_identities()
         .into_iter()
-        .filter(|provider| provider_is_configured_for_active(config, *provider, active))
+        .filter(|identity| provider_is_configured_for_active(config, identity, &active))
         .collect()
 }
 
 /// Catalog models for providers that qualify as configured for `active`.
 #[must_use]
-pub fn models_for_provider(
-    config: &Config,
-    active: ApiProvider,
-    provider: ApiProvider,
-) -> Vec<String> {
-    if provider_is_configured_for_active(config, provider, active) {
+pub fn models_for_provider(config: &Config, identity: &ProviderIdentity) -> Vec<String> {
+    let Ok(active) = config.active_provider_identity() else {
+        return Vec::new();
+    };
+    if provider_is_configured_for_active(config, identity, &active) {
         configured_catalog_models_for_route(
             config,
-            provider,
-            &config.provider_identity_for(provider),
-            &config.base_url_for_route(provider),
+            identity.provider,
+            identity.key.as_str(),
+            &config.base_url_for_route(identity),
         )
     } else {
         Vec::new()
@@ -1235,11 +1435,11 @@ pub(crate) fn valid_catalog_model_id(value: &str) -> bool {
 /// retained by the caller.
 #[must_use]
 pub(crate) fn catalog_models_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     identity: &str,
     base_url: &str,
 ) -> Vec<String> {
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ProviderKind::OpenaiCodex {
         return codex_model_cache::model_roster().model_ids();
     }
     if let Ok(Some(entry)) =
@@ -1254,46 +1454,28 @@ pub(crate) fn catalog_models_for_route(
         // own authority, and an explicitly attested unlisted id is offered
         // after it. This is the same list the picker, metadata lookups and the
         // route resolver read, so a user pin stays exactly what it was.
-        for row in cloud_unlisted_offerings_for_route(provider, base_url).values() {
+        for row in cloud_unlisted_offerings_for_route(provider, identity, base_url).values() {
             push_unique_model(&mut models, &row.wire_model_id);
         }
         return models;
     }
-    if provider == ApiProvider::Custom {
+    if provider == ProviderKind::Custom {
         // No compiled seeds: without a cached listing the caller retains the
         // configured model and the live refresh fills the roster (#6289).
         return Vec::new();
     }
-    if provider.kind().is_none_or(|kind| {
-        codewhale_config::provider_preserves_custom_base_url_model(kind, base_url)
-    }) {
+    if codewhale_config::provider_preserves_custom_base_url_model(provider, base_url) {
         return Vec::new();
     }
     // Do not borrow a live partition published for another endpoint.
     let catalog_id = catalog_provider_id(provider);
     let live = LIVE_SNAPSHOT.read().ok();
-    let mut rows: BTreeMap<(String, String), CatalogOffering> = bundled_snapshot()
-        .offerings_for_provider(catalog_id)
-        .into_iter()
-        .map(|row| {
-            (
-                (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
-            )
-        })
-        .collect();
-    if let Some(models_dev) = live.as_ref().and_then(|live| live.models_dev.as_ref()) {
-        for row in models_dev.offerings_for_provider(catalog_id) {
-            rows.insert(
-                (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
-            );
-        }
-    }
     let cloud = codewhale_config::cloud_facts::overlay::snapshot();
-    if cloud_facts_apply_to_route(provider, base_url) {
-        apply_cloud_facts_for_provider(&mut rows, catalog_id, &cloud);
-    }
+    let rows = source_rows_for_provider(
+        catalog_id,
+        live.as_ref().and_then(|live| live.models_dev.as_ref()),
+        cloud_facts_apply_to_route(provider, identity, base_url).then_some(&cloud),
+    );
     let mut models = catalog_models_from_offerings(rows.values());
     if models.is_empty() && cloud.facts.is_none() {
         models.extend(
@@ -1319,21 +1501,21 @@ pub(crate) struct CatalogUpdateReceipt {
 }
 
 fn cached_receipt(config: &Config, identity: &ProviderIdentity) -> CatalogUpdateReceipt {
-    let base_url = config.base_url_for_route_identity(identity.provider, &identity.key);
+    let base_url = config.base_url_for_route(identity);
     let fingerprint = base_url_fingerprint(&base_url);
     let entry = crate::provider_catalog_live::cached_entry_for_route(
         identity.provider,
-        &identity.key,
+        identity.key.as_str(),
         &base_url,
     );
     let cached = entry.as_ref().ok().and_then(Option::as_ref);
     CatalogUpdateReceipt {
-        provider: identity.key.clone(),
+        provider: identity.key.to_string(),
         source: "provider_models",
         outcome: "cached",
         status: crate::provider_catalog_live::status_for_route(
             identity.provider,
-            &identity.key,
+            identity.key.as_str(),
             &base_url,
         ),
         fetched_at: cached
@@ -1354,45 +1536,27 @@ fn catalog_identities(
     if let Some(selected) = selected {
         return Ok(vec![
             config
-                .resolve_provider_identity(selected)
+                .resolve_provider_pin_identity(selected)
                 .map_err(anyhow::Error::msg)?,
         ]);
     }
     let active = config
-        .active_provider_identity(config.api_provider())
+        .active_provider_identity()
         .map_err(anyhow::Error::msg)?;
     if !update {
         return Ok(vec![active]);
     }
-    let mut identities = vec![active];
-    for provider in configured_providers(config, config.api_provider()) {
-        if provider != ApiProvider::Custom {
-            identities.push(
-                config
-                    .active_provider_identity(provider)
-                    .map_err(anyhow::Error::msg)?,
-            );
-        }
+    let mut identities = configured_providers(config);
+    if !identities.contains(&active) {
+        identities.push(active);
     }
-    if let Some(providers) = &config.providers {
-        for (name, entry) in &providers.custom {
-            if !entry.is_openai_compatible_custom() {
-                continue;
-            }
-            identities.push(
-                config
-                    .resolve_provider_identity(name)
-                    .map_err(anyhow::Error::msg)?,
-            );
-        }
-    }
-    identities.sort_by(|a, b| a.key.cmp(&b.key));
-    identities.dedup_by(|a, b| a.key == b.key);
+    identities.sort_by(|a, b| a.key.as_str().cmp(b.key.as_str()));
+    identities.dedup_by(|a, b| a == b);
     Ok(identities)
 }
 
-fn codex_receipt(identity: &ProviderIdentity) -> CatalogUpdateReceipt {
-    let roster = codex_model_cache::model_roster();
+fn codex_receipt(config: &Config, identity: &ProviderIdentity) -> CatalogUpdateReceipt {
+    let roster = codex_model_cache::model_roster_for(config);
     codex_roster_receipt(identity, &roster)
 }
 
@@ -1402,7 +1566,7 @@ fn codex_roster_receipt(
 ) -> CatalogUpdateReceipt {
     let fresh = roster.freshness == codex_model_cache::CodexModelCacheFreshness::Fresh;
     CatalogUpdateReceipt {
-        provider: identity.key.clone(),
+        provider: identity.key.to_string(),
         source: roster.source,
         outcome: "cached",
         status: if fresh {
@@ -1419,52 +1583,54 @@ fn codex_roster_receipt(
         base_url_fingerprint: None,
         model_count: roster.models.len(),
         error: if !fresh {
-            Some("codex_cache_unavailable")
-        } else if roster.source == "codex_app_server" && !roster.observation_persisted {
-            Some("codex_observation_not_persisted")
+            Some("chatgpt_catalog_unavailable")
+        } else if !roster.observation_persisted {
+            Some("chatgpt_catalog_not_persisted")
         } else {
             None
         },
     }
 }
 
-fn codex_route_matches_cli_account(config: &Config) -> bool {
-    if config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex)
-        || [
-            "OPENAI_CODEX_ACCESS_TOKEN",
-            "CODEX_ACCESS_TOKEN",
-            "OPENAI_CODEX_ACCOUNT_ID",
-            "CODEX_ACCOUNT_ID",
-        ]
-        .iter()
-        .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
-    {
-        return false;
-    }
-    let cli_auth_path = codex_model_cache::codex_home_path().join("auth.json");
-    let cli_auth_path = std::fs::canonicalize(&cli_auth_path).unwrap_or(cli_auth_path);
-    crate::oauth::auth_file_path() == cli_auth_path
+/// Whether a provider-scoped live listing can never exist for this route.
+/// OAuth-authenticated routes (other than Codex, which owns its own roster)
+/// have no catalog endpoint Codewhale may call, so listings fall back to the
+/// next catalog layer — live Models.dev, then the bundled snapshot — instead
+/// of treating the missing live listing as "no models".
+pub(crate) fn live_catalog_unavailable(config: &Config, identity: &ProviderIdentity) -> bool {
+    config.verify_provider_identity(identity).is_ok()
+        && identity.provider != ProviderKind::OpenaiCodex
+        && config
+            .auth_mode_for_provider(identity)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("oauth"))
 }
 
 pub(crate) async fn update_provider_catalog(
     config: &Config,
     identity: &ProviderIdentity,
 ) -> CatalogUpdateReceipt {
-    if identity.provider == ApiProvider::OpenaiCodex {
-        if !codex_route_matches_cli_account(config) {
-            let mut receipt = codex_receipt(identity);
+    if config.verify_provider_identity(identity).is_err() {
+        let mut receipt = cached_receipt(config, identity);
+        receipt.outcome = "skipped";
+        receipt.error = Some("provider_identity_changed");
+        return receipt;
+    }
+    if identity.provider == ProviderKind::OpenaiCodex {
+        let mut route_config = config.clone();
+        if route_config.scope_to_provider_identity(identity).is_err() {
+            let mut receipt = cached_receipt(config, identity);
             receipt.outcome = "skipped";
-            receipt.error = Some("codex_account_route_mismatch");
+            receipt.error = Some("provider_identity_changed");
             return receipt;
         }
-        return match codex_model_cache::update_from_codex_cli().await {
+        return match codex_model_cache::update_from_chatgpt(&route_config).await {
             Ok(roster) => {
                 let mut receipt = codex_roster_receipt(identity, &roster);
-                receipt.outcome = "loaded";
+                receipt.outcome = "updated";
                 receipt
             }
             Err(error) => {
-                let mut receipt = codex_receipt(identity);
+                let mut receipt = codex_receipt(&route_config, identity);
                 receipt.outcome = "failed";
                 receipt.error = Some(error);
                 receipt
@@ -1472,30 +1638,28 @@ pub(crate) async fn update_provider_catalog(
         };
     }
     let mut route_config = config.clone();
-    route_config.scope_to_provider_identity(identity);
+    if route_config.scope_to_provider_identity(identity).is_err() {
+        let mut receipt = cached_receipt(config, identity);
+        receipt.outcome = "skipped";
+        receipt.error = Some("provider_identity_changed");
+        return receipt;
+    }
     let base_url = route_config.active_route_base_url();
     let fingerprint = base_url_fingerprint(&base_url);
     let mut receipt = cached_receipt(&route_config, identity);
-    if identity.provider == ApiProvider::Antigravity {
+    if identity.provider == ProviderKind::Antigravity {
         receipt.outcome = "skipped";
         receipt.error = Some("provider_retired");
         return receipt;
     }
     if crate::config::explicit_cli_api_key_override().is_some()
-        && config
-            .active_provider_identity(config.api_provider())
-            .ok()
-            .as_ref()
-            != Some(identity)
+        && config.active_provider_identity().ok().as_ref() != Some(identity)
     {
         receipt.outcome = "skipped";
         receipt.error = Some("cli_key_is_scoped_to_active_provider");
         return receipt;
     }
-    if route_config
-        .auth_mode_for_provider(identity.provider)
-        .is_some_and(|mode| mode.eq_ignore_ascii_case("oauth"))
-    {
+    if live_catalog_unavailable(&route_config, identity) {
         receipt.outcome = "skipped";
         receipt.error = Some("oauth_catalog_unavailable");
         return receipt;
@@ -1524,7 +1688,7 @@ pub(crate) async fn update_provider_catalog(
     }
     let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
         identity.provider,
-        &identity.key,
+        identity.key.as_str(),
         &base_url,
     );
     let result = tokio::time::timeout(
@@ -1562,7 +1726,7 @@ pub(crate) async fn update_provider_catalog(
                 receipt.error = Some("catalog_endpoint_mismatch");
                 return receipt;
             }
-            delta.provider = identity.key.clone();
+            delta.provider = identity.key.to_string();
             match crate::provider_catalog_live::record_success_if_current(&ticket, delta) {
                 None => {
                     receipt.outcome = "skipped";
@@ -1580,7 +1744,7 @@ pub(crate) async fn update_provider_catalog(
         Err(reason) => {
             crate::provider_catalog_live::record_failure_if_current(
                 &ticket,
-                &identity.key,
+                identity.key.as_str(),
                 &fingerprint,
                 reason,
             );
@@ -1698,12 +1862,6 @@ pub(crate) async fn run_models(
                         .map_or_else(String::new, |error| format!("\terror={error}"))
                 );
             }
-            if receipts
-                .iter()
-                .any(|receipt| matches!(receipt.source, "codex_cli_cache" | "codex_app_server"))
-            {
-                println!("{}", tr(locale, MessageId::ModelsCodexHint));
-            }
         }
         if failed > 0 {
             anyhow::bail!("{}", tr(locale, MessageId::ModelsUpdatePartial));
@@ -1712,25 +1870,38 @@ pub(crate) async fn run_models(
     }
     let identity = &identities[0];
     let mut route_config = config.clone();
-    route_config.scope_to_provider_identity(identity);
+    route_config
+        .scope_to_provider_identity(identity)
+        .map_err(anyhow::Error::msg)?;
     let mut models = configured_catalog_models_for_route(
-        config,
+        &route_config,
         identity.provider,
-        &identity.key,
+        identity.key.as_str(),
         &route_config.active_route_base_url(),
     );
     let default_model = route_config.default_model();
-    if !default_model.is_empty() && !default_model.eq_ignore_ascii_case("auto") {
+    if identity.provider != ProviderKind::OpenaiCodex
+        && !default_model.is_empty()
+        && !default_model.eq_ignore_ascii_case("auto")
+    {
         push_unique_model(&mut models, &default_model);
     }
-    models.sort();
-    models.dedup();
+    if identity.provider != ProviderKind::OpenaiCodex {
+        models.sort();
+        models.dedup();
+    }
     if json {
         // Preserve the existing array + AvailableModel field shape.
+        let chatgpt_roster = (identity.provider == ProviderKind::OpenaiCodex)
+            .then(|| codex_model_cache::model_roster_for(&route_config));
         let rows: Vec<_> = models
             .iter()
             .map(|id| crate::client::AvailableModel {
                 id: id.clone(),
+                display_name: chatgpt_roster
+                    .as_ref()
+                    .and_then(|roster| roster.metadata_for(id))
+                    .and_then(|model| model.display_name.clone()),
                 owned_by: None,
                 created: None,
             })
@@ -1740,11 +1911,11 @@ pub(crate) async fn run_models(
         println!(
             "{}",
             tr(locale, MessageId::ModelsListHeader)
-                .replace("{provider}", &identity.key)
+                .replace("{provider}", identity.key.as_str())
                 .replace("{model}", &default_model)
         );
-        let receipt = if identity.provider == ApiProvider::OpenaiCodex {
-            codex_receipt(identity)
+        let receipt = if identity.provider == ProviderKind::OpenaiCodex {
+            codex_receipt(&route_config, identity)
         } else {
             cached_receipt(&route_config, identity)
         };
@@ -1775,6 +1946,30 @@ mod tests {
     use super::*;
     use crate::config::{DEFAULT_TOGETHER_FLASH_MODEL, DEFAULT_TOGETHER_MODEL};
     use codewhale_config::catalog::CatalogSource;
+
+    #[test]
+    fn wire_model_lookup_is_exact_first_and_never_guesses_between_case_variants() {
+        let row = |id: &str| CatalogOffering {
+            provider: "p".to_string(),
+            wire_model_id: id.to_string(),
+            ..Default::default()
+        };
+        let rows = vec![row("org/Model-A"), row("org/model-a"), row("org/Model-B")];
+        let found =
+            |needle: &str| find_wire_model(&rows, needle).map(|row| row.wire_model_id.clone());
+        assert_eq!(found("org/model-a").as_deref(), Some("org/model-a"));
+        assert_eq!(found("org/Model-A").as_deref(), Some("org/Model-A"));
+        assert_eq!(found("ORG/MODEL-A"), None, "two distinct ids fold together");
+        assert_eq!(found("org/model-b").as_deref(), Some("org/Model-B"));
+
+        // Listing keeps both case variants: each is a distinct, pickable id.
+        let listed = catalog_models_from_offerings(rows.iter());
+        assert!(
+            listed.contains(&"org/Model-A".to_string())
+                && listed.contains(&"org/model-a".to_string()),
+            "case variants of a wire id are distinct models: {listed:?}"
+        );
+    }
 
     fn catalog_test_config(first_url: &str, second_url: &str) -> Config {
         use crate::config::{ProviderConfig, ProvidersConfig};
@@ -1869,8 +2064,8 @@ mod tests {
         assert_eq!(receipt.error, Some("refresh_credentials_changed"));
         assert!(
             crate::provider_catalog_live::cached_entry_for_route(
-                ApiProvider::Custom,
-                &identity.key,
+                ProviderKind::Custom,
+                identity.key.as_str(),
                 &upstream.uri()
             )
             .unwrap()
@@ -1917,15 +2112,15 @@ mod tests {
         // Simulate restart: remove only this memo, not any persistent state.
         crate::provider_catalog_live::reset_cache_for_test();
         assert_eq!(
-            catalog_models_for_route(ApiProvider::Custom, "catalog-first", &first.uri()),
+            catalog_models_for_route(ProviderKind::Custom, "catalog-first", &first.uri()),
             ["new-first-model"]
         );
         assert_eq!(
-            catalog_models_for_route(ApiProvider::Custom, "catalog-second", &second.uri()),
+            catalog_models_for_route(ProviderKind::Custom, "catalog-second", &second.uri()),
             ["new-second-model"]
         );
         assert!(
-            catalog_models_for_route(ApiProvider::Custom, "catalog-first", &second.uri())
+            catalog_models_for_route(ProviderKind::Custom, "catalog-first", &second.uri())
                 .is_empty()
         );
         let prior = cached_receipt(&config, &first_id).fetched_at;
@@ -1947,7 +2142,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            catalog_models_for_route(ApiProvider::Custom, "catalog-first", &first.uri()),
+            catalog_models_for_route(ProviderKind::Custom, "catalog-first", &first.uri()),
             ["new-first-model"]
         );
         let body =
@@ -1989,13 +2184,21 @@ mod tests {
             if model.starts_with("old-") || model.starts_with("new-") {
                 assert_eq!(receipt.outcome, "updated");
                 assert_eq!(
-                    catalog_models_for_route(ApiProvider::Custom, &identity.key, &server.uri()),
+                    catalog_models_for_route(
+                        ProviderKind::Custom,
+                        identity.key.as_str(),
+                        &server.uri()
+                    ),
                     [model]
                 );
             } else {
                 assert_eq!(receipt.outcome, "failed");
                 assert_eq!(
-                    catalog_models_for_route(ApiProvider::Custom, &identity.key, &server.uri()),
+                    catalog_models_for_route(
+                        ProviderKind::Custom,
+                        identity.key.as_str(),
+                        &server.uri()
+                    ),
                     ["new-model"]
                 );
             }
@@ -2013,41 +2216,24 @@ mod tests {
         // refresh. Preserve the last usable rows and disclose that failure.
         assert_eq!(receipt.outcome, "failed");
         assert_eq!(
-            catalog_models_for_route(ApiProvider::Custom, &identity.key, &server.uri()),
+            catalog_models_for_route(ProviderKind::Custom, identity.key.as_str(), &server.uri()),
             ["new-model"]
         );
     }
 
-    #[test]
-    fn codex_update_does_not_attribute_another_accounts_roster_to_overridden_credentials() {
+    #[tokio::test]
+    async fn chatgpt_catalog_refresh_rejects_unregistered_legacy_credentials() {
         let _env = crate::test_support::lock_test_env();
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::test_support::EnvVarGuard::set("CODEX_HOME", home.path());
-        let _overrides: Vec<_> = [
-            "OPENAI_CODEX_AUTH_FILE",
-            "OPENAI_CODEX_ACCESS_TOKEN",
-            "CODEX_ACCESS_TOKEN",
-            "OPENAI_CODEX_ACCOUNT_ID",
-            "CODEX_ACCOUNT_ID",
-        ]
-        .iter()
-        .map(|name| crate::test_support::EnvVarGuard::remove(name))
-        .collect();
+        let _token = crate::test_support::EnvVarGuard::set("CODEX_ACCESS_TOKEN", "legacy-token");
         let config = Config {
             provider: Some("openai-codex".to_string()),
             ..Default::default()
         };
-        assert!(codex_route_matches_cli_account(&config));
-        {
-            let _token =
-                crate::test_support::EnvVarGuard::set("CODEX_ACCESS_TOKEN", "standalone-token");
-            assert!(!codex_route_matches_cli_account(&config));
-        }
-        let _other = crate::test_support::EnvVarGuard::set(
-            "OPENAI_CODEX_AUTH_FILE",
-            home.path().join("other-auth.json"),
-        );
-        assert!(!codex_route_matches_cli_account(&config));
+        let identity = config.resolve_provider_identity("openai-codex").unwrap();
+        let receipt = update_provider_catalog(&config, &identity).await;
+        assert_eq!(receipt.outcome, "failed");
+        assert_eq!(receipt.error, Some("chatgpt_plan_permission_required"));
+        assert_eq!(receipt.model_count, 0);
     }
 
     #[test]
@@ -2060,12 +2246,12 @@ mod tests {
             freshness: codex_model_cache::CodexModelCacheFreshness::Fresh,
             fetched_at: None,
             observed_at: Some(chrono::Utc::now()),
-            source: "codex_app_server",
+            source: "chatgpt_plan_api",
             observation_persisted: false,
         };
         let receipt = codex_roster_receipt(&identity, &roster);
         assert_eq!(receipt.status, CatalogStatus::Fresh);
-        assert_eq!(receipt.error, Some("codex_observation_not_persisted"));
+        assert_eq!(receipt.error, Some("chatgpt_catalog_not_persisted"));
         assert_eq!(receipt.fetched_at, None);
         assert!(receipt.observed_at.is_some());
     }
@@ -2124,7 +2310,7 @@ mod tests {
             assert_eq!(
                 identities
                     .iter()
-                    .filter(|identity| identity.key == name)
+                    .filter(|identity| identity.key.as_str() == name)
                     .count(),
                 1
             );
@@ -2141,7 +2327,7 @@ mod tests {
     fn together_catalog_includes_flash_from_bundled_asset() {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
-        let models = all_catalog_models_for_provider(ApiProvider::Together);
+        let models = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(
             models.contains(&DEFAULT_TOGETHER_MODEL.to_string()),
             "missing Together pro: {models:?}"
@@ -2163,14 +2349,15 @@ mod tests {
         let _openai_token = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
         let _codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
         let config = Config::default();
-        let active = ApiProvider::Deepseek;
-        let expected: Vec<_> = ApiProvider::sorted_for_display()
+        let active = config.active_provider_identity().unwrap();
+        let expected: Vec<_> = config
+            .provider_identities()
             .into_iter()
-            .filter(|provider| {
-                crate::config::provider_is_configured_for_active(&config, *provider, active)
+            .filter(|identity| {
+                crate::config::provider_is_configured_for_active(&config, identity, &active)
             })
             .collect();
-        assert_eq!(configured_providers(&config, active), expected);
+        assert_eq!(configured_providers(&config), expected);
     }
 
     #[test]
@@ -2179,10 +2366,18 @@ mod tests {
         let _together = crate::test_support::EnvVarGuard::remove("TOGETHER_API_KEY");
         let config = Config::default();
         assert!(
-            models_for_provider(&config, ApiProvider::Deepseek, ApiProvider::Together).is_empty()
+            models_for_provider(
+                &config,
+                &config.test_identity_for_kind(ProviderKind::Together)
+            )
+            .is_empty()
         );
         assert!(
-            !models_for_provider(&config, ApiProvider::Deepseek, ApiProvider::Deepseek).is_empty()
+            !models_for_provider(
+                &config,
+                &config.test_identity_for_kind(ProviderKind::Deepseek)
+            )
+            .is_empty()
         );
     }
 
@@ -2212,9 +2407,9 @@ mod tests {
         let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
         let _live = lock_live_snapshot();
         clear_live_snapshot();
-        for &provider in ApiProvider::all() {
+        for &provider in ProviderKind::all() {
             let legacy_len = model_completion_names_for_provider(provider).len();
-            if legacy_len == 0 {
+            if legacy_len == 0 || provider == ProviderKind::OpenaiCodex {
                 continue;
             }
             assert!(
@@ -2235,25 +2430,14 @@ mod tests {
         let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
         let _live = lock_live_snapshot();
         clear_live_snapshot();
-        let openai_codex = all_catalog_models_for_provider(ApiProvider::OpenaiCodex);
-        assert!(
-            !openai_codex.is_empty(),
-            "openai-codex must keep a default model offline: {openai_codex:?}"
-        );
-        assert_eq!(
-            openai_codex,
-            model_completion_names_for_provider(ApiProvider::OpenaiCodex)
-                .iter()
-                .map(|m| (*m).to_string())
-                .collect::<Vec<_>>(),
-            "openai-codex should come from the compatibility fallback table"
-        );
+        // A public model table cannot attest account plan permission.
+        assert!(all_catalog_models_for_provider(ProviderKind::OpenaiCodex).is_empty());
 
         // Ollama intentionally has an empty legacy table (user-supplied ids);
         // the lake must still return empty rather than inventing rows.
-        assert!(all_catalog_models_for_provider(ApiProvider::Ollama).is_empty());
-        assert!(model_completion_names_for_provider(ApiProvider::Ollama).is_empty());
-        assert!(live_per_provider_models(ApiProvider::Ollama).is_empty());
+        assert!(all_catalog_models_for_provider(ProviderKind::Ollama).is_empty());
+        assert!(model_completion_names_for_provider(ProviderKind::Ollama).is_empty());
+        assert!(live_per_provider_models(ProviderKind::Ollama).is_empty());
     }
 
     #[test]
@@ -2274,7 +2458,7 @@ mod tests {
             LiveSource::ModelsDev,
         );
         assert!(
-            live_per_provider_models(ApiProvider::Ollama).is_empty(),
+            live_per_provider_models(ProviderKind::Ollama).is_empty(),
             "Models.dev must not satisfy a local Ollama default"
         );
 
@@ -2286,7 +2470,7 @@ mod tests {
             ..Default::default()
         }]);
         assert_eq!(
-            live_per_provider_models(ApiProvider::Ollama),
+            live_per_provider_models(ProviderKind::Ollama),
             vec!["qwen2.5:0.5b".to_string()]
         );
         clear_live_snapshot();
@@ -2303,10 +2487,10 @@ mod tests {
         clear_live_snapshot();
         let merged = merged_snapshot();
         let mut exercised = 0usize;
-        for &provider in ApiProvider::all() {
+        for &provider in ProviderKind::all() {
             // OpenAI Codex deliberately owns an account-scoped cache source;
             // its fallback behavior is covered separately above.
-            if provider == ApiProvider::OpenaiCodex {
+            if provider == ProviderKind::OpenaiCodex {
                 continue;
             }
             let catalog_id = catalog_provider_id(provider);
@@ -2337,7 +2521,7 @@ mod tests {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
         // With no live snapshot, we get bundled models.
-        let bundled = all_catalog_models_for_provider(ApiProvider::Deepseek);
+        let bundled = all_catalog_models_for_provider(ProviderKind::Deepseek);
         assert!(!bundled.is_empty());
 
         // Set a live snapshot that adds a synthetic model.
@@ -2350,13 +2534,13 @@ mod tests {
             }],
         };
         set_live_snapshot(live, LiveSource::ModelsDev);
-        let merged = all_catalog_models_for_provider(ApiProvider::Deepseek);
+        let merged = all_catalog_models_for_provider(ProviderKind::Deepseek);
         assert!(merged.contains(&"deepseek-v4-synthetic".to_string()));
         // The bundled model is still present.
         assert!(merged.iter().any(|m| bundled.contains(m)));
 
         clear_live_snapshot();
-        let after_clear = all_catalog_models_for_provider(ApiProvider::Deepseek);
+        let after_clear = all_catalog_models_for_provider(ProviderKind::Deepseek);
         assert_eq!(after_clear, bundled);
     }
 
@@ -2364,7 +2548,7 @@ mod tests {
     fn provider_owned_roster_replaces_bundled_and_models_dev_rows() {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
-        let bundled = all_catalog_models_for_provider(ApiProvider::Openrouter);
+        let bundled = all_catalog_models_for_provider(ProviderKind::Openrouter);
         assert!(
             !bundled.is_empty(),
             "OpenRouter must have an offline fallback roster"
@@ -2394,13 +2578,13 @@ mod tests {
         );
 
         assert_eq!(
-            all_catalog_models_for_provider(ApiProvider::Openrouter),
+            all_catalog_models_for_provider(ProviderKind::Openrouter),
             vec!["provider-owned-openrouter-model".to_string()],
             "a successful provider-owned refresh must remove stale bundled and Models.dev ids"
         );
 
         replace_provider_live_snapshot("openrouter", CatalogSnapshot::default());
-        let restored_cross_provider = all_catalog_models_for_provider(ApiProvider::Openrouter);
+        let restored_cross_provider = all_catalog_models_for_provider(ProviderKind::Openrouter);
         assert!(
             restored_cross_provider.contains(&"models-dev-only-openrouter-model".to_string()),
             "clearing the exact partition must restore the cross-provider fallback"
@@ -2414,7 +2598,7 @@ mod tests {
 
         clear_live_snapshot();
         assert_eq!(
-            all_catalog_models_for_provider(ApiProvider::Openrouter),
+            all_catalog_models_for_provider(ProviderKind::Openrouter),
             bundled
         );
     }
@@ -2428,7 +2612,7 @@ mod tests {
         // custom route offers nothing rather than a compiled default (#6289).
         for identity in ["baseten", "another-custom-host"] {
             assert!(
-                all_catalog_models_for_provider_identity(ApiProvider::Custom, Some(identity))
+                all_catalog_models_for_provider_identity(ProviderKind::Custom, Some(identity))
                     .is_empty(),
                 "{identity} must not invent models offline"
             );
@@ -2451,25 +2635,25 @@ mod tests {
         );
 
         assert_eq!(
-            all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("baseten")),
+            all_catalog_models_for_provider_identity(ProviderKind::Custom, Some("baseten")),
             vec!["synthetic-live-baseten-model".to_string()]
         );
         let case_distinct =
-            all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("BASETEN"));
+            all_catalog_models_for_provider_identity(ProviderKind::Custom, Some("BASETEN"));
         assert!(
             case_distinct.is_empty(),
             "a case variant shares neither seeds nor another exact table's live roster"
         );
         assert!(
             catalog_offering_for_model_identity(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 Some("baseten"),
                 "synthetic-live-baseten-model",
             )
             .is_some()
         );
         assert!(
-            catalog_offering_for_model(ApiProvider::Custom, "synthetic-live-baseten-model",)
+            catalog_offering_for_model(ProviderKind::Custom, "synthetic-live-baseten-model",)
                 .is_none(),
             "the generic custom bucket must not see Baseten rows"
         );
@@ -2497,23 +2681,23 @@ mod tests {
         }
 
         assert_eq!(
-            all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("CustomA")),
+            all_catalog_models_for_provider_identity(ProviderKind::Custom, Some("CustomA")),
             vec!["upper-model".to_string()]
         );
         assert_eq!(
-            all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("customa")),
+            all_catalog_models_for_provider_identity(ProviderKind::Custom, Some("customa")),
             vec!["lower-model".to_string()]
         );
-        let built_in_openai = all_catalog_models_for_provider(ApiProvider::Openai);
+        let built_in_openai = all_catalog_models_for_provider(ProviderKind::Openai);
         assert!(!built_in_openai.is_empty());
         assert!(
-            all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("openai"))
+            all_catalog_models_for_provider_identity(ProviderKind::Custom, Some("openai"))
                 .is_empty(),
             "a custom table named openai must not borrow the first-class OpenAI template"
         );
         for model in &built_in_openai {
             assert!(
-                catalog_offering_for_model_identity(ApiProvider::Custom, Some("openai"), model)
+                catalog_offering_for_model_identity(ProviderKind::Custom, Some("openai"), model)
                     .is_none(),
                 "an exact custom table named openai must not inherit built-in model {model}"
             );
@@ -2521,7 +2705,7 @@ mod tests {
 
         let custom_model = "custom-openai-only-model";
         replace_provider_live_snapshot_for_identity(
-            ApiProvider::Custom,
+            ProviderKind::Custom,
             "openai",
             CatalogSnapshot {
                 offerings: vec![CatalogOffering {
@@ -2533,23 +2717,23 @@ mod tests {
             },
         );
         assert_eq!(
-            all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("openai")),
+            all_catalog_models_for_provider_identity(ProviderKind::Custom, Some("openai")),
             vec![custom_model.to_string()],
             "the exact custom table must retrieve its own built-in-looking roster"
         );
         assert_eq!(
-            all_catalog_models_for_provider(ApiProvider::Openai),
+            all_catalog_models_for_provider(ProviderKind::Openai),
             built_in_openai,
             "publishing custom openai must not replace or suppress built-in OpenAI"
         );
         assert!(
-            catalog_offering_for_model(ApiProvider::Openai, custom_model).is_none(),
+            catalog_offering_for_model(ProviderKind::Openai, custom_model).is_none(),
             "the built-in OpenAI route must not see the custom table's row"
         );
 
         let built_in_live_model = "built-in-openai-only-model";
         replace_provider_live_snapshot_for_identity(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "openai",
             CatalogSnapshot {
                 offerings: vec![CatalogOffering {
@@ -2561,11 +2745,11 @@ mod tests {
             },
         );
         assert_eq!(
-            all_catalog_models_for_provider(ApiProvider::Openai),
+            all_catalog_models_for_provider(ProviderKind::Openai),
             vec![built_in_live_model.to_string()]
         );
         assert_eq!(
-            all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("openai")),
+            all_catalog_models_for_provider_identity(ProviderKind::Custom, Some("openai")),
             vec![custom_model.to_string()],
             "publishing built-in OpenAI must not replace the custom table's roster"
         );
@@ -2578,7 +2762,7 @@ mod tests {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
         let wire = "accounts/fireworks/models/deepseek-v4-flash-0731";
-        assert_eq!(live_catalog_origin(ApiProvider::Fireworks, wire), None);
+        assert_eq!(live_catalog_origin(ProviderKind::Fireworks, wire), None);
 
         set_live_snapshot(
             CatalogSnapshot {
@@ -2592,7 +2776,7 @@ mod tests {
             LiveSource::ModelsDev,
         );
         assert_eq!(
-            live_catalog_origin(ApiProvider::Fireworks, wire),
+            live_catalog_origin(ProviderKind::Fireworks, wire),
             Some(LiveSource::ModelsDev)
         );
 
@@ -2608,9 +2792,66 @@ mod tests {
             LiveSource::PerProvider,
         );
         assert_eq!(
-            live_catalog_origin(ApiProvider::Fireworks, wire),
+            live_catalog_origin(ProviderKind::Fireworks, wire),
             Some(LiveSource::PerProvider)
         );
+        clear_live_snapshot();
+    }
+
+    /// Footprint: the merge holds `Arc`s into the bundled and Models.dev
+    /// layers, so only rows it rewrites exist twice in memory.
+    #[test]
+    fn merged_snapshot_shares_rows_with_its_layers_instead_of_copying_them() {
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+
+        let live_id = "deepseek-shared-row-probe";
+        set_live_snapshot(
+            CatalogSnapshot {
+                offerings: vec![CatalogOffering {
+                    provider: "deepseek".to_string(),
+                    wire_model_id: live_id.to_string(),
+                    endpoint_key: "chat".to_string(),
+                    ..Default::default()
+                }],
+            },
+            LiveSource::ModelsDev,
+        );
+        let merged = merged_snapshot();
+        let live_row = {
+            let live = LIVE_SNAPSHOT.read().expect("live snapshot");
+            let models_dev = live.models_dev.as_ref().expect("models.dev partition");
+            Arc::clone(&models_dev.offerings[0])
+        };
+        let merged_live_row = merged
+            .offerings
+            .iter()
+            .find(|row| row.wire_model_id == live_id)
+            .expect("live row merged");
+        assert!(
+            Arc::ptr_eq(merged_live_row, &live_row),
+            "the merge must share the Models.dev row, not hold a second copy"
+        );
+
+        let bundled = bundled_snapshot();
+        let shared_bundled = merged
+            .offerings
+            .iter()
+            .filter(|row| bundled.offerings.iter().any(|b| Arc::ptr_eq(b, row)))
+            .count();
+        let untouched_bundled = bundled
+            .offerings
+            .iter()
+            .filter(|row| {
+                ProviderKind::parse(&row.provider) != Some(ProviderKind::OpencodeGo)
+                    && !(row.provider == "deepseek" && row.wire_model_id == live_id)
+            })
+            .count();
+        assert_eq!(
+            shared_bundled, untouched_bundled,
+            "every bundled row the merge does not rewrite must be shared"
+        );
+
         clear_live_snapshot();
     }
 
@@ -2702,7 +2943,7 @@ mod tests {
         set_live_snapshot(CatalogSnapshot { offerings }, LiveSource::ModelsDev);
 
         let models: std::collections::BTreeSet<_> =
-            all_catalog_models_for_provider(ApiProvider::OpencodeGo)
+            all_catalog_models_for_provider(ProviderKind::OpencodeGo)
                 .into_iter()
                 .collect();
         let expected: std::collections::BTreeSet<_> = crate::config::opencode_go_models()
@@ -2711,13 +2952,13 @@ mod tests {
             .collect();
         assert_eq!(models, expected);
         for (model, endpoint) in [("minimax-m3", "messages"), ("grok-4.6", "responses")] {
-            let row = catalog_offering_for_model(ApiProvider::OpencodeGo, model)
+            let row = catalog_offering_for_model(ProviderKind::OpencodeGo, model)
                 .expect("documented model survives refresh");
             assert_eq!(row.endpoint_key, endpoint);
         }
         assert!(
             catalog_offering_for_model(
-                ApiProvider::OpencodeGo,
+                ProviderKind::OpencodeGo,
                 crate::config::DEFAULT_OPENCODE_GO_MODEL,
             )
             .is_some()
@@ -2734,7 +2975,7 @@ mod tests {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
 
-        let bundled_moonshot = all_catalog_models_for_provider(ApiProvider::Moonshot);
+        let bundled_moonshot = all_catalog_models_for_provider(ProviderKind::Moonshot);
         assert!(
             !bundled_moonshot.is_empty(),
             "offline bundled Moonshot seed required: {bundled_moonshot:?}"
@@ -2785,7 +3026,7 @@ mod tests {
             "alias-normalized providers must not leave a duplicate moonshotai bucket"
         );
 
-        let models = all_catalog_models_for_provider(ApiProvider::Moonshot);
+        let models = all_catalog_models_for_provider(ProviderKind::Moonshot);
         let mut seen = std::collections::BTreeSet::new();
         for model in &models {
             assert!(
@@ -2798,13 +3039,13 @@ mod tests {
         // Legacy fallback is skipped when catalog rows exist (even if legacy
         // lists additional ids) — catalog is authoritative once non-empty.
         assert!(
-            !model_completion_names_for_provider(ApiProvider::Moonshot).is_empty(),
+            !model_completion_names_for_provider(ProviderKind::Moonshot).is_empty(),
             "legacy Moonshot table should still exist as fallback documentation"
         );
 
         clear_live_snapshot();
         assert_eq!(
-            all_catalog_models_for_provider(ApiProvider::Moonshot),
+            all_catalog_models_for_provider(ProviderKind::Moonshot),
             bundled_moonshot,
             "clearing live must restore offline bundled Moonshot rows"
         );
@@ -2864,7 +3105,7 @@ mod tests {
             LiveSource::ModelsDev,
         );
 
-        let models = all_catalog_models_for_provider(ApiProvider::Moonshot);
+        let models = all_catalog_models_for_provider(ProviderKind::Moonshot);
         let kimi_count = models.iter().filter(|m| m.as_str() == "kimi-k2.5").count();
         assert_eq!(
             kimi_count, 1,
@@ -3315,8 +3556,8 @@ mod tests {
         overlay::clear();
         clear_live_snapshot();
         crate::provider_catalog_live::reset_cache_for_test();
-        let provider = ApiProvider::Openai;
-        let base = provider.default_base_url();
+        let provider = ProviderKind::Openai;
+        let base = provider.provider().default_base_url();
         let model = "cloud-catalog-fixture";
         let config = Config {
             provider: Some("openai".into()),
@@ -3523,8 +3764,8 @@ mod tests {
     fn roster_omission_stands_unless_the_payload_explicitly_attests_the_id() {
         let _env = cloud_facts_test_env();
 
-        let provider = ApiProvider::Deepseek;
-        let base = provider.default_base_url();
+        let provider = ProviderKind::Deepseek;
+        let base = provider.provider().default_base_url();
         // One id the bundled catalog knows, one it has never heard of. Neither
         // fact changes what the roster is authoritative about.
         let bundled = "deepseek-v4-flash";
@@ -3633,8 +3874,8 @@ mod tests {
         use codewhale_config::cloud_facts::{ModelFact, ModelOp};
         let _env = cloud_facts_test_env();
 
-        let provider = ApiProvider::Deepseek;
-        let base = provider.default_base_url();
+        let provider = ProviderKind::Deepseek;
+        let base = provider.provider().default_base_url();
         let hidden = "deepseek-v4-flash";
         let preview = "deepseek-v4-nano-preview";
         let before = catalog_models_for_route(provider, "deepseek", base);
@@ -3746,25 +3987,25 @@ mod tests {
                 upsert_fact("siliconflow", siliconflow_preview, 65_536),
             ],
         );
-        let offers = |provider: ApiProvider, identity: &str, model: &str| {
-            catalog_models_for_route(provider, identity, provider.default_base_url())
+        let offers = |provider: ProviderKind, identity: &str, model: &str| {
+            catalog_models_for_route(provider, identity, provider.provider().default_base_url())
                 .iter()
                 .any(|id| id == model)
         };
 
         assert!(
-            offers(ApiProvider::Deepseek, "deepseek", preview),
+            offers(ProviderKind::Deepseek, "deepseek", preview),
             "the exact signed route must offer the row"
         );
         // Same host, but a TUI-only legacy alias with no canonical identity.
         assert!(
-            !offers(ApiProvider::DeepseekCN, "deepseek-cn", preview),
+            !offers(ProviderKind::Deepseek, "deepseek-cn", preview),
             "the legacy CN alias inherits nothing from the primary identity"
         );
         // Reads the `deepseek` partition, but is a separate endpoint contract.
         assert!(
             !offers(
-                ApiProvider::DeepseekAnthropic,
+                ProviderKind::DeepseekAnthropic,
                 "deepseek-anthropic",
                 preview
             ),
@@ -3772,12 +4013,16 @@ mod tests {
         );
         // A regional sibling that shares a catalog partition, not an identity.
         assert!(
-            offers(ApiProvider::Siliconflow, "siliconflow", siliconflow_preview),
+            offers(
+                ProviderKind::Siliconflow,
+                "siliconflow",
+                siliconflow_preview
+            ),
             "the exact signed SiliconFlow route must offer the row"
         );
         assert!(
             !offers(
-                ApiProvider::SiliconflowCn,
+                ProviderKind::SiliconflowCN,
                 "siliconflow-CN",
                 siliconflow_preview
             ),
@@ -3786,7 +4031,7 @@ mod tests {
         // A proxy or redirect on the right identity is still the wrong endpoint.
         assert!(
             !catalog_models_for_route(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek",
                 "https://deepseek-proxy.invalid/v1"
             )
@@ -3798,7 +4043,7 @@ mod tests {
         // The price travels with the row and no further. A signed rate that
         // renders somewhere it cannot be billed is the failure this layer must
         // not have, so the offered row and the dispatch quote answer together.
-        let quote = |provider: ApiProvider, identity: &str, base: &str| {
+        let quote = |provider: ProviderKind, identity: &str, base: &str| {
             crate::provider_catalog_live::fresh_dispatch_pricing_quote_at(
                 provider,
                 identity,
@@ -3809,26 +4054,26 @@ mod tests {
         };
         assert!(
             quote(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek",
-                ApiProvider::Deepseek.default_base_url()
+                ProviderKind::Deepseek.provider().default_base_url()
             )
             .is_some(),
             "a signed price on the exact signed route is billable — this is what \
              makes a rate change data rather than a release"
         );
         for (provider, identity) in [
-            (ApiProvider::DeepseekCN, "deepseek-cn"),
-            (ApiProvider::DeepseekAnthropic, "deepseek-anthropic"),
+            (ProviderKind::Deepseek, "deepseek-cn"),
+            (ProviderKind::DeepseekAnthropic, "deepseek-anthropic"),
         ] {
             assert!(
-                quote(provider, identity, provider.default_base_url()).is_none(),
+                quote(provider, identity, provider.provider().default_base_url()).is_none(),
                 "{identity} must not mint a quote from another endpoint's facts"
             );
         }
         assert!(
             quote(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek",
                 "https://deepseek-proxy.invalid/v1"
             )
@@ -3837,9 +4082,9 @@ mod tests {
         );
         assert!(
             quote(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-custom-table",
-                ApiProvider::Deepseek.default_base_url()
+                ProviderKind::Deepseek.provider().default_base_url()
             )
             .is_none(),
             "a differently-named provider table is a separate billing relationship"
@@ -3849,16 +4094,16 @@ mod tests {
     /// A roster that answers with ids alone has not said its models have no
     /// limits. Signed facts complete that silence for the picker, the metadata
     /// lookup and the executor alike — and lose every field the provider did
-    /// state. Price stays the provider's business: nothing renders a cloud rate
-    /// on a provider row that the dispatch quote would refuse to bill.
+    /// state. A completed price keeps its signed source separately from the
+    /// provider roster's existence claim.
     #[test]
     fn provider_id_only_rows_take_signed_limits_while_provider_facts_and_prices_win() {
         use codewhale_config::cloud_facts::{ModelFact, PricingFact};
         use codewhale_config::models_dev::ModelsDevLimit;
         let _env = cloud_facts_test_env();
 
-        let provider = ApiProvider::Deepseek;
-        let base = provider.default_base_url();
+        let provider = ProviderKind::Deepseek;
+        let base = provider.provider().default_base_url();
         let id_only = "deepseek-roster-bare";
         let detailed = "deepseek-roster-detailed";
         record_roster(
@@ -3903,13 +4148,11 @@ mod tests {
             "the row is still the provider's: {:?}",
             bare.source
         );
-        assert_eq!(
-            bare.cost, None,
-            "a signed price must not appear on a provider-live row"
-        );
+        assert_eq!(bare.cost.as_ref().and_then(|cost| cost.input), Some(1.0));
+        assert_eq!(bare.cost.as_ref().and_then(|cost| cost.output), Some(2.0));
         assert!(
-            !matches!(bare.pricing_source(), CatalogSource::CloudFacts { .. }),
-            "price provenance must not claim a cloud rate here"
+            matches!(bare.pricing_source(), CatalogSource::CloudFacts { .. }),
+            "the estimate must retain its signed price authority"
         );
         assert!(
             crate::provider_catalog_live::fresh_dispatch_pricing_quote_at(
@@ -3920,7 +4163,7 @@ mod tests {
                 codewhale_config::catalog::now_unix(),
             )
             .is_none(),
-            "and nothing bills against one either"
+            "a completed estimate must not become a provider-confirmed quote"
         );
 
         let stated = catalog_offering_for_route(provider, "deepseek", base, detailed)
@@ -3967,8 +4210,8 @@ mod tests {
         use codewhale_config::cloud_facts::{ModelFact, PricingFact};
         let _env = cloud_facts_test_env();
 
-        let provider = ApiProvider::Deepseek;
-        let base = provider.default_base_url();
+        let provider = ProviderKind::Deepseek;
+        let base = provider.provider().default_base_url();
         let model = "deepseek-enriched-only";
         let body = format!(
             r#"{{
@@ -4091,5 +4334,77 @@ mod tests {
             catalog_offering_for_route(provider, "deepseek", base, model).is_none(),
             "an unattested correction cannot survive the roster's omission"
         );
+    }
+
+    /// #6705: through the production runtime resolver, a curated Zen
+    /// transport row wins over a Models.dev row for the same id, a
+    /// catalog-only row routes on the wire its row declares, and a deprecated
+    /// catalog row stays unroutable.
+    #[test]
+    fn opencode_zen_runtime_resolver_keeps_curated_wire_over_models_dev_row() {
+        use codewhale_config::models_dev::ModelsDevCatalog;
+        use codewhale_config::route::{LogicalModelRef, RequestProtocol, RouteError, RouteRequest};
+
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+        let raw = r#"{
+          "providers": {
+            "opencode": {
+              "id": "opencode",
+              "npm": "@ai-sdk/openai-compatible",
+              "models": {
+                "gpt-5.6-sol": { "id": "gpt-5.6-sol", "provider": { "npm": "@ai-sdk/anthropic" } },
+                "claude-opus-9": { "id": "claude-opus-9", "provider": { "npm": "@ai-sdk/anthropic" } },
+                "claude-2-retired": {
+                  "id": "claude-2-retired",
+                  "status": "deprecated",
+                  "provider": { "npm": "@ai-sdk/anthropic" }
+                }
+              }
+            }
+          }
+        }"#;
+        let catalog = ModelsDevCatalog::parse_json(raw).expect("fixture parses");
+        set_live_snapshot(
+            CatalogSnapshot {
+                offerings: codewhale_config::catalog::live_offerings_from_models_dev(&catalog, 1),
+            },
+            LiveSource::ModelsDev,
+        );
+
+        let provider = ProviderKind::OpencodeZen;
+        let resolver = runtime_catalog_resolver_for_identity(
+            provider,
+            None,
+            provider.provider().default_base_url(),
+            CatalogStatus::Unknown,
+        )
+        .resolver;
+        let resolve = |model: &str| {
+            resolver.resolve(&RouteRequest {
+                explicit_provider: Some(provider),
+                model_selector: Some(LogicalModelRef::from(model)),
+                saved_provider_model: None,
+                base_url_override: None,
+                limit_overrides: Vec::new(),
+            })
+        };
+
+        let curated = resolve("gpt-5.6-sol").expect("curated Zen row resolves");
+        assert_eq!(
+            curated.protocol(),
+            RequestProtocol::Responses,
+            "the curated transport row must win over the catalog's conflicting row"
+        );
+        let catalog_only = resolve("claude-opus-9").expect("catalog-proven Zen row resolves");
+        assert_eq!(catalog_only.protocol(), RequestProtocol::AnthropicMessages);
+        match resolve("claude-2-retired") {
+            Err(RouteError::UnsupportedModelProtocol { endpoint_key, .. }) => {
+                assert_eq!(endpoint_key, "deprecated");
+            }
+            other => panic!("a deprecated Zen row must fail closed, got {other:?}"),
+        }
+
+        clear_live_snapshot();
     }
 }

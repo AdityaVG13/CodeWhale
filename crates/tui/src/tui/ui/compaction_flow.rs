@@ -12,25 +12,32 @@ use super::*;
 /// when the turn is busy. A dropped refresh is safe: the next turn rebuilds
 /// its compaction config from `App`, and the status message tells the user
 /// whether the update was queued or deferred.
+///
+/// The model and its compaction budget are one route update: both mailbox
+/// slots are reserved before either op is sent, so a full mailbox defers the
+/// whole update instead of applying the model without its budget (U03-05).
 pub(crate) fn try_apply_model_and_compaction_update(
     engine_handle: &EngineHandle,
     compaction: crate::compaction::CompactionConfig,
     mode: AppMode,
     route_limits: Option<codewhale_config::route::RouteLimits>,
 ) -> bool {
-    if engine_handle
-        .try_send(Op::SetModel {
+    let Ok(model_permit) = engine_handle.tx_op.clone().try_reserve_owned() else {
+        return false;
+    };
+    let Ok(compaction_permit) = engine_handle.tx_op.clone().try_reserve_owned() else {
+        return false;
+    };
+    engine_handle.send_reserved_op(
+        model_permit,
+        Op::SetModel {
             model: compaction.model.clone(),
             mode,
             route_limits,
-        })
-        .is_err()
-    {
-        return false;
-    }
-    engine_handle
-        .try_send(Op::SetCompaction { config: compaction })
-        .is_ok()
+        },
+    );
+    engine_handle.send_reserved_op(compaction_permit, Op::SetCompaction { config: compaction });
+    true
 }
 
 pub(crate) fn set_explicit_compaction_status(
@@ -341,7 +348,14 @@ pub(crate) fn apply_compaction_completed(
 pub(crate) fn apply_compaction_failed(app: &mut App, id: &str, auto: bool, message: String) {
     if settle_compaction(app, id, auto) {
         add_compaction_receipt(app, &message);
-        set_explicit_compaction_status(app, message, StatusToastLevel::Error, true);
+        // A pass the user asked for keeps its sticky footer error. An
+        // automatic pass is the engine's own recovery: the transcript receipt
+        // records it, and when the turn then fails its error line is the
+        // headline. Echoing the same failure in the footer made one failure
+        // read as three (experience mark 2).
+        if !auto {
+            set_explicit_compaction_status(app, message, StatusToastLevel::Error, true);
+        }
     }
 }
 
@@ -373,7 +387,7 @@ pub(crate) fn try_cancel_compaction(app: &mut App, engine_handle: &EngineHandle)
     if !app.is_compacting && app.deferred_manual_compaction.take().is_some() {
         app.manual_compaction_queued = false;
         app.manual_compaction_id = None;
-        let message = "Context compaction canceled before it started".to_string();
+        let message = "Making room stopped before it started".to_string();
         add_compaction_receipt(app, &message);
         set_explicit_compaction_status(app, message, StatusToastLevel::Info, false);
         return true;
@@ -392,13 +406,13 @@ pub(crate) fn try_cancel_compaction(app: &mut App, engine_handle: &EngineHandle)
         Ok(()) => {
             set_explicit_compaction_status(
                 app,
-                "Canceling context compaction…".to_string(),
+                "Stopping making room…".to_string(),
                 StatusToastLevel::Info,
                 false,
             );
         }
         Err(error) => {
-            let message = format!("Could not cancel context compaction: {error}");
+            let message = format!("Could not stop making room: {error}");
             add_compaction_receipt(app, &message);
             set_explicit_compaction_status(app, message, StatusToastLevel::Error, true);
         }
@@ -469,7 +483,7 @@ pub(crate) fn maybe_warn_context_pressure_for_config(
         ", unverified window"
     };
 
-    let recommendation = "Automatic compaction is disabled. Enable auto_compact or use /compact.";
+    let recommendation = "Making room automatically is off. Turn on auto_compact or use /compact.";
 
     if percent >= CONTEXT_CRITICAL_THRESHOLD_PERCENT {
         set_context_pressure_status(
@@ -564,5 +578,39 @@ mod config_update_tests {
             mock.rx_op.recv().await,
             Some(Op::SetCompaction { config }) if config == compaction
         ));
+    }
+
+    /// U03-05: with room for only one op, neither half of the route update
+    /// is queued; a model without its compaction budget is a half-applied
+    /// route with nothing to roll it back.
+    #[tokio::test]
+    async fn live_compaction_update_is_all_or_nothing_when_one_slot_is_free() {
+        let mut mock = mock_engine_handle();
+        let mut fillers = 0;
+        while mock.handle.tx_op.capacity() > 1 {
+            mock.handle
+                .try_send(Op::ListSubAgents)
+                .expect("filler op fits");
+            fillers += 1;
+        }
+        let compaction = crate::compaction::CompactionConfig {
+            model: "deepseek-v4-flash".to_string(),
+            ..crate::compaction::CompactionConfig::default()
+        };
+
+        assert!(!try_apply_model_and_compaction_update(
+            &mock.handle,
+            compaction,
+            AppMode::Agent,
+            None,
+        ));
+
+        for _ in 0..fillers {
+            assert!(matches!(mock.rx_op.try_recv(), Ok(Op::ListSubAgents)));
+        }
+        assert!(
+            mock.rx_op.try_recv().is_err(),
+            "no half of the route update may be queued"
+        );
     }
 }

@@ -9,6 +9,9 @@ use crate::tui::views::ModalKind;
 use super::model::{RailPanel, WorkRowId};
 
 pub(crate) fn select_dock_panel(app: &mut App, panel: RailPanel) {
+    if panel == RailPanel::Terminal {
+        app.launch.dismiss();
+    }
     app.work_surface.panel = panel;
     app.work_surface.explicit_view = true;
     app.work_surface.dismissed = false;
@@ -84,6 +87,14 @@ pub fn activate_primary(
     Some(action)
 }
 
+/// Whether the work-surface-owned detail is actually on screen. A row action
+/// that runs a command without pushing a view (the Context panel's `/compact`
+/// row) still records `opened`; with nothing stacked above the dock that owner
+/// is stale, and Esc belongs to the dock again (#6502).
+pub(crate) fn opened_detail_on_screen(app: &App) -> bool {
+    app.work_surface.opened.is_some() && !app.view_stack.is_empty()
+}
+
 /// Close the work-surface-owned detail (pager when we opened it).
 pub fn close_opened(app: &mut App) {
     if app.work_surface.opened.take().is_none() {
@@ -116,7 +127,7 @@ mod tests {
         let options = TuiOptions {
             use_mouse_capture: true,
             max_subagents: 4,
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
     }

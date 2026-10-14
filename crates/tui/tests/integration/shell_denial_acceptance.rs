@@ -19,7 +19,7 @@ const COMMAND: &str = "printf fixture > denial-canary.txt";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn denied_bash_cannot_be_reached_through_task_search_and_start() {
-    scenario("task_shell_start", true).await;
+    scenario("bash", true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -29,7 +29,7 @@ async fn denied_bash_cannot_be_reached_through_tasks_gate_action() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrestricted_task_search_and_start_still_executes() {
-    scenario("task_shell_start", false).await;
+    scenario("bash", false).await;
 }
 
 #[derive(Clone)]
@@ -99,7 +99,7 @@ async fn scenario(tool: &'static str, deny: bool) {
         "allow_shell = true\ntelemetry = false\n[retry]\nenabled = false\n",
     )
     .unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codewhale-tui"));
+    let mut command = Command::new(crate::binary::codewhale());
     command.env_clear();
     for key in ["PATH", "LANG", "TMPDIR"] {
         if let Some(value) = std::env::var_os(key) {
@@ -187,11 +187,12 @@ async fn scenario(tool: &'static str, deny: bool) {
             );
         }
     } else {
-        assert!(
-            results
-                .iter()
-                .any(|message| message["tool_call_id"] == "route-retry"
-                    && message["content"].as_str().unwrap().contains("task_id"))
-        );
+        assert!(results.iter().any(|message| {
+            message["tool_call_id"] == "route-retry"
+                && !message["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("disallowed-tools")
+        }));
     }
 }

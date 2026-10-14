@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, stat, readdir, rename, symlink, utimes } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdtemp, readFile, writeFile, stat, readdir, rename, symlink, utimes, realpath } from 'node:fs/promises';
+import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPetRecorder } from '../scripts/lib/pet-recorder.mjs';
 import { compilePetTelemetry, encodePetJSONL, decodePetJSONL, PetLiveTape } from '../dist/core/pet-telemetry.js';
@@ -79,19 +79,26 @@ test('the actual watch CLI keeps recording at one pathname through several rotat
   const { setTimeout: delay } = await import('node:timers/promises');
   const path = await destination(), input = `${path}.source.json`;
   await writeFile(input, JSON.stringify({ schemaVersion: 1, id: 'old', traceId: 'fixture', name: 'bash', category: 'code', startTime: 0, endTime: 1, attributes: {} }));
-  const child = spawnRecorder([`--input=${input}`, `--output=${path}`, '--watch', '--segment-buckets=2']);
+  // Test-only preload, using the suspension fixture's existing clock seam:
+  // advance one bucket per tick so a slow filesystem cannot turn this rotation
+  // test into a legitimate partial-segment restart. Production time is unchanged.
+  const clock = 'let calls=0;performance.now=()=>Math.max(0,calls++-1)*400;';
+  const archiveReport = `Archived pet recording: ${join(await realpath(dirname(path)), basename(part(path, 3)))}`;
+  const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=data:text/javascript,${encodeURIComponent(clock)}`.trim() };
+  const child = spawnRecorder([`--input=${input}`, `--output=${path}`, '--watch', '--segment-buckets=2'], env);
   let log = ''; child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
   const exited = once(child, 'exit');
   t.after(() => { if (child.exitCode === null) child.kill('SIGTERM'); });
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline && child.exitCode === null) {
-    try { if (decodePetJSONL(await readFile(path, 'utf8')).length >= 1 && (await stat(part(path, 3))).size) break; } catch { /* Wait for the next complete segment. */ }
+    try { if (log.includes(archiveReport) && decodePetJSONL(await readFile(path, 'utf8')).length >= 1) break; } catch { /* Wait for the published segment. */ }
     await delay(25);
   }
   child.stopRecorder(); const [code] = await exited; assert.equal(code, 0, log);
-  for (let i = 1; i <= 3; i++) assert.equal(decodePetJSONL(await readFile(part(path, i), 'utf8')).length, 2);
+  for (let i = 1; i <= 3; i++) assert.equal(decodePetJSONL(await readFile(part(path, i), 'utf8')).length, 2, part(path, i));
   assert.ok(decodePetJSONL(await readFile(path, 'utf8')).length >= 1);
-  assert.match(log, /Archived pet recording:/);
+  assert.ok(log.includes(archiveReport), log);
+  assert.doesNotMatch(log, /Recorder was suspended or stalled/);
 });
 
 test('a post-publication error preserves correct row accounting and allows the next distinct append', async () => {
@@ -223,4 +230,33 @@ test('the actual CLI resumes after process death at the same path without reclai
   await waitFor(async () => third.log.includes('Recording local live pet states.') && (await stat(part(path, 2))).size && decodePetJSONL(await readFile(path, 'utf8')).length >= 2);
   third.stopRecorder(); assert.equal((await third.exited)[0], 0, third.log);
   assert.equal(decodePetJSONL(await readFile(part(path, 2), 'utf8')).length, buckets.length);
+});
+
+test('the actual watch CLI starts a new segment after a suspension instead of replaying every missed bucket', { timeout: 20_000 }, async t => {
+  const { once } = await import('node:events');
+  const { setTimeout: delay } = await import('node:timers/promises');
+  const path = await destination(), input = `${path}.source.json`;
+  await writeFile(input, JSON.stringify({ schemaVersion: 1, id: 'old', traceId: 'fixture', name: 'bash', category: 'code', startTime: 0, endTime: 1, attributes: {} }));
+  // Test-only preload: after one second the monotonic clock jumps 100 s
+  // (250 buckets), as a resumed laptop would. The shipped recorder is unchanged.
+  const jump = 'const now=performance.now.bind(performance),t0=Date.now();performance.now=()=>now()+(Date.now()-t0>1000?100000:0);';
+  const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=data:text/javascript,${encodeURIComponent(jump)}`.trim() };
+  const child = spawnRecorder([`--input=${input}`, `--output=${path}`, '--watch', '--segment-buckets=50'], env);
+  let log = ''; child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
+  const exited = once(child, 'exit');
+  t.after(() => { if (child.exitCode === null) child.kill('SIGTERM'); });
+  const deadline = Date.now() + 12_000;
+  while (Date.now() < deadline && child.exitCode === null) {
+    // The archive link precedes replacement; the report follows it.
+    try { if (/Archived pet recording/.test(log) && decodePetJSONL(await readFile(path, 'utf8')).length >= 2) break; } catch { /* Wait for the post-gap segment. */ }
+    await delay(25);
+  }
+  child.stopRecorder(); const [code] = await exited; assert.equal(code, 0, log);
+  const names = (await readdir(dirname(path))).filter(name => name.startsWith(`${basename(path)}.segment-`));
+  assert.deepEqual(names, [`${basename(path)}.segment-000001.jsonl`], 'One outage archives one segment, not 250 replayed buckets');
+  const before = decodePetJSONL(await readFile(part(path, 1), 'utf8')), after = decodePetJSONL(await readFile(path, 'utf8'));
+  assert.ok(before.length >= 1 && before.length < 50, `${before.length} pre-suspension rows`);
+  assert.ok(after.length >= 2 && after.length < 50, `${after.length} post-suspension rows`);
+  assert.equal(after[0].observed, 0, 'The first bucket after the outage is unknown');
+  assert.match(log, /suspended or stalled for 10\d s; starting a new segment/);
 });

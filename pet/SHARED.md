@@ -10,6 +10,8 @@ prompts, provider calls or second telemetry classifier.
 flowchart LR
   E[Existing Engine: accepted metadata] --> T[Terminal projection]
   T --> O[Local companion: one PetNative world]
+  E --> R[Runtime host: activity projection]
+  R -->|existing companion, idle handoff| O
   O --> S[Private checkpoint and immutable archives]
   O --> W[Ratatui Watch / full habitat]
   O --> B[Browser view]
@@ -36,16 +38,28 @@ In the running application:
 | --- | --- |
 | `/pet` | Toggle pet mode for this terminal: the habitat takes the whole content viewport now and on every accepted turn |
 | `/pet on` / `/pet off` | Enable or disable explicitly; `off` closes the view and stops automatic entry while the companion keeps the pet alive |
-| `/pet appearance` | Configure the shared palette in the authenticated local browser studio |
+| `/pet appearance` | Configure the shared palette, whale style and large-text language in the authenticated local browser studio |
+| `/pet style smooth\|pixel` | Choose the smooth aurora or pixel whale |
+| `/pet language auto\|en\|zh-Hans\|zh-Hant\|ja` | Choose large activity phrases independently of the interface language |
 | `/pet window` | Open the independently closable native macOS window |
 | `/pet source` | Explicitly select this terminal session as the source |
 | `/pet sound on\|off` | Request/release the companion's audio device |
 | `/pet export` | Save a replay to this saved session's artifacts |
 | `/pet status` | Mode, view, identity and measured terminal output counters |
 
-The pet has no workbar panel; the habitat is its only terminal view. Escape
-leaves it without cancelling the turn or touching the composer draft. F6
-toggles sound, F8 opens the appearance studio, and F9 opens the native window;
+Large text follows the interface language by default. English, Simplified
+Chinese, Traditional Chinese and Japanese phrases are available; other
+interface languages currently use English large text. A fixed choice lets an
+English reader learn Chinese or Japanese phrases beside the normal English
+status. Both whale styles turn their 980 drones into these same activity words.
+The saved presentation settings leave the pet’s identity and recording intact.
+
+The pet has no workbar panel. In the terminal it is the pet main view above the
+composer, with the F5 inspector over it. On the main view Ctrl+] cycles the
+pet's views: whale, cove, braille, pixels, particles, whale-girl and installed
+avatar packs. Escape leaves the inspector without cancelling the turn or
+touching the composer draft. F6 toggles sound, F8 opens the appearance studio,
+and F9 opens the native window, on the main view and in the inspector;
 reduced motion follows the shell's existing motion setting. Hints and key
 admission use the existing shell binding table. The habitat uses the modal
 stack; composer contents, transcript, selection and active Engine state stay
@@ -55,10 +69,14 @@ underneath it. Consent and approval views retain their existing priority.
 selects an isolated companion directory; its default is
 `~/.codewhale/pet-shared`. `CODEWHALE_PET_PORT` chooses the initial loopback port
 (default 4633; zero allocates an unused port for tests). A saved world retains
-its selected port. `CODEWHALE_PET_GRAPHICS=braille` forces the text fallback.
-None of these commands replace an installed global CLI.
+its selected port. `CODEWHALE_PET_GRAPHICS=braille` keeps the `pixels` view on
+its particles fallback. None of these commands replace an installed global CLI.
 
 ## Appearance and work-to-result preview
+
+The current Ocean palette, activity colors and smooth whale are **Codewhale by
+default**, as the founder confirmed for 0.10.2. This records the existing look;
+the appearance controls and saved choices keep their current behavior.
 
 The habitat studio provides Ocean, Chalk, Graphite, Linen, Forest, Plum, Ember
 and Cobalt presets. Background, upper light, particle color, activity colors,
@@ -131,6 +149,18 @@ The first attached saved terminal selects its session only when the source is
 `unattached`. Later terminals are views until explicitly selected. Session IDs
 are represented by a short SHA-256 identifier. Multiple sessions are never mixed.
 
+The HTTP Runtime host attaches to an existing companion when an accepted turn
+starts. It may follow an idle source; an optional `only_if_idle` condition on the
+existing select action makes the owner check the live producer atomically.
+Automatic handoff cannot evict a producer that attached after the frame was read.
+Manual `/pet source` remains an explicit selection. Runtime activity persists
+for 12 seconds after terminal completion, then its producer lease expires.
+An event gap clears the observed turn and starts the same release deadline;
+only a new turn starts a fresh observation.
+The host never starts the companion. ACP and TUI background-task threads are
+outside this feed. The projection is bounded metadata only, has no model-visible
+input, and adds no KV-cache bytes.
+
 Interactions require a client UUID, consecutive sequence and current source
 revision. The world and receipt are saved before acknowledgement. Repeating the
 same packet returns its receipt; changing a duplicate, skipping a sequence or
@@ -169,7 +199,9 @@ Stillness uses a separate stable projection and cannot change the authoritative
 simulation, score, journal or digest. Missing coverage remains hollow and
 labeled; sleep dims it separately.
 
-Pixels require a successful Kitty graphics query and synchronized output.
+Pixels draw only in the opt-in `pixels` view and require a successful Kitty
+graphics query, synchronized output and a known cell size in pixels.
+`CODEWHALE_PET_GRAPHICS=braille` disables that image.
 Inline RGB uses zlib and base64 chunks of at most 4,096 bytes. One image ID per
 process is replaced inside the existing Ratatui synchronized frame, with cursor
 save/restore and deletion on layout changes, covered views and exit. The
@@ -179,7 +211,8 @@ transport follows the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/
 status` reports actual frames, elapsed output time, bytes/second, raster time
 and write time for that visit. Slow encoding drops intermediate presentations.
 The 30 Hz world does not depend on display rate. Unsupported terminals, tmux,
-Sixel-only terminals and disabled synchronized output use braille. SSH can use
+Sixel-only terminals and disabled synchronized output show the Braille particles
+instead of an image in the `pixels` view. SSH can use
 inline Kitty bytes if the remote terminal answers the probe, but bandwidth and
 end-to-end SSH compatibility require separate measurement. No tmux passthrough
 or Sixel pixel renderer is claimed.

@@ -10,26 +10,32 @@
 // the two can never be confused.
 //
 // One tab per computer session; the last session out closes the shared
-// browser. Node needs a global WebSocket (22+, or 21 with the default-on
+// browser.
+//
+// Attach mode (CODEWHALE_CU_BROWSER_ATTACH=/run/cw/cdp.sock, a Codewhale
+// Computer): nothing is launched. The plugin connects to the CDP bridge of the
+// one Chromium a person also sees on the shared display — NUL-delimited JSON
+// over a Unix socket, the --remote-debugging-pipe framing — so the agent's
+// navigations appear in that person's window and the tabs they open appear in
+// the agent's targets. That browser is never closed and no tab is closed:
+// stop only detaches. Node needs a global WebSocket (22+, or 21 with the default-on
 // flag); older runtimes refuse with `unsupported_runtime` instead of
 // half-working.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import net from "node:net";
 import { spawn } from "node:child_process";
 import { ExecError, currentSignal } from "./exec.mjs";
 import { stateDir } from "./registry.mjs";
+import { recordingsDir as defaultRecordingsDir } from "./recordings.mjs";
 
 const APPLICATIONS = ["Google Chrome", "Chromium", "Brave Browser", "Microsoft Edge"];
 const LINUX_BINARIES = ["google-chrome", "chromium", "chromium-browser", "brave-browser", "microsoft-edge"];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const badArgs = (message) => Object.assign(new ExecError(message), { code: "bad_args" });
-
-function defaultRecordingsDir() {
-  return process.env.CODEWHALE_CU_RECORDINGS_DIR || path.join(stateDir(), "recordings");
-}
 
 /** Only http(s) and about:blank can be navigated to; everything else is refused. */
 export function checkBrowserUrl(url) {
@@ -39,7 +45,12 @@ export function checkBrowserUrl(url) {
   let parsed;
   try { parsed = new URL(trimmed); } catch { throw badArgs(`"${trimmed}" is not a URL`); }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw badArgs(`only http(s):// and about:blank URLs can be opened (got "${parsed.protocol}//")`);
+    // A person asking to "open" a local file wants to see it, not to have
+    // this self-owned browser read the disk: point at the route that shows it.
+    const hint = parsed.protocol === "file:"
+      ? "; to show a workspace file to the person use open_in_app when the Codewhale app offers it, or serve it over http://127.0.0.1"
+      : "";
+    throw badArgs(`only http(s):// and about:blank URLs can be opened (got "${parsed.protocol}//")${hint}`);
   }
   return parsed.href;
 }
@@ -80,7 +91,11 @@ export function findBrowserApp(platform = process.platform, env = process.env, e
   return null;
 }
 
-/** Launch detached so the browser is its own process, never a child we must reap. */
+/**
+ * Launch detached so the browser is its own process, never a child we must
+ * reap. Returns a handle that keeps the tail of its stderr and its exit, so a
+ * browser that dies at start can say why instead of timing out silently.
+ */
 function defaultLaunch({ app, profileDir, url, platform = process.platform }) {
   const flags = ["--remote-debugging-port=0", `--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check"];
   const target = url || "about:blank";
@@ -89,9 +104,89 @@ function defaultLaunch({ app, profileDir, url, platform = process.platform }) {
   // the person already has Chrome running — the args never reach a new process.
   if (platform === "darwin") { cmd = "open"; args = ["-g", "-n", "-a", app, "--args", ...flags, target]; }
   else { cmd = app; args = [...flags, target]; }
-  const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
-  child.on("error", () => {});
+  const child = spawn(cmd, args, { detached: true, stdio: ["ignore", "ignore", "pipe"] });
+  const handle = { stderr: "", exit: null };
+  child.stderr.on("data", (chunk) => { handle.stderr = (handle.stderr + chunk).slice(-4000); });
+  child.on("error", (error) => { handle.exit = { code: null, signal: null, error: error.message }; });
+  child.on("exit", (code, signal) => { handle.exit = { code, signal }; });
   child.unref();
+  return handle;
+}
+
+/**
+ * The error for a browser that did not produce a debugging endpoint. Chromium
+ * refuses to run as root without --no-sandbox; Codewhale does not add that
+ * flag, so that case names the two supported ways forward instead.
+ */
+export function browserStartFailure(handle, profileDir) {
+  const tail = handle?.stderr ?? "";
+  if (/Running as root without --no-sandbox/.test(tail)) {
+    return Object.assign(new ExecError("Chromium refused to start because it runs as root without its sandbox. Codewhale does not disable the sandbox. Run the Computer Use server as a non-root user, or set CODEWHALE_CU_BROWSER_APP to a launcher you control that supplies the flags you accept."), { code: "browser_unavailable" });
+  }
+  const exit = handle?.exit
+    ? `the browser exited before it opened its debugging endpoint (${handle.exit.error ?? `code ${handle.exit.code ?? "none"}${handle.exit.signal ? `, signal ${handle.exit.signal}` : ""}`})`
+    : "the browser started but its debugging endpoint never came up";
+  const detail = tail.trim().split("\n").slice(-2).join(" | ").slice(-300);
+  return Object.assign(new ExecError(`${exit} (profile ${profileDir})${detail ? `: ${detail}` : ""}`), { code: "browser_unavailable" });
+}
+
+/** The CDP bridge socket to attach to, or null for launch mode. */
+export function attachSocket(env = process.env) {
+  const value = env.CODEWHALE_CU_BROWSER_ATTACH;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/**
+ * Connect to a NUL-framed CDP Unix socket and expose the small WebSocket-like
+ * surface makeChannel uses (addEventListener message/close/error, send, close).
+ * The bridge admits one client; a second gets `{"error":"cdp_busy"}` and EOF,
+ * surfaced as `closeReason`.
+ */
+export function connectPipeSocket(socketPath, { timeoutMs = 8_000, createConnection = net.createConnection } = {}) {
+  return new Promise((resolve, reject) => {
+    const listeners = { message: [], close: [], error: [] };
+    const emit = (type, event) => { for (const entry of [...listeners[type]]) { if (entry.once) listeners[type] = listeners[type].filter((e) => e !== entry); entry.fn(event); } };
+    let inbuf = Buffer.alloc(0);
+    let opened = false;
+    let closed = false;
+    const ws = {
+      closeReason: null,
+      addEventListener(type, fn, opts) { listeners[type]?.push({ fn, once: !!opts?.once }); },
+      send(text) { if (!closed) sock.write(`${text}\0`); },
+      close() { if (closed) return; closed = true; sock.destroy(); emit("close", {}); },
+    };
+    const sock = createConnection(socketPath);
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(Object.assign(new ExecError(`the CDP bridge at ${socketPath} did not accept within ${timeoutMs}ms`), { code: "browser_unavailable" }));
+    }, timeoutMs);
+    sock.on("connect", () => { opened = true; clearTimeout(timer); resolve(ws); });
+    sock.on("data", (chunk) => {
+      inbuf = Buffer.concat([inbuf, chunk]);
+      let i;
+      while ((i = inbuf.indexOf(0)) >= 0) {
+        const text = inbuf.subarray(0, i).toString("utf8");
+        inbuf = inbuf.subarray(i + 1);
+        if (text.startsWith("{\"error\"")) {
+          try { ws.closeReason = JSON.parse(text).error ?? ws.closeReason; } catch {}
+          continue;
+        }
+        emit("message", { data: text });
+      }
+    });
+    sock.on("error", (error) => {
+      if (!opened) {
+        clearTimeout(timer);
+        const denied = error?.code === "EACCES";
+        reject(Object.assign(new ExecError(denied
+          ? `permission denied on the CDP bridge ${socketPath} — only the Engine's user may attach to the shared browser`
+          : `cannot reach the CDP bridge at ${socketPath} (${error?.code ?? error?.message}) — is the chrome service running?`), { code: "browser_unavailable" }));
+        return;
+      }
+      emit("error", error);
+    });
+    sock.on("close", () => { if (!closed) { closed = true; emit("close", {}); } });
+  });
 }
 
 /**
@@ -121,6 +216,12 @@ function defaultConnect(url, { timeoutMs = 8_000 } = {}) {
   });
 }
 
+/** Per-command CDP reply deadline; teardown uses its own shorter bound. */
+const commandTimeoutMs = () => Number(process.env.CODEWHALE_CU_BROWSER_COMMAND_TIMEOUT_MS) || 30_000;
+// Teardown ignores the (possibly already cancelled) request signal and gives
+// an unanswered peer at most three seconds per command.
+const teardown = () => ({ timeoutMs: Math.min(3_000, commandTimeoutMs()), signal: null });
+
 /** id-matched JSON-RPC over the WebSocket, plus CDP event fan-out. */
 function makeChannel(ws) {
   let nextId = 0;
@@ -129,7 +230,7 @@ function makeChannel(ws) {
   let closed = false;
   const failAll = (reason) => {
     closed = true;
-    for (const [, entry] of pending) entry.reject(Object.assign(new ExecError(reason), { code: "browser_not_running" }));
+    for (const entry of [...pending.values()]) entry.reject(Object.assign(new ExecError(reason), { code: "browser_not_running" }));
     pending.clear();
   };
   ws.addEventListener("message", (event) => {
@@ -148,11 +249,29 @@ function makeChannel(ws) {
   ws.addEventListener("error", () => {});
   return {
     get alive() { return !closed; },
-    send(method, params = {}, sessionId) {
+    /**
+     * One CDP command. Bounded: a peer that keeps the socket open but never
+     * answers must not hang the request (or a stop/teardown awaiting it)
+     * forever. After the command is written its effect is unknown, so a
+     * timeout or cancel carries requestDispatched; a late reply is dropped.
+     */
+    send(method, params = {}, sessionId, { timeoutMs = commandTimeoutMs(), signal = currentSignal() } = {}) {
       if (closed) return Promise.reject(Object.assign(new ExecError("the browser is no longer reachable (CDP connection closed)"), { code: "browser_not_running" }));
+      if (signal?.aborted) return Promise.reject(Object.assign(new ExecError("computer request cancelled"), { code: "cancelled" }));
       return new Promise((resolve, reject) => {
         const id = ++nextId;
-        pending.set(id, { resolve, reject });
+        let timer = null;
+        const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); pending.delete(id); };
+        const onAbort = () => { finish(); reject(Object.assign(new ExecError("computer request cancelled"), { code: "cancelled", requestDispatched: true })); };
+        pending.set(id, {
+          resolve: (value) => { finish(); resolve(value); },
+          reject: (error) => { finish(); reject(error); },
+        });
+        timer = setTimeout(() => {
+          finish();
+          reject(Object.assign(new ExecError(`CDP ${method} got no reply within ${timeoutMs}ms`), { code: "timeout", requestDispatched: true }));
+        }, timeoutMs);
+        signal?.addEventListener("abort", onAbort, { once: true });
         ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
       });
     },
@@ -196,8 +315,10 @@ export function createBrowser({
   findApp = findBrowserApp,
   recordingsDir = defaultRecordingsDir,
   platform = process.platform,
+  attach = attachSocket(),
+  connectAttach = connectPipeSocket,
 } = {}) {
-  const state = { channel: null, port: null, profileDir: null, app: null, targetId: null, sessionId: null, pageEnabled: false, domEnabled: false };
+  const state = { channel: null, port: null, profileDir: null, app: null, targetId: null, sessionId: null, pageEnabled: false, domEnabled: false, attached: false, product: null, closeReason: null };
 
   const profileDir = () => path.join(stateDir(), "browser", "profile");
   const loadTimeout = () => Number(process.env.CODEWHALE_CU_BROWSER_LOAD_TIMEOUT_MS) || 15_000;
@@ -208,8 +329,8 @@ export function createBrowser({
     const { targetInfo: info } = await state.channel.send("Target.getTargetInfo", { targetId });
     return { url: info?.url ?? "", title: info?.title ?? "" };
   }
-  async function listTabs() {
-    const { targetInfos } = await state.channel.send("Target.getTargets", {});
+  async function listTabs(options) {
+    const { targetInfos } = await state.channel.send("Target.getTargets", {}, undefined, options);
     return (targetInfos ?? []).filter((t) => t.type === "page");
   }
   async function ensureDom() {
@@ -262,13 +383,76 @@ export function createBrowser({
     return { verified };
   }
 
+  /**
+   * Attach mode: bind to a requested tab, or adopt a lone blank tab, or open
+   * a new foreground tab in the person's window — and bring it to the front so
+   * what the agent does is visible. A person's open tab is only taken when
+   * named explicitly with `tab`.
+   */
+  async function bindSharedTab(url, tab) {
+    const tabs = await listTabs();
+    let targetId = null;
+    if (tab != null) {
+      if (!tabs.some((t) => t.targetId === tab)) throw Object.assign(new ExecError(`no tab ${JSON.stringify(tab)} in the shared browser — browser {action:"status"} lists them`), { code: "bad_target" });
+      targetId = tab;
+    } else if (tabs.length === 1 && /^(about:blank|chrome:\/\/newtab\/?|chrome:\/\/new-tab-page\/?)$/.test(tabs[0].url ?? "")) {
+      targetId = tabs[0].targetId;
+    } else {
+      ({ targetId } = await state.channel.send("Target.createTarget", { url: "about:blank", background: false }));
+    }
+    const { sessionId } = await state.channel.send("Target.attachToTarget", { targetId, flatten: true });
+    await state.channel.send("Target.activateTarget", { targetId }).catch(() => {});
+    state.targetId = targetId;
+    state.sessionId = sessionId;
+    state.pageEnabled = false;
+    state.domEnabled = false;
+    let verified = true;
+    if (url && url !== "about:blank") {
+      const load = waitLoad(loadTimeout());
+      await state.channel.send("Page.navigate", { url }, sessionId);
+      verified = await load.then(() => true).catch(() => false);
+    }
+    return { verified, adopted: tab != null || targetId !== null && tabs.some((t) => t.targetId === targetId) };
+  }
+
+  async function startAttached(target, tab) {
+    const ws = await connectAttach(attach);
+    state.channel = makeChannel(ws);
+    state.attached = true;
+    state.app = `attached:${attach}`;
+    try {
+      const version = await state.channel.send("Browser.getVersion", {});
+      state.product = version.product ?? null;
+      const { verified, adopted } = await bindSharedTab(target, tab);
+      const info = await targetInfo(state.targetId);
+      return {
+        running: true, attached: true, launched: false, shared: true, browser: state.product, socket: attach,
+        tab: { id: state.targetId, url: info.url, title: info.title }, adopted_tab: adopted, verified,
+        note: "attached to the computer's shared browser: the person watching sees this tab, and tabs they open appear in browser status. Stop only detaches.",
+      };
+    } catch (error) {
+      const reason = ws.closeReason;
+      state.channel?.close();
+      state.channel = null; state.attached = false; state.targetId = null; state.sessionId = null;
+      if (reason === "cdp_busy") throw Object.assign(new ExecError(`the shared browser's CDP bridge (${attach}) already has a client — only one controller may attach at a time`), { code: "browser_busy" });
+      throw error;
+    }
+  }
+
   const api = {
-    async start({ url } = {}) {
+    async start({ url, tab } = {}) {
       const target = url ? checkBrowserUrl(url) : "about:blank";
       if (state.channel) {
+        if (state.attached && tab != null && tab !== state.targetId) {
+          await state.channel.send("Target.detachFromTarget", { sessionId: state.sessionId }).catch(() => {});
+          const { verified } = await bindSharedTab(target, tab);
+          return { ...(await this.status()), switched_tab: true, verified };
+        }
         if (url) await this.navigate({ url: target });
         return { ...(await this.status()), already_running: true };
       }
+      if (tab != null && !attach) throw badArgs("tab selects a tab of the shared browser and needs attach mode (CODEWHALE_CU_BROWSER_ATTACH)");
+      if (attach) return startAttached(target, tab);
       if (typeof WebSocket === "undefined") throw Object.assign(new ExecError("browser actions need a Node runtime with a global WebSocket (22+); this runtime does not have one"), { code: "unsupported_runtime" });
       const app = findApp();
       if (!app) throw Object.assign(new ExecError(`no Chromium-family browser found (looked for ${APPLICATIONS.join(", ")}); set CODEWHALE_CU_BROWSER_APP to the app path`), { code: "browser_not_installed" });
@@ -300,7 +484,7 @@ export function createBrowser({
         else { try { fs.rmSync(portFile, { force: true }); } catch {} }
       }
       if (!ws) {
-        await launch({ app, profileDir: dir, url: "about:blank", platform });
+        const launched = await launch({ app, profileDir: dir, url: "about:blank", platform });
         const deadline = Date.now() + 20_000;
         for (;;) {
           if (currentSignal()?.aborted) throw Object.assign(new ExecError("computer request cancelled"), { code: "cancelled" });
@@ -309,7 +493,9 @@ export function createBrowser({
             ws = await attempt(file);
             if (ws) { state.port = file.port; break; }
           }
-          if (Date.now() > deadline) throw Object.assign(new ExecError(`the browser started but its debugging endpoint never came up (profile ${dir}); is it running with a usable profile?`), { code: "browser_unavailable" });
+          // A browser that already exited will not open the endpoint: report
+          // now, with its stderr, rather than after the full timeout.
+          if (launched?.exit || Date.now() > deadline) throw browserStartFailure(launched, dir);
           await sleep(300);
         }
       }
@@ -326,9 +512,20 @@ export function createBrowser({
     },
 
     async status() {
-      if (!state.channel) return { running: false, browser: state.app, profile: state.profileDir ?? profileDir(), note: "no browser session for this computer session yet — browser {action:\"start\"} launches a self-owned instance" };
+      if (!state.channel) {
+        if (attach) return { running: false, attached: false, socket: attach, note: "not attached yet — browser {action:\"start\"} attaches to the computer's shared browser" };
+        return { running: false, browser: state.app, profile: state.profileDir ?? profileDir(), note: "no browser session for this computer session yet — browser {action:\"start\"} launches a self-owned instance" };
+      }
       try {
         const tabs = await listTabs();
+        if (state.attached) {
+          return {
+            running: true, attached: true, shared: true, browser: state.product, socket: attach,
+            tabs: tabs.map((t) => ({ id: t.targetId, title: t.title, url: t.url, agent: t.targetId === state.targetId })),
+            activeTab: tabs.some((t) => t.targetId === state.targetId) ? (({ url, title }) => ({ id: state.targetId, url, title }))(await targetInfo(state.targetId)) : null,
+            note: "every page tab in the shared browser, including the person's; start {tab} moves the agent to one of them",
+          };
+        }
         return {
           running: true, browser: state.app, port: state.port, profile: state.profileDir,
           tabs: tabs.map((t) => ({ id: t.targetId, title: t.title, url: t.url })),
@@ -422,12 +619,19 @@ export function createBrowser({
 
     async stop() {
       if (!state.channel) return { running: false, note: "no browser session for this computer session" };
-      try { await state.channel.send("Target.closeTarget", { targetId: state.targetId }); } catch { /* the tab may already be gone */ }
+      if (state.attached) {
+        // The person's browser: never close a tab or the browser, only detach.
+        if (state.sessionId) await state.channel.send("Target.detachFromTarget", { sessionId: state.sessionId }, undefined, teardown()).catch(() => {});
+        state.channel.close();
+        state.channel = null; state.targetId = null; state.sessionId = null; state.pageEnabled = false; state.domEnabled = false; state.attached = false;
+        return { running: false, detached: true, browser_closed: false, note: "detached from the shared browser; its window and tabs stay as they are" };
+      }
+      try { await state.channel.send("Target.closeTarget", { targetId: state.targetId }, undefined, teardown()); } catch { /* the tab may already be gone */ }
       let remaining = null;
-      try { remaining = (await listTabs()).length; } catch { remaining = null; }
+      try { remaining = (await listTabs(teardown())).length; } catch { remaining = null; }
       let browserClosed = false;
       if (remaining === 0) {
-        try { await state.channel.send("Browser.close"); browserClosed = true; } catch {}
+        try { await state.channel.send("Browser.close", {}, undefined, teardown()); browserClosed = true; } catch {}
         await sleep(200);
       }
       state.channel.close();

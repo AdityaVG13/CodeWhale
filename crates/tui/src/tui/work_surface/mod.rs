@@ -12,7 +12,7 @@
 //!   `work_surface_top_height` (5..=16) or `work_surface_side_width`
 //!   (26..=80) to `settings.toml`.
 //! - **panel** — what it shows. [`RailPanel`]: `Tasks` (default) | `Agents` |
-//!   `Background` | `Files` | `Notepad` | `Context` | `Git` | `Price`, from
+//!   `Background` | `Terminal` | `Files` | `Notepad` | `Context` | `Git` | `Price`, from
 //!   the `rail_panel` setting. The legacy `sidebar_focus` key migrates into
 //!   it.
 //!
@@ -65,6 +65,7 @@ mod input;
 mod interaction;
 mod model;
 mod render;
+mod terminal;
 mod views;
 
 pub use input::{cycle_view, enter_agents, handle_key, handle_mouse};
@@ -72,6 +73,7 @@ pub(crate) use interaction::{agent_details_closed, release_focus, select_dock_pa
 pub use model::{RailPanel, WorkSurfacePlacement, WorkSurfaceState};
 pub(crate) use render::collapse_strip;
 pub use render::{height, render, split_chat};
+pub(crate) use terminal::{handle_paste as handle_terminal_paste, poll as poll_terminal};
 
 #[cfg(test)]
 mod tests {
@@ -83,7 +85,7 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
 
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tools::subagent::{
         AgentWorkerStatus, FleetRole, MailboxMessage, SubAgentAssignment, SubAgentResult,
         SubAgentStatus,
@@ -109,7 +111,7 @@ mod tests {
         let options = TuiOptions {
             use_mouse_capture: true,
             max_subagents: 4,
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = codewhale_localization::Locale::En;
@@ -296,8 +298,9 @@ mod tests {
 
     #[test]
     fn scheduled_automations_do_not_create_background_work() {
-        let mut app =
-            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options("."),
+        );
         app.automation_panel.active_automations = 2;
         assert!(!super::model::background_has_live_work(&mut app));
     }
@@ -1006,11 +1009,15 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "Wire settled file activity".to_string(),
                 role: Some("general".to_string()),
             },
             model: "test-model".to_string(),
-            nickname: Some("Blue Whale".to_string()),
+            nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                "agent_worker",
+                "en",
+            )),
             status: SubAgentStatus::Running,
             worker_status: Some(AgentWorkerStatus::RunningTool),
             runtime_permissions: None,
@@ -1024,6 +1031,8 @@ mod tests {
             duration_ms: 50,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         });
         app.agent_progress_meta.insert(
             "agent_worker".to_string(),
@@ -1048,7 +1057,10 @@ mod tests {
         // The identity column leads with the agent's nickname and keeps the
         // fleet role as the fallback spelling. It is never the raw agent id
         // (#36), and carries no `(+N)` while the agent is childless.
-        assert_eq!(row.label, "Blue Whale");
+        assert_eq!(
+            row.label,
+            crate::tools::subagent::whale_name_for_id_in_locale("agent_worker", "en")
+        );
         let facts = row.agent.as_ref().expect("agent row facts");
         assert_eq!(facts.role_label, "general");
         assert_eq!(facts.objective, "Wire settled file activity");
@@ -1088,6 +1100,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: format!("objective for {id}"),
                 role: Some(role.to_string()),
             },
@@ -1106,6 +1119,8 @@ mod tests {
             duration_ms: 50,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -1198,9 +1213,10 @@ mod tests {
 
     #[test]
     fn agent_rows_completed_agents_render_quietly_without_spawn_metadata() {
-        // #36: quiet completion — a finished agent keeps status + objective;
-        // in-flight metadata (tool, step counters, file tallies) must not
-        // linger as a receipt dump.
+        // #36: quiet completion — a finished agent keeps status + what it
+        // did; in-flight metadata (tool, step counters) must not linger as a
+        // receipt dump. #6565: what it changed is the receipt, and once its
+        // result is known the row says what it produced.
         let mut app = app();
         app.current_session_id = Some(SESSION.to_string());
         app.subagent_cache.push(cached_worker(
@@ -1238,7 +1254,23 @@ mod tests {
         );
         assert!(!row.detail.contains("using "), "{}", row.detail);
         assert!(!row.detail.contains("step 7"), "{}", row.detail);
-        assert!(!row.detail.contains("files changed"), "{}", row.detail);
+        assert!(row.detail.contains("4 files changed"), "{}", row.detail);
+
+        app.subagent_cache[0].result =
+            Some("## Summary\n\nPatched the parser. Tests pass.".to_string());
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_done")
+            .expect("completed agent row");
+        assert_eq!(
+            row.detail, "completed · Patched the parser. · 4 files changed",
+            "the headline replaces the assignment"
+        );
+        assert_eq!(
+            row.agent.as_ref().map(|facts| facts.objective.as_str()),
+            Some("Patched the parser.")
+        );
     }
 
     // ---- Fleet row layout -------------------------------------------------
@@ -1359,10 +1391,10 @@ mod tests {
 
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Deepseek,
-            ApiProvider::Deepseek.as_str(),
+            ProviderKind::Deepseek,
+            ProviderKind::Deepseek.as_str(),
             "deepseek-v4-pro",
-            Some(ApiProvider::Deepseek.default_base_url()),
+            Some(ProviderKind::Deepseek.provider().default_base_url()),
             chrono::Utc::now(),
         );
         let usage = |source_id: &str, input_tokens, output_tokens| MailboxMessage::TokenUsage {
@@ -1768,6 +1800,37 @@ mod tests {
         assert!(row.detail.contains("step 5"), "{}", row.detail);
     }
 
+    /// #6565: when the activity detail already names the step and the tool,
+    /// the dock row says them once, not again as `using …` and `step N`.
+    #[test]
+    fn dock_agent_row_states_each_step_fact_once() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.agent_progress
+            .insert("agent_reader".to_string(), String::new());
+        app.agent_progress_meta.insert(
+            "agent_reader".to_string(),
+            crate::tui::app::AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::RunningTool,
+                    Some("step 6: finished tool 'read_file'".to_string()),
+                    Some("read_file".to_string()),
+                    Some(6),
+                )),
+                ..crate::tui::app::AgentProgressMeta::default()
+            },
+        );
+
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_reader")
+            .expect("progress-only work row");
+        assert_eq!(row.detail.matches("step 6").count(), 1, "{}", row.detail);
+        assert_eq!(row.detail.matches("read_file").count(), 1, "{}", row.detail);
+        assert!(!row.detail.contains("using read_file"), "{}", row.detail);
+    }
+
     // === #5906: a parked husk is not an agent waiting for input ==========
 
     /// Build a child exactly the way the turn-end parking projection does:
@@ -1948,11 +2011,15 @@ mod tests {
                 git_branch: Some("codex/details".to_string()),
                 agent_type: FleetRole::Builder,
                 assignment: SubAgentAssignment {
+                    native_preset: None,
                     objective: "Verify keyboard and mouse convergence".to_string(),
                     role: Some("worker".to_string()),
                 },
                 model: "test-model".to_string(),
-                nickname: Some("Blue Whale".to_string()),
+                nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                    "agent_converge",
+                    "en",
+                )),
                 status: SubAgentStatus::Running,
                 worker_status: Some(AgentWorkerStatus::Running),
                 runtime_permissions: None,
@@ -1966,6 +2033,8 @@ mod tests {
                 duration_ms: 100,
                 started_at: None,
                 from_prior_session: false,
+                idle_ms: None,
+                heartbeat_timeout_ms: None,
             });
         }
 
@@ -2918,6 +2987,140 @@ mod tests {
     }
 
     #[test]
+    fn dock_selection_is_readable_and_close_target_stays_inside_small_hosts() {
+        use super::model::DockTabTarget;
+        use ratatui::style::Modifier;
+        for theme_id in codewhale_palette::SELECTABLE_THEMES {
+            let mut app = app();
+            app.ui_theme = theme_id.ui_theme();
+            app.work_surface.explicit_view = true;
+            add_todos(&mut app, 1);
+            let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, frame.area(), &mut app))
+                .unwrap();
+            let tab = app
+                .work_surface
+                .dock_tabs
+                .iter()
+                .find(|tab| tab.target == DockTabTarget::Panel(super::RailPanel::Tasks))
+                .unwrap();
+            let cell = &terminal.backend().buffer()[(tab.area.x + 1, tab.area.y)];
+            assert_eq!(cell.bg, app.ui_theme.selection_bg, "{theme_id:?}");
+            assert!(!cell.modifier.contains(Modifier::REVERSED), "{theme_id:?}");
+            if let Some(ratio) = codewhale_palette::contrast_ratio(cell.fg, cell.bg) {
+                assert!(ratio >= 4.5, "{theme_id:?}: {cell:?} ({ratio})");
+            } else {
+                // Native terminal colors are user supplied and cannot be measured here.
+                assert_eq!(*theme_id, codewhale_palette::ThemeId::Terminal);
+            }
+        }
+        for width in [1, 2, 3, 8, 16, 40, 60, 80] {
+            for placement in [WorkSurfacePlacement::Top, WorkSurfacePlacement::Bottom] {
+                let mut app = app();
+                app.work_surface.explicit_view = true;
+                app.work_surface.effective_placement = placement;
+                let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                terminal
+                    .draw(|frame| super::render(frame, frame.area(), &mut app))
+                    .unwrap();
+                let close = app
+                    .work_surface
+                    .dock_tabs
+                    .iter()
+                    .find(|tab| tab.target == DockTabTarget::Close)
+                    .unwrap();
+                assert!(close.area.right() <= width);
+                assert!(close.area.width > 0);
+            }
+        }
+    }
+
+    /// #6502: the close control names Esc only while Esc closes the dock.
+    /// Unfocused, Esc stops the running turn, so the `×` stands alone and
+    /// the Esc hint stays with the turn status.
+    #[test]
+    fn close_control_names_esc_only_while_esc_closes_the_dock() {
+        let tab_row = |app: &mut App| {
+            render_rows(app, 80, 8)
+                .into_iter()
+                .find(|row| row.contains("Tasks"))
+                .expect("dock tab row")
+        };
+        let mut app = app();
+        add_todos(&mut app, 3);
+        app.is_loading = true;
+
+        let row = tab_row(&mut app);
+        assert!(
+            !row.contains("Esc"),
+            "unfocused dock must not claim Esc: {row:?}"
+        );
+
+        app.work_surface.focused = true;
+        let row = tab_row(&mut app);
+        assert!(
+            row.contains("Esc"),
+            "focused dock names its close key: {row:?}"
+        );
+        assert!(
+            super::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_some(),
+            "the advertised Esc is the one that closes the dock"
+        );
+        assert!(app.work_surface.dismissed);
+        assert!(!app.work_surface.focused);
+    }
+
+    /// #6502 review: a row action that opens no view (the Context panel's
+    /// `/compact` row) leaves a stale `opened` owner. The hint must follow
+    /// what Esc will really do: close the dock when nothing is stacked above
+    /// it, and stay quiet while a detail pager owns Esc.
+    #[test]
+    fn esc_hint_follows_the_pending_detail_state() {
+        let tab_row = |app: &mut App| {
+            render_rows(app, 80, 8)
+                .into_iter()
+                .find(|row| row.contains("Tasks"))
+                .expect("dock tab row")
+        };
+        let mut app = app();
+        add_todos(&mut app, 3);
+        app.is_loading = true;
+        app.work_surface.focused = true;
+        let row = super::model::project(&mut app)
+            .into_iter()
+            .find(|row| row.selectable)
+            .expect("work row");
+
+        // A detail pager is on screen: Esc closes it, not the dock.
+        app.work_surface.opened = Some(row.id.clone());
+        app.view_stack.push(crate::tui::pager::PagerView::from_text(
+            "Work · test".to_string(),
+            "body",
+            40,
+        ));
+        let rendered = tab_row(&mut app);
+        assert!(
+            !rendered.contains("Esc"),
+            "Esc belongs to the open detail: {rendered:?}"
+        );
+        app.view_stack.pop();
+
+        // The row's command opened nothing: `opened` is stale, and the
+        // advertised Esc closes the dock in one press.
+        let rendered = tab_row(&mut app);
+        assert!(
+            rendered.contains("Esc"),
+            "stale owner must not hide the dock's close key: {rendered:?}"
+        );
+        assert!(
+            super::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_some()
+        );
+        assert!(app.work_surface.dismissed, "one Esc closes the dock");
+        assert!(app.work_surface.opened.is_none());
+    }
+
+    #[test]
     fn narrow_dock_drops_counts_before_optional_tabs() {
         let mut app = app();
         add_todos(&mut app, 3);
@@ -2933,13 +3136,14 @@ mod tests {
             .next()
             .expect("dock tab row");
 
-        assert!(first_row.contains("TODO"), "{first_row:?}");
-        assert!(first_row.contains("AGENTS"), "{first_row:?}");
-        assert!(!first_row.contains("TODO 3"), "{first_row:?}");
-        assert!(!first_row.contains("AGENTS 1"), "{first_row:?}");
-        assert!(first_row.contains("CONTEXT"), "{first_row:?}");
+        assert!(first_row.contains("Tasks"), "{first_row:?}");
+        assert!(first_row.contains("Fleet"), "{first_row:?}");
+        assert!(!first_row.contains("Tasks 3"), "{first_row:?}");
+        assert!(!first_row.contains("Fleet 1"), "{first_row:?}");
+        assert!(first_row.contains("Terminal"), "{first_row:?}");
+        assert!(!first_row.contains("Context"), "{first_row:?}");
         // Shed from the right: price goes before any work view.
-        assert!(!first_row.contains("PRICE"), "{first_row:?}");
+        assert!(!first_row.contains("Cost"), "{first_row:?}");
     }
 
     #[test]
@@ -3736,6 +3940,76 @@ mod tests {
         assert!(
             matches!(handled, Some(Some(SidebarRowAction::InspectWork { .. }))),
             "⌥V opens the selected row's own details: {handled:?}"
+        );
+    }
+
+    /// T1: a real right-click over an agent row opens that row's menu. The
+    /// work surface's catch-all arm marked every event consumed, so
+    /// `handle_mouse_event` returned before its right-click branch and no
+    /// menu ever opened over the dock.
+    #[test]
+    fn right_click_on_an_agent_row_opens_its_menu() {
+        use crate::tui::views::{ContextMenuAction, ModalKind, ViewEvent};
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut app = app();
+        app.work_surface.panel = super::RailPanel::Agents;
+        app.current_session_id = Some(SESSION.to_string());
+        app.subagent_cache.push(cached_worker(
+            "agent-live",
+            "builder",
+            None,
+            None,
+            SubAgentStatus::Running,
+        ));
+        let _ = render_text(&mut app, 100, 6);
+        let row_y = app
+            .work_surface
+            .hitboxes
+            .iter()
+            .find(|hit| hit.id.0 == "worker:agent-live")
+            .expect("the live agent row is painted")
+            .row_y;
+
+        let events = crate::tui::mouse_ui::handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 2,
+                row: row_y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ContextMenu));
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        app.view_stack.render(area, &mut buf);
+        let text: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(text.matches("Focus agent").count(), 1, "{text}");
+        assert!(
+            text.contains("Stop agent…"),
+            "a running agent can be stopped"
+        );
+        assert!(!text.contains("Message agent") && !text.contains("Open transcript"));
+        assert!(
+            !text.contains("Command palette"),
+            "app chrome stays off a row's menu"
+        );
+
+        // Enter runs the primary entry: the same focus a left click runs.
+        let events = app
+            .view_stack
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ViewEvent::ContextMenuSelected {
+                    action: ContextMenuAction::Row(SidebarRowAction::OpenAgentTranscript { agent_id }),
+                }] if agent_id == "agent-live"
+            ),
+            "{events:?}"
         );
     }
 }

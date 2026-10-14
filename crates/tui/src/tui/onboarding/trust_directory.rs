@@ -117,7 +117,7 @@ mod tests {
     fn prompt_names_the_workspace_boundary_and_effects() {
         let options = TuiOptions {
             model: "test-model".to_string(),
-            ..crate::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = codewhale_localization::Locale::En;
@@ -144,7 +144,7 @@ mod tests {
         let mut app = App::new(
             TuiOptions {
                 model: "test-model".to_string(),
-                ..crate::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
+                ..crate::tui::test_support::test_tui_options(PathBuf::from("workspace-fixture"))
             },
             &Config::default(),
         );
@@ -187,7 +187,7 @@ mod narrow_terminal_tests {
     fn app_at(workspace: &str) -> App {
         let options = TuiOptions {
             model: "test-model".to_string(),
-            ..crate::test_support::test_tui_options(PathBuf::from(workspace))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from(workspace))
         };
         App::new(options, &Config::default())
     }

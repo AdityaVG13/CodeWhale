@@ -6,6 +6,7 @@
 //! [`crate::fleet::store`] with an atomic save and a receipt naming the exact
 //! file and scope.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 /// Rows a PageUp/PageDown travels. Both lists here are modal and short, so a
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 const DETAIL_PAGE: usize = 10;
 const ROUTE_PICK_PAGE: usize = 10;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -22,13 +23,14 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Widget, Wrap},
 };
 
-use crate::config::{ApiProvider, Config};
+use crate::config::Config;
 use crate::fleet::role::public_role_label;
 use crate::fleet::store::{
     FleetFile, FleetMember, FleetOperator, FleetScope, MemberCapability, load_fleet_in_scope,
     save_fleet, set_selected,
 };
 use crate::tui::app::App;
+use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
 };
@@ -84,11 +86,16 @@ struct RouteRow {
     summary: String,
     provider: Option<String>,
     model: Option<String>,
+    /// The provider's fresh live roster no longer lists this model (#6035).
+    /// A bundled catalog row can outlive the account's roster, so offering
+    /// the route is not proof it is still listed.
+    roster_missing: bool,
 }
 
 pub struct FleetDetailView {
     fleet: FleetFile,
     editor_id: uuid::Uuid,
+    pub(crate) return_to_roster: bool,
     saved_source: Option<String>,
     locale: Locale,
     scope: FleetScope,
@@ -96,6 +103,9 @@ pub struct FleetDetailView {
     workspace: PathBuf,
     /// 0 = operator row; 1.. = members.
     selected: usize,
+    row_hitboxes: RefCell<Vec<(Rect, usize)>>,
+    last_mouse_selected: Option<usize>,
+    hovered_row: Option<usize>,
     step: DetailStep,
     pick_target: FleetRouteTarget,
     routes: Vec<RouteRow>,
@@ -159,13 +169,12 @@ impl FleetDetailView {
             &session_provider,
             &session_model,
         );
-        if let Some(member_id) = member_id.map(str::trim).filter(|id| !id.is_empty())
-            && let Some(index) = view
+        if let Some(member_id) = member_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let index = view
                 .fleet
                 .members
                 .iter()
-                .position(|member| member.id.eq_ignore_ascii_case(member_id))
-        {
+                .position(|member| member.id.eq_ignore_ascii_case(member_id))?;
             view.selected = index + 1;
         }
         Some(view)
@@ -188,12 +197,16 @@ impl FleetDetailView {
         let mut view = Self {
             fleet,
             editor_id: uuid::Uuid::new_v4(),
+            return_to_roster: false,
             saved_source,
             locale,
             scope,
             source,
             workspace,
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
+            last_mouse_selected: None,
+            hovered_row: None,
             step: DetailStep::Overview,
             pick_target: FleetRouteTarget::Operator,
             routes,
@@ -236,6 +249,32 @@ impl FleetDetailView {
             .and_then(|idx| self.fleet.members.get(idx))
     }
 
+    /// Whether the file on disk is still exactly what this editor loaded (or
+    /// last wrote). Every write from the editor checks it first, so a save
+    /// never replaces a newer version written by another session or by hand,
+    /// and never recreates a file that was removed meanwhile.
+    ///
+    /// Known limitation: this is check-then-write, not a lock; a write that
+    /// lands between the check and the atomic rename is not detected.
+    fn source_unchanged(&self) -> bool {
+        self.saved_source.is_some()
+            && std::fs::read_to_string(&self.source).ok() == self.saved_source
+    }
+
+    /// The pager shown when the source moved underneath the editor.
+    fn stale_source_action(&self, title: &str) -> ViewAction {
+        ViewAction::Emit(ViewEvent::OpenTextPager {
+            title: title.to_string(),
+            content: format!(
+                "Nothing was written.\n\n{} changed on disk after this editor opened it \
+                 (another session or an external edit). Saving now would overwrite \
+                 that newer version.\n\nClose this editor and reopen the team to load \
+                 the current file, then make the change again.",
+                self.source.display()
+            ),
+        })
+    }
+
     fn start_rename(&mut self) {
         self.rename_mode = true;
         self.rename_input = self.fleet.name.clone();
@@ -250,6 +289,10 @@ impl FleetDetailView {
         if new_name == self.fleet.name {
             self.rename_mode = false;
             return Some(ViewAction::None);
+        }
+        if !self.source_unchanged() {
+            self.rename_mode = false;
+            return Some(self.stale_source_action("Rename refused"));
         }
         // The rename must not collide with a different Fleet of the same slug
         // in this scope (the store refuses that at save).
@@ -394,6 +437,26 @@ impl FleetDetailView {
         }
     }
 
+    pub(crate) fn direct_assignment(&mut self) -> (uuid::Uuid, FleetRouteTarget) {
+        self.return_to_roster = true;
+        (self.editor_id, self.selected_route_target())
+    }
+
+    pub(crate) fn assignment_context(&self) -> (String, String) {
+        let role = self
+            .selected_member()
+            .map(|member| member.id.clone())
+            .unwrap_or_else(|| "Coordinator".into());
+        (
+            role,
+            format!("{} · {}", self.fleet.name, self.scope.label()),
+        )
+    }
+
+    pub(crate) fn is_direct_assignment(&self, editor_id: uuid::Uuid) -> bool {
+        self.return_to_roster && self.editor_id == editor_id
+    }
+
     pub(crate) fn route_selection(
         &self,
         editor_id: uuid::Uuid,
@@ -446,10 +509,7 @@ impl FleetDetailView {
     ) -> Result<String, String> {
         // A picker belongs to one editor instance and the exact saved file
         // it opened. Never recreate a removed file or overwrite newer edits.
-        if editor_id != self.editor_id
-            || self.saved_source.is_none()
-            || std::fs::read_to_string(&self.source).ok() != self.saved_source
-        {
+        if editor_id != self.editor_id || !self.source_unchanged() {
             return Err(tr(self.locale, MessageId::FleetRoutePickUnavailable).into_owned());
         }
         if let FleetRouteTarget::Member(idx) = target
@@ -610,6 +670,9 @@ impl FleetDetailView {
     }
 
     fn save(&self) -> Option<ViewAction> {
+        if !self.source_unchanged() {
+            return Some(self.stale_source_action("Save refused"));
+        }
         match save_fleet(&self.fleet, self.scope, &self.workspace) {
             Ok(path) => Some(ViewAction::EmitAndClose(ViewEvent::FleetStoreChanged {
                 message: format!(
@@ -685,8 +748,6 @@ impl FleetDetailView {
                 let mut hints = vec![
                     ActionHint::new("↑/↓", "move"),
                     ActionHint::new("Enter", tr(self.locale, MessageId::PickerActionModels)),
-                    ActionHint::new("o", "Coordinator model"),
-                    ActionHint::new("e", "member model"),
                     ActionHint::new("r", "rename"),
                     ActionHint::new("s", "save"),
                     ActionHint::new("c", "copy destination"),
@@ -718,6 +779,8 @@ impl ModalView for FleetDetailView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        self.last_mouse_selected = None;
+        self.hovered_row = None;
         match self.step {
             DetailStep::PickRoute => match key.code {
                 // Esc clears a filter before it leaves, so a mistyped query
@@ -866,7 +929,46 @@ impl ModalView for FleetDetailView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        // Mouse browsing cannot bypass a rename or removal confirmation.
+        if self.step != DetailStep::Overview || self.rename_mode || self.pending_remove {
+            return ViewAction::None;
+        }
+        let hit = self.row_hitboxes.borrow().iter().find_map(|(rect, row)| {
+            rect.contains((mouse.column, mouse.row).into())
+                .then_some(*row)
+        });
+        match mouse.kind {
+            MouseEventKind::Moved => self.hovered_row = hit,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                return self.handle_key(KeyEvent::new(
+                    if mouse.kind == MouseEventKind::ScrollUp {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    },
+                    KeyModifiers::NONE,
+                ));
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(row) = hit {
+                    let open = self.selected == row && self.last_mouse_selected == Some(row);
+                    self.selected = row;
+                    self.last_mouse_selected = Some(row);
+                    if open {
+                        return self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    }
+                } else {
+                    self.last_mouse_selected = None;
+                }
+            }
+            _ => {}
+        }
+        ViewAction::None
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         Clear.render(area, buf);
         Block::default()
             .style(Style::default().bg(palette::WHALE_BG))
@@ -924,22 +1026,28 @@ impl ModalView for FleetDetailView {
 
 impl FleetDetailView {
     /// A saved route pin is drifted when the `(provider, model)` pair is not
-    /// among the routes the picker can currently offer — the provider table
-    /// was removed, or the model dropped out of the provider's roster. The
-    /// pin may still serve upstream, so this only flags; it never rewrites.
+    /// among the routes the picker can currently offer (the provider table
+    /// was removed), or when the provider's fresh live roster no longer
+    /// lists the model even though a bundled row still offers it (#6035).
+    /// The pin may still serve upstream, so this only flags; it never
+    /// rewrites.
     fn pin_drifted(&self, provider: &str, model: &str) -> bool {
-        !self.routes.iter().any(|row| {
-            row.provider
-                .as_deref()
-                .is_some_and(|p| p.eq_ignore_ascii_case(provider))
-                && row
-                    .model
+        self.routes
+            .iter()
+            .find(|row| {
+                row.provider
                     .as_deref()
-                    .is_some_and(|m| m.eq_ignore_ascii_case(model))
-        })
+                    .is_some_and(|p| p.eq_ignore_ascii_case(provider))
+                    && row
+                        .model
+                        .as_deref()
+                        .is_some_and(|m| m.eq_ignore_ascii_case(model))
+            })
+            .is_none_or(|row| row.roster_missing)
     }
 
     fn render_overview(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -947,8 +1055,8 @@ impl FleetDetailView {
         let scroll = self.selected.saturating_sub(rows_visible.saturating_sub(1));
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        // Operator row.
-        if self.selected == 0 {
+        // Keep the Coordinator in place until it actually scrolls offscreen.
+        if scroll == 0 {
             let selected = self.selected == 0;
             let base = if selected {
                 Style::default().fg(palette::WHALE_ACTION).bold()
@@ -986,6 +1094,9 @@ impl FleetDetailView {
                     Style::default().fg(palette::STATUS_WARNING),
                 ));
             }
+            self.row_hitboxes
+                .borrow_mut()
+                .push((Rect::new(area.x, area.y, area.width, 1), 0));
             lines.push(Line::from(spans));
         }
 
@@ -994,6 +1105,10 @@ impl FleetDetailView {
             if row < scroll || row >= scroll + rows_visible {
                 continue;
             }
+            self.row_hitboxes.borrow_mut().push((
+                Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+                row,
+            ));
             let selected = row == self.selected;
             let base = if selected {
                 Style::default().fg(palette::WHALE_ACTION).bold()
@@ -1058,6 +1173,31 @@ impl FleetDetailView {
                 lines.push(Line::from(spans));
             }
         }
+        for ((rect, row), line) in self.row_hitboxes.borrow().iter().zip(lines.iter_mut()) {
+            let style = if *row == self.selected && !self.pending_remove {
+                Some(menu_style::selected_row_style())
+            } else if self.hovered_row == Some(*row) {
+                Some(menu_style::hovered_row_style())
+            } else {
+                None
+            };
+            if let Some(style) = style {
+                buf.set_style(*rect, style);
+                line.style = style;
+                for span in &mut line.spans {
+                    // Focus owns the fill, while warnings retain their
+                    // semantic ink and explicit diagnostic label.
+                    span.style = match span.style.fg {
+                        Some(ink)
+                            if ink == palette::STATUS_WARNING || ink == palette::WHALE_ERROR =>
+                        {
+                            style.fg(ink)
+                        }
+                        _ => style,
+                    };
+                }
+            }
+        }
         Paragraph::new(ratatui::text::Text::from(lines)).render(area, buf);
     }
 
@@ -1109,7 +1249,7 @@ impl FleetDetailView {
             } else {
                 Style::default().fg(palette::TEXT_SECONDARY)
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(if selected { "» " } else { "  " }, base),
                 Span::styled(route.label.clone(), base),
                 Span::styled("  ", Style::default()),
@@ -1117,7 +1257,15 @@ impl FleetDetailView {
                     route.summary.clone(),
                     Style::default().fg(palette::TEXT_DIM),
                 ),
-            ]));
+            ];
+            // Where the pin is edited, say so before it is picked (#6035).
+            if route.roster_missing {
+                spans.push(Span::styled(
+                    tr(self.locale, MessageId::FleetRouteNotInCatalog),
+                    Style::default().fg(palette::STATUS_WARNING),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
         Paragraph::new(ratatui::text::Text::from(lines)).render(area, buf);
     }
@@ -1132,25 +1280,26 @@ fn build_route_rows(config: &Config) -> Vec<RouteRow> {
         summary: String::new(),
         provider: None,
         model: None,
+        roster_missing: false,
     }];
     let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
-    let active = config
-        .provider
-        .as_deref()
-        .and_then(ApiProvider::parse)
-        .unwrap_or(ApiProvider::Deepseek);
-    let routes = super::fleet_setup::cross_provider_model_routes(config, active, &health);
+    let active = config.active_provider_identity().ok();
+    let routes = super::fleet_setup::cross_provider_model_routes(config, active.as_ref(), &health);
     for (provider, model, readiness) in routes {
         let provider_label = crate::tui::views::fleet_setup::provider_display_label(&provider);
         let readiness_label = readiness
             .blocked_reason()
             .map(|r| r.into_owned())
             .unwrap_or_else(|| readiness.label().into_owned());
+        let roster_missing =
+            crate::provider_catalog_live::pin_missing_from_fresh_roster(config, &provider, &model)
+                == Some(true);
         rows.push(RouteRow {
             label: format!("{provider_label}/{model}"),
             summary: readiness_label,
             provider: Some(provider),
             model: Some(model),
+            roster_missing,
         });
     }
     rows
@@ -1186,7 +1335,7 @@ mod tests {
 
     fn app_in(workspace: PathBuf) -> App {
         let options = TuiOptions {
-            ..crate::test_support::test_tui_options(workspace.clone())
+            ..crate::tui::test_support::test_tui_options(workspace.clone())
         };
         let mut app = App::new(options, &Config::default());
         app.workspace = workspace;
@@ -1271,6 +1420,58 @@ mod tests {
             FleetDetailView::open(&app, &Config::default(), "Nope", FleetScope::Workspace)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn fleet_role_mouse_selection_opens_the_same_model_picker_as_enter() {
+        let ws = tempfile::TempDir::new().unwrap();
+        save_fleet(&sample_fleet("Team"), FleetScope::Workspace, ws.path()).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Team",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+        for (width, height) in [(40, 12), (80, 24), (140, 40)] {
+            view.selected = 0;
+            view.last_mouse_selected = None;
+            let area = Rect::new(0, 0, width, height);
+            view.render(area, &mut Buffer::empty(area));
+            let hit = view
+                .row_hitboxes
+                .borrow()
+                .iter()
+                .find_map(|(rect, row)| (*row == 1).then_some(*rect))
+                .expect("member row");
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(matches!(view.handle_mouse(click), ViewAction::None));
+            assert_eq!(view.selected, 1);
+            // Selection must not move the Coordinator out of the viewport.
+            view.render(area, &mut Buffer::empty(area));
+            assert_eq!(view.row_hitboxes.borrow()[0].1, 0);
+            assert_eq!(view.row_hitboxes.borrow()[1].0, hit);
+            assert!(matches!(view.handle_mouse(click),
+                ViewAction::Emit(ViewEvent::FleetDetailRoutePickRequested {
+                    target: FleetRouteTarget::Member(0), editor_id,
+                }) if editor_id == view.editor_id));
+            assert!(matches!(view.handle_key(key(KeyCode::Enter)),
+                ViewAction::Emit(ViewEvent::FleetDetailRoutePickRequested {
+                    target: FleetRouteTarget::Member(0), editor_id,
+                }) if editor_id == view.editor_id));
+            // Clicking never skips an active destructive confirmation.
+            view.pending_remove = true;
+            assert!(matches!(view.handle_mouse(click), ViewAction::None));
+            view.pending_remove = false;
+            let empty = Rect::new(0, 0, 0, 0);
+            view.render(empty, &mut Buffer::empty(empty));
+            assert!(view.row_hitboxes.borrow().is_empty());
+        }
     }
 
     /// Enter on a row asks the host for the standard `/model` picker, and the
@@ -1647,9 +1848,9 @@ mod tests {
         save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
         let config = Config {
             provider: Some("deepseek".into()),
-            api_key: Some("test-key".into()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".into()), None);
         let mut view = FleetDetailView::open_for_member(
             &app_in(ws.path().to_path_buf()),
             &config,
@@ -1769,6 +1970,77 @@ mod tests {
         );
     }
 
+    /// #6035: a bundled catalog row can outlive the provider's live roster.
+    /// A route the fresh roster dropped is flagged in the overview and in the
+    /// pin editor, and the pin is never rewritten. (`build_route_rows` asks
+    /// `pin_missing_from_fresh_roster`, which carries its own roster tests;
+    /// seeding the process-wide catalog here would leak into parallel tests.)
+    #[test]
+    fn a_pin_the_fresh_roster_dropped_is_flagged_in_overview_and_picker() {
+        let ws = tempfile::TempDir::new().unwrap();
+        // The operator pins deepseek/deepseek-v4-flash.
+        let fleet = sample_fleet("Roster");
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Roster",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+        let dropped = |row: &RouteRow| {
+            row.provider.as_deref() == Some("deepseek")
+                && row.model.as_deref() == Some("deepseek-v4-flash")
+        };
+        match view.routes.iter_mut().find(|row| dropped(row)) {
+            Some(row) => row.roster_missing = true,
+            None => view.routes.push(RouteRow {
+                label: "DeepSeek/deepseek-v4-flash".to_string(),
+                summary: String::new(),
+                provider: Some("deepseek".to_string()),
+                model: Some("deepseek-v4-flash".to_string()),
+                roster_missing: true,
+            }),
+        }
+        assert!(view.pin_drifted("deepseek", "deepseek-v4-flash"));
+
+        let render = |view: &FleetDetailView, pick: bool| {
+            let area = Rect::new(0, 0, 160, 12);
+            let mut buf = Buffer::empty(area);
+            if pick {
+                view.render_pick_route(area, &mut buf);
+            } else {
+                view.render_overview(area, &mut buf);
+            }
+            (0..area.height)
+                .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect::<Vec<String>>()
+        };
+        let overview = render(&view, false);
+        let operator_row = overview
+            .iter()
+            .find(|row| row.contains("deepseek-v4-flash"))
+            .expect("operator row rendered");
+        assert!(
+            operator_row.contains("not in current catalog"),
+            "{operator_row}"
+        );
+
+        view.open_route_picker(FleetRouteTarget::Operator);
+        view.pick_query = "deepseek-v4-flash".to_string();
+        let picker = render(&view, true);
+        let row = picker
+            .iter()
+            .find(|row| row.contains("/deepseek-v4-flash"))
+            .expect("dropped route still offered in the picker");
+        assert!(row.contains("not in current catalog"), "{row}");
+        assert_eq!(
+            view.fleet.operator.as_ref().map(|op| op.model.as_str()),
+            Some("deepseek-v4-flash"),
+            "a warning never rewrites the pin"
+        );
+    }
+
     #[test]
     fn save_writes_the_file_and_receipt_names_the_path() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -1810,6 +2082,66 @@ mod tests {
         let op = loaded.operator.expect("operator");
         assert_eq!(op.model, "deepseek-v4-pro");
         assert_eq!(op.reasoning.as_deref(), Some("high"));
+
+        {
+            let _env = crate::test_support::lock_test_env();
+            let root = tempfile::tempdir().unwrap();
+            let _home =
+                crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("state"));
+            let config: Config = toml::from_str(
+                r#"
+provider = "ReviewerRoute"
+[providers.ReviewerRoute]
+kind = "openai-compatible"
+api_key = "fixture-review-key"
+base_url = "http://127.0.0.1:9/v1"
+model = "fixture-review-model"
+"#,
+            )
+            .unwrap();
+            let mut fleet = FleetFile::new("Editor restart acceptance".into(), None).unwrap();
+            fleet.members.push(
+                serde_json::from_value(serde_json::json!({
+                    "id":"review-pin", "role":"reviewer", "instructions":"SAVED_REVIEW_INSTRUCTION"
+                }))
+                .unwrap(),
+            );
+            save_fleet(&fleet, FleetScope::Workspace, root.path()).unwrap();
+            let mut app = App::new(
+                crate::tui::test_support::test_tui_options(root.path()),
+                &config,
+            );
+            app.workspace = root.path().to_path_buf();
+            let mut view = FleetDetailView::open_for_member(
+                &app,
+                &config,
+                &fleet.name,
+                FleetScope::Workspace,
+                Some("review-pin"),
+            )
+            .unwrap();
+            let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            view.handle_key(key(KeyCode::Char('e')));
+            for ch in "ReviewerRoute".chars() {
+                view.handle_key(key(KeyCode::Char(ch)));
+            }
+            view.handle_key(key(KeyCode::Enter));
+            // Off survives generic route normalization and distinguishes the saved
+            // choice from default reasoning without inventing fixture capabilities.
+            view.handle_key(key(KeyCode::Char('t')));
+            assert!(matches!(
+                view.handle_key(key(KeyCode::Char('s'))),
+                ViewAction::EmitAndClose(ViewEvent::FleetStoreChanged { .. })
+            ));
+            let (saved, _) =
+                load_fleet_in_scope(&fleet.name, FleetScope::Workspace, root.path()).unwrap();
+            let pin = &saved.members[0];
+            assert!(!pin.shortlist);
+            assert_eq!(pin.role, "reviewer");
+            assert_eq!(pin.provider.as_deref(), Some("ReviewerRoute"));
+            assert_eq!(pin.model.as_deref(), Some("fixture-review-model"));
+            assert_eq!(pin.reasoning.as_deref(), Some("off"));
+        }
     }
 
     #[test]
@@ -1873,5 +2205,59 @@ mod tests {
         view.handle_key(key(KeyCode::Char('d')));
         view.handle_key(key(KeyCode::Char('y')));
         assert_eq!(view.fleet.members, fleet.members);
+    }
+
+    /// U09-01: an ordinary Save or rename never overwrites a Fleet file that
+    /// changed on disk after the editor opened it; the newer version survives
+    /// and the editor says to reload.
+    #[test]
+    fn save_and_rename_refuse_an_externally_newer_source() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let fleet = sample_fleet("Fleet S");
+        let path = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Fleet S",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+
+        // Another session saves a newer version of the same team.
+        let mut newer = fleet.clone();
+        newer.operator = Some(FleetOperator {
+            provider: "openai".to_string(),
+            model: "gpt-5.6".to_string(),
+            reasoning: None,
+        });
+        save_fleet(&newer, FleetScope::Workspace, ws.path()).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+
+        view.fleet.operator = Some(FleetOperator {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            reasoning: None,
+        });
+        let action = view.handle_key(key(KeyCode::Char('s')));
+        assert!(
+            matches!(&action, ViewAction::Emit(ViewEvent::OpenTextPager { title, .. }) if title == "Save refused"),
+            "{action:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        view.handle_key(key(KeyCode::Char('r')));
+        for _ in "Fleet S".chars() {
+            view.handle_key(key(KeyCode::Backspace));
+        }
+        for ch in "Fleet T".chars() {
+            view.handle_key(key(KeyCode::Char(ch)));
+        }
+        let action = view.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&action, ViewAction::Emit(ViewEvent::OpenTextPager { title, .. }) if title == "Rename refused"),
+            "{action:?}"
+        );
+        assert_eq!(view.fleet.name, "Fleet S");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
     }
 }

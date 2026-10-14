@@ -22,7 +22,12 @@ use super::{appearance::Appearance, persistence::Store};
 use crate::fleet::files::{WorkspaceFile, same_file};
 
 const LEASE: Duration = Duration::from_secs(2);
+const OWNER_IDLE_EXIT: Duration = Duration::from_secs(600);
 const MAX_CLIENTS: usize = 4096;
+/// Request body limit for every owner route. Clients size batches to it.
+pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// How long a route waits for the world thread's reply before answering 503.
+pub(super) const WORK_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,9 +101,19 @@ pub struct Request {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
-    Interact { food: bool, x: f64, y: f64 },
-    Select { source: String },
-    Appearance { appearance: Appearance },
+    Interact {
+        food: bool,
+        x: f64,
+        y: f64,
+    },
+    Select {
+        source: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        only_if_idle: bool,
+    },
+    Appearance {
+        appearance: Appearance,
+    },
 }
 
 #[derive(Deserialize)]
@@ -111,6 +126,8 @@ pub struct Producer {
     pub source_revision: u64,
     pub seq: u64,
     pub waiting: bool,
+    #[serde(default)]
+    pub locale: Option<String>,
     pub events: Vec<Value>,
 }
 
@@ -122,6 +139,7 @@ pub struct AudioLease {
 }
 
 enum Work {
+    View,
     Action(Request, tokio::sync::oneshot::Sender<Result<Value, String>>),
     Producer(
         Producer,
@@ -190,7 +208,7 @@ async fn submit(
     if state.tx.try_send(make(tx)).is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    match tokio::time::timeout(WORK_REPLY_TIMEOUT, rx).await {
         Ok(Ok(result)) => answer(result),
         _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -204,6 +222,7 @@ async fn frame(
     if !authorized(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let _ = state.tx.try_send(Work::View);
     let Ok(frames) = state.frames.lock() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -371,10 +390,11 @@ pub fn serve(root: PathBuf, requested_port: u16) -> anyhow::Result<()> {
         .route("/", get(|| async { Html(include_str!("shared.html")) }))
         .route("/pet-native.js", get(|| async { ([("content-type", "text/javascript")], include_str!("pet-native.js")) }))
         .route("/whale-points.tsv", get(|| async { include_str!("../ambient_life/whale-points.tsv") }))
+        .route("/pixel-whale.webp", get(|| async { ([("content-type", "image/webp")], include_bytes!("pixel-whale.webp").as_slice()) }))
         .route("/v1/frame", get(frame)).route("/v1/action", post(action))
         .route("/v1/producer", post(producer)).route("/v1/audio", post(audio))
         .route("/v1/export", get(export)).route("/v1/attach", post(attach))
-        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(|request: axum::extract::Request, next: axum::middleware::Next| async move {
             let mut response = next.run(request).await;
             for (key, value) in [("cache-control", "no-store"), ("referrer-policy", "no-referrer"), ("x-content-type-options", "nosniff"), ("content-security-policy", "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")] {
@@ -453,6 +473,11 @@ fn run_world(
     let origin = Instant::now();
     let initial_time: f64 = context.with(|ctx| ctx.eval("JSON.parse(pet.snapshot()).timeMs"))?;
     let mut last = origin;
+    let mut last_view = origin;
+    let mut interface_language = "en".to_string();
+    let mut was_active = true;
+    let mut idle_since: Option<Instant> = None;
+    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
     let mut ticks = 0u64;
     let mut measurements = VecDeque::<f64>::new();
     save(&context, &mut saved, &mut store)?;
@@ -480,13 +505,27 @@ fn run_world(
         {
             audio = None;
         }
+        let viewed = now.duration_since(last_view) <= LEASE;
+        let active = viewed || producer.is_some() || audio.is_some();
+        if active {
+            idle_since = None;
+        } else if now.duration_since(*idle_since.get_or_insert(now)) > OWNER_IDLE_EXIT {
+            save(&context, &mut saved, &mut store)?;
+            return Ok(());
+        }
+        if !active || !was_active {
+            last = now;
+        }
         let elapsed = now.duration_since(last).as_secs_f64();
-        if elapsed >= 1.0 / 30.0 {
+        if active && now.duration_since(last) >= frame_interval {
             // A suspended machine advances a bounded amount and marks a gap;
             // offline wall time never invents activity or historical sound.
             let count = (elapsed * 30.0).floor().min(3.0) as u64;
             if elapsed > 0.25 {
-                producer = None;
+                // A delayed clock tick loses observation coverage, not the
+                // producer's transport sequence. Keep its lease until LEASE
+                // expires above; ordinary scheduler stalls must not reject
+                // the next valid packet as an unknown producer.
                 waiting = false;
                 context.with(|ctx| ctx.eval::<(), _>("pet.disconnectEngine()"))?;
             }
@@ -543,74 +582,127 @@ fn run_world(
             } else {
                 last + Duration::from_secs_f64(count as f64 / 30.0)
             };
-            let text: String = context.with(|ctx| ctx.eval("pet.presentation()"))?;
-            let mut frame: Value = serde_json::from_str(&text)?;
-            frame["version"] = json!(1);
-            frame["identity"] = json!(saved.identity);
-            frame["epoch"] = json!(epoch);
-            frame["tick"] =
-                json!((frame["timeMs"].as_f64().unwrap_or(0.0) * 30.0 / 1000.0).round() as u64);
-            frame["cursor"] = json!(saved.cursor);
-            frame["source"] = json!(saved.source);
-            frame["sourceRevision"] = json!(saved.source_revision);
-            // Presentation material keeps missing coverage legible. The core
-            // pigment, score, particle digest and recording are unchanged.
-            for key in ["", "still"] {
-                let pose = if key.is_empty() {
-                    &mut frame
-                } else {
-                    &mut frame[key]
-                };
-                let hollow =
-                    producer.is_none() || pose["style"]["hollow"].as_bool().unwrap_or(true);
-                if hollow {
-                    pose["style"]["hollow"] = json!(true);
-                    pose["style"]["r"] = json!(153);
-                    pose["style"]["g"] = json!(176);
-                    pose["style"]["b"] = json!(184);
-                    pose["style"]["alpha"] =
-                        json!(0.68 * pose["state"]["lit"].as_f64().unwrap_or(1.0).max(0.25));
-                }
-            }
-            for key in ["", "still"] {
-                let pose = if key.is_empty() {
-                    &mut frame
-                } else {
-                    &mut frame[key]
-                };
-                if !saved.appearance.event_colors {
-                    for (key, value) in ["r", "g", "b"].into_iter().zip(saved.appearance.particle) {
-                        pose["style"][key] = json!(value);
+            if viewed {
+                let appearance_json = serde_json::to_string(&saved.appearance)?;
+                let text: String = context.with(|ctx| -> rquickjs::Result<String> {
+                    ctx.globals()
+                        .set("appearanceJSON", appearance_json.as_str())?;
+                    ctx.globals()
+                        .set("interfaceLanguage", interface_language.as_str())?;
+                    ctx.eval("pet.presentation(JSON.parse(appearanceJSON),interfaceLanguage)")
+                })?;
+                let mut frame: Value = serde_json::from_str(&text)?;
+                frame["version"] = json!(1);
+                frame["identity"] = json!(saved.identity);
+                frame["epoch"] = json!(epoch);
+                frame["tick"] =
+                    json!((frame["timeMs"].as_f64().unwrap_or(0.0) * 30.0 / 1000.0).round() as u64);
+                frame["cursor"] = json!(saved.cursor);
+                frame["source"] = json!(saved.source);
+                frame["sourceRevision"] = json!(saved.source_revision);
+                bind_activity(&mut frame, &saved.source, saved.cursor);
+                // Presentation material keeps missing coverage legible. The core
+                // pigment, score, particle digest and recording are unchanged.
+                for key in ["", "still"] {
+                    let pose = if key.is_empty() {
+                        &mut frame
+                    } else {
+                        &mut frame[key]
+                    };
+                    let hollow =
+                        producer.is_none() || pose["style"]["hollow"].as_bool().unwrap_or(true);
+                    if hollow {
+                        pose["style"]["hollow"] = json!(true);
+                        pose["style"]["r"] = json!(153);
+                        pose["style"]["g"] = json!(176);
+                        pose["style"]["b"] = json!(184);
+                        pose["style"]["alpha"] =
+                            json!(0.68 * pose["state"]["lit"].as_f64().unwrap_or(1.0).max(0.25));
                     }
                 }
-                pose["style"]["alpha"] = json!(
-                    (pose["style"]["alpha"].as_f64().unwrap_or(0.5) * saved.appearance.brightness)
-                        .clamp(0.0, 1.0)
-                );
-            }
-            frame["appearance"] = json!(saved.appearance);
-            frame["producerConnected"] = json!(producer.is_some());
-            frame["storageAvailable"] = json!(!storage_error);
-            frame["audioOwner"] = json!(audio.as_ref().map(|(id, _)| id));
-            frame["audioUnavailable"] = json!(audio_error);
-            measurements.push_back(started.elapsed().as_secs_f64() * 1000.0);
-            if measurements.len() > 300 {
-                measurements.pop_front();
-            }
-            frame["performance"] = json!({"worldHz":30,"frames":ticks,"uptimeSeconds":origin.elapsed().as_secs_f64(),"workMs":measurements.back()});
-            let mut output = frames
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Frame lock failed"))?;
-            output.push_back(frame);
-            if output.len() > 16 {
-                output.pop_front();
+                for key in ["", "still"] {
+                    let pose = if key.is_empty() {
+                        &mut frame
+                    } else {
+                        &mut frame[key]
+                    };
+                    if !saved.appearance.event_colors {
+                        for (key, value) in
+                            ["r", "g", "b"].into_iter().zip(saved.appearance.particle)
+                        {
+                            pose["style"][key] = json!(value);
+                        }
+                    }
+                    let hollow = pose["style"]["hollow"].as_bool().unwrap_or(true);
+                    let lit = pose["state"]["lit"]
+                        .as_f64()
+                        .unwrap_or(1.0)
+                        .clamp(0.18, 1.0);
+                    let light = saved
+                        .appearance
+                        .background
+                        .iter()
+                        .map(|v| f64::from(*v))
+                        .sum::<f64>()
+                        > 510.0;
+                    if let Some(materials) = pose["materials"].as_array_mut() {
+                        for material in materials {
+                            if let Some(channels) = material.as_array_mut().filter(|c| c.len() == 4)
+                            {
+                                for k in 0..3 {
+                                    let value = if hollow {
+                                        [153., 176., 184.][k]
+                                    } else if !saved.appearance.event_colors {
+                                        f64::from(saved.appearance.particle[k])
+                                    } else {
+                                        channels[k].as_f64().unwrap_or(160.0)
+                                    };
+                                    channels[k] = json!(if light { value * 0.48 } else { value });
+                                }
+                                let alpha = channels[3].as_f64().unwrap_or(0.5);
+                                channels[3] = json!(
+                                    (alpha * saved.appearance.brightness * lit).clamp(0.0, 1.0)
+                                );
+                            }
+                        }
+                    }
+                    pose["style"]["alpha"] = json!(
+                        (pose["style"]["alpha"].as_f64().unwrap_or(0.5)
+                            * saved.appearance.brightness)
+                            .clamp(0.0, 1.0)
+                    );
+                }
+                frame["appearance"] = json!(saved.appearance);
+                frame["producerConnected"] = json!(producer.is_some());
+                frame["storageAvailable"] = json!(!storage_error);
+                frame["audioOwner"] = json!(audio.as_ref().map(|(id, _)| id));
+                frame["audioUnavailable"] = json!(audio_error);
+                measurements.push_back(started.elapsed().as_secs_f64() * 1000.0);
+                if measurements.len() > 300 {
+                    measurements.pop_front();
+                }
+                frame["performance"] = json!({"worldHz":30,"frames":ticks,"uptimeSeconds":origin.elapsed().as_secs_f64(),"workMs":measurements.back()});
+                let mut output = frames
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Frame lock failed"))?;
+                output.push_back(frame);
+                if output.len() > 16 {
+                    output.pop_front();
+                }
             }
         }
-        if last_save.elapsed() >= Duration::from_secs(1) {
+        if (active || was_active || storage_error) && last_save.elapsed() >= Duration::from_secs(1)
+        {
             storage_error = save(&context, &mut saved, &mut store).is_err();
             last_save = Instant::now();
         }
-        let work = match rx.recv_timeout(Duration::from_millis(2)) {
+        was_active = active;
+        let wait = if active {
+            frame_interval.saturating_sub(last.elapsed())
+        } else {
+            Duration::from_secs(1)
+        };
+        let work = match rx.recv_timeout(wait) {
             Ok(work) => work,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -618,7 +710,9 @@ fn run_world(
                 return Ok(());
             }
         };
+        last_view = Instant::now();
         match work {
+            Work::View => {}
             Work::Export(reply) => {
                 let result = context
                     .with(|ctx| super::persistence::export_recording(&ctx, true))
@@ -652,6 +746,12 @@ fn run_world(
                         || request.source != saved.source
                         || request.source_revision != saved.source_revision
                         || request.events.len() > 64
+                        || request.locale.as_ref().is_some_and(|locale| {
+                            locale.len() > 35
+                                || !locale
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        })
                     {
                         return Err(
                             "Source changed; attach at the current frame and discard stale input"
@@ -659,7 +759,7 @@ fn run_world(
                         );
                     }
                     use sha2::{Digest, Sha256};
-                    let hash=Sha256::digest(serde_json::to_vec(&json!({"seq":request.seq,"events":request.events,"waiting":request.waiting})).unwrap()).iter().map(|b|format!("{b:02x}")).collect::<String>();
+                    let hash=Sha256::digest(serde_json::to_vec(&json!({"seq":request.seq,"events":request.events,"waiting":request.waiting,"locale":request.locale})).unwrap()).iter().map(|b|format!("{b:02x}")).collect::<String>();
                     if let Some((id, seq, _, prior_hash)) = &producer {
                         if *id != request.client {
                             return Err("This source already has a producer".into());
@@ -702,6 +802,14 @@ fn run_world(
                     }
                     producer = Some((request.client, request.seq, Instant::now(), hash));
                     waiting = request.waiting;
+                    if let Some(locale) = request.locale {
+                        interface_language =
+                            if matches!(locale.as_str(), "en" | "zh-Hans" | "zh-Hant" | "ja") {
+                                locale
+                            } else {
+                                "en".into()
+                            };
+                    }
                     Ok(json!({"seq":request.seq,"cursor":saved.cursor,"durable":false}))
                 })();
                 let _ = reply.send(result);
@@ -763,12 +871,22 @@ fn run_world(
                                 })
                                 .map_err(|_| "Interaction failed")?;
                         }
-                        Action::Select { source } => {
+                        Action::Select {
+                            source,
+                            only_if_idle,
+                        } => {
                             if !valid_source(&source) {
                                 return Err("Invalid source identity".into());
                             }
+                            if only_if_idle && producer.is_some() {
+                                return Err("The followed source has a live producer".into());
+                            }
+                            let next_revision = saved
+                                .source_revision
+                                .checked_add(1)
+                                .ok_or("Source revision exhausted")?;
                             saved.source = source;
-                            saved.source_revision += 1;
+                            saved.source_revision = next_revision;
                             producer = None;
                             waiting = false;
                             context
@@ -833,4 +951,109 @@ fn save(context: &Context, saved: &mut Saved, store: &mut Store) -> anyhow::Resu
         context.with(|ctx| ctx.eval::<(), _>("pet.commitSegment()"))?;
     }
     Ok(())
+}
+
+/// Bind the reducer's account-neutral owner projection to the session and
+/// cursor this owner serves. The reducer never knows either; `Scene::valid`
+/// rejects a frame whose projection disagrees with them.
+fn bind_activity(frame: &mut Value, source: &str, cursor: u64) {
+    if let Some(activity) = frame["activity"].as_object_mut() {
+        let session = if source == "unattached" {
+            Value::Null
+        } else {
+            json!(source)
+        };
+        activity.insert("sessionId".into(), session);
+        activity.insert("cursor".into(), json!(cursor));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codewhale_protocol::engine_owner::{
+        EngineOwnerProjection, OwnerActivityKind, OwnerFreshness, OwnerPresence,
+    };
+
+    /// Drive the committed `pet-native.js` bundle (the one the owner and the
+    /// worker actually evaluate) and read back its projection the way the
+    /// live client does: strict schema, then the contract's invariants.
+    fn projection(ctx: &rquickjs::Ctx<'_>, source: &str, cursor: u64) -> EngineOwnerProjection {
+        let text: String = ctx.eval("pet.presentation()").unwrap();
+        let mut frame: Value = serde_json::from_str(&text).unwrap();
+        bind_activity(&mut frame, source, cursor);
+        let activity: EngineOwnerProjection =
+            serde_json::from_value(frame["activity"].clone()).expect("bundle matches the contract");
+        assert!(activity.is_valid(), "invalid projection: {activity:?}");
+        assert_eq!(activity.cursor, cursor);
+        activity
+    }
+
+    #[test]
+    fn committed_bundle_projection_satisfies_the_owner_contract() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let points: Vec<Vec<f64>> = include_str!("../ambient_life/whale-points.tsv")
+                .lines()
+                .map(|line| line.split_whitespace().filter_map(|n| n.parse().ok()).collect())
+                .collect();
+            ctx.globals()
+                .set("points", serde_json::to_string(&points).unwrap())
+                .unwrap();
+            ctx.eval::<(), _>(include_bytes!("pet-native.js").as_slice())
+                .unwrap();
+            ctx.eval::<(), _>("globalThis.pet = new PetNative(points, '', '[]', true)")
+                .unwrap();
+
+            let unattached = projection(&ctx, "unattached", 0);
+            assert_eq!(unattached.freshness, OwnerFreshness::Missing);
+            assert_eq!(unattached.session_id, None);
+
+            let feed = |events: &str, at: f64| {
+                ctx.globals().set("events", events).unwrap();
+                ctx.globals().set("at", at).unwrap();
+                ctx.eval::<(), _>("pet.observeEngineBatch(events, at); pet.advanceEngine(at + 50, true, false)")
+                    .unwrap();
+            };
+            feed(
+                r#"[{"event":"turn_started","turn_id":"turn-1"},
+                    {"event":"operation_activity_started","span_id":"call-1","activity_kind":"computer"}]"#,
+                0.0,
+            );
+            let working = projection(&ctx, "session-a", 3);
+            assert_eq!(working.session_id.as_deref(), Some("session-a"));
+            assert_eq!(working.freshness, OwnerFreshness::Fresh);
+            assert_eq!(working.authoritative_presence, OwnerPresence::Working);
+            assert_eq!(working.activity_kind, Some(OwnerActivityKind::Computer));
+
+            // The old tool-name feed is refused at the boundary.
+            ctx.globals()
+                .set(
+                    "events",
+                    r#"[{"event":"tool_call_started","tool_call_id":"a","tool_name":"exec_shell"}]"#,
+                )
+                .unwrap();
+            assert!(ctx.eval::<(), _>("pet.observeEngineBatch(events, 100)").is_err());
+            let _ = ctx.catch();
+
+            feed(
+                r#"[{"event":"operation_activity_completed","span_id":"call-1","activity_kind":"computer","outcome":"succeeded"},
+                    {"event":"turn_complete","turn_id":"turn-1","turn_outcome":"completed"}]"#,
+                200.0,
+            );
+            let done = projection(&ctx, "session-a", 4);
+            assert_eq!(done.authoritative_presence, OwnerPresence::Done);
+            assert_eq!(done.done_effect_id.as_deref(), Some("turn-1"));
+
+            feed(
+                r#"[{"event":"turn_started","turn_id":"turn-2"},
+                    {"event":"turn_complete","turn_id":"turn-2","turn_outcome":"interrupted"}]"#,
+                400.0,
+            );
+            let interrupted = projection(&ctx, "session-a", 5);
+            assert_ne!(interrupted.authoritative_presence, OwnerPresence::Done);
+            assert_eq!(interrupted.done_effect_id, None);
+        });
+    }
 }

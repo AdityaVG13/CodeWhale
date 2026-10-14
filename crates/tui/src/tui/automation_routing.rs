@@ -521,7 +521,9 @@ pub(super) fn settled_run_receipt(locale: Locale, run: &SettledRun) -> HistoryCe
         parts.push(error);
     }
     if let Some(duration_ms) = run.duration_ms {
-        parts.push(crate::elapsed::format_elapsed_ms(duration_ms));
+        parts.push(codewhale_command_contract::elapsed::format_elapsed_ms(
+            duration_ms,
+        ));
     }
     parts.push(format!(
         "{} {}",
@@ -613,6 +615,7 @@ mod tests {
             updated_at: now,
             next_run_at: None,
             last_run_at: None,
+            revision: 0,
         }
     }
 
@@ -622,8 +625,8 @@ mod tests {
         use ratatui::{buffer::Buffer, layout::Rect};
 
         let root = TempDir::new().unwrap();
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(root.path()),
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(root.path()),
         );
         app.view_stack
             .push(AutomationsView::from_rows(Vec::new(), Locale::En));
@@ -956,6 +959,9 @@ mod tests {
         };
         assert!(preview.contains("Nothing was deleted"), "{preview}");
         assert!(preview.contains("Recorded runs: 1"), "{preview}");
+        assert!(preview.contains("all runs to settle"), "{preview}");
+        assert!(preview.contains("Up to 50"), "{preview}");
+        assert!(preview.contains("kept in the archive"), "{preview}");
         assert!(
             !preview.contains("--confirm"),
             "the token stays in the control"
@@ -1042,6 +1048,22 @@ mod tests {
             manager.lock().await.get_automation(&automation.id).is_err(),
             "confirmed deletion removes definition"
         );
-        assert!(!runs_dir.exists(), "confirmed deletion removes run history");
+        assert!(
+            !runs_dir.exists(),
+            "confirmed deletion removes live receipts"
+        );
+        let archived = manager
+            .lock()
+            .await
+            .list_archived_runs(&automation.id)
+            .expect("archived history");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, run.id);
+        assert!(
+            deleted.detail.as_deref().is_some_and(|detail| {
+                detail.contains("up to 50") && detail.contains("kept in the archive")
+            }),
+            "deletion receipt explains retention: {deleted:?}"
+        );
     }
 }

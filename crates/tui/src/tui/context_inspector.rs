@@ -29,14 +29,15 @@ use codewhale_core::ContextReferenceSource;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_models::{SystemPrompt, Tool};
 use codewhale_palette as palette;
+use codewhale_runtime::context_budget::{
+    CONTEXT_CRITICAL_THRESHOLD_PERCENT, CONTEXT_WARNING_THRESHOLD_PERCENT,
+};
 
 /// Marker used by per-turn working-set metadata. Replicated here so the
 /// context inspector can distinguish stable prompt blocks from volatile
 /// working-set context without importing engine internals.
 const WORKING_SET_MARKER: &str = "## Repo Working Set";
 
-pub(crate) const CONTEXT_WARNING_THRESHOLD_PERCENT: f64 = 85.0;
-pub(crate) const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
 const MAX_REFERENCE_ROWS: usize = 12;
 const MAX_TOOL_ROWS: usize = 8;
 const MAX_SCHEMA_COST_ROWS: usize = 24;
@@ -52,11 +53,6 @@ const SYSTEM_LAYER_MARKERS: &[(&str, &str, PromptLayerKind)] = &[
     (
         "Output formatting",
         "## Output Formatting",
-        PromptLayerKind::Static,
-    ),
-    (
-        "User-global constitution",
-        "<codewhale_user_constitution",
         PromptLayerKind::Static,
     ),
     (
@@ -235,6 +231,32 @@ pub fn build_context_inspector_text(app: &App, locale: Locale) -> String {
     push_compaction_and_anchors(&mut out, app, locale);
     let _ = writeln!(out);
     push_system_prompt_structure(&mut out, app, locale);
+    if let Some(record) = app
+        .api_messages
+        .iter()
+        .rev()
+        .find_map(crate::runtime_handoff::constitution_display)
+    {
+        let source = match record
+            .split_once("\n\n")
+            .map(|(_, guidance)| guidance.lines().next().unwrap_or_default())
+        {
+            Some(line) if line.starts_with("Account profile constitution, settings revision ") => {
+                tr(locale, MessageId::CtxInspConstitutionAccount).replace(
+                    "{revision}",
+                    line.trim_start_matches("Account profile constitution, settings revision ")
+                        .trim_end_matches('.'),
+                )
+            }
+            Some(_) => tr(locale, MessageId::CtxInspConstitutionLocal).into_owned(),
+            None => tr(locale, MessageId::CtxInspConstitutionWithdrawn).into_owned(),
+        };
+        let label = tr(locale, MessageId::CtxInspPersonalConstitution);
+        let tokens = record.chars().count().div_ceil(3);
+        let unit = tr(locale, MessageId::CtxInspTokens);
+        let cadence = tr(locale, MessageId::CtxInspChangesByTurn);
+        let _ = writeln!(out, "\n{label} ({source}): ~{tokens} {unit} [{cadence}]");
+    }
     let _ = writeln!(out);
     push_references(&mut out, &app.session_context_references, locale);
     let _ = writeln!(out);
@@ -981,9 +1003,13 @@ impl ModalView for ContextInspectorView {
             let value = tr(self.locale, MessageId::CtxInspRowTokens)
                 .replace("{tokens}", &row.tokens.to_string())
                 .replace("{percent}", &format!("{:.1}", row.percent));
-            let label_width = width.saturating_sub(value.len() + 5);
+            // Display cells, not bytes: a CJK or localized row measured in
+            // bytes padded short and pushed the value off the row (U04-m5).
+            let value_width = crate::tui::ui_text::text_display_width(&value);
+            let label_width = width.saturating_sub(value_width + 5);
             let label = crate::tui::ui_text::semantic_truncate(&row.label, label_width);
-            let gap = width.saturating_sub(label.len() + value.len() + 3);
+            let gap = width
+                .saturating_sub(crate::tui::ui_text::text_display_width(&label) + value_width + 3);
             let y = content
                 .y
                 .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
@@ -1030,14 +1056,14 @@ mod tests {
                 model: "unknown-model".to_string(),
                 skills_dir: PathBuf::from("/tmp/skills"),
                 notes_path: PathBuf::from("notes.md"),
-                ..crate::test_support::test_tui_options(PathBuf::from("/tmp/project"))
+                ..crate::tui::test_support::test_tui_options(PathBuf::from("/tmp/project"))
             },
             &Config::default(),
         );
         // Pin the route identity: App::new consults the developer's real
         // saved settings, so on a machine with customized provider/model
         // the context-window assertions computed against a different route.
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.auto_model = false;
         app.last_effective_model = None;
         app.active_route_limits = None;
@@ -1333,7 +1359,7 @@ mod tests {
     fn inspector_text_prompt_shows_layer_map() {
         let mut app = test_app();
         app.system_prompt = Some(SystemPrompt::Text(
-            "## Codewhale\nBundled base law.\n\n## Language\nUse English.\n\n## Output Formatting\nBe clear.\n\n<codewhale_user_constitution>\nUser law\n</codewhale_user_constitution>\n\n<codewhale_repo_constitution>\nRepo law\n</codewhale_repo_constitution>\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
+            "## Codewhale\nBundled base law.\n\n## Language\nUse English.\n\n## Output Formatting\nBe clear.\n\n<codewhale_repo_constitution>\nRepo law\n</codewhale_repo_constitution>\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
         ));
 
         let text = build_context_inspector_text(&app, Locale::En);
@@ -1342,7 +1368,6 @@ mod tests {
         assert!(text.contains("Bundled constitution"));
         assert!(text.contains("Language policy"));
         assert!(text.contains("Output formatting"));
-        assert!(text.contains("User-global constitution"));
         assert!(text.contains("Repository constitution"));
         assert!(text.contains("Project context"));
         assert!(text.contains("Project context pack"));
@@ -1464,10 +1489,10 @@ mod tests {
             messages_after: 4,
         });
         let text = build_context_inspector_text(&app, Locale::En);
-        assert!(text.contains("compaction"), "{text}");
+        assert!(text.contains("making room"), "{text}");
         assert!(text.contains("16 → 4 messages"), "{text}");
         let view = ContextInspectorView::new(&app);
-        assert!(view.row_labels().iter().any(|label| label == "compaction"));
+        assert!(view.row_labels().iter().any(|label| label == "making room"));
         assert!(view.row_labels().iter().any(|label| label == "anchors"));
     }
 }

@@ -40,7 +40,8 @@ observe that one Runtime.
 ```
 
 - A **sub-agent** is the user-facing name for a *nested assignment* with a role
-  (`explore`, `review`, `implementer`, `verifier`, ...). It should be backed by
+  (`explore`, `reviewer`, `implement`, `test`, ... — see the canonical seven in
+  `docs/SUBAGENTS.md`). It should be backed by
   the same Runtime worker lifecycle used for a fleet-selected Agent. `agent` is
   the model-facing launcher, not a second runtime.
 - **`codewhale exec`** is the headless front door: usable by anyone at any time
@@ -237,8 +238,9 @@ Codewhale should converge with Claude Code on **shape**, not on branding:
 The litmus test for any new agent surface: *does it launch and observe the one
 runtime, or does it invent a second one?* Only the former is allowed.
 
-## What remains after v0.9.0
+## Historical note: what remained after v0.9.0
 
+Archived roadmap snapshot — live state is the issue tracker, not this list.
 Refreshed 2026-08-17 from a full audit of the older 0.9-era documents. Those
 plans are evidence, not a second source of truth. v0.9.0 consolidated the
 underwater shell, message-first Operate, permission postures, the wired

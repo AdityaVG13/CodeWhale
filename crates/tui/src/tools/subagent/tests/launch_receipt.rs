@@ -27,11 +27,11 @@ fn consultant_runtime(
         ..Default::default()
     };
     let config = crate::config::Config {
-        api_key: Some("deepseek-test-key".to_string()),
         provider: Some("deepseek".to_string()),
         providers: Some(providers),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-test-key".to_string()), None);
     let client = CodewhaleClient::new(&config).expect("DeepSeek parent client");
     SubAgentRuntime::new(
         client,
@@ -374,12 +374,15 @@ async fn issue_5305_receipt_survives_ledger_interruption_completion_and_resume()
             workspace.path(),
             vec![text_message("assistant", "checkpointed work")],
         );
-        guard
+        // This is a direct root child. The generic seed's invented parent
+        // actor is absent; keep the production session and descendant guards.
+        let worker = guard
             .worker_records
             .get_mut(&agent_id)
-            .expect("worker record")
-            .spec
-            .child_route = Some(receipt.clone());
+            .expect("worker record");
+        worker.parent_run_id = None;
+        worker.spec.parent_run_id = None;
+        worker.spec.child_route = Some(receipt.clone());
         let ledger = guard
             .coordination_summary_for(&agent_id, 4)
             .expect("ledger projection");

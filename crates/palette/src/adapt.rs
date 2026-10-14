@@ -3,9 +3,8 @@
 use ratatui::style::Color;
 
 use super::detect::PaletteMode;
-use super::themes::{
-    GRAYSCALE_UI_THEME, LIGHT_UI_THEME, SOLARIZED_LIGHT_UI_THEME, ThemeId, UiTheme,
-};
+use super::ids::ThemeId;
+use super::themes::{GRAYSCALE_UI_THEME, LIGHT_UI_THEME, SOLARIZED_LIGHT_UI_THEME, UiTheme};
 use super::tokens::*;
 
 #[must_use]
@@ -218,6 +217,7 @@ pub const fn theme_remap_active(theme: ThemeId) -> bool {
             | ThemeId::Claude
             | ThemeId::Matrix
             | ThemeId::SolarizedLight
+            | ThemeId::Uwu
     )
 }
 
@@ -408,7 +408,18 @@ fn adapt_fg_for_grayscale_palette(color: Color) -> Color {
 }
 
 fn adapt_bg_for_grayscale_palette(color: Color) -> Color {
-    if color == Color::Reset {
+    // Direct UiTheme paints have already resolved these slots. Bucketing
+    // their luminance again collapses selection into panel and raised
+    // surfaces into the field, so preserve the authored grayscale ladder.
+    if color == Color::Reset
+        || color == GRAYSCALE_SURFACE
+        || color == GRAYSCALE_PANEL
+        || color == GRAYSCALE_ELEVATED
+        || color == GRAYSCALE_REASONING
+        || color == GRAYSCALE_SELECTION_BG
+        || color == GRAYSCALE_SUCCESS
+        || color == GRAYSCALE_ERROR
+    {
         return color;
     }
     if color == WHALE_BG || color == BACKGROUND_DARK || color == LIGHT_SURFACE {
@@ -420,12 +431,9 @@ fn adapt_bg_for_grayscale_palette(color: Color) -> Color {
         || color == LIGHT_PANEL
     {
         GRAYSCALE_PANEL
-    } else if color == SURFACE_ELEVATED
-        || color == SURFACE_TOOL_ACTIVE
-        || color == LIGHT_ELEVATED
-        || color == SELECTION_BG
-        || color == LIGHT_SELECTION_BG
-    {
+    } else if color == SELECTION_BG || color == LIGHT_SELECTION_BG {
+        GRAYSCALE_SELECTION_BG
+    } else if color == SURFACE_ELEVATED || color == SURFACE_TOOL_ACTIVE || color == LIGHT_ELEVATED {
         GRAYSCALE_ELEVATED
     } else if color == SURFACE_REASONING
         || color == SURFACE_REASONING_TINT
@@ -488,6 +496,9 @@ pub(crate) fn luma(r: u8, g: u8, b: u8) -> u8 {
 /// tints) on terminals that can't render them faithfully.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorDepth {
+    /// Explicit NO_COLOR: terminal-owned foreground/background, with text
+    /// modifiers and semantic symbols retained.
+    Monochrome,
     /// 16-color terminals (macOS Terminal.app default, dumb tmux setups).
     /// Background tints distort the named-palette mapping, so we drop them.
     Ansi16,
@@ -630,17 +641,14 @@ impl ColorDepth {
     /// `NO_COLOR` contract is testable without mutating process env.
     ///
     /// `NO_COLOR` (no-color.org): present and non-empty ⇒ suppress color.
-    /// The TUI's contained answer is to force the mono/ascii-safe path —
-    /// ANSI-16 depth, where backgrounds drop to `Color::Reset` and the
-    /// injective role matrix carries meaning in glyph/intensity, never hue.
-    /// TODO(depth): a fully colorless SGR stream would additionally need a
-    /// theme-level Reset override; that is deliberately out of this fix.
+    /// Monochrome is distinct from a terminal that supports ANSI-16 hues.
+    /// Text modifiers and Unicode symbols remain independent preferences.
     #[must_use]
     pub(crate) fn detect_with(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
         if let Some(no_color) = get("NO_COLOR")
             && !no_color.is_empty()
         {
-            return Self::Ansi16;
+            return Self::Monochrome;
         }
         if let Some(ct) = get("COLORTERM") {
             let ct = ct.to_string_lossy().to_ascii_lowercase();
@@ -685,10 +693,10 @@ impl ColorDepth {
 /// palette; ANSI-16 uses a generic nearest named color. Rendered semantic
 /// foregrounds must go through [`adapt_fg_for_depth`] so role identity is not
 /// inferred from RGB proximity.
-#[allow(dead_code)]
 #[must_use]
 pub fn adapt_color(color: Color, depth: ColorDepth) -> Color {
     match (color, depth) {
+        (_, ColorDepth::Monochrome) => Color::Reset,
         (_, ColorDepth::TrueColor) => color,
         (Color::Rgb(r, g, b), ColorDepth::Ansi256) => Color::Indexed(rgb_to_ansi256(r, g, b)),
         (Color::Rgb(r, g, b), ColorDepth::Ansi16) => nearest_ansi16(r, g, b),
@@ -699,21 +707,19 @@ pub fn adapt_color(color: Color, depth: ColorDepth) -> Color {
 /// Adapt a background color. On Ansi16 terminals background tints are noisy,
 /// so we drop them to `Color::Reset` rather than attempt a coarse named-color
 /// match — a quiet background reads cleaner than a wrong one.
-#[allow(dead_code)]
 #[must_use]
 pub fn adapt_bg(color: Color, depth: ColorDepth) -> Color {
     match (color, depth) {
         (_, ColorDepth::TrueColor) => color,
         (Color::Rgb(r, g, b), ColorDepth::Ansi256) => Color::Indexed(rgb_to_ansi256(r, g, b)),
         (_, ColorDepth::Ansi256) => color,
-        (_, ColorDepth::Ansi16) => Color::Reset,
+        (_, ColorDepth::Ansi16 | ColorDepth::Monochrome) => Color::Reset,
     }
 }
 
 /// Mix two RGB colors at `alpha` (0.0 = `bg`, 1.0 = `fg`). Anything that's not
 /// RGB falls back to `fg` — there's no meaningful alpha blend on a named
 /// palette entry.
-#[allow(dead_code)]
 #[must_use]
 pub fn blend(fg: Color, bg: Color, alpha: f32) -> Color {
     let alpha = alpha.clamp(0.0, 1.0);
@@ -736,7 +742,7 @@ pub fn blend(fg: Color, bg: Color, alpha: f32) -> Color {
 #[must_use]
 pub fn reasoning_surface_tint(depth: ColorDepth) -> Option<Color> {
     match depth {
-        ColorDepth::Ansi16 => None,
+        ColorDepth::Ansi16 | ColorDepth::Monochrome => None,
         _ => Some(adapt_bg(SURFACE_REASONING_TINT, depth)),
     }
 }
@@ -764,7 +770,6 @@ pub fn pulse_brightness(color: Color, now_ms: u64) -> Color {
 /// `adapt_color` on Ansi16 terminals; we lean on hue dominance + lightness so
 /// brand colors land on the obviously-related named entry (sky → cyan, blue →
 /// blue, red → red, etc.) rather than dithering around grey.
-#[allow(dead_code)]
 pub(crate) fn nearest_ansi16(r: u8, g: u8, b: u8) -> Color {
     let lum = (u16::from(r) + u16::from(g) + u16::from(b)) / 3;
     if lum < 24 {
@@ -831,7 +836,6 @@ pub(crate) fn nearest_ansi16(r: u8, g: u8, b: u8) -> Color {
 /// Map an RGB color to the nearest xterm 256-color palette index. We use only
 /// the stable 6x6x6 cube and grayscale ramp (16..255), not the terminal's
 /// user-configurable 0..15 colors.
-#[allow(dead_code)]
 pub(crate) fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 

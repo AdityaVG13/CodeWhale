@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use globset::{GlobBuilder, GlobMatcher, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-
-use crate::tools::search::matches_glob;
 
 use super::file::{PATH_ALIASES, SEARCH_NAME_ALIASES, SEARCH_NAME_PARAMS, apply_param_aliases};
 use super::spec::{
@@ -40,7 +39,7 @@ impl ToolSpec for FileSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Find workspace files by name using fuzzy matching with score-based ranking. Pass extensions to filter by suffix."
+        "Find workspace files by name, path, or glob (e.g. src/**/*.rs). Space-separated terms must all match. Literal matches rank above fuzzy matches; results are capped. Respects ignore files and skips build/dependency directories by default. Use extensions to filter suffixes."
     }
 
     fn input_schema(&self) -> Value {
@@ -49,7 +48,7 @@ impl ToolSpec for FileSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (file name or path fragment)."
+                    "description": "File name, path fragment, space-separated terms, or glob (e.g. **/engine*.rs)."
                 },
                 "path": {
                     "type": "string",
@@ -57,7 +56,7 @@ impl ToolSpec for FileSearchTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results to return (default: 20)."
+                    "description": "Maximum number of ranked results to return (default: 20, maximum: 200)."
                 },
                 "extensions": {
                     "type": "array",
@@ -67,7 +66,7 @@ impl ToolSpec for FileSearchTool {
                 "exclude": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional glob patterns to exclude (e.g. [\"target/**\", \"*.lock\"])."
+                    "description": "Optional replacement exclusion globs (e.g. [\"**/target/**\", \"*.lock\"]); [] disables default exclusions."
                 }
             },
             "required": ["query"]
@@ -80,6 +79,10 @@ impl ToolSpec for FileSearchTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Auto
+    }
+
+    fn supports_parallel(&self) -> bool {
+        true
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -110,9 +113,6 @@ impl ToolSpec for FileSearchTool {
 
         let extensions = parse_extensions(&input);
         let exclude_patterns = parse_exclude_patterns(&input);
-        let pod_root = base_path.clone();
-        let pod_excludes = exclude_patterns.clone();
-        let pod_extensions = extensions.clone();
         let matches = search_files_async(
             query.to_string(),
             base_path,
@@ -124,34 +124,7 @@ impl ToolSpec for FileSearchTool {
             context.follow_symlinks,
         )
         .await?;
-        // Echolocation sounding: chart the matched dirs (sorted, capped)
-        // so each candidate arrives with its neighborhood. Dirs resolve
-        // against the search root, which is the workspace by default.
-        let paths: Vec<String> = matches.iter().map(|item| item.path.clone()).collect();
-        let vis = super::echolocation::PodVisibility {
-            include: &[],
-            exclude: &pod_excludes,
-            extensions: &pod_extensions,
-            glob_root: &pod_root,
-            gitignore: true,
-        };
-        let (pods, pods_omitted) = super::echolocation::sound_match_pods(&pod_root, &paths, &vis);
-        let pods_json: Vec<Value> = pods
-            .iter()
-            .map(|pod| {
-                json!({
-                    "dir": pod.dir,
-                    "mates": pod.mates,
-                    "mate_total": pod.mate_total,
-                })
-            })
-            .collect();
-        ToolResult::json(&json!({
-            "matches": matches,
-            "pods": pods_json,
-            "pods_omitted": pods_omitted,
-        }))
-        .map_err(|e| ToolError::execution_failed(e.to_string()))
+        ToolResult::json(&matches).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
 
@@ -165,29 +138,49 @@ async fn search_files_async(
     cancel_token: Option<CancellationToken>,
     timeout: Duration,
     follow_symlinks: bool,
-) -> Result<Vec<FileSearchMatch>, ToolError> {
-    let worker_cancel_token = cancel_token.clone();
-    run_blocking_file_search(timeout, cancel_token, move || {
-        search_files(
+) -> Result<Value, ToolError> {
+    run_blocking_file_search(timeout, cancel_token, move |worker_cancel_token| {
+        let matches = search_files(
             &query,
             &base_path,
-            extensions,
-            exclude_patterns,
+            extensions.clone(),
+            exclude_patterns.clone(),
             limit,
-            worker_cancel_token.as_ref(),
+            Some(&worker_cancel_token),
             follow_symlinks,
-        )
+        )?;
+        check_cancelled(Some(&worker_cancel_token))?;
+        let paths: Vec<String> = matches.iter().map(|item| item.path.clone()).collect();
+        let vis = super::echolocation::PodVisibility {
+            include: &[],
+            exclude: &exclude_patterns,
+            extensions: &extensions,
+            glob_root: &base_path,
+            gitignore: true,
+        };
+        let (pods, pods_omitted) = super::echolocation::sound_match_pods(&base_path, &paths, &vis);
+        let pods_json: Vec<Value> = pods
+            .iter()
+            .map(|pod| {
+                json!({
+                    "dir": pod.dir, "mates": pod.mates, "mate_total": pod.mate_total,
+                })
+            })
+            .collect();
+        check_cancelled(Some(&worker_cancel_token))?;
+        Ok(json!({ "matches": matches, "pods": pods_json, "pods_omitted": pods_omitted }))
     })
     .await
 }
 
-async fn run_blocking_file_search<F>(
+async fn run_blocking_file_search<F, T>(
     timeout: Duration,
     cancel_token: Option<CancellationToken>,
     search: F,
-) -> Result<Vec<FileSearchMatch>, ToolError>
+) -> Result<T, ToolError>
 where
-    F: FnOnce() -> Result<Vec<FileSearchMatch>, ToolError> + Send + 'static,
+    F: FnOnce(CancellationToken) -> Result<T, ToolError> + Send + 'static,
+    T: Send + 'static,
 {
     if cancel_token
         .as_ref()
@@ -196,7 +189,12 @@ where
         return Err(file_search_cancelled());
     }
 
-    let task = tokio::task::spawn_blocking(search);
+    let worker_cancel_token = cancel_token
+        .as_ref()
+        .map(CancellationToken::child_token)
+        .unwrap_or_default();
+    let _worker_cancel_guard = worker_cancel_token.clone().drop_guard();
+    let task = tokio::task::spawn_blocking(move || search(worker_cancel_token));
     let result = match cancel_token {
         Some(token) => {
             tokio::select! {
@@ -261,12 +259,12 @@ fn parse_exclude_patterns(input: &Value) -> Vec<String> {
     }
 
     [
-        "target/**",
-        "node_modules/**",
-        ".git/**",
-        "DerivedData/**",
-        "dist/**",
-        "build/**",
+        "**/target/**",
+        "**/node_modules/**",
+        "**/.git/**",
+        "**/DerivedData/**",
+        "**/dist/**",
+        "**/build/**",
         "*.lock",
         "*.plist",
     ]
@@ -293,14 +291,91 @@ fn search_files(
         )));
     }
 
-    let query_norm = query.to_ascii_lowercase();
-    let mut results: Vec<FileSearchMatch> = Vec::new();
+    let query_norm = query.to_lowercase().replace('\\', "/");
+    let query_norm = query_norm.strip_prefix("./").unwrap_or(&query_norm);
+    if query_norm.is_empty() {
+        return Err(ToolError::invalid_input("query cannot be empty"));
+    }
+    let query_glob = if query_norm.contains(['*', '?', '[', '{']) {
+        let pattern = if query_norm.contains('/') {
+            query_norm.to_string()
+        } else {
+            format!("**/{query_norm}")
+        };
+        match GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .case_insensitive(true)
+            .build()
+        {
+            Ok(glob) => Some(glob.compile_matcher()),
+            Err(err) if query_norm.contains(['*', '?']) => {
+                return Err(ToolError::invalid_input(format!(
+                    "Invalid query glob: {err}"
+                )));
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let query_terms: Vec<_> = query_norm.split_whitespace().collect();
+    let mut exclusions = GlobSetBuilder::new();
+    for pattern in exclude_patterns {
+        let pattern = pattern.replace('\\', "/");
+        let pattern = if pattern.contains('/') {
+            pattern
+        } else {
+            format!("**/{pattern}")
+        };
+        for glob in std::iter::once(pattern.as_str()).chain(pattern.strip_suffix("/**")) {
+            exclusions.add(
+                GlobBuilder::new(glob)
+                    .literal_separator(true)
+                    .build()
+                    .map_err(|err| {
+                        ToolError::invalid_input(format!("Invalid exclude glob: {err}"))
+                    })?,
+            );
+        }
+    }
+    let exclusions = exclusions
+        .build()
+        .map_err(|err| ToolError::invalid_input(format!("Invalid exclude globs: {err}")))?;
+    let mut results: Vec<FileSearchMatch> = Vec::with_capacity(limit);
+    let walk_root = base_path.to_path_buf();
+    let walk_cancel_token = cancel_token.cloned();
 
     let mut builder = WalkBuilder::new(base_path);
     builder
         .hidden(false)
         .follow_links(follow_symlinks)
-        .require_git(false);
+        .require_git(false)
+        .filter_entry(move |entry| {
+            let rel_path = entry
+                .path()
+                .strip_prefix(&walk_root)
+                .unwrap_or(entry.path());
+            if entry.depth() > 0
+                && !walk_cancel_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                && exclusions.is_match(rel_path)
+            {
+                return false;
+            }
+            // Sandbox read deny-list (S1). A walk rooted above a denied tree
+            // must not enumerate its names. Reject directories before descent;
+            // the explicit root refusal remains at the guard above.
+            if let Err(denial) = crate::sandbox::read_guard::active().check(entry.path()) {
+                tracing::debug!(
+                    target: "codewhale::sandbox::read_guard",
+                    requested = %denial.requested.display(),
+                    "sandbox read deny-list skipped an entry during file_search"
+                );
+                return false;
+            }
+            true
+        });
     let walker = builder.build();
 
     for entry in walker {
@@ -310,20 +385,6 @@ fn search_files(
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        // Sandbox read deny-list (S1). A walk rooted above a denied tree —
-        // e.g. `path = "~"` — must not enumerate the names inside it
-        // (`~/.ssh/id_rsa` …), exactly as `search` skips denied files during
-        // its walk. Skipped silently rather than failing the whole search: a
-        // name search is not a directed read, and the explicit refusal for one
-        // lives at the root guard above.
-        if let Err(denial) = crate::sandbox::read_guard::active().check(entry.path()) {
-            tracing::debug!(
-                target: "codewhale::sandbox::read_guard",
-                requested = %denial.requested.display(),
-                "sandbox read deny-list skipped an entry during file_search"
-            );
-            continue;
-        }
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
@@ -334,32 +395,45 @@ fn search_files(
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
-        if should_exclude(&rel_path, &exclude_patterns) {
-            continue;
-        }
-
         if !extensions.is_empty() && !extension_matches(path, &extensions) {
             continue;
         }
 
         let name = file_name(path);
 
-        let score = match score_match(&query_norm, &rel_path, &name) {
+        let score = match score_match(
+            query_norm,
+            &query_terms,
+            query_glob.as_ref(),
+            &rel_path,
+            &name,
+        ) {
             Some(score) => score,
             None => continue,
         };
 
-        results.push(FileSearchMatch {
+        let found = FileSearchMatch {
             path: rel_path,
             name,
             score,
-        });
+        };
+        if results.len() == limit
+            && results
+                .last()
+                .is_some_and(|worst| compare_match(&found, worst) != Ordering::Less)
+        {
+            continue;
+        }
+        let index = results
+            .binary_search_by(|existing| compare_match(existing, &found))
+            .unwrap_or_else(|index| index);
+        if index < limit {
+            results.insert(index, found);
+            results.truncate(limit);
+        }
     }
 
-    results.sort_by(compare_match);
-    if results.len() > limit {
-        results.truncate(limit);
-    }
+    check_cancelled(cancel_token)?;
     Ok(results)
 }
 
@@ -368,12 +442,6 @@ fn check_cancelled(cancel_token: Option<&CancellationToken>) -> Result<(), ToolE
         return Err(file_search_cancelled());
     }
     Ok(())
-}
-
-fn should_exclude(rel_path: &str, exclude_patterns: &[String]) -> bool {
-    exclude_patterns
-        .iter()
-        .any(|pattern| matches_glob(rel_path, pattern))
 }
 
 pub(crate) fn extension_matches(path: &Path, extensions: &[String]) -> bool {
@@ -390,36 +458,70 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
-fn score_match(query: &str, rel_path: &str, name: &str) -> Option<f64> {
-    let path_norm = rel_path.to_ascii_lowercase();
-    let name_norm = name.to_ascii_lowercase();
-
-    if name_norm == query {
+fn score_match(
+    query: &str,
+    terms: &[&str],
+    glob: Option<&GlobMatcher>,
+    rel_path: &str,
+    name: &str,
+) -> Option<f64> {
+    let path_norm = rel_path.to_lowercase();
+    let name_norm = name.to_lowercase();
+    if path_norm == query {
         return Some(1.0);
     }
+    if name_norm == query {
+        return Some(0.99);
+    }
+    if let Some(glob) = glob {
+        if name_norm.contains(query) || path_norm.contains(query) {
+            return score_fragment(query, &path_norm, &name_norm);
+        }
+        return glob
+            .is_match(&path_norm)
+            .then(|| 0.9 + 0.08 / name.chars().count().max(1) as f64);
+    }
+
+    if terms.len() > 1 {
+        let mut total = 0.0;
+        let mut minimum = 1.0_f64;
+        for term in terms {
+            let score = score_fragment(term, &path_norm, &name_norm)?;
+            minimum = minimum.min(score);
+            total += score;
+        }
+        return Some(minimum * 0.995 + 0.005 * total / terms.len() as f64);
+    }
+    score_fragment(query, &path_norm, &name_norm)
+}
+
+fn score_fragment(query: &str, path_norm: &str, name_norm: &str) -> Option<f64> {
     if path_norm == query {
-        return Some(0.98);
+        return Some(1.0);
+    }
+    if name_norm == query {
+        return Some(0.99);
     }
 
     if name_norm.starts_with(query) {
-        return Some(0.9 + length_bonus(query, &name_norm));
+        return Some(0.9 + length_bonus(query, name_norm));
     }
     if path_norm.starts_with(query) {
-        return Some(0.85 + length_bonus(query, &path_norm));
+        return Some(0.8 + length_bonus(query, path_norm));
     }
 
     if name_norm.contains(query) {
-        return Some(0.75 + length_bonus(query, &name_norm));
+        return Some(0.7 + length_bonus(query, name_norm));
     }
     if path_norm.contains(query) {
-        return Some(0.7 + length_bonus(query, &path_norm));
+        return Some(0.6 + length_bonus(query, path_norm));
     }
 
-    if let Some(score) = fuzzy_score(query, &name_norm) {
-        return Some(0.6 + 0.4 * score);
+    if let Some(score) = fuzzy_score(query, name_norm) {
+        return Some(0.4 + 0.15 * score);
     }
-    if let Some(score) = fuzzy_score(query, &path_norm) {
-        return Some(0.55 + 0.4 * score);
+    if let Some(score) = fuzzy_score(query, path_norm) {
+        return Some(0.2 + 0.15 * score);
     }
 
     None
@@ -432,13 +534,17 @@ fn length_bonus(query: &str, target: &str) -> f64 {
 }
 
 fn fuzzy_score(query: &str, target: &str) -> Option<f64> {
-    let mut positions = Vec::new();
     let mut query_chars = query.chars();
     let mut current = query_chars.next()?;
+    let mut first = None;
+    let mut last = 0;
+    let mut matched = 0;
 
     for (idx, ch) in target.chars().enumerate() {
         if ch == current {
-            positions.push(idx);
+            first.get_or_insert(idx);
+            last = idx;
+            matched += 1;
             if let Some(next) = query_chars.next() {
                 current = next;
             } else {
@@ -447,12 +553,12 @@ fn fuzzy_score(query: &str, target: &str) -> Option<f64> {
         }
     }
 
-    if positions.len() != query.chars().count() {
+    if matched != query.chars().count() {
         return None;
     }
 
-    let first = *positions.first().unwrap_or(&0) as f64;
-    let last = *positions.last().unwrap_or(&0) as f64;
+    let first = first? as f64;
+    let last = last as f64;
     let span = (last - first + 1.0).max(1.0);
     let query_len = query.chars().count().max(1) as f64;
     let target_len = target.chars().count().max(1) as f64;
@@ -491,36 +597,6 @@ mod tests {
 
         assert!(result.success);
         assert!(result.content.contains("main.rs"));
-    }
-
-    #[tokio::test]
-    async fn test_file_search_charts_match_pods() {
-        let tmp = tempdir().expect("tempdir");
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src/net")).expect("mkdir");
-        std::fs::write(root.join("src/net/server.rs"), "fn serve() {}\n").expect("write");
-        std::fs::write(root.join("src/net/client.rs"), "fn connect() {}\n").expect("write");
-
-        let ctx = ToolContext::new(root.to_path_buf());
-        let result = FileSearchTool
-            .execute(json!({"query": "server", "limit": 5}), &ctx)
-            .await
-            .expect("execute");
-
-        assert!(result.success);
-        let body: Value = serde_json::from_str(&result.content).expect("json result");
-        assert!(!body["matches"].as_array().expect("matches").is_empty());
-        let pods = body["pods"].as_array().expect("pods array");
-        assert_eq!(pods.len(), 1);
-        assert_eq!(pods[0]["dir"], "src/net");
-        let mates: Vec<&str> = pods[0]["mates"]
-            .as_array()
-            .expect("mates")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(mates.contains(&"server.rs (match)"), "{mates:?}");
-        assert!(mates.contains(&"client.rs"), "{mates:?}");
     }
 
     #[tokio::test]
@@ -579,8 +655,9 @@ mod tests {
 
         assert!(result.success);
         let body: Value = serde_json::from_str(&result.content).expect("search json");
+        let matches = &body["matches"];
         assert!(
-            body["matches"]
+            matches
                 .as_array()
                 .expect("matches")
                 .iter()
@@ -595,6 +672,12 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("target")).expect("mkdir");
         std::fs::write(root.join("target").join("needle.txt"), "no\n").expect("write");
+        std::fs::create_dir_all(root.join("member").join("target")).expect("mkdir nested");
+        std::fs::write(
+            root.join("member").join("target").join("nested_needle.txt"),
+            "no\n",
+        )
+        .expect("write nested");
         std::fs::write(root.join("needle.txt"), "yes\n").expect("write");
 
         let ctx = ToolContext::new(root.to_path_buf());
@@ -606,14 +689,46 @@ mod tests {
 
         assert!(result.success);
         let body: Value = serde_json::from_str(&result.content).expect("search json");
+        let matches = &body["matches"];
         assert!(
-            body["matches"]
+            matches
                 .as_array()
                 .expect("matches")
                 .iter()
                 .any(|item| item.get("path").and_then(Value::as_str) == Some("needle.txt"))
         );
         assert!(!result.content.contains("target/needle.txt"));
+        assert!(!result.content.contains("nested_needle.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_file_search_default_excludes_stop_at_the_directory() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("build")).expect("mkdir");
+        std::fs::create_dir_all(root.join("builders")).expect("mkdir");
+        std::fs::write(root.join("build").join("build_out.rs"), "no\n").expect("write");
+        std::fs::write(root.join("build.rs"), "yes\n").expect("write");
+        std::fs::write(root.join("builders").join("build_x.rs"), "yes\n").expect("write");
+
+        let ctx = ToolContext::new(root.to_path_buf());
+        let result = FileSearchTool
+            .execute(json!({"query": "build", "limit": 20}), &ctx)
+            .await
+            .expect("execute");
+
+        let body: Value = serde_json::from_str(&result.content).expect("search json");
+        let matches = &body["matches"];
+        let paths: Vec<&str> = matches
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .collect();
+        // `build/**` hides the build directory, not same-prefix siblings.
+        assert!(paths.contains(&"build.rs"), "{paths:?}");
+        assert!(paths.contains(&"builders/build_x.rs"), "{paths:?}");
+        assert!(!paths.contains(&"build/build_out.rs"), "{paths:?}");
     }
 
     #[tokio::test]
@@ -639,16 +754,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_search_blocking_wrapper_reports_timeout() {
-        let err = run_blocking_file_search(Duration::from_millis(1), None, || {
-            std::thread::sleep(Duration::from_millis(50));
-            Ok(Vec::new())
-        })
+        let (finished, worker_finished) = tokio::sync::oneshot::channel();
+        let err = run_blocking_file_search::<_, Vec<FileSearchMatch>>(
+            Duration::from_millis(1),
+            None,
+            move |cancel_token| {
+                while !cancel_token.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let _ = finished.send(cancel_token.is_cancelled());
+                Err(file_search_cancelled())
+            },
+        )
         .await
         .expect_err("slow file_search worker should time out");
 
         assert!(
             matches!(err, ToolError::Timeout { seconds: 1 }),
             "unexpected error: {err:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), worker_finished)
+                .await
+                .expect("timed-out worker must stop")
+                .expect("worker completion"),
+            "timeout must cancel the worker without a parent cancellation token"
         );
     }
 
@@ -713,6 +843,12 @@ mod tests {
         std::fs::write(root.join("needle.txt"), "yes\n").expect("write");
         std::fs::write(root.join(".env"), "SECRET=1\n").expect("write env");
         std::fs::write(root.join(".env.local"), "SECRET=2\n").expect("write env local");
+        std::fs::create_dir_all(root.join("denied").join(".env")).expect("mkdir denied");
+        std::fs::write(
+            root.join("denied").join(".env").join("needle-secret.txt"),
+            "SECRET=3\n",
+        )
+        .expect("write denied child");
 
         let ctx = ToolContext::new(root.to_path_buf());
         let tool = FileSearchTool;
@@ -736,5 +872,35 @@ mod tests {
             .expect("execute");
         assert!(result.success);
         assert!(result.content.contains("needle.txt"));
+        assert!(!result.content.contains("needle-secret.txt"));
+    }
+    #[tokio::test]
+    async fn test_file_search_charts_match_pods() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/net")).expect("mkdir");
+        std::fs::write(root.join("src/net/server.rs"), "fn serve() {}\n").expect("write");
+        std::fs::write(root.join("src/net/client.rs"), "fn connect() {}\n").expect("write");
+
+        let ctx = ToolContext::new(root.to_path_buf());
+        let result = FileSearchTool
+            .execute(json!({"query": "server", "limit": 5}), &ctx)
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        let body: Value = serde_json::from_str(&result.content).expect("json result");
+        assert!(!body["matches"].as_array().expect("matches").is_empty());
+        let pods = body["pods"].as_array().expect("pods array");
+        assert_eq!(pods.len(), 1);
+        assert_eq!(pods[0]["dir"], "src/net");
+        let mates: Vec<&str> = pods[0]["mates"]
+            .as_array()
+            .expect("mates")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(mates.contains(&"server.rs (match)"), "{mates:?}");
+        assert!(mates.contains(&"client.rs"), "{mates:?}");
     }
 }

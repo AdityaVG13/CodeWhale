@@ -57,6 +57,7 @@ pub(super) fn handle_tool_call_started(
                 ExploringEntry {
                     label,
                     status: ToolStatus::Running,
+                    error: None,
                 },
             )
             .map_or(0, |(_, inner)| inner);
@@ -112,6 +113,7 @@ pub(super) fn handle_tool_call_started(
                     duration_ms: None,
                     stale_elapsed_since_output_ms: None,
                     source,
+                    description: None,
                     interaction: Some(summary.clone()),
                     output_summary: None,
                 })),
@@ -149,6 +151,10 @@ pub(super) fn handle_tool_call_started(
                 duration_ms: None,
                 stale_elapsed_since_output_ms: None,
                 source,
+                description: input
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 interaction: None,
                 output_summary: None,
             })),
@@ -631,24 +637,6 @@ fn visible_tool_output(content: &str) -> Option<String> {
     }
 }
 
-/// Read the process exit code a tool reported, when it reported one.
-///
-/// Only process-backed tools (`exec_shell`, task runners) carry one, and only
-/// a real, integer-valued `exit_code` counts. Everything else stays `None` so
-/// an `exit_code` condition never matches on a fabricated value.
-/// Reported as `i64`, not `i32`: a Windows crash code such as `3221225477`
-/// (`0xC0000005`) is a real value the shell tool records in its metadata, and
-/// narrowing it dropped exactly those codes — the hook saw no exit code at all
-/// for the crashes it most wanted to catch.
-pub(crate) fn reported_tool_exit_code(result: &Result<ToolResult, ToolError>) -> Option<i64> {
-    let metadata = result.as_ref().ok()?.metadata.as_ref()?;
-    let code = metadata.get("exit_code")?;
-    if code.is_null() {
-        return None;
-    }
-    code.as_i64()
-}
-
 /// Fire `tool_call_after` for every settled tool call, plus `on_error` when
 /// the call failed.
 ///
@@ -677,33 +665,39 @@ fn fire_tool_completion_hooks(
         return;
     }
 
-    let (result_text, success): (String, bool) = match result.as_ref() {
-        Ok(tool_result) => (tool_result.content.clone(), tool_result.success),
-        Err(err) => (err.to_string(), false),
-    };
-    let exit_code = reported_tool_exit_code(result);
+    let input = app
+        .active_tool_details
+        .get(id)
+        .or_else(|| {
+            app.tool_cells
+                .get(id)
+                .and_then(|index| app.tool_details_by_cell.get(index))
+        })
+        .map(|detail| detail.input.clone());
+    let context = app
+        .base_hook_context()
+        .with_tool_name(name)
+        .with_tool_call_id(id)
+        .with_tool_outcome(result);
+    let context = input.as_ref().map_or_else(
+        || context.clone(),
+        |input| context.clone().with_tool_args(input),
+    );
+    let failed = context.tool_success == Some(false);
+    let error_context = (wants_error && failed).then(|| {
+        let text = context.tool_result.as_deref().unwrap_or_default();
+        let message = format!("tool `{name}` failed: {text}");
+        context.clone().with_error(&message)
+    });
 
-    if wants_after {
-        let context = app
-            .base_hook_context()
-            .with_tool_name(name)
-            .with_tool_call_id(id)
-            .with_tool_result(&result_text, success, exit_code);
-        if let Err(error) = app.submit_hooks(HookEvent::ToolCallAfter, context) {
-            app.surface_observer_hook_submission_failure(error);
-        }
+    if wants_after && let Err(error) = app.submit_hooks(HookEvent::ToolCallAfter, context) {
+        app.surface_observer_hook_submission_failure(error);
     }
 
-    if wants_error && !success {
-        let context = app
-            .base_hook_context()
-            .with_tool_name(name)
-            .with_tool_call_id(id)
-            .with_tool_result(&result_text, success, exit_code)
-            .with_error(&format!("tool `{name}` failed: {result_text}"));
-        if let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context) {
-            app.surface_observer_hook_submission_failure(error);
-        }
+    if let Some(context) = error_context
+        && let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context)
+    {
+        app.surface_observer_hook_submission_failure(error);
     }
 }
 
@@ -726,16 +720,18 @@ pub(super) fn handle_tool_call_complete(
     // Preserve the execution/audit name while recovering the action-qualified
     // semantic name from the registered call input. Active entries and
     // already-flushed history use separate detail stores.
-    let semantic_name = app
-        .active_tool_details
-        .get(id)
-        .or_else(|| {
-            app.tool_cells
-                .get(id)
-                .and_then(|cell_index| app.tool_details_by_cell.get(cell_index))
-        })
+    let detail = app.active_tool_details.get(id).or_else(|| {
+        app.tool_cells
+            .get(id)
+            .and_then(|cell_index| app.tool_details_by_cell.get(cell_index))
+    });
+    let semantic_name = detail
         .map_or(name, |detail| canonical_action_alias(name, &detail.input))
         .to_string();
+    let explicit_background = detail.is_some_and(|detail| {
+        exec_is_background(&detail.input)
+            || detail.input.get("tty").and_then(serde_json::Value::as_bool) == Some(true)
+    });
 
     // Roll any child-LLM token usage the tool reports into the
     // session-cost counter. Runs unconditionally so future tools that
@@ -750,6 +746,27 @@ pub(super) fn handle_tool_call_complete(
     // event at all, so "fires after each tool call" was not true.
     fire_tool_completion_hooks(app, id, name, result);
 
+    // The engine prefixes an approved call's result with a note for the model
+    // ("[approval] This tool call required approval…"). The person gave that
+    // approval a moment ago; repeating it as the first line of the output
+    // reads as an internal log (#6566). The model's copy keeps the note. The
+    // engine's approval stamp decides what is a note, never the text alone.
+    let displayed;
+    let result = match result {
+        Ok(tool_result) => {
+            let shown_content = crate::core::engine::content_without_approval_note(tool_result);
+            if shown_content.len() == tool_result.content.len() {
+                result
+            } else {
+                let mut shown = tool_result.clone();
+                shown.content = shown_content.to_string();
+                displayed = Ok(shown);
+                &displayed
+            }
+        }
+        Err(_) => result,
+    };
+
     // Exploring entries land in the per-tool map regardless of whether they
     // live in the active cell or in finalized history; the path is the same.
     if let Some((cell_index, entry_index)) = app.exploring_entries.remove(id) {
@@ -760,6 +777,14 @@ pub(super) fn handle_tool_call_complete(
             && let Some(entry) = cell.entries.get_mut(entry_index)
         {
             entry.status = tool_status_from_result(result);
+            entry.error = if entry.status == ToolStatus::Failed {
+                match result {
+                    Ok(tool_result) => visible_tool_output(&tool_result.content),
+                    Err(err) => Some(err.to_string()),
+                }
+            } else {
+                None
+            };
             app.mark_history_updated();
             // Mutating the in-flight exploring cell needs an active-cell
             // revision bump so the transcript cache invalidates the synthetic
@@ -800,6 +825,7 @@ pub(super) fn handle_tool_call_complete(
     })
     .flatten();
     let mut workflow_panel_output: Option<String> = None;
+    let mut moved_to_jobs = false;
 
     if let Some(cell) = app.cell_at_virtual_index_mut(cell_index) {
         match cell {
@@ -865,11 +891,8 @@ pub(super) fn handle_tool_call_complete(
                             .as_deref()
                             .map(super::history::summarize_tool_output);
                         exec.live_output = None;
-                    } else if status == ToolStatus::Running
-                        && exec.interaction.is_none()
-                        && !tool_result.content.is_empty()
-                    {
-                        exec.live_output = Some(tool_result.content.clone());
+                    } else if status == ToolStatus::Running && exec.interaction.is_none() {
+                        moved_to_jobs = !explicit_background;
                     }
                 } else if let Err(err) = result.as_ref()
                     && exec.interaction.is_none()
@@ -989,6 +1012,12 @@ pub(super) fn handle_tool_call_complete(
     // `Event::WorkflowUi`; this path covers tool-complete hydration.
     if let Some(output) = workflow_panel_output.as_deref() {
         apply_workflow_output_to_panel(app, output);
+    }
+    if moved_to_jobs {
+        let notice = app
+            .tr(codewhale_localization::MessageId::ShellWaitReleased)
+            .replace("{jobs}", "/jobs");
+        app.push_status_toast(notice, crate::tui::app::StatusToastLevel::Info, Some(6_000));
     }
 
     // If the mutated cell lived inside the active group, bump the active-cell
@@ -1116,32 +1145,27 @@ fn degraded_reason_label(reason: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// Hydrate or advance the WorkflowPanel from a workflow tool JSON payload.
-/// Accepts a single run record (with optional `events` array) or a status
-/// list. Log-only events are filtered by the panel itself so the transcript
-/// stays free of progress spam (#4121). Also keeps the matching history card
-/// snapshot aligned (#4122).
+/// Hydrate or advance a workflow run from a workflow tool JSON payload: a
+/// run record (with its retained `events` tail) or a status envelope. A
+/// status envelope only refreshes runs this view already holds — polling an
+/// old run must not bring it back, or its finish line would be written twice.
 fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
         return;
     };
-
-    // A status response is an envelope rather than a run. Route only its
-    // selected record through the same identity checks as direct results.
     if value.get("action").and_then(|v| v.as_str()) == Some("status") {
-        if let Some(runs) = value.get("runs").and_then(|r| r.as_array())
-            && let Some(run) = runs.last()
-        {
-            apply_workflow_output_to_panel(app, &run.to_string());
+        if let Some(runs) = value.get("runs").and_then(|r| r.as_array()) {
+            for run in runs {
+                apply_workflow_run_record(app, run, false);
+            }
         }
-        return;
+    } else {
+        apply_workflow_run_record(app, &value, true);
     }
+    app.announce_settled_workflows();
+}
 
-    // Tool completions can arrive after a newer run has already selected the
-    // shared panel. Bind the entire payload to one run before replaying any of
-    // its retained events. A different run may replace a settled panel only
-    // when its recorded start is strictly newer; missing/older provenance
-    // fails closed instead of contaminating the displayed run.
+fn apply_workflow_run_record(app: &mut App, value: &serde_json::Value, may_create: bool) {
     let Some(run_id) = value
         .get("run_id")
         .and_then(|v| v.as_str())
@@ -1164,48 +1188,37 @@ fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
     else {
         return;
     };
-    if let Some(panel) = app.workflow_panel.as_ref()
-        && panel.run_id != run_id
-    {
-        let incoming_started_at = value.get("started_at_ms").and_then(|v| v.as_u64());
-        if panel.lifecycle.is_running()
-            || incoming_started_at.is_none_or(|at_ms| at_ms <= panel.started_at_ms)
-        {
-            return;
-        }
+    if app.workflow_run(&run_id).is_none() && !may_create {
+        return;
     }
+    let label = value
+        .get("workflow_goal")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("workflow_id").and_then(|v| v.as_str()))
+        .unwrap_or(&run_id)
+        .to_string();
+    let at_ms = value
+        .get("started_at_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     // Prefer the typed event stream when present.
     if let Some(events) = value.get("events").and_then(|e| e.as_array()) {
-        // Ensure the selected panel belongs to this payload before applying.
-        // A newer settled run can reach this branch without a retained
-        // run_started event, so replace it with a correctly identified shell.
-        if app
-            .workflow_panel
-            .as_ref()
-            .is_none_or(|panel| panel.run_id != run_id)
-        {
-            let label = value
-                .get("workflow_goal")
-                .and_then(|v| v.as_str())
-                .or_else(|| value.get("workflow_id").and_then(|v| v.as_str()))
-                .unwrap_or(&run_id)
-                .to_string();
-            let at_ms = value
-                .get("started_at_ms")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+        if app.workflow_run(&run_id).is_none() {
             let mut panel = crate::tui::widgets::workflow_panel::WorkflowPanel::new(
                 run_id.clone(),
                 label,
                 at_ms,
             );
             panel.locale = app.ui_locale;
-            app.workflow_panel = Some(panel);
+            app.push_workflow_run(panel);
         }
-        if let Some(panel) = app.workflow_panel.as_mut() {
-            let mut injected = Vec::with_capacity(events.len());
-            for event in events {
+        let Some(panel) = app.workflow_run_mut(&run_id) else {
+            return;
+        };
+        let injected: Vec<serde_json::Value> = events
+            .iter()
+            .map(|event| {
                 let mut event = event.clone();
                 if let Some(obj) = event.as_object_mut() {
                     // The top-level run record is authoritative. Do not let a
@@ -1215,60 +1228,58 @@ fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
                         serde_json::Value::String(run_id.clone()),
                     );
                 }
-                injected.push(event);
-            }
-            panel.apply_json_events(&injected);
-            // Completion/status payloads replay a retained event tail. Merge
-            // the authoritative exact count + bounded structured ledger after
-            // replay so live dispatch failures are neither duplicated nor
-            // lost when older events have fallen out of the tail (#5528).
-            panel.merge_dispatch_failures_from_run_json(&value);
-            // Carry final result / source into panel for expanded history card.
-            if let Some(summary) = value
-                .get("result")
-                .map(|v| v.to_string())
-                .filter(|s| s != "null")
-            {
-                panel.result_summary = Some(summary);
-            }
-            if let Some(path) = value.get("source_path").and_then(|v| v.as_str()) {
-                panel.source_path = Some(PathBuf::from(path));
-            }
-            app.needs_redraw = true;
+                event
+            })
+            .collect();
+        // A replayed tail can repeat this run's `run_started`, which resets
+        // its state; whether the finish line was written survives that.
+        let announced = panel.finish_announced;
+        panel.apply_json_events(&injected);
+        panel.finish_announced = announced || panel.finish_announced;
+        // Completion/status payloads replay a retained event tail. Merge
+        // the authoritative exact count + bounded structured ledger after
+        // replay so live dispatch failures are neither duplicated nor
+        // lost when older events have fallen out of the tail (#5528).
+        panel.merge_dispatch_failures_from_run_json(value);
+        if let Some(summary) = value
+            .get("result")
+            .and_then(crate::tools::workflow::workflow_result_preview)
+        {
+            panel.result_summary = Some(summary);
         }
-        sync_workflow_history_card_from_panel(app);
+        if let Some(path) = value.get("source_path").and_then(|v| v.as_str()) {
+            panel.source_path = Some(PathBuf::from(path));
+        }
+        app.needs_redraw = true;
+        sync_workflow_history_card(app, &run_id);
         return;
     }
 
-    // Prefer full panel hydration from summary/phases snapshot when present.
+    // A summary/phases snapshot hydrates the whole run.
     if let Some(mut panel) =
-        crate::tui::widgets::workflow_panel::WorkflowPanel::from_run_json(&value)
+        crate::tui::widgets::workflow_panel::WorkflowPanel::from_run_json(value)
     {
         panel.locale = app.ui_locale;
-        app.workflow_panel = Some(panel);
+        match app.workflow_run_mut(&run_id) {
+            Some(existing) => {
+                panel.finish_announced = existing.finish_announced;
+                *existing = panel;
+            }
+            None => app.push_workflow_run(panel),
+        }
         app.needs_redraw = true;
-        sync_workflow_history_card_from_panel(app);
+        sync_workflow_history_card(app, &run_id);
         return;
     }
 
-    // Fallback: bare run record without events — at least surface header state.
-    if value.get("run_id").and_then(|v| v.as_str()).is_some() {
-        use crate::tui::widgets::workflow_panel::{WorkflowPanelEvent, WorkflowPanelLifecycle};
-        let label = value
-            .get("workflow_goal")
-            .and_then(|v| v.as_str())
-            .or_else(|| value.get("workflow_id").and_then(|v| v.as_str()))
-            .unwrap_or(&run_id)
-            .to_string();
-        let at_ms = value
-            .get("started_at_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let status = value
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("running");
-        let started_applied = app.apply_workflow_panel_event(
+    // Fallback: bare run record without events — at least surface its state.
+    use crate::tui::widgets::workflow_panel::{WorkflowPanelEvent, WorkflowPanelLifecycle};
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
+    if app.workflow_run(&run_id).is_none() {
+        app.apply_workflow_panel_event(
             &run_id,
             WorkflowPanelEvent::RunStarted {
                 run_id: run_id.clone(),
@@ -1285,62 +1296,85 @@ fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
                 at_ms,
             },
         );
-        if !started_applied {
-            return;
-        }
-        if status != "running" {
-            let life = match status {
-                "completed" | "succeeded" => WorkflowPanelLifecycle::Succeeded,
-                "degraded" => WorkflowPanelLifecycle::Degraded,
-                "failed" => WorkflowPanelLifecycle::Failed,
-                "cancelled" | "canceled" => WorkflowPanelLifecycle::Cancelled,
-                _ => WorkflowPanelLifecycle::Running,
-            };
-            if life != WorkflowPanelLifecycle::Running {
-                app.apply_workflow_panel_event(
-                    &run_id,
-                    WorkflowPanelEvent::RunCompleted {
-                        status: life,
-                        error: value
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        at_ms: value
-                            .get("completed_at_ms")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(at_ms),
-                    },
-                );
-            }
-        }
-        sync_workflow_history_card_from_panel(app);
     }
+    let life = match status {
+        "completed" | "succeeded" => WorkflowPanelLifecycle::Succeeded,
+        "degraded" => WorkflowPanelLifecycle::Degraded,
+        "failed" => WorkflowPanelLifecycle::Failed,
+        "cancelled" | "canceled" => WorkflowPanelLifecycle::Cancelled,
+        _ => WorkflowPanelLifecycle::Running,
+    };
+    if life != WorkflowPanelLifecycle::Running
+        && app
+            .workflow_run(&run_id)
+            .is_some_and(|run| !run.lifecycle.is_terminal())
+    {
+        app.apply_workflow_panel_event(
+            &run_id,
+            WorkflowPanelEvent::RunCompleted {
+                status: life,
+                error: value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                at_ms: value
+                    .get("completed_at_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(at_ms),
+            },
+        );
+    }
+    sync_workflow_history_card(app, &run_id);
 }
 
-/// Apply one live `WorkflowUi` engine event to the panel and history card.
+/// Apply one live `WorkflowUi` engine event to its run.
+///
+/// Progress is applied to state at once but costs nothing else: only a run's
+/// start and end touch the transcript, so a 75-agent fan-out's stream of
+/// task and budget events never rescans history or reserializes a card.
 pub(super) fn apply_workflow_ui_event(app: &mut App, run_id: &str, event: &serde_json::Value) {
     use crate::tui::widgets::workflow_panel::WorkflowPanelEvent;
 
     let mut event = event.clone();
     if let Some(obj) = event.as_object_mut() {
         // The engine envelope owns route identity. An embedded stale id must
-        // not move this event onto another run's panel.
+        // not move this event onto another run's state.
         obj.insert(
             "run_id".to_string(),
             serde_json::Value::String(run_id.to_string()),
         );
     }
-    if let Some(panel_event) = WorkflowPanelEvent::from_json_value(&event)
-        && !app.apply_workflow_panel_event(run_id, panel_event)
+    let event_type = event
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // The engine names what the run returned; keep it for the finish line.
+    // Set before the event applies, so the line written on this very event
+    // already carries it.
+    if event_type == "run_completed"
+        && let Some(preview) = event
+            .get("result_preview")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        && let Some(run) = app.workflow_run_mut(run_id)
     {
+        run.result_summary = Some(preview);
+    }
+    let Some(panel_event) = WorkflowPanelEvent::from_json_value(&event) else {
+        return;
+    };
+    if !app.apply_workflow_panel_event(run_id, panel_event) {
         return;
     }
-    sync_workflow_history_card_from_panel(app);
+    if event_type == "run_started" {
+        sync_workflow_history_card(app, run_id);
+    }
 }
 
 /// Apply a live workflow event only when its immutable owner is the active
 /// conversation. This check deliberately sits in the mutation helper so every
-/// caller fails closed before touching the panel or transcript history.
+/// caller fails closed before touching the run or transcript history.
 pub(super) fn apply_owned_workflow_ui_event(
     app: &mut App,
     owner_session_id: &str,
@@ -1354,23 +1388,17 @@ pub(super) fn apply_owned_workflow_ui_event(
     true
 }
 
-/// Mirror the live WorkflowPanel snapshot into the in-flight (or most recent)
-/// workflow history tool cell so compact/expanded cards stay current.
-fn sync_workflow_history_card_from_panel(app: &mut App) {
-    let Some(panel) = app.workflow_panel.as_ref() else {
+/// A foreground `run` card has no output until the tool returns, but its
+/// start line names the run. Give the newest still-running `workflow` card —
+/// the one this run belongs to, or one that has no run yet — the run's
+/// snapshot. A card whose tool has returned keeps its own output.
+fn sync_workflow_history_card(app: &mut App, run_id: &str) {
+    let Some(snapshot) = app
+        .workflow_run(run_id)
+        .map(|panel| panel.to_run_json().to_string())
+    else {
         return;
     };
-    let run_id = panel.run_id.clone();
-    let snapshot = panel.to_run_json().to_string();
-    let degraded = matches!(
-        panel.lifecycle,
-        crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Degraded
-    );
-
-    // Prefer an in-flight Generic(workflow) cell whose output already carries
-    // this run_id, else the newest running workflow cell, else any workflow
-    // cell (tool-complete path already wrote the final output).
-    let mut target: Option<usize> = None;
     let history_len = app.history.len();
     let total = history_len
         + app
@@ -1378,75 +1406,41 @@ fn sync_workflow_history_card_from_panel(app: &mut App) {
             .as_ref()
             .map(|a| a.entries().len())
             .unwrap_or(0);
-
+    let mut target = None;
     for idx in (0..total).rev() {
-        let Some(cell) = app.cell_at_virtual_index(idx) else {
+        let Some(HistoryCell::Tool(ToolCell::Generic(generic))) = app.cell_at_virtual_index(idx)
+        else {
             continue;
         };
-        let HistoryCell::Tool(ToolCell::Generic(generic)) = cell else {
-            continue;
-        };
-        if generic.name != "workflow" {
+        if generic.name != "workflow" || generic.status != ToolStatus::Running {
             continue;
         }
-        let matches_run = generic
+        let card_run = generic
             .output
             .as_deref()
             .and_then(|out| serde_json::from_str::<serde_json::Value>(out).ok())
             .and_then(|v| {
                 v.get("run_id")
                     .and_then(|id| id.as_str())
-                    .map(|id| id == run_id)
-            })
-            .unwrap_or(false);
-        let is_running = generic.status == ToolStatus::Running;
-        if matches_run || (is_running && target.is_none()) {
-            target = Some(idx);
-            if matches_run {
+                    .map(str::to_string)
+            });
+        match card_run.as_deref() {
+            Some(id) if id == run_id => {
+                target = Some(idx);
                 break;
             }
+            None if target.is_none() => target = Some(idx),
+            _ => {}
         }
     }
-
     let Some(idx) = target else {
         return;
     };
     if let Some(HistoryCell::Tool(ToolCell::Generic(generic))) = app.cell_at_virtual_index_mut(idx)
     {
-        // Preserve a richer final output if the tool completion already wrote
-        // a full run record with an events array longer than the snapshot.
-        let replace = match generic.output.as_deref() {
-            None => true,
-            Some(existing) => {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(existing) else {
-                    return;
-                };
-                let existing_run = value.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
-                if !existing_run.is_empty() && existing_run != run_id {
-                    return;
-                }
-                // Prefer full event-bearing records when the tool has completed.
-                if generic.status == ToolStatus::Running {
-                    true
-                } else {
-                    value
-                        .get("events")
-                        .and_then(|e| e.as_array())
-                        .is_none_or(|e| e.is_empty())
-                }
-            }
-        };
-        let status_changed = degraded && generic.status != ToolStatus::Warning;
-        if status_changed {
-            generic.status = ToolStatus::Warning;
-        }
-        if replace {
-            generic.output = Some(snapshot);
-            generic.output_summary = Some(format!("workflow {}", run_id));
-        }
-        if replace || status_changed {
-            app.mark_history_updated();
-        }
+        generic.output = Some(snapshot);
+        generic.output_summary = Some(format!("workflow {run_id}"));
+        app.mark_history_updated();
     }
 }
 
@@ -1957,9 +1951,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn late_live_event_from_prior_run_does_not_mutate_active_run() {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+    fn concurrent_runs_keep_their_own_events() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
         );
         apply_workflow_ui_event(
             &mut app,
@@ -1984,14 +1978,9 @@ mod tests {
             "run-b",
             &json!({"type": "phase_started", "title": "Build", "at_ms": 2_100}),
         );
-        let before = app
-            .workflow_panel
-            .as_ref()
-            .expect("run B panel")
-            .to_run_json();
+        let before = app.workflow_run("run-b").expect("run B").to_run_json();
 
-        // Even a delayed start cannot rewind the selected panel to an older
-        // run. A genuinely newer run B was already accepted above.
+        // Both runs are rows of their own; a delayed start for A touches A.
         apply_workflow_ui_event(
             &mut app,
             "run-a",
@@ -2025,15 +2014,23 @@ mod tests {
             }),
         );
 
-        let panel = app.workflow_panel.as_ref().expect("run B remains active");
-        assert_eq!(panel.run_id, "run-b");
-        assert_eq!(panel.to_run_json(), before);
+        assert_eq!(app.workflow_runs.len(), 2, "two runs, two rows");
+        assert_eq!(
+            app.workflow_run("run-b").expect("run B").to_run_json(),
+            before
+        );
+        let run_a = app.workflow_run("run-a").expect("run A");
+        assert_eq!(
+            run_a.lifecycle,
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Failed
+        );
+        assert_eq!(run_a.dispatch_failure_count, 1);
     }
 
     #[test]
-    fn prior_run_completion_replay_does_not_replace_active_run() {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+    fn a_completion_replay_for_another_run_never_touches_this_one() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
         );
         apply_workflow_ui_event(
             &mut app,
@@ -2049,14 +2046,10 @@ mod tests {
             "run-b",
             &json!({"type": "phase_started", "title": "Verify", "at_ms": 2_100}),
         );
-        let before = app
-            .workflow_panel
-            .as_ref()
-            .expect("run B panel")
-            .to_run_json();
+        let before = app.workflow_run("run-b").expect("run B").to_run_json();
 
         // A retained completion tail can contain run_started. The top-level
-        // run identity and timestamp keep the whole replay off run B.
+        // run identity keeps the whole replay on run A.
         apply_workflow_output_to_panel(
             &mut app,
             &json!({
@@ -2094,15 +2087,17 @@ mod tests {
             .to_string(),
         );
 
-        let panel = app.workflow_panel.as_ref().expect("run B remains active");
-        assert_eq!(panel.run_id, "run-b");
-        assert_eq!(panel.to_run_json(), before);
+        assert_eq!(
+            app.workflow_run("run-b").expect("run B").to_run_json(),
+            before
+        );
+        assert!(app.workflow_run("run-a").is_some());
     }
 
     #[test]
     fn workflow_completion_replay_uses_authoritative_dispatch_failure_ledger() {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
         );
         let failure = json!({
             "type": "task_dispatch_failed",
@@ -2122,9 +2117,8 @@ mod tests {
         );
         apply_workflow_ui_event(&mut app, "run-1", &failure);
         assert_eq!(
-            app.workflow_panel
-                .as_ref()
-                .expect("live panel")
+            app.workflow_run("run-1")
+                .expect("live run")
                 .dispatch_failure_count,
             1
         );
@@ -2149,16 +2143,16 @@ mod tests {
             .to_string(),
         );
 
-        let panel = app.workflow_panel.as_ref().expect("completed panel");
+        let panel = app.workflow_run("run-1").expect("completed run");
         assert_eq!(panel.dispatch_failure_count, 1);
         assert_eq!(panel.dispatch_failures.len(), 1);
         assert_eq!(panel.failure_cancel_counts(), (1, 0));
     }
 
     #[test]
-    fn degraded_workflow_snapshot_marks_history_receipt_as_warning() {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+    fn degraded_run_writes_one_warning_finish_line_after_its_start_card() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
         );
         app.history
             .push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
@@ -2192,12 +2186,250 @@ mod tests {
 
         let HistoryCell::Tool(ToolCell::Generic(receipt)) = app.history.last().expect("receipt")
         else {
-            panic!("workflow receipt must remain generic")
+            panic!("the finish line is a workflow card")
         };
         assert_eq!(receipt.status, ToolStatus::Warning);
+        let output: serde_json::Value =
+            serde_json::from_str(receipt.output.as_deref().expect("snapshot")).expect("json");
+        assert_eq!(output["transcript_line"], "finished");
+        assert_eq!(output["run_id"], "run-partial");
         assert!(!history_cell_has_running_tool(
             app.history.last().expect("receipt")
         ));
+
+        // The live stream delivering the same terminal event later does not
+        // write the line again.
+        let cells = app.history.len();
+        apply_workflow_ui_event(
+            &mut app,
+            "run-partial",
+            &json!({"type": "run_completed", "status": "degraded", "at_ms": 2_000}),
+        );
+        assert_eq!(app.history.len(), cells);
+    }
+
+    #[test]
+    fn a_foreground_run_card_carries_its_own_finish_line() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let mut active = crate::tui::active_cell::ActiveCell::new();
+        active.push_untracked(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "workflow".to_string(),
+            status: ToolStatus::Running,
+            input_summary: None,
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })));
+        app.active_cell = Some(active);
+        apply_workflow_ui_event(
+            &mut app,
+            "run-fg",
+            &json!({"type": "run_started", "workflow_goal": "survey", "at_ms": 1_000}),
+        );
+        apply_workflow_ui_event(
+            &mut app,
+            "run-fg",
+            &json!({"type": "run_completed", "status": "completed", "result_preview": "3 findings", "at_ms": 5_000}),
+        );
+        // The tool returns the settled record into its own card.
+        if let Some(HistoryCell::Tool(ToolCell::Generic(card))) = app
+            .active_cell
+            .as_mut()
+            .and_then(|active| active.entry_mut(0))
+        {
+            card.status = ToolStatus::Success;
+            card.output = Some(
+                json!({
+                    "run_id": "run-fg",
+                    "workflow_goal": "survey",
+                    "status": "completed",
+                    "started_at_ms": 1_000,
+                    "completed_at_ms": 5_000,
+                    "result": {"summary": "3 findings"},
+                })
+                .to_string(),
+            );
+        }
+        app.flush_active_cell();
+        assert_eq!(
+            app.history.len(),
+            1,
+            "the card owns the finish; no second line"
+        );
+        let rendered = app.history[0]
+            .lines(100)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The settled record replaces `started`: one row for the run.
+        assert!(!rendered.contains("started"), "{rendered}");
+        assert!(rendered.contains("finished"), "{rendered}");
+        assert!(rendered.contains("3 findings"), "{rendered}");
+    }
+
+    #[test]
+    fn a_detached_finish_waits_for_its_start_card_to_leave_the_active_group() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let start_card = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "workflow".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some(
+                json!({"run_id": "run-fast", "workflow_goal": "quick", "status": "running"})
+                    .to_string(),
+            ),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }));
+        let mut active = crate::tui::active_cell::ActiveCell::new();
+        active.push_untracked(start_card);
+        app.active_cell = Some(active);
+        for event in [
+            json!({"type": "run_started", "workflow_goal": "quick", "at_ms": 1_000}),
+            json!({"type": "run_completed", "status": "failed", "error": "script error, line 3", "at_ms": 1_400}),
+        ] {
+            apply_workflow_ui_event(&mut app, "run-fast", &event);
+        }
+        assert!(
+            app.history.is_empty(),
+            "the finish line must not jump above its start"
+        );
+
+        app.flush_active_cell();
+        // One row per run: the start card becomes the finish, in place.
+        assert_eq!(app.history.len(), 1, "the start card is the finish line");
+        let HistoryCell::Tool(ToolCell::Generic(finish)) = &app.history[0] else {
+            panic!("finish line is a workflow card");
+        };
+        assert_eq!(finish.status, ToolStatus::Failed);
+        let rendered = app.history[0]
+            .lines(100)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("failed"), "{rendered}");
+        assert!(rendered.contains("quick"), "{rendered}");
+        assert!(rendered.contains("script error, line 3"), "{rendered}");
+        assert!(!rendered.contains("started"), "{rendered}");
+
+        // The live stream repeating the terminal event writes nothing more.
+        apply_workflow_ui_event(
+            &mut app,
+            "run-fast",
+            &json!({"type": "run_completed", "status": "failed", "error": "script error, line 3", "at_ms": 1_400}),
+        );
+        assert_eq!(app.history.len(), 1);
+    }
+
+    fn workflow_card(record: serde_json::Value) -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "workflow".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some(record.to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    }
+
+    fn is_finish_card(cell: &HistoryCell) -> bool {
+        let HistoryCell::Tool(ToolCell::Generic(tool)) = cell else {
+            return false;
+        };
+        tool.output
+            .as_deref()
+            .and_then(|out| serde_json::from_str::<serde_json::Value>(out).ok())
+            .is_some_and(|value| value.get("transcript_line").is_some())
+    }
+
+    fn settle_run(app: &mut App, run_id: &str) {
+        for event in [
+            json!({"type": "run_started", "workflow_goal": "quick", "at_ms": 1_000}),
+            json!({"type": "run_completed", "status": "failed", "error": "script error", "at_ms": 1_355}),
+        ] {
+            apply_workflow_ui_event(app, run_id, &event);
+        }
+    }
+
+    #[test]
+    fn a_status_poll_that_returned_the_settled_record_is_the_only_finish() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let mut active = crate::tui::active_cell::ActiveCell::new();
+        active.push_untracked(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"}),
+        ));
+        active.push_untracked(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "failed"}),
+        ));
+        app.active_cell = Some(active);
+        settle_run(&mut app, "run-x");
+        app.flush_active_cell();
+
+        assert_eq!(app.history.len(), 2, "no extra finish appended");
+        assert!(
+            !app.history.iter().any(is_finish_card),
+            "the poll already shows the finish; the start card must not repeat it"
+        );
+    }
+
+    #[test]
+    fn the_finish_rewrites_the_start_card_not_a_later_status_poll() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let running = json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"});
+        app.add_message(workflow_card(running.clone()));
+        app.add_message(workflow_card(running));
+        settle_run(&mut app, "run-x");
+
+        assert_eq!(app.history.len(), 2);
+        assert!(is_finish_card(&app.history[0]), "the start card settles");
+        assert!(!is_finish_card(&app.history[1]), "the poll is left alone");
+    }
+
+    #[test]
+    fn a_run_that_settles_after_the_conversation_moved_on_finishes_at_the_tail() {
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        app.add_message(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"}),
+        ));
+        app.add_message(HistoryCell::User {
+            content: "meanwhile, something else".to_string(),
+        });
+        settle_run(&mut app, "run-x");
+
+        assert_eq!(app.history.len(), 3, "the finish is appended");
+        assert!(!is_finish_card(&app.history[0]));
+        assert!(
+            is_finish_card(&app.history[2]),
+            "the finish sits at the tail"
+        );
     }
 
     #[cfg(unix)]
@@ -2239,8 +2471,8 @@ mod tests {
             )
         };
 
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(dir.path()),
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(dir.path()),
         );
         app.workspace = dir.path().to_path_buf();
         app.hooks = HookExecutor::new(
@@ -2282,6 +2514,83 @@ mod tests {
         let errors = hook_log_lines_eventually(&error_log, 1);
         assert_eq!(after, vec![id, second]);
         assert_eq!(errors, vec![id]);
+    }
+
+    /// #6582: hooks see a `bash` command's real exit code and status, for a
+    /// failing command as well as a passing one. A nonzero exit is a
+    /// `ToolError`. A foreground wait that expires is not: the command moves
+    /// to the background and stays running, so `on_error` does not fire for it.
+    #[cfg(unix)]
+    #[test]
+    fn bash_completion_hooks_get_exit_code_and_status_for_failures() {
+        use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
+        use crate::tools::spec::{ToolContext, ToolSpec};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after_log = dir.path().join("after.log");
+        let error_log = dir.path().join("error.log");
+        let script = |path: &std::path::Path| {
+            format!(
+                "printf '%s %s %s %s\\n' \"$DEEPSEEK_TOOL_CALL_ID\" \"${{DEEPSEEK_TOOL_EXIT_CODE-unset}}\" \"${{DEEPSEEK_TOOL_STATUS-unset}}\" \"$DEEPSEEK_TOOL_SUCCESS\" >> {}",
+                path.display()
+            )
+        };
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(dir.path()),
+        );
+        app.workspace = dir.path().to_path_buf();
+        app.hooks = HookExecutor::new(
+            HooksConfig {
+                enabled: true,
+                hooks: vec![
+                    Hook::new(HookEvent::ToolCallAfter, &script(&after_log)),
+                    Hook::new(HookEvent::OnError, &script(&error_log)),
+                ],
+                ..HooksConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let context = ToolContext::new(dir.path());
+        let cases = [
+            ("call-exit-0", json!({"command": "exit 0"})),
+            ("call-exit-1", json!({"command": "exit 1"})),
+            (
+                "call-exit-127",
+                json!({"command": "codewhale-no-such-command-6582"}),
+            ),
+            (
+                "call-timeout",
+                json!({"command": "sleep 5", "timeout": 0.2}),
+            ),
+        ];
+        for (id, input) in cases {
+            let result =
+                runtime.block_on(crate::tools::shell::LowercaseBashTool.execute(input, &context));
+            handle_tool_call_complete(&mut app, id, "bash", &result);
+        }
+
+        let mut after = hook_log_lines_eventually(&after_log, 4);
+        let mut errors = hook_log_lines_eventually(&error_log, 2);
+        after.sort();
+        errors.sort();
+        assert_eq!(
+            after,
+            vec![
+                "call-exit-0 0 completed true",
+                "call-exit-1 1 failed false",
+                "call-exit-127 127 failed false",
+                "call-timeout unset running true",
+            ]
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "call-exit-1 1 failed false",
+                "call-exit-127 127 failed false",
+            ]
+        );
     }
 
     #[test]
@@ -2463,6 +2772,7 @@ mod tests {
             duration_ms: Some(120),
             stale_elapsed_since_output_ms: None,
             source: ExecSource::Assistant,
+            description: None,
             interaction: None,
             output_summary: None,
         });
@@ -2486,63 +2796,6 @@ mod tests {
             transcript.contains("(no output)"),
             "Transcript mode still records the placeholder: {transcript:?}"
         );
-    }
-
-    /// #455 — `exit_code` conditions must only ever see a real, reported exit
-    /// code. `tool_call_after` used to hard-code `None`, which made every
-    /// `{ type = "exit_code" }` condition permanently unmatchable.
-    #[test]
-    fn reported_tool_exit_code_reads_only_real_metadata_codes() {
-        let with_code = Ok(ToolResult {
-            content: "boom".to_string(),
-            success: false,
-            metadata: Some(serde_json::json!({ "exit_code": 127 })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&with_code), Some(127));
-
-        // Zero is a real code, not a missing one.
-        let zero = Ok(ToolResult {
-            content: "ok".to_string(),
-            success: true,
-            metadata: Some(serde_json::json!({ "exit_code": 0 })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&zero), Some(0));
-
-        // Tools that report no exit code stay `None` — never synthesized from
-        // the success flag.
-        let no_metadata = Ok(ToolResult::error("failed"));
-        assert_eq!(super::reported_tool_exit_code(&no_metadata), None);
-
-        let null_code = Ok(ToolResult {
-            content: String::new(),
-            success: true,
-            metadata: Some(serde_json::json!({ "exit_code": serde_json::Value::Null })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&null_code), None);
-
-        let wrong_type = Ok(ToolResult {
-            content: String::new(),
-            success: false,
-            metadata: Some(serde_json::json!({ "exit_code": "127" })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&wrong_type), None);
-
-        // A Windows crash code does not fit in an `i32`, but it is a real code
-        // and a hook scoped to it must be able to see it.
-        let windows_crash = Ok(ToolResult {
-            content: String::new(),
-            success: false,
-            metadata: Some(serde_json::json!({ "exit_code": 3_221_225_477_i64 })),
-        });
-        assert_eq!(
-            super::reported_tool_exit_code(&windows_crash),
-            Some(3_221_225_477)
-        );
-
-        // A transport-level tool error has no metadata at all.
-        let errored: Result<ToolResult, ToolError> =
-            Err(ToolError::execution_failed("no such tool"));
-        assert_eq!(super::reported_tool_exit_code(&errored), None);
     }
 
     // === #5472 finding 3: retained tool outputs are bounded ===
@@ -2574,7 +2827,7 @@ mod tests {
     #[test]
     fn oldest_tool_outputs_are_released_once_the_budget_is_exceeded() {
         let mut app = crate::tui::app::App::new(
-            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
             &crate::config::Config::default(),
         );
         // 200 records x 64 KiB = 12.8 MiB, well past the 8 MiB budget.

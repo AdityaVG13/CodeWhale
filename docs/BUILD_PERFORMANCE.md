@@ -1,5 +1,7 @@
 # Build and test performance
 
+> 阅读简体中文版：[zh_hans/BUILD_PERFORMANCE.md](zh_hans/BUILD_PERFORMANCE.md)。
+
 Measured facts about how long Codewhale takes to build and test, what was
 changed to make the contributor loop faster, and what is deferred. Numbers
 are from one machine (Apple Silicon, 14 cores, rustc 1.97.0, Xcode 26.2
@@ -8,7 +10,7 @@ average 10–27, recorded next to each number), so treat them as relative
 before/after evidence, not benchmarks.
 
 > Split plan: [TUI deconstruction](design/TUI_DECONSTRUCTION.md) contains the
-> September 9 source audit and current proposed extraction order. Measurements
+> current source audit, target crate map and extraction order. Measurements
 > below are historical; the B3/deferred candidate lists are not an execution queue.
 
 ## Where the time goes (baseline, commit 533c530b)
@@ -62,7 +64,7 @@ a0-incremental-lib-test-timing.html, a0-llvm-lines-top40.txt).
 | Receipt | Wall | Load (1 min) |
 | --- | --- | --- |
 | Cold `cargo test -p codewhale-tui --lib --locked --no-run --timings` | 127 s (user 329 s) | 8.9 |
-| `touch crates/tui/src/elapsed.rs` + same command | 21 s | 12.3 |
+| `touch crates/runtime/src/elapsed.rs` + same command | 21 s | 12.3 |
 | `touch` + `cargo test -p codewhale-tui --lib --locked elapsed::` (the everyday loop) | 20 s (4 tests run) | 11.2 |
 | Lib-test binary size | 357 MB (`codewhale_tui-<hash>`); links with the `__eh_frame section too large (max 16MB)` compact-unwind warning | — |
 | `cargo check -p codewhale-tui --lib --tests` incremental after `touch` (frontend only) | 14 s | 6.2 |
@@ -151,12 +153,20 @@ Defaults never contain a machine-specific absolute path:
 export CODEWHALE_CACHE_ROOT=/path/to/cache/codewhale
 
 scripts/dev-cache.sh --self-check
-scripts/dev-test.sh crates/tui/src/elapsed.rs
+scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked --no-run
 ```
 
-Hermetic script tests (no rustc compile): `sh scripts/dev-cache.test.sh` and
-`sh scripts/dev-test.test.sh`.
+Hermetic script test (no rustc compile): `sh scripts/dev-cache.test.sh`.
+When the repository build lock governs Cargo, the entry point disables the
+external `cargowhale` governor for that process. Running both governors can
+replace the selected cache and recreate deleted tracked files while forcing
+their timestamps. Keep one build owner and a frozen source manifest; a build
+helper must not change that source. This leaves the machine's global settings
+unchanged.
+`scripts/dev-test.sh --self-check` reports the helper's resolved cache
+topology; its own script test, `scripts/dev-test.test.sh`, was removed in
+`d64b9429b7`.
 
 ### Helper verification (2026-08-15, this worktree)
 
@@ -178,7 +188,7 @@ helper now stays isolated unless `CODEWHALE_DEV_CACHE=local` or `0`.
 | Warm isolated same command (after the stub-target fix) | 0.13 s | `Finished` in 0.07 s |
 | `touch crates/config/src/lib.rs` + isolated `--no-run` | 0.93 s | only `codewhale-config` rebuilt |
 | First isolated `codewhale-tui --lib --no-run` | **121.5 s** (user 305 s) | 600 units; 340 MB binary; A0 empty-target was 127 s / 329 s |
-| `touch crates/tui/src/elapsed.rs` + isolated `--no-run` | **18.15 s** | everyday compile loop; A0 was 21 s / 19 s |
+| `touch crates/runtime/src/elapsed.rs` + isolated `--no-run` | **18.15 s** | everyday compile loop; A0 was 21 s / 19 s |
 | `CODEWHALE_SCCACHE=1` config `--no-run` on the already-warm tree | 5.21 s then 0.14 s | wrapper and `SCCACHE_DIR=…/sccache/<rustc-commit>` set; 0 sccache hits because only workspace crates recompiled and the build-dir was not emptied |
 
 **Test-runtime**:
@@ -187,22 +197,25 @@ helper now stays isolated unless `CODEWHALE_DEV_CACHE=local` or `0`.
 | --- | ---: | --- |
 | `scripts/dev-test.sh config` (nextest, 557 tests) | run 0.479 s / real 2.40 s | includes a 0.85 s profile flip compile |
 | `CODEWHALE_DEV_NEXTEST=0 scripts/dev-test.sh config` (libtest) | body 0.11 s / real 0.27 s | 557 tiny tests: process-per-test is slower here |
-| `scripts/dev-test.sh crates/tui/src/elapsed.rs` | run 0.023 s / real 2.81 s | 4 passed, 10,516 skipped; nextest filter works |
+| `scripts/dev-test.sh crates/runtime/src/elapsed.rs` | run 0.023 s / real 2.81 s | 4 passed, 10,516 skipped; nextest filter works |
 
 The 268 s → ~100 s nextest win remains the earlier tui-unit-suite receipt.
 Config is too small for that win; nextest is still the right default for
 unfiltered crate/workspace runs.
 
-**Ergonomics:** `sh` and `dash` both pass `dev-cache.test.sh` (22) and
-`dev-test.test.sh` (27). Missing sccache is a fallback. `--list` covers
+**Ergonomics:** `sh` and `dash` both passed `dev-cache.test.sh` (22) and
+`dev-test.test.sh` (27) at the time; `dev-test.test.sh` has since been removed
+(`d64b9429b7`). Missing sccache is a fallback. `--list` covers
 every workspace crate.
 
 ### A2 nextest in CI
 
-`cargo test --workspace --all-features --locked --doc` inventories
-**3 passing / 8 ignored doctests across 21 crates**; CI keeps them as a
-separate step next to `cargo nextest run --workspace --all-features
---locked --profile ci`.
+`cargo test --workspace --all-features --locked --doc` inventoried
+**3 passing / 8 ignored doctests across 21 crates**. All 8 ignored fences
+were in codewhale-tui, which has no runnable doc example and now sets
+`doctest = false`, so its doc pass is skipped (the new inventory is not
+re-measured yet). CI keeps the doc run as a separate step next to
+`cargo nextest run --workspace --all-features --locked --profile ci`.
 
 ### A3/A4 (not adopted, measured)
 
@@ -346,13 +359,28 @@ TUI-DOG-017) — left as they are.
 6. Then `fleet/`, `tools/`, `core/engine` — each behind the crate boundary
    its tests already respect, measured with the A0 table.
 
+## One build per machine
+
+`scripts/dev-cargo.sh` and `scripts/dev-test.sh` hold an exclusive machine-wide
+build lock (`<cache root>/build.lock`, via `scripts/build-lock.py`) for the
+whole Cargo invocation. Cargo's own lock is per target directory, so two
+agents building into different target dirs still ran concurrently and exhausted
+memory. A second build waits and prints who holds the lock. Set
+`CODEWHALE_BUILD_LOCK=0` to skip it, or `CODEWHALE_BUILD_LOCK_FILE` to name the
+lock file. A self-hosted CI runner on the same machine joins the lock when its
+`.env` sets `CODEWHALE_BUILD_LOCK_FILE` to the same path: the macOS Test job
+then holds it from the first test build to the end of the job. The lock is advisory: Cargo started
+directly, outside these scripts, does not take it, and on platforms without
+`fcntl` (Windows) the build runs unlocked after a warning.
+
 ## What changed (this lane)
 
 1. **`scripts/dev-cache.sh` / `scripts/dev-cargo.sh` activate the measured
    isolated build-dir topology** from `scripts/dev-test.sh`. New worktrees
    no longer compile into a private cold `./target` unless the helper is
    disabled. sccache is opt-in and incremental-gated. Script self-checks
-   live in `scripts/dev-cache.test.sh` and `scripts/dev-test.test.sh`.
+   live in `scripts/dev-cache.test.sh` and `scripts/dev-test.sh --self-check`
+   (`scripts/dev-test.test.sh` was removed in `d64b9429b7`).
 2. **`cargo nextest` is supported and documented** (`.config/nextest.toml`).
    Same test binaries, one process per test, so the tui unit suite runs in
    ~100 s instead of ~270 s here and slow or hanging tests are named instead

@@ -42,32 +42,32 @@ pub fn provider_slot(provider: ProviderKind) -> &'static str {
 /// Remove any plaintext `api_key` left in the config for `provider`.
 pub fn clear_provider_api_key_from_config(store: &mut ConfigStore, provider: ProviderKind) {
     store.config.providers.for_provider_mut(provider).api_key = None;
-    if provider == ProviderKind::Deepseek {
-        store.config.api_key = None;
-    }
 }
 
 /// Plaintext-free metadata that accompanies a saved key.
+///
+/// Saving a credential never writes a model: every provider resolves an
+/// unset model to its own default, and model choice belongs to the
+/// model/config commands.
 pub fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: ProviderKind) {
-    store.config.auth_mode = Some("api_key".to_string());
+    // The root `auth_mode` is the active provider's fallback marker. Writing
+    // it for an inactive provider would leak `api_key` onto the active route
+    // (e.g. a keyless local Ollama), so only the saved provider's own table
+    // is marked unless it is the active one.
+    if provider == store.config.provider {
+        store.config.auth_mode = Some("api_key".to_string());
+    }
     let provider_config = store.config.providers.for_provider_mut(provider);
     provider_config.auth_mode = Some("api_key".to_string());
     provider_config.external_credentials = None;
-    if provider == ProviderKind::Xai {
+    if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
         provider_config.oauth_credential_generation = None;
     }
-    if provider == ProviderKind::Deepseek && store.config.default_text_model.is_none() {
-        store.config.default_text_model = Some(
-            store
-                .config
-                .providers
-                .deepseek
-                .model
-                .clone()
-                .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
-        );
-    }
 }
+
+/// ChatGPT plan access uses Codewhale's issued OAuth registration. A saved
+/// API key would belong to a different billing route.
+pub const OPENAI_CODEX_API_KEY_REFUSAL: &str = "Sign in with ChatGPT via `codewhale auth chatgpt` to use your plan allowance with Codewhale-owned credentials. Use the openai provider for a separately billed API key. Codewhale does not store an API key for this provider.";
 
 /// Persist a provider credential to the durable secret store without silently
 /// downgrading a backend failure to plaintext config storage.
@@ -80,9 +80,26 @@ pub fn set_provider_api_key(
     provider: ProviderKind,
     api_key: &str,
 ) -> Result<bool> {
+    anyhow::ensure!(
+        provider != ProviderKind::OpenaiCodex,
+        OPENAI_CODEX_API_KEY_REFUSAL
+    );
+    // #6528: strip pasted invisible characters and whitespace in one place.
+    let api_key = codewhale_secrets::normalize_api_key(api_key);
+    anyhow::ensure!(!api_key.is_empty(), "Refusing to save an empty API key.");
+    let api_key = api_key.as_str();
     if provider == ProviderKind::Xai {
         return crate::with_xai_oauth_revocation_transaction(|| {
             set_provider_api_key_unlocked(store, secrets, provider, api_key)
+        });
+    }
+    if provider == ProviderKind::Anthropic {
+        return crate::with_xai_oauth_lifecycle_lock(|_| {
+            let saved = set_provider_api_key_unlocked(store, secrets, provider, api_key)?;
+            crate::clear_all_claude_oauth_credentials_locked().context(
+                "API-key billing was selected and saved, but old Claude sign-in cleanup failed",
+            )?;
+            Ok(saved)
         });
     }
     set_provider_api_key_unlocked(store, secrets, provider, api_key)
@@ -158,8 +175,9 @@ fn set_provider_api_key_unlocked(
 pub struct ClearOutcome {
     /// The secret-store slot the clear targeted.
     pub slot: &'static str,
-    /// `None` when the secret store accepted the delete; otherwise the backend
-    /// error, already stringified so it carries no credential material.
+    /// `None` when the secret store accepted the delete or holds no key for the
+    /// slot; otherwise the backend error, already stringified so it carries no
+    /// credential material.
     pub secret_store_error: Option<String>,
 }
 
@@ -206,9 +224,150 @@ pub fn clear_provider_api_key(
         store.config = original_config;
         return Err(error);
     }
-    let secret_store_error = secrets.delete(slot).err().map(|error| error.to_string());
+    // A backend that refuses every delete (a read-only store) but holds no key
+    // for this slot has nothing left to revoke, so that refusal is not a
+    // failure. Both callers get this rule from here.
+    let secret_store_error = secrets
+        .delete(slot)
+        .err()
+        .filter(|_| !matches!(secrets.get(slot), Ok(None)))
+        .map(|error| error.to_string());
     Ok(ClearOutcome {
         slot,
         secret_store_error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codewhale_secrets::{KeyringStore, SecretsError};
+    use std::sync::Arc;
+
+    /// A store that refuses every delete and holds `.0` for every slot.
+    struct UndeletableStore(Option<&'static str>);
+
+    impl KeyringStore for UndeletableStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, SecretsError> {
+            Ok(self.0.map(str::to_string))
+        }
+
+        fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::ReadOnly)
+        }
+
+        fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::Keyring("test delete failure".to_string()))
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "undeletable test store"
+        }
+    }
+
+    #[test]
+    fn a_refused_delete_fails_the_clear_only_while_the_store_still_holds_a_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        for (held, fails) in [(Some("sk-keyring-fixture"), true), (None, false)] {
+            let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+            store.config.providers.deepseek.api_key = Some("sk-config-fixture".to_string());
+            let secrets = Secrets::new(Arc::new(UndeletableStore(held)));
+            let outcome = clear_provider_api_key(&mut store, &secrets, ProviderKind::Deepseek)
+                .expect("the config leg saves");
+            assert!(store.config.providers.deepseek.api_key.is_none());
+            assert_eq!(outcome.is_complete(), !fails, "delete refusal completion");
+            if let Some(error) = outcome.secret_store_error {
+                assert!(
+                    !error.contains("sk-keyring-fixture"),
+                    "credential leaked into error"
+                );
+            }
+        }
+    }
+
+    fn store_with(body: &str) -> (tempfile::TempDir, ConfigStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("seed config");
+        let store = ConfigStore::load(Some(path)).expect("store loads");
+        (dir, store)
+    }
+
+    fn in_memory_secrets() -> Secrets {
+        Secrets::new(std::sync::Arc::new(
+            codewhale_secrets::InMemoryKeyringStore::new(),
+        ))
+    }
+
+    #[test]
+    fn saving_a_key_for_an_inactive_provider_leaves_root_auth_mode_alone() {
+        let (_dir, mut store) = store_with("provider = \"ollama\"\n");
+        let secrets = in_memory_secrets();
+
+        set_provider_api_key(&mut store, &secrets, ProviderKind::Openrouter, "or-key")
+            .expect("save succeeds");
+
+        let saved = ConfigStore::load(Some(store.path().to_path_buf())).expect("reload");
+        assert_eq!(saved.config.provider, ProviderKind::Ollama);
+        assert_eq!(saved.config.auth_mode, None);
+        assert_eq!(
+            saved.config.providers.openrouter.auth_mode.as_deref(),
+            Some("api_key")
+        );
+    }
+
+    #[test]
+    fn saving_a_key_for_the_active_provider_still_marks_root_auth_mode() {
+        let (_dir, mut store) = store_with("provider = \"openrouter\"\n");
+        let secrets = in_memory_secrets();
+
+        set_provider_api_key(&mut store, &secrets, ProviderKind::Openrouter, "or-key")
+            .expect("save succeeds");
+
+        let saved = ConfigStore::load(Some(store.path().to_path_buf())).expect("reload");
+        assert_eq!(saved.config.auth_mode.as_deref(), Some("api_key"));
+    }
+
+    #[test]
+    fn openai_codex_key_save_is_refused_and_keeps_external_consent() {
+        let (_dir, mut store) = store_with(
+            "provider = \"openai-codex\"\n\n[providers.openai-codex]\nauth_mode = \"oauth\"\n",
+        );
+        store.config.providers.openai_codex.external_credentials =
+            Some(crate::ExternalCredentialConsentToml::read_only(
+                ProviderKind::OpenaiCodex,
+                crate::ExternalCredentialSource::CodexCli,
+                std::path::PathBuf::from("/synthetic/codex/auth.json"),
+            ));
+        store.save().expect("seed consent");
+        let before = std::fs::read_to_string(store.path()).expect("config before");
+        let secrets = in_memory_secrets();
+
+        let error = set_provider_api_key(&mut store, &secrets, ProviderKind::OpenaiCodex, "k")
+            .expect_err("openai-codex keys are not stored");
+
+        assert!(
+            error.to_string().contains("Sign in with ChatGPT"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.path()).expect("config after"),
+            before
+        );
+        assert!(
+            store
+                .config
+                .providers
+                .openai_codex
+                .external_credentials
+                .is_some()
+        );
+        assert_eq!(
+            secrets
+                .get(provider_slot(ProviderKind::OpenaiCodex))
+                .expect("read"),
+            None
+        );
+    }
 }

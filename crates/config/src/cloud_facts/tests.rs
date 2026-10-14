@@ -510,8 +510,19 @@ fn catalog_layer_15_patches_sit_between_models_dev_and_provider_live() {
     assert_eq!(scoped.models[0].op, ModelOp::Upsert);
 }
 
+/// The overlay is process-global: a test that configures it while another is
+/// mid-sequence invalidates that test's ticket. Every overlay test holds this.
+static OVERLAY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn overlay_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    OVERLAY_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn overlay_supplies_provider_defaults_only_from_the_scoped_view() {
+    let _overlay = overlay_test_guard();
     let keys = [test_only_key(KeyStatus::Active)];
     let verified = verify(FIXTURE_V7.as_bytes(), &keys).unwrap();
     let scoped = scoped_view(&verified, &v("0.9.11"), NOW);
@@ -681,6 +692,7 @@ fn capability_patch_preserves_cost_authority_and_price_block_is_atomic() {
             output: Some(2.0),
             cache_read: Some(0.1),
             cache_write: Some(3.0),
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -721,7 +733,8 @@ fn capability_patch_preserves_cost_authority_and_price_block_is_atomic() {
             input: Some(4.0),
             output: None,
             cache_read: None,
-            cache_write: None
+            cache_write: None,
+            ..Default::default()
         })
     );
     facts.valid_until = Some(0);
@@ -732,6 +745,7 @@ fn capability_patch_preserves_cost_authority_and_price_block_is_atomic() {
 
 #[test]
 fn overlay_tickets_disable_expiry_and_source_changes_keep_channel_rollback_floors() {
+    let _overlay = overlay_test_guard();
     use super::scope::ScopedFacts;
     let facts = |channel: &str, version| ScopedFacts {
         channel: channel.into(),

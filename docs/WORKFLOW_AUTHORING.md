@@ -1,5 +1,7 @@
 # Workflow Authoring
 
+> 阅读简体中文版：[zh_hans/WORKFLOW_AUTHORING.md](zh_hans/WORKFLOW_AUTHORING.md)。
+
 > **Ordinary multi-agent work does not require this file.** In Operate, send
 > normal messages. Small work stays direct; multiple delegated steps use a
 > compact Workflow plan with dependencies, bounded scopes, and completion
@@ -57,7 +59,7 @@ See the Workflow JS sandbox tests for the fail-closed host surface inventory.
 
 ## Language Choice
 
-| Surface | Strength | Tradeoff | v0.8.60 stance |
+| Surface | Strength | Tradeoff | Stance |
 |---|---|---|---|
 | YAML / JSON IR | Simple, reviewable, no runtime | Verbose for generated workflows | Keep as interchange/debug format |
 | JavaScript | Familiar object syntax and easy agent generation | Unsafe if executed as a general runtime | First-class authoring through declarative compile-only subset |
@@ -114,6 +116,48 @@ a familiar declaration format, not a second execution runtime. The denied
 effects are not denied to the run — put them in a child worker, which has
 the full tool surface, and keep the script to coordination.
 
+## Gates
+
+A gate fires on a role's completion (`on: role_complete`) and blocks the role
+named in `blocks_role` until the gate passes. That makes `blocks_role` a
+**different** role from the one being gated — a gate that verifies phase 2's
+work must block phase 3, never phase 2:
+
+```js
+// Correct: verify the implementer, block the next stage.
+gates: [{
+  id: "verify-fix",
+  gate: "verify",
+  on: "role_complete",
+  role: "implement",
+  blocks_role: "verify",
+  on_fail: "escalate",
+  max_retries: 1,
+  require_explicit_verdict: true,
+}]
+```
+
+A gate that blocks its own role can never pass, so the plan is rejected when it
+is submitted, before any child is dispatched; the error names the gate and both
+fields. A `blocks_role` that names a role from an **earlier** phase is not
+caught there and still deadlocks the run. That failure reads
+`spawn rejected: workflow gate blocks role \`implement\`: waiting for required
+ gate outcome`, the run ends `Failed`, and because the blocked phase never
+started, **the work its children would have done never happens and produces no
+result** — the phases that already ran are the only salvageable part. Retrying
+with the same plan reproduces it, so treat the message as a plan defect, not a
+transient dispatch error.
+
+Two habits keep this from costing a run:
+
+- Read the gate block back before launch and check that every `blocks_role`
+  names a role in a **later** phase than the gated `role`. With at most one
+gate, `blocks_role` is never the gated role itself.
+- Make each phase's result usable on its own. A localize/implement/verify split
+  survives a dispatch failure in the last phase when the middle phase's
+  findings were already returned, and a phase that only writes files is worth
+  nothing if it never starts.
+
 ## Verification
 
 - `cargo test -p codewhale-workflow --locked javascript`
@@ -157,10 +201,11 @@ workers, but users and agents may override any slot when the task calls for it.
 ## Experimental search is a Workflow option
 
 Experimental search generalizes the existing best-of-N recipe without adding a
-new product mode, scheduler, or sub-agent API. A provider-neutral
-`WorkflowSearchSpec` freezes the objective, baseline, model request and resolved
-version, public evidence, evaluator hash, hard gates, scoring rule, budgets,
-write scope, rounds, and review-only integration policy before admission.
+new product mode, scheduler, or sub-agent API. The proposed search spec would
+freeze the objective, baseline, model request and resolved version, public
+evidence, evaluator hash, hard gates, scoring rule, budgets, write scope,
+rounds, and review-only integration policy before admission; it is a design,
+not shipped code.
 
 The current JS starter supports structured generation and read-only review with
 `strategy: "search"`. Runtime-owned command gates, hidden evaluation, benchmark

@@ -54,7 +54,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 ```
 
 Windows users should choose the matching installer or archive from
-[GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest).
+[GitHub Releases](https://github.com/codewhale-hq/CodeWhale/releases/latest).
 For an existing direct install, use `codewhale update --check`, then
 `codewhale update`. npm and Cargo remain secondary packaging routes; Cargo
 also supports source builds where a compatible prebuilt is unavailable.
@@ -62,7 +62,8 @@ For occupied directories, package-managed installs, and PATH setup, follow
 [the installation and migration guide](INSTALL.md#recommended-official-github-releases).
 Android/Termux uses its own [preview archive or source-build path](INSTALL.md#android--termux-arm64).
 
-Docker is also available when you want an isolated runtime:
+Docker is also available when you want an isolated runtime. The published
+image is currently 0.10.0; to test current `main`, [build it from source](DOCKER.md#building-locally).
 
 ```bash
 docker volume create codewhale-home
@@ -84,16 +85,16 @@ codewhale
 For the default GitHub installer destination, you can use
 `"$HOME/.local/bin/codewhale"` until that directory is on PATH.
 
-On first launch, Codewhale asks only for decisions this installation still
-needs: language when it cannot infer one, a provider when no usable route is
-configured, and workspace trust when the folder requires a decision. The
-provider step includes an explicit offline route. The ready screen then opens
-the real composer, preserving a task supplied on the command line or suggesting
-a first task for the current folder.
+On first launch, Codewhale opens the composer, even with no key or route.
+With no key or route, workspace trust is asked once a provider is connected;
+otherwise only when the folder requires a decision. A provider is asked for
+when you send your first message: the message stays in the box while you sign
+in or use your own key, and a local model is offered only when a local Ollama
+server answers. The provider step also has an explicit offline route.
 
 Everything optional stays available after that. Use `/setup` for the
 progressive setup and repair guide, `/settings` for the full typed editor, and
-`/constitution` when you want to customize the bundled working agreement.
+`/constitution` when you want your own constitution on top of the bundled one.
 The localized telemetry choice appears only after the workspace is ready and
 does not block the composer.
 
@@ -203,7 +204,7 @@ Codewhale works best when you let investigation and implementation happen in
 separate steps for unfamiliar code. For small, well-understood changes, a
 single implementation request is fine.
 
-Next: [MODES.md](MODES.md) explains when to use Plan, Act, and Operate.
+Next: [MODES.md](MODES.md) explains when to use Plan, Work, and Operate.
 
 ## 4. Understanding the Interface
 
@@ -236,7 +237,7 @@ visible, or set `[tui].status_items` in `config.toml`. Each key owns exactly
 one thing on screen: `mode` is the posture bar's plan/act/operate chip, and
 `model`, `context_percent`, `cost`, `balance` (prepaid providers only:
 DeepSeek, DeepSeekCN, OpenRouter, SiliconFlow), `cache`, `tokens` and
-`session_metrics`, `workspace` and `git_branch` are segments of the metrics line below it. Omit
+`ttft`, `output_rate`, `workspace` and `git_branch` are segments of the metrics line below it. Omit
 `status_items` to keep the built-in default; set it to `[]` to strip the
 metrics line down to the help hint.
 
@@ -260,19 +261,22 @@ ignored with a warning in the log.
 `status_items` composes the rows; two size presets decide how much of each
 row paints. `[tui].posture_bar` and `[tui].metrics_line` each take `full`,
 `compact`, or `hidden`. The posture bar defaults to `full` so active controls
-stay visible; the metrics line defaults to `compact` to keep routine telemetry
-out of the working surface. These are also settable at runtime with
+stay visible; the metrics line defaults to `compact` to keep selected performance
+readings while removing secondary counts and help. These are also settable at runtime with
 `/config posture_bar compact`. TOML values must be lowercase; `/config`
 accepts either case. `compact` is the row after its first shed
 rungs: the posture bar keeps its permission and mode chips — and the cap
 warning, which is advice, not decoration — and drops the clocks, counts and
 hint; the metrics line keeps the route, the context reading, the cost and
-the balance, and drops the telemetry and the help hint. `hidden` gives the
+the balance, plus selected TTFT and output rate when space allows, and drops
+secondary counts and the help hint. `hidden` gives the
 row back to the transcript. A small tmux pane can hide both rows without
 touching what `/statusline` composes.
 
-With `metrics_line = "full"`, `session_metrics` (on by default) paints the latency pair on the metrics
-line: `ttft 1.5s` — the mean time to first streamed token — and `120 avg tok/s`,
+Both `ttft` and `output_rate` are on by default and work in full or compact
+rows. `/statusline` lets you toggle them separately; Space previews, Enter saves,
+and Esc restores your previous settings. Legacy `session_metrics` still enables
+both readings. The pair shows: `ttft 1.5s` — the mean time to first streamed token — and `120 avg tok/s`,
 the session's provider-reported output tokens divided by the measured request
 seconds for those same calls. The rate includes connection setup, time to first
 token and pauses within a response, and excludes tools and idle time between
@@ -283,9 +287,11 @@ the last measured average stays visible. Both readings use the same
 accumulators `/status` prints in full. Missing evidence is omitted rather than
 estimated. On narrow rows the pair sheds before cost and context.
 
-The transcript is the audit trail. When Codewhale reads files, runs commands,
-or edits code, the action appears there. If a command fails, use the visible
-failure output as part of your next instruction instead of starting over.
+Every file read, command, and edit appears in the transcript as it happens.
+`/receipts` lists what the session did, one line per action; see
+[What Codewhale records](#what-codewhale-records). If a command fails, use the
+visible failure output as part of your next instruction instead of starting
+over.
 
 The composer accepts normal prompts and slash commands. Type `/` to discover
 available commands. Use file mentions when you want the model to focus on a
@@ -307,7 +313,7 @@ Codewhale has three visible TUI modes:
 | Mode | Use it for | Default posture |
 | --- | --- | --- |
 | Plan | Exploration, design, and review before changes | Read-only investigation |
-| Act | Normal multi-step coding work | Tool use with approval gates |
+| Work | Normal multi-step coding work | Tool use with approval gates |
 | Operate | Direct work plus parallel or background coordination | Tools follow the active posture; delegate when useful |
 
 Switch modes from the TUI with the mode picker:
@@ -320,19 +326,23 @@ Or switch directly:
 
 ```text
 /mode plan
-/mode act
+/mode work
 /mode operate
 ```
 
 Plan mode is the safest place to start in an unfamiliar repository. It is for
 inspection and decision-making, not file edits.
-For non-trivial work, Plan mode's confirmation prompt can show a grounded
-PlanArtifact: objective, context, sources used, critical files, constraints,
-approach, verification plan, risks, and handoff notes. Empty sections are
-visible when the agent uses the rich artifact shape, so you can ask for a
-revision instead of accepting an under-specified plan.
+When a Plan turn successfully finishes a nonempty response, Codewhale asks
+how to continue, including when the plan is plain text. **Work (Ask)** and
+**Work (Auto-Review)** switch to Work with that permission and send the exact
+approved response as the next message. Existing To-dos from that turn are
+preserved; a prose-only plan adds one pending item without replacing unrelated
+work. If Codewhale cannot prepare the work state, it stays in Plan without
+starting the task. **Keep planning**, or `Esc`, stays in Plan. You can also
+type feedback there to have the plan revised. The question appears only when
+the composer is empty and no other view is open; `/mode work` always works.
 
-Act mode is the default for most contribution work. It lets Codewhale read,
+Work mode is the default for most contribution work. It lets Codewhale read,
 run checks, and edit files while keeping risky actions behind approval gates.
 
 Operate keeps that direct tool surface and its approval, sandbox, shell,
@@ -341,9 +351,8 @@ direct. Multi-step delegation uses a compact Workflow plan with dependencies,
 bounded scopes, and completion evidence passed between steps. Fleet configures
 and manages those same sub-agents and their roles. One bounded, independent
 task can use a direct agent; continued work reuses it through `followup`.
-Heavy work can also be proposed to a Daytona cloud agent with `codewhale
-dispatch` or `/dispatch` (explicit confirmation; remotes are `github` / `cnb` /
-`gitee`). See [DAYTONA_CLOUD_DISPATCH.md](DAYTONA_CLOUD_DISPATCH.md).
+Heavy work can also run on a cloud computer with `codewhale dispatch "<task>"`,
+which goes through the signed-in account with a quote and EU-compute consent.
 
 For trusted workspaces where you intentionally want actions to proceed without
 approval prompts, select the Full Access permission posture with `Shift+Tab`.
@@ -379,6 +388,7 @@ Common commands for first-time users:
 | `/workflows` | Open the live Workflow run dashboard: every run this workspace's journal keeps, with phases, children, progress, and host-side cancel |
 | `/config` | Edit runtime and provider settings |
 | `/statusline` | Choose which footer status chips are visible |
+| `/receipts` | List what this session did: files changed, commands run, web and MCP calls, agents, approvals and who gave them, failures |
 | `/compact` | Summarize long context to recover token budget |
 | `/copy` | Copy the last completed assistant response to the clipboard |
 | `/review` | Ask for a structured review workflow |
@@ -457,7 +467,7 @@ Examples of tool-backed work include:
 
 Tool use is governed by mode, approvals, and sandbox policy. The exact behavior
 depends on the current mode and config, but the basic rule is simple: start in
-Plan for read-only exploration, use Act for normal changes, and reserve Full
+Plan for read-only exploration, use Work for normal changes, and reserve Full
 Access for trusted automation.
 
 The workspace boundary matters. Codewhale is expected to work in the directory
@@ -485,6 +495,48 @@ the transcript easier to review and the final diff easier to merge.
 
 Next: [TOOL_SURFACE.md](TOOL_SURFACE.md) lists the tool surface and
 [SANDBOX.md](SANDBOX.md) explains sandbox behavior.
+
+### What Codewhale records
+
+Codewhale keeps these records on your machine, under `~/.codewhale/`:
+
+- **The session.** `sessions/<id>.json` holds the full conversation,
+  including every tool call and its result text. App and `codewhale serve`
+  threads keep each call as a turn item under `tasks/runtime/`, with its
+  input, status, start and end time, and structured result.
+- **Approvals.** `sessions/<id>/approval_receipts.jsonl` records every
+  approval Codewhale asked for, the decision, and who made it: you, a
+  session rule, or the active posture. App threads also record each decision
+  in their event log. A call that ran without asking (Full Access, an allow
+  rule, a remembered grant) has no approval record; the posture each turn
+  ran under is saved with the turn.
+- **Undo points.** Workspace snapshots let you go back. `/undo` takes back
+  your last request in one step: every file it changed, plus the request and
+  its reply. It works in every access mode and lists the files it put back.
+  If one of those files changed after the request, `/undo` changes nothing
+  and says which file. If a request was cut off before Codewhale recorded
+  where its changes end, `/undo` says so; `/undo force` undoes it anyway,
+  including edits made to those files since it started. `/restore` rolls the
+  whole folder back to a point you pick, overwriting later edits, so it
+  needs `/trust on` or Full Access. Esc Esc rewinds the conversation only;
+  `/undo` afterwards puts the files back.
+- **Security events.** `audit.log` records credential changes, hook
+  environment key names, compaction passes, the terminal's approval
+  routing, and Auto-Review verdicts. It is not a list of what a session did.
+
+To see what a session did, run `/receipts`, or from a shell:
+
+```bash
+codewhale receipts --last
+codewhale receipts <session-id> --format json
+```
+
+A receipt says what it cannot show. A terminal session's receipt lists the
+files a command changed from each turn's workspace snapshots; a Runtime
+thread's lists only file tools. Terminal sessions do not save a passing
+command's exit code or how long each call took. A call Codewhale blocked
+before it started (Auto-Review, a policy, invalid input) is listed as
+blocked, with the reason, and is not counted as run. [RECEIPTS.md](RECEIPTS.md) has the full contract.
 
 ## 8. Sub-agents and Parallel Work
 
@@ -637,7 +689,7 @@ open when configuring a non-default route.
 
 ### Which mode should I use first?
 
-Use Plan for unfamiliar code, Act for normal implementation, and Full Access
+Use Plan for unfamiliar code, Work for normal implementation, and Full Access
 only for trusted repositories where automatic execution is acceptable.
 
 ### Why does Codewhale ask before running commands?
@@ -764,3 +816,24 @@ and sub-agents.
 Next: [INSTALL.md](INSTALL.md), [CONFIGURATION.md](CONFIGURATION.md),
 [PROVIDERS.md](PROVIDERS.md), [MODES.md](MODES.md), and
 [TOOL_SURFACE.md](TOOL_SURFACE.md).
+
+## Live Terminal dock
+
+Open `/workbar terminal` to watch the same workspace PTY sessions the model
+uses. Click the dock or press `Alt+W` to give it input focus. While focused,
+typing, Enter, Tab and Ctrl+C reach the selected shell. Esc returns focus to
+the composer; the output remains visible. Click a session or use `Alt+Down` /
+`Alt+Up` to switch. `Ctrl+N` starts your own fresh shell without replacing the
+model’s session. Mouse-wheel and PageUp/PageDown review the retained output.
+The active permission posture and filesystem scope govern fresh shells and
+refuse reuse of an unsandboxed shell after the scope narrows.
+
+The dock shows the latest 64 KiB, reports omitted bytes, and never consumes the
+model’s output cursor. A reset or lost session requires explicit selection;
+input cannot silently follow a reused session name. PTYs are currently supported
+on macOS and Linux. This is an ANSI-styled output view: cursor-addressed programs,
+alternate screens and replay after process restart are outside its scope. Paste
+is direct terminal input and may execute commands containing newlines; control
+characters and pastes over 64 KiB are refused. While a process uses canonical
+line input, batches of 1 KiB or more are refused before any bytes are sent:
+the terminal can discard oversized input. Transfer long content through a file.

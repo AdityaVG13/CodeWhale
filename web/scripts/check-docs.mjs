@@ -12,9 +12,11 @@
  *
  * Relies on facts-lib.mjs for version / provider / tool derivation.
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildInstallGuide, installAnchorErrors } from "./install-guide-lib.mjs";
+import { readDocTopics } from "./docs-sources-lib.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = resolve(__dirname, "..");
@@ -23,30 +25,6 @@ const REPO_ROOT = resolve(WEB_DIR, "..");
 /* ------------------------------------------------------------------ */
 /*  Parse docs-map.ts (regex — avoids ts-node dependency)              */
 /* ------------------------------------------------------------------ */
-
-function parseDocsMap() {
-  const path = resolve(WEB_DIR, "lib", "docs-map.ts");
-  if (!existsSync(path)) {
-    console.error(`[check-docs] ERROR: docs-map.ts not found at ${path}`);
-    process.exit(1);
-  }
-  const src = readFileSync(path, "utf-8");
-
-  const topics = [];
-  const re =
-    /\{\s*id:\s*"(\w[^"]*)",\s*slug:\s*"(\w[^"]*)",[\s\S]*?repoSource:\s*(\[[^\]]+\]|"[^"]+")/g;
-  let m;
-  while ((m = re.exec(src)) !== null) {
-    const id = m[1];
-    const slug = m[2];
-    let rawSource = m[3];
-    const sources = rawSource.startsWith("[")
-      ? rawSource.match(/"([^"]+)"/g)?.map((s) => s.slice(1, -1)) ?? []
-      : [rawSource.slice(1, -1)];
-    topics.push({ id, slug, repoSource: sources });
-  }
-  return topics;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Check 1: every repo source file exists                             */
@@ -90,24 +68,29 @@ function checkInstallSnippets() {
   const version = deriveVersion();
   if (!version) return { ok: false, note: "could not derive version" };
 
-  const installPath = resolve(WEB_DIR, "app", "[locale]", "install", "page.tsx");
-  if (!existsSync(installPath)) return { ok: true, note: "install page not found" };
-
-  const src = readFileSync(installPath, "utf-8");
-  const versionRefs = [...src.matchAll(/codewhale.*?([\d]+\.[\d]+\.[\d]+)/g)];
+  // The page renders the verified document, including historical release
+  // examples; those versions must not be rewritten to the workspace candidate.
+  const src = readFileSync(resolve(REPO_ROOT, "docs/INSTALL.md"), "utf-8");
+  const guide = buildInstallGuide(src);
   const stale = [];
-  for (const ref of versionRefs) {
-    const v = ref[1];
-    if (v !== version) {
-      stale.push({ found: v, expected: version, context: ref[0].slice(0, 60) });
+  function checkLinks(dir) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = resolve(dir, entry.name);
+      if (entry.isDirectory()) checkLinks(path);
+      else if (/\.(tsx?|md|json)$/.test(entry.name) && !entry.name.endsWith(".test.ts")) {
+        for (const anchor of installAnchorErrors(readFileSync(path, "utf8"), guide.anchors)) {
+          stale.push({ found: anchor, expected: "an existing INSTALL.md anchor", context: path });
+        }
+      }
     }
   }
+  for (const dir of ["app", "components", "lib"]) checkLinks(resolve(WEB_DIR, dir));
 
   // A clone without an explicit destination creates a directory whose name
   // matches the repository slug exactly. Keep the following `cd` command
   // case-correct so source installation works on case-sensitive filesystems.
   const sourceCheckout = src.match(
-    /git clone https:\/\/github\.com\/Hmbown\/([^\s`]+)\s*\ncd\s+([^\s`]+)/,
+    /git clone[^\n]*https:\/\/github\.com\/codewhale-hq\/([^\s`]+)\s*\ncd\s+([^\s`]+)/,
   );
   const checkout = sourceCheckout
     ? {
@@ -125,7 +108,7 @@ function checkInstallSnippets() {
 /* ------------------------------------------------------------------ */
 
 function main() {
-  const topics = parseDocsMap();
+  const topics = readDocTopics(WEB_DIR);
   if (topics.length === 0) {
     console.error("[check-docs] ERROR: no topics parsed from docs-map.ts");
     process.exit(1);
@@ -155,7 +138,7 @@ function main() {
   const install = checkInstallSnippets();
   if (!install.ok && !install.note) {
     if (install.stale.length > 0) {
-      console.error("[check-docs] FAIL — stale version in install snippets:");
+      console.error("[check-docs] FAIL — missing install-guide anchor:");
       for (const s of install.stale) {
         console.error(`  found "${s.found}", expected "${s.expected}" in: ${s.context}`);
       }

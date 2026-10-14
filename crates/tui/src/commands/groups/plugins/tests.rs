@@ -8,6 +8,80 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+#[test]
+fn extension_owner_report_escapes_every_plugin_controlled_field() {
+    struct Presentation(Locale);
+    impl CommandPresentationContext for Presentation {
+        fn translate(&self, key: &str, replacements: &[(&str, &str)]) -> Result<String, String> {
+            let id = crate::commands::contract::key_to_plugin_message_id(key).unwrap();
+            let mut output = codewhale_localization::tr(self.0, id).to_string();
+            for (name, value) in replacements {
+                output = output.replace(&format!("{{{name}}}"), value);
+            }
+            Ok(output)
+        }
+    }
+    let mut output = String::new();
+    append_host_owner_report(
+        &Presentation(Locale::En),
+        &mut output,
+        &crate::extension_host::OwnerReport {
+            state: Some(crate::extension_host::registry::OwnerState::Failed(
+                "\u{1b}[31m<script>".into(),
+            )),
+            tools: vec!["[tool](https://example.invalid)".into()],
+            diagnostics: vec!["\n# approved\u{202e}".into()],
+        },
+    );
+    assert!(output.contains("Extension host:"));
+    for value in [
+        "\u{1b}[31m<script>",
+        "[tool](https://example.invalid)",
+        "\n# approved\u{202e}",
+    ] {
+        assert!(output.contains(&escape_review_text(value)));
+        assert!(!output.contains(value));
+    }
+    let mut localized = String::new();
+    append_host_owner_report(
+        &Presentation(Locale::ZhHans),
+        &mut localized,
+        &crate::extension_host::OwnerReport {
+            state: None,
+            tools: vec![],
+            diagnostics: vec![],
+        },
+    );
+    assert_eq!(
+        localized,
+        "\n扩展宿主：\n  状态：未激活\n  活动工具（0）：—"
+    );
+}
+
+#[test]
+fn plugin_config_summary_lists_keys_never_values_and_escapes_them() {
+    let mut output = String::new();
+    append_plugin_config_summary(
+        &mut output,
+        "greeter",
+        &Ok(vec!["greeting".to_string(), "\u{1b}[31mkey".to_string()]),
+    );
+    assert!(output.contains("[plugins.\"greeter\".config]"), "{output}");
+    assert!(output.contains("values not shown"));
+    assert!(output.contains("greeting"));
+    assert!(output.contains(&escape_review_text("\u{1b}[31mkey")));
+    assert!(!output.contains('\u{1b}'));
+
+    let mut refused = String::new();
+    append_plugin_config_summary(
+        &mut refused,
+        "greeter",
+        &Err("config is 20000 bytes\n# approved".to_string()),
+    );
+    assert!(refused.contains("is refused: "), "{refused}");
+    assert!(!refused.contains("\n# approved"), "{refused}");
+}
+
 fn create_test_app(root: &Path) -> (App, TempDir) {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config.toml");
@@ -27,7 +101,7 @@ fn create_test_app(root: &Path) -> (App, TempDir) {
         memory_path: temp.path().join("memory.md"),
         notes_path: temp.path().join("notes.txt"),
         mcp_config_path: temp.path().join("mcp.json"),
-        ..crate::test_support::test_tui_options(root)
+        ..crate::tui::test_support::test_tui_options(root)
     };
     let config = Config {
         tools: Some(crate::config::ToolsConfig {
@@ -424,6 +498,47 @@ fn legacy_tool_detail_remains_available_under_tools_namespace() {
     assert!(message.contains("required"));
 }
 
+/// D4: `/plugin tools` names a script whose `approval: auto` was ignored and
+/// shows the approval it actually runs with.
+#[test]
+fn legacy_tools_report_ignored_auto_approval() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+    let (mut app, _temp) = create_test_app(root.path());
+    fs::write(
+        root.path().join("tools/greet.sh"),
+        "# name: greet\n# description: Say hello\n# approval: auto\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("tools/audit.sh"),
+        "# name: audit\n# description: Audit\n# approval: required\n",
+    )
+    .unwrap();
+    // The renderer escapes Markdown in plugin-controlled text.
+    let warning = "[script_tool_auto_approval_ignored]: script tool 'greet': \\`approval: auto\\` is no longer supported for script tools";
+
+    let list = plugins_with_kimi_home_override(&mut app, Some("tools"), None)
+        .message
+        .unwrap();
+    assert!(list.contains(warning), "{list}");
+    assert!(!list.contains("script tool 'audit'"), "{list}");
+
+    let detail = plugins_with_kimi_home_override(&mut app, Some("tools greet"), None)
+        .message
+        .unwrap();
+    assert!(detail.contains("suggest"), "{detail}");
+    assert!(detail.contains(warning), "{detail}");
+    let other = plugins_with_kimi_home_override(&mut app, Some("tools audit"), None)
+        .message
+        .unwrap();
+    assert!(
+        !other.contains("script_tool_auto_approval_ignored"),
+        "{other}"
+    );
+}
+
 #[test]
 fn install_update_uninstall_verbs_validate_arguments() {
     let _lock = crate::test_support::lock_test_env();
@@ -488,13 +603,37 @@ fn install_update_uninstall_verbs_drive_the_guided_trust_flow() {
                 .exists()
         );
 
-        // Local-path installs cannot be updated from the network.
+        // An unchanged local source succeeds without changing the review token.
         let update = plugins_with_kimi_home_override(&mut app, Some("update installed-demo"), None);
-        assert!(update.is_error);
-        assert!(update.message.unwrap().contains("local path"));
+        assert!(!update.is_error, "{:?}", update.message);
+        assert!(update.message.unwrap().contains("already up to date"));
 
         let arg = confirmation.trim_start_matches("/plugin ").to_string();
         assert!(!plugins_with_kimi_home_override(&mut app, Some(&arg), None).is_error);
+        assert!(
+            !plugins_with_kimi_home_override(&mut app, Some("enable installed-demo"), None)
+                .is_error
+        );
+        assert!(app.plugin_registry.is_active("installed-demo"));
+
+        fs::write(
+            source.join("plugin.toml"),
+            "schema_version = 1\n[plugin]\nname = \"installed-demo\"\nversion = \"2.0.0\"\n",
+        )
+        .unwrap();
+        let updated =
+            plugins_with_kimi_home_override(&mut app, Some("update installed-demo"), None);
+        assert!(!updated.is_error, "{:?}", updated.message);
+        let message = updated.message.unwrap();
+        let current_confirmation = message
+            .lines()
+            .find(|line| line.starts_with("/plugin trust installed-demo "))
+            .expect("changed local content must route into its current review");
+        assert_ne!(current_confirmation, confirmation);
+        assert!(!app.plugin_registry.is_active("installed-demo"));
+        assert!(plugins_with_kimi_home_override(&mut app, Some(&arg), None).is_error);
+        let current_arg = current_confirmation.trim_start_matches("/plugin ");
+        assert!(!plugins_with_kimi_home_override(&mut app, Some(current_arg), None).is_error);
         assert!(
             !plugins_with_kimi_home_override(&mut app, Some("enable installed-demo"), None)
                 .is_error
@@ -522,6 +661,88 @@ fn install_update_uninstall_verbs_drive_the_guided_trust_flow() {
             "uninstall must prune the state entry: {raw}"
         );
     });
+}
+
+#[test]
+fn dsh_import_reviews_without_installing_then_installs_the_exact_bundle() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let codewhale_home = root.path().join("codewhale-home");
+    let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+    let package = root.path().join("dsh-package");
+    fs::create_dir_all(package.join("pack-skills/guide")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name": "@demo/docs-dsh", "version": "2.0.0", "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("cordis.patch.yml"),
+        "- insert:\n  - id: docs\n    name: '@deepseek-ai/dsh-mcp-client'\n    config: {serverName: docs, transport: streamable-http, url: 'https://docs.example.invalid/mcp'}\n  - id: skills\n    name: '@deepseek-ai/dsh-skill-filesystem'\n    config: {customSkillDirs: [pack-skills]}\n  - id: theme\n    name: '@deepseek-ai/dsh-client-ui-theme'\n",
+    )
+    .unwrap();
+    fs::write(
+        package.join("pack-skills/guide/SKILL.md"),
+        "---\nname: guide\ndescription: Bundled guide\n---\nBody.\n",
+    )
+    .unwrap();
+
+    let (mut app, _temp) = create_test_app(root.path());
+    let help = plugins_with_kimi_home_override(&mut app, Some("help"), None)
+        .message
+        .unwrap();
+    assert!(help.contains("/plugin import dsh <package-dir>"), "{help}");
+    let review = plugins_with_kimi_home_override(
+        &mut app,
+        Some(&format!("import dsh {}", package.display())),
+        None,
+    );
+    assert!(!review.is_error, "{:?}", review.message);
+    let message = review.message.unwrap();
+    for fact in [
+        "@demo/docs-dsh@2.0.0",
+        "plugin 'docs-dsh'",
+        "Skills: guide",
+        "Remote MCP servers: docs",
+        "Network hosts it will request: docs.example.invalid",
+        "theme",
+        "Nothing was installed",
+    ] {
+        // Untrusted package text is rendered with review escaping.
+        assert!(
+            message.replace('\\', "").contains(fact),
+            "{fact}: {message}"
+        );
+    }
+    let approval = message
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("/plugin "))
+        .expect("review renders an exact approval command")
+        .to_string();
+    assert!(!codewhale_home.join("plugins/docs-dsh").exists());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let installed = plugins_with_kimi_home_override(&mut app, Some(&approval), None);
+        assert!(!installed.is_error, "{:?}", installed.message);
+        assert!(
+            installed
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("disabled and untrusted"))
+        );
+    });
+    let plugin = app.plugin_registry.get("docs-dsh").unwrap();
+    assert!(!plugin.enabled && !plugin.trusted());
+    assert!(
+        codewhale_home
+            .join("plugins/docs-dsh/CONVERSION.md")
+            .is_file()
+    );
 }
 
 #[test]
@@ -700,4 +921,139 @@ fn export_verb_writes_agent_plugins_bundle() {
             .join(".codewhale/plugins/demo/plugin.toml")
             .exists()
     );
+}
+
+#[test]
+fn plugin_dismissals_list_and_reset_both_kinds() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let codewhale_home = root.path().join("home");
+    fs::create_dir_all(&codewhale_home).unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+    let (mut app, _temp) = create_test_app(root.path());
+    crate::settings::Settings::transact_opt(|settings| {
+        Ok(settings
+            .dismissed_plugin_suggestions
+            .insert("keptaway".to_string())
+            .then_some(()))
+    })
+    .unwrap();
+    app.plugin_cta.dismissed.insert("keptaway".to_string());
+    app.plugin_cta.dismissed.insert("esconce".to_string());
+
+    let listed = plugins_with_kimi_home_override(&mut app, Some("dismissals"), None)
+        .message
+        .expect("dismissal list");
+    let kept = listed
+        .find("keptaway")
+        .unwrap_or_else(|| panic!("{listed}"));
+    let session = listed.find("esconce").unwrap_or_else(|| panic!("{listed}"));
+    assert!(listed.contains("Don't suggest again"), "{listed}");
+    assert!(listed.contains("This session only"), "{listed}");
+    assert!(kept < session, "{listed}");
+
+    let reset = plugins_with_kimi_home_override(&mut app, Some("dismissals reset KeptAway"), None)
+        .message
+        .expect("reset receipt");
+    assert!(reset.contains("keptaway"), "{reset}");
+    assert!(
+        crate::settings::Settings::load()
+            .unwrap()
+            .dismissed_plugin_suggestions
+            .is_empty(),
+        "reset must reach the saved choice"
+    );
+    assert!(!app.plugin_cta.dismissed.contains("keptaway"));
+    assert!(app.plugin_cta.dismissed.contains("esconce"));
+
+    plugins_with_kimi_home_override(&mut app, Some("dismissals reset"), None);
+    assert!(app.plugin_cta.dismissed.is_empty());
+    let empty = plugins_with_kimi_home_override(&mut app, Some("dismissals"), None)
+        .message
+        .expect("empty list");
+    assert!(empty.contains("No plugins are hidden"), "{empty}");
+}
+
+#[test]
+fn doctor_reports_read_only_then_fix_retires_stale_records_with_a_backup() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    // The registry's own private state layout: 0700 directory, 0600 file.
+    let plugins_dir = home.join("plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&plugins_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let state_path = plugins_dir.join("state.json");
+    let stale = serde_json::json!({
+        "schema_version": 1,
+        "plugins": {
+            "workspace/111111111111/old-demo": {
+                "generation": 4,
+                "enabled": false,
+                "trust": null,
+                "review_history": [{
+                    "content_hash": "c",
+                    "capability_hash": "k",
+                    "reviewed_capabilities": crate::plugins::manifest::PluginInventory::default(),
+                    "reviewed_at": "2026-01-01T00:00:00+00:00"
+                }]
+            }
+        }
+    });
+    fs::write(&state_path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+    let (mut app, _temp) = create_test_app(root.path());
+
+    let report = plugins_with_kimi_home_override(&mut app, Some("doctor"), None);
+    assert!(!report.is_error, "{report:?}");
+    let text = report.message.unwrap();
+    assert!(text.contains("nothing was changed"), "{text}");
+    // The renderer escapes markdown, so the hyphen arrives backslashed.
+    assert!(text.contains("old\\-demo"), "{text}");
+    assert!(text.contains("/plugin doctor --fix"), "{text}");
+    assert!(
+        fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("old-demo"),
+        "the report must not write"
+    );
+
+    let fixed = plugins_with_kimi_home_override(&mut app, Some("doctor --fix"), None);
+    assert!(!fixed.is_error, "{fixed:?}");
+    assert!(
+        fixed
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("Retired 1 records")
+    );
+    assert!(matches!(
+        fixed.action,
+        Some(AppAction::PluginRegistryChanged)
+    ));
+    assert!(
+        !fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("old-demo")
+    );
+    assert!(
+        fs::read_to_string(plugins_dir.join("state.json.pre-gc"))
+            .unwrap()
+            .contains("old-demo"),
+        "the previous state is kept"
+    );
+
+    let usage = plugins_with_kimi_home_override(&mut app, Some("doctor --force"), None);
+    assert!(usage.is_error);
+    assert!(usage.message.unwrap().contains("Usage: /plugin doctor"));
 }

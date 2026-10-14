@@ -23,8 +23,7 @@ use crate::config::{Config, has_api_key};
 use crate::prompts::{
     BASE_PROMPT_OVERRIDE_OPT_IN_ENV, CONSTITUTION_OVERRIDE_FILE, base_prompt_override_opt_in,
 };
-use crate::tui::app::App;
-use crate::tui::onboarding;
+use crate::tui::app::{App, AppModeUi};
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_panel_scroll_rail, render_underwater_surface,
@@ -50,12 +49,10 @@ mod tools_mcp;
 pub(crate) use fleet_draft::{draft_fleet_profile_with_model, workspace_fingerprint};
 pub(crate) use model_draft::draft_constitution_with_model;
 use persistence::SetupPersistenceFacts;
+pub(crate) use provider::record_configured_route;
 use remote::SetupRemoteFacts;
 
-/// Target lane for the once-per-version constitution checkpoint. Bumped per
-/// release when the bundled constitution materially changes, so existing users
-/// re-acknowledge it once. 0.9.4 re-ships the Fleet/operate constitution.
-pub const CONSTITUTION_CHECKPOINT_VERSION: &str = "0.9.4";
+use crate::prompts::CONSTITUTION_CHECKPOINT_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupCommitKind {
@@ -190,6 +187,10 @@ pub struct SetupWizardView {
     /// Display label of the model that authored `model_draft` (safe metadata,
     /// e.g. "GLM-5.2"), for provenance copy only.
     model_draft_label: Option<String>,
+    /// The answers (and free-form note) the in-flight model draft was asked
+    /// to write. A draft lands only while they are still the wizard's
+    /// answers; one requested for answers since changed is stale (U08-06).
+    model_draft_request: Option<(GuidedConstitutionDraft, Option<String>)>,
     runtime_preset: SetupRuntimePreset,
     runtime_preset_preview_seen: bool,
     body_scroll: usize,
@@ -202,6 +203,7 @@ struct SetupRuntimeFacts {
     auth: String,
     health: String,
     provider_ready: bool,
+    provider_status: StepStatus,
     provider_result: String,
     work_intent: String,
     approval: String,
@@ -262,6 +264,7 @@ impl Default for SetupRuntimeFacts {
             auth: "not checked".to_string(),
             health: "not checked".to_string(),
             provider_ready: false,
+            provider_status: StepStatus::NeedsAction,
             provider_result: "provider/model not loaded".to_string(),
             work_intent: "not loaded".to_string(),
             approval: "not loaded".to_string(),
@@ -272,11 +275,11 @@ impl Default for SetupRuntimeFacts {
             sandbox_mode_value: "default".to_string(),
             network: "not configured".to_string(),
             network_default_value: "prompt".to_string(),
-            runtime_result: "runtime posture not loaded".to_string(),
+            runtime_result: "permissions not loaded".to_string(),
             operate_runtime_ready: false,
-            operate_runtime_result: "worker runtime not loaded".to_string(),
+            operate_runtime_result: "agent runtime not loaded".to_string(),
             fleet_roster_ready: false,
-            fleet_roster_result: "Team roster not loaded".to_string(),
+            fleet_roster_result: "Fleet not loaded".to_string(),
             operate_concurrency_result: "concurrency not loaded".to_string(),
             operate_result: "operate readiness not loaded".to_string(),
             hotbar_bindings_result: "Hotbar config not loaded".to_string(),
@@ -316,27 +319,39 @@ impl Default for SetupRuntimeFacts {
 impl SetupRuntimeFacts {
     fn from_app_config(app: &App, config: &Config) -> Self {
         let expert_override = SetupExpertOverrideState::load();
-        let readiness = crate::provider_readiness::resolve_for_model(
-            config,
-            app.api_provider,
-            if app.auto_model { "auto" } else { &app.model },
-            &app.provider_health,
-        );
+        let readiness = app
+            .admitted_provider_identity()
+            .ok()
+            .filter(|identity| config.verify_provider_identity(identity).is_ok())
+            .map_or(
+                crate::provider_readiness::ResolvedProviderReadiness::InvalidRoute,
+                |identity| {
+                    crate::provider_readiness::resolve_for_model(
+                        config,
+                        identity,
+                        if app.auto_model { "auto" } else { &app.model },
+                        &app.provider_health,
+                    )
+                },
+            );
         // A failed observed check remains retryable in route pickers, but the
         // setup receipt must not certify it as healthy. Saved-unchecked and
         // local-unchecked are honest reviewed configuration states; an actual
         // session failure is NeedsAction until a later success replaces it.
-        let provider_ready = readiness.can_attempt()
-            && !matches!(
-                &readiness,
-                crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
-            );
+        let provider_status = provider::step_status(&readiness);
+        let provider_ready = matches!(
+            provider_status,
+            StepStatus::Configured | StepStatus::Verified
+        );
         let model = app.model_display_label();
-        let provider_name = if app.api_provider == crate::config::ApiProvider::Custom {
-            app.provider_identity_for_persistence().to_string()
-        } else {
-            app.api_provider.display_name().to_string()
-        };
+        let provider_name = app
+            .admitted_provider_identity()
+            .map_or("unavailable", |identity| {
+                identity
+                    .compatibility()
+                    .map_or(identity.key.as_str(), |row| row.label)
+            })
+            .to_string();
         let context_window = crate::route_budget::route_context_window_tokens(
             app.api_provider,
             &app.model,
@@ -353,7 +368,7 @@ impl SetupRuntimeFacts {
             crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
         ) {
             format!("{}; retry or open /provider", readiness.label())
-        } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
+        } else if app.api_provider == crate::config::ProviderKind::OpenaiCodex {
             format!(
                 "{}; Sign in with ChatGPT via `codewhale auth chatgpt` or /provider setup openai-codex (subscription billing). Codex CLI import remains an explicit alternative.",
                 readiness.label()
@@ -394,7 +409,7 @@ impl SetupRuntimeFacts {
         );
         let shell = if app.allow_shell { "enabled" } else { "hidden" }.to_string();
         let trust = if app.trust_mode {
-            "trusted workspace / writes allowed by posture"
+            "trusted workspace / writes allowed by permissions"
         } else {
             "workspace trust not elevated"
         }
@@ -486,8 +501,9 @@ impl SetupRuntimeFacts {
             auth,
             health,
             provider_ready,
+            provider_status,
             provider_result,
-            work_intent: app.mode.display_name().to_string(),
+            work_intent: app.mode.display_name_localized(app.ui_locale).into_owned(),
             approval: app
                 .approval_mode
                 .permission_chip_label()
@@ -527,17 +543,12 @@ impl SetupRuntimeFacts {
             remote_command_provider: remote.command_provider,
             remote_result: remote.result,
             remote_control_result: {
-                let status = app.remote_control.status_line();
-                let message = if status.starts_with("Remote control: connected") {
-                    MessageId::SetupRemoteStatusReady
-                } else if status.starts_with("Remote control: connecting")
-                    || status.starts_with("Remote control: stopping")
-                {
-                    MessageId::SetupStatusInProgress
-                } else if status.starts_with("Remote control: disconnected") {
-                    MessageId::SetupRemoteStatusNeedsAction
-                } else {
-                    MessageId::SetupRemoteStatusDisabled
+                use crate::remote_control::Status;
+                let message = match app.remote_control.status() {
+                    Status::Connected => MessageId::SetupRemoteStatusReady,
+                    Status::Connecting | Status::Stopping => MessageId::SetupStatusInProgress,
+                    Status::Failed => MessageId::SetupRemoteStatusNeedsAction,
+                    Status::Off => MessageId::SetupRemoteStatusDisabled,
                 };
                 tr(app.ui_locale, message).into_owned()
             },
@@ -815,63 +826,63 @@ impl GuidedConstitutionDraft {
             let own_words = match locale {
                 Locale::Ja => format!(
                     "\nユーザー自由原則：{}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::ZhHans => format!(
                     "\n用户自定义准则：{}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::ZhHant => format!(
                     "\n使用者自由原則：{}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::PtBr => format!(
                     "\nPrincípio livre do usuário: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Es419 => format!(
                     "\nPrincipio libre del usuario: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Vi => format!(
                     "\nNguyên tắc tự do của người dùng: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Ko => format!(
                     "\n사용자 자유 원칙: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Ca => format!(
                     "\nPrincipi lliure de l'usuari: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::De => format!(
                     "\nFreitext-Prinzip des Nutzers: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Fr => format!(
                     "\nPrincipe en texte libre de l'utilisateur : {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Id => format!(
                     "\nPrinsip bebas pengguna: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Hi => format!(
                     "\nउपयोगकर्ता मुक्त-पाठ सिद्धांत: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Ru => format!(
                     "\nСвободный принцип пользователя: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 Locale::Uk => format!(
                     "\nВільний принцип користувача: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
                 _ => format!(
                     "\nUser freeform principle: {}",
-                    bounded_freeform_note(note, MAX_NOTES_LEN)
+                    bounded_freeform_note(note, FREEFORM_NOTE_MAX)
                 ),
             };
             notes.push_str(&own_words);
@@ -2106,6 +2117,8 @@ fn authority_priority(locale: Locale) -> &'static str {
     }
 }
 
+const FREEFORM_NOTE_MAX: usize = MAX_NOTES_LEN - 1_000;
+
 fn bounded_freeform_note(input: &str, max_chars: usize) -> String {
     input
         .chars()
@@ -2312,6 +2325,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2339,6 +2353,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2466,19 +2481,19 @@ impl SetupWizardView {
     }
 
     fn commit_provider_model_review(&mut self) -> ViewAction {
-        let status = provider::step_status(self.facts.provider_ready);
+        let status = self.facts.provider_status;
         let mut state = self.state.clone();
         state.set_step(
             SetupStep::ProviderModel,
             provider::step_entry(
-                self.facts.provider_ready,
+                status,
                 CONSTITUTION_CHECKPOINT_VERSION,
                 self.facts.provider_result.clone(),
             ),
         );
         self.state = state.clone();
         self.move_next();
-        let message_id = if status == StepStatus::Verified {
+        let message_id = if self.facts.provider_ready {
             MessageId::SetupProviderModelReviewed
         } else {
             MessageId::SetupProviderModelNeedsActionSaved
@@ -2840,10 +2855,11 @@ impl SetupWizardView {
     /// `A` on the constitution step: ask the first configured model to draft.
     /// Requires a ready provider route; otherwise the key is inert and the
     /// deterministic guided flow stands untouched.
-    fn request_model_draft(&self) -> ViewAction {
+    fn request_model_draft(&mut self) -> ViewAction {
         if !self.facts.provider_ready {
             return ViewAction::None;
         }
+        self.model_draft_request = Some(self.current_model_draft_request());
         ViewAction::Emit(ViewEvent::SetupConstitutionModelDraftRequested {
             draft: self.guided_draft,
             freeform_note: self.freeform_note_for_draft().map(str::to_string),
@@ -2858,6 +2874,13 @@ impl SetupWizardView {
         ViewAction::None
     }
 
+    fn current_model_draft_request(&self) -> (GuidedConstitutionDraft, Option<String>) {
+        (
+            self.guided_draft,
+            self.freeform_note_for_draft().map(str::to_string),
+        )
+    }
+
     fn freeform_note_for_draft(&self) -> Option<&str> {
         let note = self.freeform_note.trim();
         (!note.is_empty()).then_some(note)
@@ -2866,7 +2889,7 @@ impl SetupWizardView {
     fn append_freeform_note_text(&mut self, text: &str) {
         let mut next = self.freeform_note.clone();
         next.push_str(text);
-        self.freeform_note = bounded_freeform_note(&next, MAX_NOTES_LEN);
+        self.freeform_note = bounded_freeform_note(&next, FREEFORM_NOTE_MAX);
         self.guided_preview_seen = false;
         self.model_draft = None;
         self.model_draft_label = None;
@@ -2902,12 +2925,20 @@ impl SetupWizardView {
     /// ratification preview the host must open in the same breath — that is
     /// what satisfies the preview gate. Ratifying still takes the explicit
     /// `G` keypress afterwards.
+    ///
+    /// Returns `None`, installing nothing, when the answers or note changed
+    /// after the draft was requested: that draft is law for answers the
+    /// person no longer holds (U08-06).
     #[must_use]
     pub(crate) fn install_model_draft(
         &mut self,
         constitution: Box<UserConstitution>,
         model_label: String,
-    ) -> (String, String) {
+    ) -> Option<(String, String)> {
+        if self.model_draft_request.as_ref() != Some(&self.current_model_draft_request()) {
+            return None;
+        }
+        self.model_draft_request = None;
         let content = constitution_ratification_text(
             self.locale,
             &constitution,
@@ -2916,7 +2947,7 @@ impl SetupWizardView {
         self.model_draft = Some(constitution);
         self.model_draft_label = Some(model_label);
         self.guided_preview_seen = true;
-        (ratification_preview_title(self.locale).to_string(), content)
+        Some((ratification_preview_title(self.locale).to_string(), content))
     }
 
     fn commit_constitution(&self, kind: SetupCommitKind) -> ViewAction {
@@ -3014,6 +3045,7 @@ impl SetupWizardView {
                 StepStatus::Optional => MessageId::SetupStatusOptional,
                 StepStatus::Deferred => MessageId::SetupStatusDeferred,
                 StepStatus::InProgress => MessageId::SetupStatusInProgress,
+                StepStatus::Configured => MessageId::PickerActionConfigured,
                 StepStatus::NeedsAction => MessageId::SetupStatusNeedsAction,
                 StepStatus::Verified => MessageId::SetupStatusVerified,
                 StepStatus::Skipped => MessageId::SetupStatusSkipped,
@@ -3181,8 +3213,12 @@ impl ModalView for SetupWizardView {
             KeyCode::Char('k') if self.selected_step() == SetupStep::Constitution => {
                 self.commit_keep_existing_constitution()
             }
-            KeyCode::Char('u') => self.commit_constitution(SetupCommitKind::BundledConstitution),
-            KeyCode::Char('d') => self.commit_constitution(SetupCommitKind::DeferredConstitution),
+            KeyCode::Char('u') if self.selected_step() == SetupStep::Constitution => {
+                self.commit_constitution(SetupCommitKind::BundledConstitution)
+            }
+            KeyCode::Char('d') if self.selected_step() == SetupStep::Constitution => {
+                self.commit_constitution(SetupCommitKind::DeferredConstitution)
+            }
             KeyCode::Enter if self.selected_step() == SetupStep::Constitution => {
                 self.commit_constitution(SetupCommitKind::BundledConstitution)
             }
@@ -3283,7 +3319,11 @@ impl ModalView for SetupWizardView {
         let spec = self.selected_spec();
         let (title_text, question_text) = if self.progressive_guide {
             match self.selected_step() {
-                SetupStep::ProviderModel => (
+                SetupStep::Verification if self.facts.provider_ready => (
+                    tr(self.locale, MessageId::OnboardReadyTitle).into_owned(),
+                    tr(self.locale, MessageId::OnboardReadyLead).into_owned(),
+                ),
+                SetupStep::ProviderModel | SetupStep::Verification => (
                     tr(self.locale, MessageId::OnboardProviderTitle).into_owned(),
                     tr(self.locale, MessageId::OnboardProviderBlurb).into_owned(),
                 ),
@@ -3294,10 +3334,6 @@ impl ModalView for SetupWizardView {
                 SetupStep::RemoteRuntime => (
                     "/rc".to_string(),
                     tr(self.locale, MessageId::CmdRemoteControlDescription).into_owned(),
-                ),
-                SetupStep::Verification => (
-                    tr(self.locale, MessageId::OnboardReadyTitle).into_owned(),
-                    tr(self.locale, MessageId::OnboardReadyLead).into_owned(),
                 ),
                 _ => (
                     tr(self.locale, spec.title_id()).into_owned(),
@@ -3404,14 +3440,30 @@ impl SetupWizardView {
                 details(),
                 exit(),
             ],
-            SetupStep::Verification => vec![
-                ActionHint::new(
-                    "Enter",
-                    tr(self.locale, MessageId::OnboardReadyStart).to_string(),
-                ),
-                details(),
-                exit(),
-            ],
+            SetupStep::Verification => {
+                let mut hints = vec![
+                    ActionHint::new(
+                        "Enter",
+                        tr(self.locale, MessageId::OnboardReadyStart).to_string(),
+                    ),
+                    ActionHint::new(
+                        "C",
+                        tr(self.locale, MessageId::SetupActionCustomize).to_string(),
+                    ),
+                    details(),
+                    exit(),
+                ];
+                if !self.facts.provider_ready {
+                    hints.insert(
+                        0,
+                        ActionHint::new(
+                            "P",
+                            tr(self.locale, MessageId::SetupActionProvider).to_string(),
+                        ),
+                    );
+                }
+                hints
+            }
             _ => vec![exit()],
         };
         let position = self
@@ -4083,7 +4135,7 @@ impl SetupWizardView {
         }
         if !matches!(
             self.state.status(SetupStep::ProviderModel),
-            StepStatus::Verified | StepStatus::NeedsAction
+            StepStatus::Configured | StepStatus::Verified | StepStatus::NeedsAction
         ) {
             return MessageId::SetupReportNextActionProvider;
         }
@@ -4236,15 +4288,11 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
     // workspace falls back to the user's baseline. Say so here rather than
     // only in a log line the TUI never shows.
     if let Some((path, reason)) = outcome.invalid() {
-        let path = path.display();
-        return Some(match locale {
-            Locale::ZhHans => format!(
-                "无法解析项目配置 {path}（{reason}）。此工作区的项目级运行姿态限制未生效，将回退到用户默认值。",
-            ),
-            _ => format!(
-                "Project config {path} could not be parsed ({reason}). Its runtime posture restrictions are NOT in effect; this workspace falls back to your user defaults.",
-            ),
-        });
+        return Some(
+            tr(locale, MessageId::SetupProjectPermissionsInvalid)
+                .replace("{path}", &path.display().to_string())
+                .replace("{reason}", reason),
+        );
     }
     let project = outcome.into_config()?;
     let mut fields = Vec::new();
@@ -4257,16 +4305,10 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
     if fields.is_empty() {
         return None;
     }
-    Some(match locale {
-        Locale::ZhHans => format!(
-            "此工作区的项目配置包含 {}。预设会保存用户默认值；项目配置仍可在此工作区收紧运行姿态。",
-            fields.join(", ")
-        ),
-        _ => format!(
-            "Project config contains {}. Presets save user defaults; project config can still tighten runtime posture in this workspace.",
-            fields.join(", ")
-        ),
-    })
+    Some(
+        tr(locale, MessageId::SetupProjectPermissionsOverride)
+            .replace("{fields}", &fields.join(", ")),
+    )
 }
 
 fn setup_report_result(state: &SetupState, facts: &SetupRuntimeFacts) -> String {
@@ -4392,7 +4434,6 @@ fn constitution_ratification_text(
             Locale::Uk => "Структурована конституція порожня.".to_string(),
             _ => "The structured constitution is empty.".to_string(),
         });
-    let layer_order = tr(locale, MessageId::SetupCheckpointLayerOrder);
 
     match locale {
         Locale::Ja => {
@@ -4425,7 +4466,7 @@ fn constitution_ratification_text(
                  すべての個別判断を裁くのではなく権限と境界を定め、セッションを越えて協働を継続させます。\
                  ただしこれは記憶ではありません。履歴ではなく原則を保持します。\n\n\
                  {rendered}\n\n\
-                 権限の階層\n{layer_order}\nあなたの直接の指示は常にこの文書より優先されます。\n\n\
+                 権限の階層\nあなたの直接の指示は常にこの文書より優先されます。\n\n\
                  これができないこと\n\
                  これは行動を導くものです。承認ポリシー、サンドボックス、Shell、ネットワーク、信頼、MCP 権限、\
                  既定モード、公開、支出の権限を付与または変更することはできません。これらは実行時にあなたが管理します。\n\n\
@@ -4460,7 +4501,7 @@ fn constitution_ratification_text(
                  这是 Codewhale 与你协作时长期遵循的偏好和规则。内容应保持简短、便于执行，以持久原则为主，并可随时调整。\
                  它界定协作方式与行为边界，而不是替你决定每一种情况；它让协作跨会话延续——但它不是记忆，只保留原则，不保留历史。\n\n\
                  {rendered}\n\n\
-                 权限层级\n{layer_order}\n你的直接指令始终高于本文件。\n\n\
+                 权限层级\n你的直接指令始终高于本文件。\n\n\
                  它不能做什么\n\
                  它只提供行为指导，不能授予或更改审批策略、沙箱、Shell、网络、信任、MCP 权限、默认模式、发布或支出权限——这些始终由你在运行时掌控。\n\n\
                  精简核心与可选策略\n\
@@ -4493,7 +4534,7 @@ fn constitution_ratification_text(
                  這是 Codewhale 與你協作的長期準則。像優秀的憲法一樣：足夠簡短因而可用，由持久原則而非詳盡規則構成，並且可以隨你修訂。\
                  它界定權力與邊界，而非裁決每個具體決定；它讓協作跨會話延續，但它不是記憶，它承載的是原則，而非歷史。\n\n\
                  {rendered}\n\n\
-                 權限層級\n{layer_order}\n你的直接指令始終高於本文件。\n\n\
+                 權限層級\n你的直接指令始終高於本文件。\n\n\
                  它不能做什麼\n\
                  它只提供行為指導，不能授予或更改審批策略、沙箱、Shell、網路、信任、MCP 權限、預設模式、發布或支出權限；這些始終由你在執行時掌控。\n\n\
                  精簡核心與可選模組\n\
@@ -4531,7 +4572,7 @@ fn constitution_ratification_text(
                  e pode ser emendada conforme você muda. Ela define poderes e limites em vez de decidir cada caso, \
                  e dá continuidade à colaboração entre sessões. Mas ela não é memória: carrega princípios, não histórico.\n\n\
                  {rendered}\n\n\
-                 HIERARQUIA DE AUTORIDADE\n{layer_order}\nSeus pedidos diretos sempre superam este documento.\n\n\
+                 HIERARQUIA DE AUTORIDADE\nSeus pedidos diretos sempre superam este documento.\n\n\
                  O QUE ISTO NÃO PODE FAZER\n\
                  Isto orienta comportamento. Não pode conceder nem alterar política de aprovação, sandbox, shell, rede, \
                  confiança, permissões MCP, modo padrão, publicação ou autoridade para gastos; isso continua sob seu controle em tempo de execução.\n\n\
@@ -4571,7 +4612,7 @@ fn constitution_ratification_text(
                  y enmendable a medida que cambias. Define poderes y límites en vez de decidir cada caso, \
                  y da continuidad a la colaboración entre sesiones. Pero no es memoria: lleva principios, no historial.\n\n\
                  {rendered}\n\n\
-                 JERARQUÍA DE AUTORIDAD\n{layer_order}\nTus pedidos directos siempre superan este documento.\n\n\
+                 JERARQUÍA DE AUTORIDAD\nTus pedidos directos siempre superan este documento.\n\n\
                  LO QUE ESTO NO PUEDE HACER\n\
                  Orienta comportamiento. No puede conceder ni cambiar política de aprobación, sandbox, shell, red, \
                  confianza, permisos MCP, modo predeterminado, publicación o autoridad de gasto; eso sigue bajo tu control en tiempo de ejecución.\n\n\
@@ -4611,7 +4652,7 @@ fn constitution_ratification_text(
                  và có thể sửa khi bạn thay đổi. Nó định khung quyền hạn và giới hạn thay vì quyết định từng trường hợp, \
                  đồng thời giữ sự liên tục giữa các phiên. Nhưng nó không phải bộ nhớ: nó mang nguyên tắc, không mang lịch sử.\n\n\
                  {rendered}\n\n\
-                 THỨ BẬC THẨM QUYỀN\n{layer_order}\nYêu cầu trực tiếp của bạn luôn cao hơn tài liệu này.\n\n\
+                 THỨ BẬC THẨM QUYỀN\nYêu cầu trực tiếp của bạn luôn cao hơn tài liệu này.\n\n\
                  ĐIỀU NÀY KHÔNG THỂ LÀM\n\
                  Nó hướng dẫn hành vi. Nó không thể cấp hoặc đổi chính sách phê duyệt, sandbox, shell, mạng, \
                  độ tin cậy, quyền MCP, chế độ mặc định, xuất bản hoặc quyền chi tiêu; những thứ đó vẫn do bạn kiểm soát lúc chạy.\n\n\
@@ -4651,7 +4692,7 @@ fn constitution_ratification_text(
                  이는 모든 개별 사례를 판단하는 대신 권한과 한계를 규정하며, 세션을 넘어 협업의 연속성을 부여합니다. \
                  다만 이것은 기억이 아닙니다: 이력이 아니라 원칙을 담습니다.\n\n\
                  {rendered}\n\n\
-                 권한 계층\n{layer_order}\n당신의 직접적인 요청은 언제나 이 문서보다 우선합니다.\n\n\
+                 권한 계층\n당신의 직접적인 요청은 언제나 이 문서보다 우선합니다.\n\n\
                  이것이 할 수 없는 일\n\
                  이것은 행동을 안내할 뿐입니다. 승인 정책, 샌드박스, 셸, 네트워크, 신뢰, MCP 권한, 기본 모드, 게시, 지출 권한을 \
                  부여하거나 바꿀 수 없습니다; 이는 여전히 런타임에서 당신이 직접 관리합니다.\n\n\
@@ -4691,7 +4732,7 @@ fn constitution_ratification_text(
                  i esmenable a mesura que canvies. Defineix poders i límits en lloc de decidir cada cas, \
                  i dona continuïtat a la col·laboració entre sessions — però no és memòria: porta principis, no història.\n\n\
                  {rendered}\n\n\
-                 JERARQUIA D'AUTORITAT\n{layer_order}\nLes teves peticions directes sempre prevalen sobre aquest document.\n\n\
+                 JERARQUIA D'AUTORITAT\nLes teves peticions directes sempre prevalen sobre aquest document.\n\n\
                  EL QUE AIXÒ NO POT FER\n\
                  Orienta el comportament. No pot concedir ni canviar la política d'aprovació, sandbox, shell, xarxa, \
                  confiança, permisos MCP, mode per defecte, publicació o autoritat de despesa; això queda sota el teu control en temps d'execució.\n\n\
@@ -4731,7 +4772,7 @@ fn constitution_ratification_text(
                  und lässt sich ändern, wenn du dich änderst. Sie rahmt Befugnisse und Grenzen, statt jeden Einzelfall zu entscheiden, \
                  und gibt deiner Zusammenarbeit Kontinuität über Sitzungen hinweg — aber sie ist kein Gedächtnis: Sie trägt Prinzipien, nicht Geschichte.\n\n\
                  {rendered}\n\n\
-                 HIERARCHIE DER AUTORITÄT\n{layer_order}\nDeine direkten Anweisungen stehen immer über diesem Dokument.\n\n\
+                 HIERARCHIE DER AUTORITÄT\nDeine direkten Anweisungen stehen immer über diesem Dokument.\n\n\
                  WAS DIES NICHT KANN\n\
                  Sie leitet Verhalten. Sie kann keine Freigaberichtlinie, Sandbox, Shell, Netzwerk, \
                  Vertrauen, MCP-Berechtigungen, Standardmodus, Veröffentlichung oder Ausgabenbefugnis gewähren oder ändern — die bleiben zur Laufzeit in deiner Hand.\n\n\
@@ -4771,7 +4812,7 @@ fn constitution_ratification_text(
                  et amendable à mesure que vous changez. Elle encadre les pouvoirs et les limites plutôt que de trancher chaque cas, \
                  et donne à votre collaboration une continuité entre les sessions — mais elle n'est pas une mémoire : elle porte des principes, pas un historique.\n\n\
                  {rendered}\n\n\
-                 HIÉRARCHIE D'AUTORITÉ\n{layer_order}\nVos demandes directes priment toujours sur ce document.\n\n\
+                 HIÉRARCHIE D'AUTORITÉ\nVos demandes directes priment toujours sur ce document.\n\n\
                  CE QU'ELLE NE PEUT PAS FAIRE\n\
                  Elle guide le comportement. Elle ne peut ni accorder ni modifier la politique d'approbation, le sandbox, le shell, le réseau, \
                  la confiance, les permissions MCP, le mode par défaut, la publication ou le pouvoir de dépense — ceux-ci restent entre vos mains à l'exécution.\n\n\
@@ -4811,7 +4852,7 @@ fn constitution_ratification_text(
                  dan dapat diamendemen seiring Anda berubah. Ia membingkai wewenang dan batasan alih-alih memutuskan setiap kasus, \
                  dan memberi kolaborasi Anda kesinambungan lintas sesi — tetapi ia bukan memori: ia membawa prinsip, bukan riwayat.\n\n\
                  {rendered}\n\n\
-                 HIERARKI OTORITAS\n{layer_order}\nPermintaan langsung Anda selalu mengungguli dokumen ini.\n\n\
+                 HIERARKI OTORITAS\nPermintaan langsung Anda selalu mengungguli dokumen ini.\n\n\
                  APA YANG TIDAK BISA DILAKUKANNYA\n\
                  Ia memandu perilaku. Ia tidak dapat memberi atau mengubah kebijakan persetujuan, sandbox, shell, jaringan, \
                  kepercayaan, izin MCP, mode default, publikasi, atau wewenang belanja — semua itu tetap di tangan Anda saat runtime.\n\n\
@@ -4849,7 +4890,7 @@ fn constitution_ratification_text(
                  और आपके बदलने के साथ संशोधनीय है। यह हर मामले का फ़ैसला करने के बजाय शक्तियों और सीमाओं का ढाँचा देता है, \
                  और आपके सहयोग को सत्रों के पार निरंतरता देता है — लेकिन यह मेमोरी नहीं है: यह इतिहास नहीं, सिद्धांत रखता है।\n\n\
                  {rendered}\n\n\
-                 अधिकार पदानुक्रम\n{layer_order}\nआपके प्रत्यक्ष अनुरोध हमेशा इस दस्तावेज़ से ऊपर हैं।\n\n\
+                 अधिकार पदानुक्रम\nआपके प्रत्यक्ष अनुरोध हमेशा इस दस्तावेज़ से ऊपर हैं।\n\n\
                  यह क्या नहीं कर सकता\n\
                  यह व्यवहार का मार्गदर्शन करता है। यह अनुमति नीति, सैंडबॉक्स, शेल, नेटवर्क, \
                  ट्रस्ट, MCP अनुमतियाँ, डिफ़ॉल्ट मोड, प्रकाशन या खर्च का अधिकार प्रदान या परिवर्तित नहीं कर सकता — वे रनटाइम पर आपके हाथ में रहते हैं।\n\n\
@@ -4889,7 +4930,7 @@ fn constitution_ratification_text(
                  и может изменяться вместе с вами. Она очерчивает полномочия и границы, а не решает каждый случай, \
                  и придаёт вашему сотрудничеству непрерывность между сессиями — но она не память: она хранит принципы, а не историю.\n\n\
                  {rendered}\n\n\
-                 ИЕРАРХИЯ ПОЛНОМОЧИЙ\n{layer_order}\nВаши прямые указания всегда важнее этого документа.\n\n\
+                 ИЕРАРХИЯ ПОЛНОМОЧИЙ\nВаши прямые указания всегда важнее этого документа.\n\n\
                  ЧЕГО ОНА НЕ МОЖЕТ\n\
                  Она направляет поведение. Она не может предоставить или изменить политику одобрения, sandbox, shell, сеть, \
                  доверие, разрешения MCP, режим по умолчанию, публикацию или право тратить — они остаются в ваших руках во время выполнения.\n\n\
@@ -4929,7 +4970,7 @@ fn constitution_ratification_text(
                  і може змінюватися разом із вами. Вона окреслює повноваження та межі, а не вирішує кожен випадок, \
                  і надає вашій співпраці неперервність між сесіями — але вона не пам'ять: вона зберігає принципи, а не історію.\n\n\
                  {rendered}\n\n\
-                 ІЄРАРХІЯ ПОВНОВАЖЕНЬ\n{layer_order}\nВаші прямі вказівки завжди важливіші за цей документ.\n\n\
+                 ІЄРАРХІЯ ПОВНОВАЖЕНЬ\nВаші прямі вказівки завжди важливіші за цей документ.\n\n\
                  ЧОГО ВОНА НЕ МОЖЕ\n\
                  Вона спрямовує поведінку. Вона не може надати або змінити політику схвалення, sandbox, shell, мережу, \
                  довіру, дозволи MCP, режим за замовчуванням, публікацію чи право витрачати — вони залишаються у ваших руках під час виконання.\n\n\
@@ -4972,7 +5013,7 @@ fn constitution_ratification_text(
                  continuity across sessions — but it is not memory: it carries principles, \
                  not history.\n\n\
                  {rendered}\n\n\
-                 HIERARCHY OF AUTHORITY\n{layer_order}\nYour direct requests always outrank this document.\n\n\
+                 HIERARCHY OF AUTHORITY\nYour direct requests always outrank this document.\n\n\
                  WHAT THIS CANNOT DO\n\
                  It guides behavior. It cannot grant or change approval policy, sandbox, shell, \
                  network, trust, MCP permissions, default mode, publishing, or spending \
@@ -5372,7 +5413,7 @@ pub(crate) fn record_provider_model_setup_state_for_app(
     state.set_step(
         SetupStep::ProviderModel,
         provider::step_entry(
-            facts.provider_ready,
+            facts.provider_status,
             CONSTITUTION_CHECKPOINT_VERSION,
             facts.provider_result,
         ),
@@ -5396,7 +5437,7 @@ fn inherited_facts_for_app(app: &App, config: &Config) -> InheritedConfigFacts {
         language: Some(app.ui_locale.tag().to_string()),
         has_provider_route: !config.default_model().trim().is_empty(),
         has_credentials_or_local_runtime: has_api_key(config),
-        trust_chosen: app.trust_mode || !onboarding::needs_trust(&app.workspace),
+        trust_chosen: app.trust_mode || !crate::config::needs_trust(&app.workspace),
         has_expert_override: expert_override.is_active(),
         has_user_constitution,
         user_constitution_validity,
@@ -5462,6 +5503,11 @@ mod progressive_tests {
             model: "stub-model".to_string(),
             auth: if provider_ready { "ready" } else { "missing" }.to_string(),
             provider_ready,
+            provider_status: if provider_ready {
+                StepStatus::Configured
+            } else {
+                StepStatus::NeedsAction
+            },
             runtime_result: "approval=ask; sandbox=workspace; network=prompt".to_string(),
             tools_mcp_result: "mcp=off, skills=off, tools=off, plugins=off, overall=off"
                 .to_string(),

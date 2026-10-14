@@ -43,7 +43,7 @@ fn click(tui: &mut Harness, text: &str) {
 }
 
 fn open(workspace: &SealedWorkspace, store: &Path, rows: u16, cols: u16) -> Harness {
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -245,7 +245,14 @@ completion_sound = "off"
         click(&mut reopened, "Confirm");
         wait(&mut reopened, "y/Enter");
         click(&mut reopened, "Confirm");
-        wait(&mut reopened, "deleted");
+        // The review already says "Nothing was deleted"; wait for the durable
+        // mutation and its receipt after the armed review has closed.
+        reopened
+            .wait_for(
+                |frame| !path.exists() && frame.contains("deleted") && !frame.contains("y/Enter"),
+                WAIT,
+            )
+            .unwrap_or_else(|error| panic!("deletion did not complete at {cols}x{rows}: {error}"));
         assert!(
             !path.exists(),
             "confirmed mouse control deletes the reviewed definition"

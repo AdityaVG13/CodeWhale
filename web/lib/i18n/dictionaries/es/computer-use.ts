@@ -9,7 +9,7 @@ import type { ComputerUseDict } from "../types";
  * the app shows them.
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Computer Use para Mac · Codewhale",
+  metaTitle: "Computer Use · Vista previa · Codewhale",
   metaDescription: "Descarga y configura Codewhale Computer Use para Mac. Control de aplicaciones en segundo plano, configuración de permisos y controles Pause y Stop en tus manos.",
   title: "Computer Use",
   lead: "Deja que Codewhale trabaje en tus aplicaciones mientras tú sigues con lo tuyo. El asistente para Mac reúne en la barra de menús los permisos, el control de aplicaciones en segundo plano y una forma de pausar o detener la entrada.",
@@ -31,7 +31,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Ejecuta la comprobación en segundo plano", body: "El asistente abre una ventana de práctica desechable, escribe texto y captura esa ventana. Comprueba si el puntero o la aplicación activa cambiaron durante la ejecución." },
     { title: "Conéctalo con Codewhale", body: "Revisa, marca como de confianza y activa Computer Use en el mercado de plugins de Codewhale. Usa el plugin 0.3.1 o posterior para que las acciones locales pasen por los controles Pause y Stop del asistente." },
   ],
-  controlsTitle: "Sigue trabajando. Mantén el control.",
+  controlsTitle: "Pausa o detén el control de las aplicaciones",
   controlsBody: "Las acciones compatibles se ejecutan en segundo plano sobre la aplicación seleccionada. Las aplicaciones y los gestos que requieren control en primer plano necesitan tu autorización. El menú muestra el destino y el modo de entrada; Pause (pausar) suspende la entrada del asistente y Stop (detener) finaliza sus sesiones existentes.",
   updateTitle: "Actualizaciones cuando tú quieras",
   updateBody: "Elige Check for updates (buscar actualizaciones) en la aplicación. Antes de instalar una actualización, comprueba la descarga, la firma de Codewhale y la notarización de Apple, y conserva la versión anterior por si necesitas recuperarla.",
@@ -40,7 +40,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Ver la comprobación en segundo plano",
   source: "Código fuente y otras plataformas",
   platforms: "Esta descarga es para Mac. En Windows y Linux, por ahora, se usa el plugin desde el código fuente y la configuración del lado del host.",
-  installTitle: "Computer Use para Mac",
-  installLead: "Añade el control de aplicaciones en segundo plano con el asistente de Computer Use. Configura los permisos de tu Mac, ejecuta una comprobación en segundo plano y pausa o detén la entrada del asistente desde la barra de menús.",
-  installLink: "Descarga y configuración de Computer Use",
 };

@@ -1,5 +1,7 @@
 # Termux / Android arm64 Support
 
+> 阅读简体中文版：[zh_hans/TERMUX.md](zh_hans/TERMUX.md)。
+
 Codewhale provides an Android arm64 build and archive path for
 [Termux](https://termux.dev). Treat Termux support as a preview until the
 real-device runtime QA tracked in #4236 and #4242 is complete. This document
@@ -9,9 +11,9 @@ should know about.
 ## Installation
 
 Use the Android-specific GitHub release archive. The
-[v0.9.11 release](https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.11)
+[v0.9.11 release](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
 includes `codewhale-android-arm64.tar.gz`; device support remains **preview**.
-Follow [the Android / Termux installation steps](INSTALL.md#android--termux-arm64)
+Follow [the Android / Termux installation steps](INSTALL.md#android--termux-arm64-preview)
 to verify the archive against the matching `codewhale-bundles-sha256.txt`, then
 run the bundled installer with `PREFIX="$PREFIX"` so commands go into
 `$PREFIX/bin`. Use `codewhale update` for an existing direct installation;
@@ -40,7 +42,7 @@ Codewhale's security model has three distinct layers on Android:
    [Android application sandbox](https://source.android.com/docs/security/app-sandbox)
    and [Termux filesystem layout](https://github.com/termux/termux-packages/wiki/Termux-file-system-layout).
 2. **Codewhale's per-command sandbox backend** — Seatbelt (macOS) or the
-   opt-in bubblewrap wrapper (Linux) can further narrow what a child command
+   bubblewrap wrapper (Linux) can further narrow what a child command
    may access. Codewhale does not currently provide that additional layer on
    Android.
 3. **Codewhale's own gates** — workspace trust, approval prompts,

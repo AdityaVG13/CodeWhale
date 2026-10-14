@@ -92,7 +92,11 @@ pub fn parse_since(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim().to_ascii_lowercase();
     let s = s.strip_prefix("now-").unwrap_or(&s);
     let secs = parse_duration_secs(s)?;
-    Ok(Utc::now() - Duration::seconds(secs))
+    let delta = Duration::try_seconds(secs)
+        .ok_or_else(|| anyhow::anyhow!("duration {s:?} is too large"))?;
+    Utc::now()
+        .checked_sub_signed(delta)
+        .ok_or_else(|| anyhow::anyhow!("duration {s:?} reaches before the earliest supported time"))
 }
 
 fn parse_duration_secs(s: &str) -> Result<i64> {
@@ -104,9 +108,12 @@ fn parse_duration_secs(s: &str) -> Result<i64> {
         match ch {
             '0'..='9' => num_buf.push(ch),
             'd' | 'h' | 'm' | 's' => {
+                if num_buf.is_empty() {
+                    anyhow::bail!("unit {ch:?} in duration {s:?} has no number before it");
+                }
                 let n: i64 = num_buf
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid duration component: {num_buf:?}"))?;
+                    .map_err(|_| anyhow::anyhow!("duration component {num_buf:?} is too large"))?;
                 num_buf.clear();
                 let factor = match ch {
                     'd' => 86_400,
@@ -115,7 +122,10 @@ fn parse_duration_secs(s: &str) -> Result<i64> {
                     's' => 1,
                     _ => unreachable!(),
                 };
-                total += n * factor;
+                total = n
+                    .checked_mul(factor)
+                    .and_then(|secs| total.checked_add(secs))
+                    .ok_or_else(|| anyhow::anyhow!("duration {s:?} is too large"))?;
             }
             _ => anyhow::bail!("unrecognised character {ch:?} in duration {s:?}"),
         }
@@ -123,8 +133,12 @@ fn parse_duration_secs(s: &str) -> Result<i64> {
 
     if !num_buf.is_empty() {
         // Trailing bare number — treat as seconds.
-        let n: i64 = num_buf.parse()?;
-        total += n;
+        let n: i64 = num_buf
+            .parse()
+            .map_err(|_| anyhow::anyhow!("duration component {num_buf:?} is too large"))?;
+        total = total
+            .checked_add(n)
+            .ok_or_else(|| anyhow::anyhow!("duration {s:?} is too large"))?;
     }
 
     if total == 0 {
@@ -456,8 +470,8 @@ fn read_audit_log(
     earlier_roots: &HashMap<[u8; 32], u64>,
     root_counts: &mut HashMap<[u8; 32], u64>,
 ) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             tracing::trace!(
@@ -469,7 +483,14 @@ fn read_audit_log(
         }
     };
 
-    for raw_line in content.lines() {
+    // Streamed line by line: an append-only log is unbounded, and holding it
+    // whole only to aggregate one line at a time made allocation scale with it.
+    for raw_line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
+        let Ok(raw_line) = raw_line.inspect_err(|e| {
+            tracing::trace!("metrics: stopped reading audit log {}: {e}", path.display());
+        }) else {
+            break;
+        };
         rollup.total_lines += 1;
         let line = raw_line.trim();
         if line.is_empty() {
@@ -879,8 +900,8 @@ fn read_events_jsonl(
     rollup: &mut Rollup,
     dedup: &mut RuntimeEventDedup,
 ) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) => {
             tracing::trace!(
                 "metrics: could not read events file {}: {}",
@@ -891,7 +912,16 @@ fn read_events_jsonl(
         }
     };
 
-    for raw_line in content.lines() {
+    // Streamed like the audit log: allocation follows one line, not the file.
+    for raw_line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
+        let Ok(raw_line) = raw_line.inspect_err(|e| {
+            tracing::trace!(
+                "metrics: stopped reading events file {}: {e}",
+                path.display()
+            );
+        }) else {
+            break;
+        };
         rollup.total_lines += 1;
         let line = raw_line.trim();
         if line.is_empty() {
@@ -1756,6 +1786,27 @@ mod tests {
     fn parse_since_error_on_invalid() {
         assert!(parse_since("xyz").is_err());
         assert!(parse_since("").is_err());
+    }
+
+    #[test]
+    fn parse_since_rejects_bare_unit() {
+        let err = parse_since("d").unwrap_err().to_string();
+        assert!(err.contains("no number"), "{err}");
+    }
+
+    #[test]
+    fn parse_since_rejects_overflow_without_panicking() {
+        // n * factor overflows i64.
+        let err = parse_since("106751991167301d").unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+        // Sum of components overflows i64.
+        assert!(parse_since("9223372036854775807s1s").is_err());
+        // Fits in i64 seconds but exceeds TimeDelta's range.
+        assert!(parse_since("9223372036854775807").is_err());
+        // Valid TimeDelta, but before the earliest representable DateTime.
+        assert!(parse_since("100000000000d").is_err());
+        // Component too large to parse as i64.
+        assert!(parse_since("99999999999999999999h").is_err());
     }
 
     // ── fmt_num ──

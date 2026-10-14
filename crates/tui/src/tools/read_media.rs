@@ -325,7 +325,7 @@ pub(crate) async fn execute_read_media(
             // Read-back fallback for tool-owned stored originals: the store
             // only holds image bytes that already passed the guards above,
             // named by content hash, so admitting it widens nothing.
-            match context
+            let stored = context
                 .runtime
                 .media_originals_dir
                 .as_deref()
@@ -335,8 +335,20 @@ pub(crate) async fn execute_read_media(
                         &context.workspace,
                         dir,
                     )
-                }) {
+                });
+            match stored {
                 Some(path) => path,
+                // An image the user attached from outside the workspace
+                // (a dropped screenshot in a temp directory) stays viewable.
+                None if matches!(primary_err, ToolError::PathEscape { .. }) => {
+                    crate::tools::file::user_attached_image_read_path(
+                        context,
+                        path_str,
+                        "read_media",
+                    )
+                    .await?
+                    .ok_or(primary_err)?
+                }
                 None => return Err(primary_err),
             }
         }
@@ -969,6 +981,25 @@ fn encode_within_budget(
     Err(over_budget_error(path, budget, smallest))
 }
 
+/// Fit `image` to `max_edge` and encode it within `budget` on the same ladder
+/// `read_media` delivers with. Attach-time ingest (`image_attach`) shares it,
+/// so a pasted Retina screenshot is normalized exactly like a tool read.
+pub(crate) fn fit_and_encode(
+    image: &DynamicImage,
+    max_edge: u32,
+    budget: usize,
+    path: &std::path::Path,
+) -> Result<(Vec<u8>, &'static str), ToolError> {
+    let (width, height) = image.dimensions();
+    let fitted = if width.max(height) > max_edge {
+        image.resize(max_edge, max_edge, FilterType::Lanczos3)
+    } else {
+        image.clone()
+    };
+    let outcome = encode_within_budget(&fitted, classify_image(&fitted), budget, path)?;
+    Ok((outcome.bytes, outcome.mime))
+}
+
 /// Fail-closed error naming the exact conversion recipe to retry with.
 fn over_budget_error(
     path: &std::path::Path,
@@ -1473,6 +1504,7 @@ mod tests {
             codewhale_models::Message {
                 role: Role::Assistant,
                 content: vec![codewhale_models::ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call_read_media".to_string(),
                     name: "read_media".to_string(),
                     input: json!({ "path": "wire.png" }),
@@ -1483,6 +1515,7 @@ mod tests {
             codewhale_models::Message {
                 role: Role::User,
                 content: vec![codewhale_models::ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_read_media".to_string(),
                     content: rich.content.clone(),
                     is_error: None,

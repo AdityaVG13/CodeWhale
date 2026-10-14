@@ -33,7 +33,8 @@ use super::candidate::{
 };
 use super::capabilities::{
     RouteCapabilities, documented_deepseek_files_api_for_route,
-    documented_moonshot_web_search_for_route, documented_zai_web_search_for_route,
+    documented_deepseek_image_input_for_route, documented_moonshot_web_search_for_route,
+    documented_zai_web_search_for_route,
 };
 use super::descriptor::ProviderDescriptor;
 use super::errors::RouteError;
@@ -117,8 +118,8 @@ impl RouteResolver {
     ///
     /// The default offerings are the committed Models.dev-shaped catalog asset
     /// (`crate::catalog::bundled_catalog_offerings`, real context windows and
-    /// honest per-row `cost`) merged with the tiny hand seam
-    /// ([`bundled_offerings`]). The hand seam is kept and given precedence on a
+    /// honest per-row `cost`) merged with the reviewed transport projection
+    /// ([`bundled_offerings`]). The reviewed projection is given precedence on a
     /// `(provider, wire id)` collision: it encodes the curated canonical-model
     /// joins the route invariants depend on (e.g. a DeepSeek-native row and the
     /// aggregator rows that map a prefixed wire id back to `deepseek-v4-pro`),
@@ -463,6 +464,18 @@ impl RouteResolver {
                 selected.wire_model_id.as_str(),
                 effective_base_url,
             );
+            // Flash accepts images on every official DeepSeek dialect,
+            // including the Messages route the curated rows do not cover.
+            // Only ever widens: an official Pro row keeps its documented
+            // `Unsupported`, a custom host keeps its cleared `Unknown`.
+            if documented_deepseek_image_input_for_route(
+                provider_kind,
+                selected.wire_model_id.as_str(),
+                effective_base_url,
+            ) == super::CapabilityState::Supported
+            {
+                selected.capabilities.image_input = super::CapabilityState::Supported;
+            }
         }
 
         let protocol = descriptor

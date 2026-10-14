@@ -2,7 +2,7 @@
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
 #[cfg(test)]
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::tui::app::{App, AppAction};
 use codewhale_localization::MessageId;
 
@@ -107,7 +107,7 @@ mod tests {
 
     fn test_app() -> App {
         let options = TuiOptions {
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
     }
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             result.action,
             Some(AppAction::OpenProviderSetup {
-                provider: Some(ApiProvider::Anthropic)
+                provider: Some(ProviderKind::Anthropic.as_str().into())
             })
         );
         assert!(result.message.is_none());

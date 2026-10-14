@@ -1,53 +1,68 @@
 import type { DocsComputersDict } from "../types";
 
-/**
- * Simplified-Chinese dictionary for `app/[locale]/docs/computers/page.tsx`.
- * Statements trace to docs/DAYTONA_CLOUD_DISPATCH.md and docs/CODEWHALE_AGENT.md.
- */
+/** 「把任务发送到云端」页的简体中文词典；与 `en/docs-computers.ts` 逐段对应。 */
 export const docsComputers: DocsComputersDict = {
-  metaTitle: "云端计算机 · Codewhale 文档",
+  metaTitle: "把任务发送到云端 · Codewhale 文档",
   metaDescription:
-    "本地 Codewhale 会话如何在 Daytona 计算机上提议、确认并跟踪一个云端 Agent——显式指定代码托管平台、凭证缺失即拒绝，以及哪些部分尚未实现。",
+    "把编码任务交给 Codewhale 云端智能体，通过你的账户运行——先报价，只有你同意后才会开始。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  overviewTitle: "云端计算机",
-  overviewLead:
-    "本地会话可以把一项编码任务卸载到云端计算机，就像编辑器派出一个云端 Agent：远程任务创建分支，并计划向明确指定的代码托管平台发起 pull request。本地保持响应。花费与推送不会悄悄发生——先写入提议，在你确认之前不会创建沙箱，也不会推送分支。",
-  proposeTitle: "先提议，再确认",
-  proposeLead:
-    "第一条命令写入提议并退出。第二条按 id 确认。TUI 中有同样的两步斜杠命令，{cloudAgent} 是 {dispatch} 的别名。",
-  jobsLead: "云端任务作为 {kind} 在现有的任务面板上是一等公民。可以在 TUI 或 CLI 中列出、查看和取消：",
-  remotesTitle: "显式指定托管平台",
-  remotesLead:
-    "远程仓库不会被默认当作 GitHub。以平台命名的远程就是该平台；其他远程按 URL 主机判定。如果存在多个平台，请传入 {remoteFlag}。",
-  remotes: [
-    ["github · cnb · gitee（按远程名）", "对应平台，与 URL 无关"],
-    ["origin 或其他 → github.com", "github"],
-    ["origin 或其他 → cnb.cool", "cnb"],
-    ["origin 或其他 → gitee.com", "gitee"],
+  title: "把任务发送到云端",
+  lede:
+    "云端智能体会把任务从你的机器上接走：它在云端算力上工作，你则可以继续在本地工作。在你看过报价并同意之前，不会启动任何东西。",
+  sections: [
+    {
+      id: "status",
+      title: "了解目前的完成度",
+      blocks: [
+        {
+          note: "云端智能体目前是预览版。任务通过你已登录的 Codewhale 账户运行，因此下文的报价和计算位置确认适用于每个任务。",
+        },
+      ],
+    },
+    {
+      id: "before",
+      title: "开始之前",
+      blocks: [
+        {
+          list: [
+            "用 `codewhale login` 登录你的 Codewhale 账户。派发任务始终通过已登录的账户运行。",
+          ],
+        },
+      ],
+    },
+    {
+      id: "send",
+      title: "先报价、再确认、后运行",
+      blocks: [
+        {
+          code: `codewhale dispatch "fix the flaky login test and open a PR"`,
+          lang: "终端",
+        },
+        {
+          p: "Codewhale 会显示你账户的任务时长报价，并请你确认仓库代码和你附加的文件将在欧盟计算资源上运行。在你同意之前不会启动任何任务。脚本中可传入 `--yes --confirm-eu-compute` 一次性回答这两个问题。",
+        },
+        {
+          p: "用 `--seconds` 设置任务时长，用 `--agent` 选择智能体，用 `--context-file` 或 `--file` 附加上下文。",
+        },
+      ],
+    },
   ],
-  enableTitle: "启用 Daytona 计算机",
-  enableLead: "凭证只存在于进程环境或 Codewhale 密钥存储中——绝不写进 config.toml 或 models.toml，也绝不提交到仓库。",
-  enableSteps: [
-    ["创建 API 密钥", "在 Daytona 控制台的 API keys 页面。"],
-    ["为本次会话导出", "{apiKey}；如需非默认端点，可选设置 {apiUrl}。"],
-    ["或一次性保存", "存入 Codewhale 密钥槽 {slot}（OS 钥匙串或 $CODEWHALE_HOME 密钥文件）。也接受 {alias} 别名。"],
+  next: [
+    {
+      href: "/docs/auth",
+      label: "连接模型提供商",
+      note: "登录 Codewhale 账户并管理密钥。",
+    },
+    {
+      href: "/docs/review",
+      label: "查看改动",
+      note: "合并之前，先审查智能体提交的拉取请求。",
+    },
+    {
+      href: "/docs/fleet",
+      label: "运行工作流",
+      note: "改为在你自己的机器上运行更长的多步骤工作。",
+    },
   ],
-  cliNote: "安装了 daytona CLI 并不等于有凭证。{status} 和不带参数的 {bare} 会分别报告 CLI 是否存在与凭证是否存在。",
-  rulesTitle: "缺失即拒绝的规则",
-  rules: [
-    ["未确认", "写入 {proposed} 任务；命令成功退出；不调用 Daytona；不推送任何内容。"],
-    ["已确认但无凭证", "写入 {refused} 任务；命令失败退出；不存在沙箱。"],
-    ["已确认且有凭证", "创建 Daytona 沙箱，并以任务 id 和平台打标签。此版本不会声称任何 GitHub、CNB 或 Gitee 的 PR 地址；缺少平台令牌时同样拒绝。"],
-  ],
-  membershipTitle: "谁可以派发",
-  membershipLead:
-    "托管 Agent 界面使用同一个 Codewhale 会员身份认证——即 {login} 的账户会话。会员资格决定云端 Agent，而不是本地派发：只要有 Daytona 与托管平台凭证，`codewhale dispatch` 无需账户即可运行。提供商品牌保持内部不可见，安装和运行本地 Runtime 完全不需要账户。",
-  leftoverTitle: "尚未实现",
-  leftover: [
-    ["实时查看", "正在运行的沙箱的日志跟随。"],
-    ["真正的取消", "从任务面板销毁付费的 Daytona 沙箱。"],
-    ["自动决定", "Codewhale 可以提议派发，但不能自己确认自己的提议。"],
-    ["远程执行器", "真正创建分支并发起 pull request 的 Agent。"],
-  ],
-  sourceNote: "源文档：docs/DAYTONA_CLOUD_DISPATCH.md、docs/CODEWHALE_AGENT.md · 修改时请同步更新 docs-map.ts。",
+  sourceNote: "来源文档：docs/GUIDE.md、docs/CODEWHALE_AGENT.md · 修改时同步更新 docs-map.ts。",
 };

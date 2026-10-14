@@ -15,7 +15,14 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 mod command_catalog;
+#[cfg(unix)]
+mod control_socket_selection;
 mod headless_catalog;
+#[cfg(unix)]
+mod owner_bootstrap;
+mod profile_constitution;
+#[cfg(any(unix, windows))]
+mod runtime_store_convergence;
 mod workspace_instructions;
 
 /// Scale a wait budget for shared CI runners.
@@ -81,11 +88,13 @@ fn web_launcher_failure_is_a_recoverable_manual_bootstrap_warning() {
 fn provider_default_model_cases() -> Vec<(&'static str, Config, &'static str)> {
     let deepseek = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("deepseek-test-key".to_string()),
-        base_url: Some("http://127.0.0.1:1/v1".to_string()),
         default_text_model: Some("deepseek-v4-flash".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("deepseek-test-key".to_string()),
+        Some("http://127.0.0.1:1/v1".to_string()),
+    );
 
     let mut zai_providers = crate::config::ProvidersConfig::default();
     zai_providers.zai.api_key = Some("zai-test-key".to_string());
@@ -159,6 +168,7 @@ async fn http_and_web_server_thread_manager_installs_configured_workshop_byte_bu
         RuntimeThreadManagerConfig {
             data_dir: temp.path().join("runtime"),
             task_data_dir: temp.path().join("tasks"),
+            sessions_dir: None,
             max_active_threads: 2,
         },
         Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
@@ -309,6 +319,7 @@ fn saved_session_with_blocks(blocks: Vec<codewhale_models::ContentBlock>) -> Sav
         work_state: None,
         window_title: None,
         last_auto_route: None,
+        turn_outcomes: Vec::new(),
     }
 }
 
@@ -369,6 +380,7 @@ fn session_detail_scenario() {
     {
         let detail = session_to_detail(saved_session_with_blocks(vec![
             codewhale_models::ContentBlock::ToolUse {
+                execution_id: Some("host-display-only".into()),
                 id: "tool-1".to_string(),
                 name: "task_shell_start".to_string(),
                 input: json!({ "cmd": "cargo test" }),
@@ -382,6 +394,10 @@ fn session_detail_scenario() {
 
         let block = &detail.messages[0]["content"][0];
         assert_eq!(block["type"].as_str(), Some("tool_use"));
+        assert!(
+            block.get("execution_id").is_none(),
+            "detail remains a display projection"
+        );
         assert_eq!(block["caller"]["type"].as_str(), Some("subagent"));
         assert_eq!(block["caller"]["tool_id"].as_str(), Some("parent-tool"));
     }
@@ -389,6 +405,7 @@ fn session_detail_scenario() {
     {
         let detail = session_to_detail(saved_session_with_blocks(vec![
             codewhale_models::ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "tool-1".to_string(),
                 content: "fallback text".to_string(),
                 is_error: Some(false),
@@ -440,6 +457,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         saved_session_checkpoint: None,
     };
     let turn = TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: 2,
         id: turn_id.clone(),
@@ -452,6 +470,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         duration_ms: Some(0),
         usage: None,
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: Some("ask".to_string()),
@@ -480,6 +499,9 @@ fn messages_from_thread_detail_batches_tool_results() {
         ],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
+        workspace_snapshots: Vec::new(),
     };
     let item = |id: &str,
                 kind: TurnItemKind,
@@ -496,6 +518,7 @@ fn messages_from_thread_detail_batches_tool_results() {
             detail: detail.map(str::to_string),
             metadata,
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(now),
             ended_at: Some(now),
         }
@@ -564,9 +587,10 @@ fn messages_from_thread_detail_batches_tool_results() {
         pending_approvals: Vec::new(),
         pending_user_inputs: Vec::new(),
         pending_dynamic_tool_calls: Vec::new(),
+        approval_grants: Vec::new(),
     };
 
-    let messages = messages_from_thread_detail(&detail);
+    let messages = messages_from_thread_detail(&detail).expect("rebuild thread history");
     let roles = messages
         .iter()
         .map(|message| message.role.as_str())
@@ -579,6 +603,7 @@ fn messages_from_thread_detail_batches_tool_results() {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             assert_eq!(tool_use_id, "tool-1");
             assert_eq!(content, "one");
@@ -598,6 +623,7 @@ fn messages_from_thread_detail_batches_tool_results() {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             assert_eq!(tool_use_id, "tool-2");
             assert_eq!(content, "two");
@@ -644,6 +670,7 @@ fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
         pending_approvals: Vec::new(),
         pending_user_inputs: Vec::new(),
         pending_dynamic_tool_calls: Vec::new(),
+        approval_grants: Vec::new(),
     };
     let config = Config {
         provider: Some("lm-studio".to_string()),
@@ -761,6 +788,28 @@ fn runtime_token_scenario() {
 
         assert_eq!(environment.token.as_deref(), Some("legacy-token"));
         assert!(environment.legacy_alias_used);
+    }
+}
+
+/// Port 0 lets a supervised loopback Runtime own an ephemeral endpoint and
+/// report it. Anything a client is handed a fixed address for keeps a real port.
+#[test]
+fn ephemeral_port_is_only_for_a_plain_loopback_runtime() {
+    let ephemeral = |host: &str, web: bool, mobile: bool| RuntimeApiOptions {
+        host: host.to_string(),
+        port: 0,
+        web,
+        mobile,
+        ..RuntimeApiOptions::default()
+    };
+    assert!(validate_runtime_listener_security(&ephemeral("127.0.0.1", false, false)).is_ok());
+    for refused in [
+        ephemeral("0.0.0.0", false, false),
+        ephemeral("127.0.0.1", true, false),
+        ephemeral("127.0.0.1", false, true),
+    ] {
+        let err = validate_runtime_listener_security(&refused).unwrap_err();
+        assert!(err.to_string().contains("Port must be > 0"), "{err}");
     }
 }
 
@@ -940,10 +989,22 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
 
 #[derive(Default)]
 struct TestServerOverrides {
+    automation_handles: Option<
+        oneshot::Sender<(
+            crate::automation_manager::SharedAutomationManager,
+            crate::task_manager::SharedTaskManager,
+        )>,
+    >,
+    /// Publish the exact manager using the production owner/frontend factory.
+    owner_socket: Option<PathBuf>,
+    /// Capture the actual owner's service table for cache/lifetime assertions.
+    workspace_scopes_handle: Option<oneshot::Sender<Arc<RuntimeWorkspaceScopes>>>,
     sub_agent_manager: Option<SharedSubAgentManager>,
     fleet_codewhale_binary: Option<String>,
     config: Option<Config>,
     config_path: Option<PathBuf>,
+    /// Observe the exact loaded config shared with the HTTP handlers.
+    config_handle: Option<Arc<parking_lot::RwLock<Config>>>,
     config_profile: Option<String>,
     mobile: Option<mobile::RuntimeMobileState>,
     web: Option<web::RuntimeWebState>,
@@ -951,6 +1012,10 @@ struct TestServerOverrides {
     plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
     /// Pre-seeded workspace LSP manager (test transports, disabled configs).
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
+    /// Engine LRU capacity; `None` keeps the fixture default of 8.
+    max_active_threads: Option<usize>,
+    /// Stops the server through the product's own graceful-shutdown path.
+    shutdown: Option<RuntimeServerShutdown>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -1065,17 +1130,23 @@ fn spawn_product_stack_server(
     runtime_token: Option<String>,
     mobile_enabled: bool,
     workspace: PathBuf,
-    overrides: TestServerOverrides,
+    mut overrides: TestServerOverrides,
     env_ticket: Option<crate::test_support::EnvScopeTicket>,
     setup_tx: oneshot::Sender<Result<Option<TestServerSetup>>>,
 ) {
+    let shutdown = overrides
+        .shutdown
+        .get_or_insert_with(RuntimeServerShutdown::default)
+        .clone();
+    let catalog = crate::command_catalog::installed();
     std::thread::Builder::new()
         .name("runtime-api-test-server".to_string())
-        .stack_size(crate::CODEWHALE_MAIN_STACK_BYTES)
+        .stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES)
         .spawn(move || {
             // Adopted for the thread's lifetime; the scope's generation check
             // refuses enrollment once the sealing test has ended.
             let _membership = crate::test_support::join_env_scope(env_ticket);
+            let _catalog = catalog.map(crate::command_catalog::CatalogGuard::install);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1091,7 +1162,7 @@ fn spawn_product_stack_server(
                 )
                 .await
                 {
-                    Ok(Some((listener, app, addr, runtime_threads))) => {
+                    Ok(Some((listener, app, addr, runtime_threads, owner_frontend))) => {
                         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                         if setup_tx
                             .send(Ok(Some((addr, runtime_threads, shutdown_tx))))
@@ -1105,15 +1176,30 @@ fn spawn_product_stack_server(
                             .expect("nonblocking test listener");
                         let listener =
                             TcpListener::from_std(listener).expect("register test listener");
+                        // Stop the owner the way the product does: trigger its
+                        // shutdown and await it while this runtime is alive, so
+                        // the owner receipt is retired before the thread exits.
+                        let owner_handle =
+                            owner_frontend.as_ref().map(|owner| owner.shutdown_handle());
+                        let mut owner_task =
+                            owner_frontend.map(|owner| tokio::spawn(owner.serve()));
                         tokio::select! {
-                            _ = async {
-                                let _ = axum::serve(
-                                    listener,
-                                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                                )
-                                .await;
-                            } => {}
+                            _ = serve_runtime_api(listener, app, shutdown) => {}
                             _ = shutdown_rx => {}
+                            _ = async {
+                                match owner_task.as_mut() {
+                                    Some(task) => { let _ = task.await; }
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                owner_task = None;
+                            }
+                        }
+                        if let Some(handle) = owner_handle {
+                            handle.trigger();
+                        }
+                        if let Some(task) = owner_task {
+                            let _ = task.await;
                         }
                     }
                     Ok(None) => {
@@ -1144,6 +1230,7 @@ async fn build_test_server(
         axum::Router,
         SocketAddr,
         SharedRuntimeThreadManager,
+        Option<codewhale_app_server::daemon_socket::DaemonSocket>,
     )>,
 > {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1155,10 +1242,12 @@ async fn build_test_server(
         Config::load(Some(path), None)?
     } else {
         Config {
-            api_key: Some("runtime-api-test-key".to_string()),
-            base_url: Some("http://127.0.0.1:1/v1".to_string()),
             ..Config::default()
         }
+        .with_legacy_root(
+            Some("runtime-api-test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+        )
     };
     config.mcp_config_path = Some(root.join("mcp.json").to_string_lossy().to_string());
     let manager = TaskManager::start_with_executor(
@@ -1184,14 +1273,19 @@ async fn build_test_server(
         RuntimeThreadManagerConfig {
             data_dir: root.join("runtime/runtime"),
             task_data_dir: root.join("runtime"),
-            max_active_threads: 8,
+            sessions_dir: Some(sessions_dir.clone()),
+            max_active_threads: overrides.max_active_threads.unwrap_or(8),
         },
     )?);
+    let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
     runtime_threads.attach_task_manager(manager.clone());
     let automations = Arc::new(Mutex::new(AutomationManager::open_for_test(
         root.join("automations"),
     )?));
     runtime_threads.attach_automation_manager(automations.clone());
+    if let Some(sender) = overrides.automation_handles {
+        let _ = sender.send((automations.clone(), manager.clone()));
+    }
 
     let auth_required = runtime_token.is_some();
     let sub_agent_manager = overrides
@@ -1214,8 +1308,23 @@ async fn build_test_server(
     } else {
         None
     };
+    let config = if let Some(handle) = overrides.config_handle {
+        *handle.write() = config;
+        handle
+    } else {
+        Arc::new(parking_lot::RwLock::new(config))
+    };
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
+    if let Some(sender) = overrides.workspace_scopes_handle {
+        let _ = sender.send(workspace_scopes.clone());
+    }
+    if let Some(manager) = overrides.lsp_manager {
+        let _ = workspace_scope.lsp.set(manager);
+    }
     let state = RuntimeApiState {
-        config: Arc::new(parking_lot::RwLock::new(config)),
+        config,
         workspace,
         plugin_discovery: overrides
             .plugin_discovery
@@ -1226,7 +1335,8 @@ async fn build_test_server(
         sessions_dir,
         config_path: overrides.config_path.clone(),
         config_profile: overrides.config_profile,
-        mcp_pool: Arc::new(Mutex::new(None)),
+        workspace_scopes,
+        workspace_scope,
         automations,
         sub_agent_manager,
         runtime_token,
@@ -1242,17 +1352,31 @@ async fn build_test_server(
         fleet_codewhale_binary: overrides
             .fleet_codewhale_binary
             .unwrap_or_else(configured_codewhale_binary),
-        lsp_manager: {
-            let cell = std::sync::OnceLock::new();
-            if let Some(manager) = overrides.lsp_manager {
-                let _ = cell.set(manager);
-            }
-            Arc::new(cell)
-        },
+        computer: super::computer_display::ComputerState::from_env(),
+        shutdown: overrides.shutdown.clone().unwrap_or_default(),
+        git_writes: Arc::new(tokio::sync::Mutex::new(())),
+        provider_switches: Arc::new(tokio::sync::Mutex::new(())),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
-    let app = build_router(state);
-    Ok(Some((listener, app, addr, runtime_threads)))
+    let (owner_frontend, compatibility) = if let Some(socket) = overrides.owner_socket {
+        let model = runtime_request_model(&state.config.read(), None)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let (owner, compatibility) =
+            bind_captured_runtime_frontends(&state, Some(socket), model, 1, false, None).await?;
+        (Some(owner), Some(compatibility))
+    } else {
+        (None, None)
+    };
+    let mut app = build_router(state.clone());
+    if let Some(compatibility) = compatibility {
+        app = app.merge(codewhale_app_server::runtime_compatibility_router(
+            compatibility,
+            &state.cors_origins,
+            state.runtime_token.clone(),
+            Some(state.workspace.clone()),
+        ));
+    }
+    Ok(Some((listener, app, addr, runtime_threads, owner_frontend)))
 }
 
 async fn spawn_test_server() -> Result<
@@ -1461,6 +1585,9 @@ fn parse_sse_frame(frame: &str) -> Result<(String, serde_json::Value)> {
     Ok((event_name, payload))
 }
 
+/// Polls until the turn is terminal. `timeout` only bounds how long a stuck
+/// turn takes to fail the test, so keep it generous: a loaded shared-process
+/// `cargo test` run can take seconds to settle a mock turn (#6698).
 async fn wait_for_terminal_turn_status(
     client: &reqwest::Client,
     addr: SocketAddr,
@@ -1907,6 +2034,7 @@ async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result
         )
         .await?
     else {
+        tracing::warn!("needs socket run: loopback listener is unavailable");
         return Ok(());
     };
     let client = crate::tls::reqwest_client_builder()
@@ -1953,13 +2081,13 @@ async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result
         .send()
         .await?;
     assert_eq!(exchange.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        exchange
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|value| value.to_str().ok()),
-        Some("/")
-    );
+    let proof = exchange
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|location| location.strip_prefix("/#p="))
+        .context("missing bootstrap request proof")?
+        .to_string();
     let set_cookie = exchange
         .headers()
         .get(header::SET_COOKIE)
@@ -1969,6 +2097,7 @@ async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result
     assert!(set_cookie.starts_with("codewhale_web_session=cwws_"));
     assert!(set_cookie.ends_with("; HttpOnly; SameSite=Strict; Path=/"));
     assert!(!set_cookie.contains(&token));
+    assert!(!set_cookie.contains(&proof));
 
     let unauthorized = client
         .get(format!("http://{addr}/v1/threads/summary"))
@@ -1980,9 +2109,40 @@ async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result
         .split(';')
         .next()
         .context("missing web session cookie pair")?;
+    for site in ["same-origin", "none"] {
+        let reloaded = client
+            .get(format!("http://{addr}/"))
+            .header(header::COOKIE, cookie_pair)
+            .header("sec-fetch-site", site)
+            .send()
+            .await?;
+        assert_eq!(reloaded.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(reloaded.text().await?.contains(&format!(
+            "name=\"codewhale-web-request\" content=\"{proof}\""
+        )));
+    }
+    for method in [reqwest::Method::GET, reqwest::Method::POST] {
+        for metadata in [false, true] {
+            for presented in [None, Some("wrong-proof")] {
+                let mut request = client
+                    .request(method.clone(), format!("http://{addr}/v1/threads"))
+                    .header(header::COOKIE, cookie_pair);
+                if metadata {
+                    request = request
+                        .header(header::ORIGIN, format!("http://{addr}"))
+                        .header("sec-fetch-site", "same-origin");
+                }
+                if let Some(proof) = presented {
+                    request = request.header(web::WEB_REQUEST_HEADER, proof);
+                }
+                assert_eq!(request.send().await?.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
     let authorized = client
         .get(format!("http://{addr}/v1/threads/summary"))
         .header(header::COOKIE, cookie_pair)
+        .header(web::WEB_REQUEST_HEADER, &proof)
         .send()
         .await?;
     assert_eq!(authorized.status(), StatusCode::OK);
@@ -1990,6 +2150,7 @@ async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result
     let same_origin_cookie_post = client
         .post(format!("http://{addr}/v1/threads"))
         .header(header::COOKIE, cookie_pair)
+        .header(web::WEB_REQUEST_HEADER, &proof)
         .header(header::ORIGIN, format!("http://{addr}"))
         .header("sec-fetch-site", "same-origin")
         .json(&json!({}))
@@ -1997,9 +2158,33 @@ async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result
         .await?;
     assert_eq!(same_origin_cookie_post.status(), StatusCode::CREATED);
 
+    let created: Value = same_origin_cookie_post.json().await?;
+    let thread_id = created["id"].as_str().context("thread id")?;
+    let ticket_response = client
+        .post(format!("http://{addr}/__codewhale/web/stream-ticket"))
+        .header(header::COOKIE, cookie_pair)
+        .header(web::WEB_REQUEST_HEADER, &proof)
+        .header(header::ORIGIN, format!("http://{addr}"))
+        .send()
+        .await?;
+    assert_eq!(ticket_response.status(), StatusCode::OK);
+    let ticket: Value = ticket_response.json().await?;
+    let ticket = ticket["stream_ticket"].as_str().context("stream ticket")?;
+    let stream_url =
+        format!("http://{addr}/v1/threads/{thread_id}/events?web_stream_ticket={ticket}");
+    for expected in [StatusCode::OK, StatusCode::UNAUTHORIZED] {
+        let stream = client
+            .get(&stream_url)
+            .header(header::COOKIE, cookie_pair)
+            .send()
+            .await?;
+        assert_eq!(stream.status(), expected);
+    }
+
     let cross_origin_cookie_post = client
         .post(format!("http://{addr}/v1/threads"))
         .header(header::COOKIE, cookie_pair)
+        .header(web::WEB_REQUEST_HEADER, &proof)
         .header(header::ORIGIN, "http://127.0.0.1:3000")
         .header("sec-fetch-site", "same-site")
         .json(&json!({}))
@@ -2268,9 +2453,25 @@ async fn workspace_file_search_auth_matching_and_bounds() -> Result<()> {
 
 #[tokio::test]
 async fn workspace_and_automation_endpoints_work() -> Result<()> {
-    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+    let root = tempfile::tempdir()?;
+    let (automation_tx, automation_rx) = oneshot::channel();
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.path().to_path_buf(),
+            root.path().join("sessions"),
+            None,
+            false,
+            root.path().join("workspace"),
+            TestServerOverrides {
+                automation_handles: Some(automation_tx),
+                ..Default::default()
+            },
+        )
+        .await?
+    else {
         return Ok(());
     };
+    let (automations, tasks) = automation_rx.await?;
     let client = crate::tls::reqwest_client();
 
     let workspace: serde_json::Value = client
@@ -2371,6 +2572,48 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
         "expected at least one run entry"
     );
 
+    // The admitted occurrence must survive deletion until its real task and
+    // the production scheduler have settled its durable run receipt.
+    let refused = client
+        .delete(format!("http://{addr}/v1/automations/{automation_id}"))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await?.contains("still active"));
+    let task_id = run_now["task_id"].as_str().context("missing task id")?;
+    let run_id = run_now["id"].as_str().context("missing run id")?;
+    let task = crate::task_manager::wait_for_terminal_state(
+        &tasks,
+        task_id,
+        ci_scaled(Duration::from_secs(15)),
+    )
+    .await?;
+    assert_eq!(task.status, crate::task_manager::TaskStatus::Completed);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let scheduler = spawn_scheduler(
+        automations.clone(),
+        tasks,
+        cancel.clone(),
+        crate::automation_manager::AutomationSchedulerConfig::default(),
+    );
+    tokio::time::timeout(ci_scaled(Duration::from_secs(15)), async {
+        loop {
+            let runs = automations.lock().await.list_runs(&automation_id, None)?;
+            if runs.iter().any(|run| {
+                run.id == run_id
+                    && run.status == crate::automation_manager::AutomationRunStatus::Completed
+            }) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("automation scheduler did not settle the completed task")??;
+    cancel.cancel();
+    scheduler.await?;
+
     let _deleted: serde_json::Value = client
         .delete(format!("http://{addr}/v1/automations/{automation_id}"))
         .send()
@@ -2385,6 +2628,12 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
         .await?
         .status();
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    let archived = automations
+        .lock()
+        .await
+        .list_archived_runs(&automation_id)?;
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].task_id.as_deref(), Some(task_id));
 
     handle.abort();
     Ok(())
@@ -2397,10 +2646,10 @@ fn test_fleet_route_config() -> crate::config::Config {
     providers.zai.api_key = Some("test-key".to_string());
     crate::config::Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("test-key".to_string()),
         providers: Some(providers),
         ..crate::config::Config::default()
     }
+    .with_legacy_root(Some("test-key".to_string()), None)
 }
 
 #[tokio::test]
@@ -2697,6 +2946,7 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             worker_id: "agent_receipt".to_string(),
             run_id: "run_receipt".to_string(),
             parent_run_id: Some("parent_run".to_string()),
+            workflow_run_id: None,
             session_name: Some("receipt_lane".to_string()),
             objective: "Verify run receipt projection".to_string(),
             role: Some("verifier".to_string()),
@@ -2754,6 +3004,9 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             note: "not reported".to_string(),
         },
         usage_source_fingerprints: Default::default(),
+        missing_usage_sources: Default::default(),
+        missing_usage_overflowed: false,
+        legacy_unreported_usage: false,
         has_unreported_usage: false,
         delivery_evidence: Default::default(),
         verification: AgentRunVerificationSummary {
@@ -2766,6 +3019,7 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             tool: Some("handle_read".to_string()),
             reason: "Worker agent_receipt completed; verify its self-report.".to_string(),
         },
+        pending_request: None,
         status: AgentWorkerStatus::Completed,
         created_at_ms: 1,
         updated_at_ms: 2,
@@ -2819,6 +3073,14 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
         .json()
         .await?;
     assert_eq!(runs["runs"][0]["spec"]["run_id"], "run_receipt");
+    // F5: the payload carries the launch governor; a calm fleet has no line.
+    assert_eq!(runs["governor"]["paused"], false);
+    assert_eq!(runs["governor"]["recent_rate_limits"], 0);
+    assert_eq!(
+        runs["governor"]["launch_slots"],
+        runs["governor"]["max_launch_slots"]
+    );
+    assert!(runs["governor"].get("status").is_none());
     assert_eq!(runs["runs"][0]["follow_up"]["tool"], "handle_read");
     assert_eq!(
         runs["runs"][0]["verification"]["status"],
@@ -2842,6 +3104,177 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
         .await?
         .status();
     assert_eq!(missing, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_run_cancel_stops_a_live_child_and_returns_its_receipt() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-agent-run-cancel-{}", Uuid::new_v4()));
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let manager = crate::tools::subagent::new_shared_subagent_manager(workspace.clone(), 2);
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("stoppable", &workspace);
+        guard.assign_test_session_owner(&id, "session-stop");
+        id
+    };
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_subagents(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace,
+            Some(manager.clone()),
+            None,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let response = client
+        .post(format!("http://{addr}/v1/agent-runs/{agent_id}/cancel"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: serde_json::Value = response.json().await?;
+    assert_eq!(receipt["spec"]["worker_id"], agent_id.as_str());
+    assert_eq!(receipt["status"], "cancelled");
+    assert_eq!(
+        manager.read().await.get_result(&agent_id)?.status,
+        crate::tools::subagent::SubAgentStatus::Cancelled
+    );
+
+    // Stopping a stopped run is a no-op that answers with the same receipt.
+    let again = client
+        .post(format!("http://{addr}/v1/agent-runs/{agent_id}/cancel"))
+        .send()
+        .await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    let again: serde_json::Value = again.json().await?;
+    assert_eq!(again["status"], "cancelled");
+
+    let missing = client
+        .post(format!("http://{addr}/v1/agent-runs/missing/cancel"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(missing, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_run_cancel_remains_idempotent_before_receipt_persistence() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().to_path_buf();
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    // A memory-only manager deterministically models a disk projection that
+    // has not caught up. Repeated stops must use its authoritative receipt.
+    let manager = Arc::new(tokio::sync::RwLock::new(
+        crate::tools::subagent::SubAgentManager::new(workspace.clone(), 2),
+    ));
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("not-yet-persisted", &workspace);
+        guard.assign_test_session_owner(&id, "session-stop");
+        id
+    };
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_subagents(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace.clone(),
+            Some(manager),
+            None,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("http://{addr}/v1/agent-runs/{agent_id}/cancel"))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt: serde_json::Value = response.json().await?;
+        assert_eq!(receipt["spec"]["worker_id"], agent_id.as_str());
+        assert_eq!(receipt["status"], "cancelled");
+    }
+    assert!(
+        !workspace
+            .join(".codewhale/state/subagents.v1.json")
+            .exists()
+    );
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_run_cancel_refuses_a_run_owned_by_a_session_it_does_not_host() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-agent-run-cancel-foreign-{}",
+        Uuid::new_v4()
+    ));
+    let workspace = root.join("workspace");
+    fs::create_dir_all(workspace.join(".codewhale/state"))?;
+    // A child parked on a question in another terminal session: in flight on
+    // disk, but no engine in this runtime owns it.
+    let mut record = {
+        let manager = crate::tools::subagent::new_shared_subagent_manager(workspace.clone(), 1);
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("elsewhere", &workspace);
+        guard.assign_test_session_owner(&id, "terminal-session");
+        guard
+            .list_worker_records()
+            .into_iter()
+            .find(|record| record.spec.worker_id == id)
+            .expect("seeded record")
+    };
+    record.status = crate::tools::subagent::AgentWorkerStatus::WaitingForUser;
+    fs::write(
+        workspace.join(".codewhale/state/subagents.v1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "agents": [],
+            "workers": [record],
+        }))?,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/agent-runs/agent_elsewhere/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response.text().await?;
+    assert!(body.contains("not hosting"), "{body}");
 
     handle.abort();
     Ok(())
@@ -2937,6 +3370,7 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
                 turn_id: "mock_compat_handoff".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -3143,6 +3577,7 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
                 turn_id: "mock_compat_input".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await?;
         let request = crate::tools::user_input::UserInputRequest {
@@ -3167,6 +3602,11 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
         harness
             .tx_event
             .send(EngineEvent::ToolCallStarted {
+                model_call: Some(crate::core::events::ModelToolCall {
+                    provider_id: "input_compat".to_string(),
+                    caller: None,
+                    thought_signature: None,
+                }),
                 id: "input_compat".to_string(),
                 name: "request_user_input".to_string(),
                 input: serde_json::to_value(&request)?,
@@ -3192,6 +3632,7 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
         harness
             .tx_event
             .send(EngineEvent::ToolCallComplete {
+                model_call: None,
                 id: "input_compat".to_string(),
                 name: "request_user_input".to_string(),
                 result: Ok(tool_result),
@@ -3560,6 +4001,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
                             turn_id: "mock_lifecycle".to_string(),
                             created_at: chrono::Utc::now(),
                             route: None,
+                            submission_id: None,
                         })
                         .await;
                     let _ = tx_event
@@ -3766,9 +4208,19 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
     assert!(!serde_json::to_string(&first)?.contains("cwc-http-operation-1"));
 
     let replay_response = client.post(&url).json(&request).send().await?;
-    assert_eq!(replay_response.status(), StatusCode::CREATED);
+    // A replay acknowledges work already accepted rather than admitting new
+    // work: 200 plus an explicit flag, so a client that retried an ambiguous
+    // submit can tell it is looking at the turn it already started (#76).
+    assert_eq!(replay_response.status(), StatusCode::OK);
     let replay: serde_json::Value = replay_response.json().await?;
     assert_eq!(replay["turn"]["id"], first_turn_id);
+    assert_eq!(replay["idempotent_replay"], true);
+    // A fresh admission carries no flag, so the response every existing client
+    // already parses is byte-identical to before.
+    assert!(
+        first.get("idempotent_replay").is_none(),
+        "only a replay is marked as one: {first}"
+    );
 
     let mismatch = client
         .post(&url)
@@ -3836,7 +4288,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
     let workspace = dir.path().join("workspace");
     let token = "turn-lookup-local-fixture";
     let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
-    let _proxy = EnvVarGuard::set("NO_PROXY", "*");
+    let _proxy = EnvVarGuard::set("NO_PROXY", "*,127.0.0.1");
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace(
         root.clone(),
         sessions.clone(),
@@ -3941,6 +4393,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
             turn_id: "lookup-fixture-engine-turn".into(),
             created_at: chrono::Utc::now(),
             route: None,
+            submission_id: None,
         },
         EngineEvent::MessageStarted { index: 0 },
         EngineEvent::MessageDelta {
@@ -3992,15 +4445,32 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
     .await
     .context("old Runtime did not release its store before restart")?;
 
-    let (addr, _manager, server) = spawn_test_server_with_root_token_mobile_workspace(
-        root,
-        sessions,
-        Some(token.into()),
-        false,
-        workspace,
-    )
-    .await?
-    .context("loopback listener required for restarted lookup proof")?;
+    // The old server tears its runtime down on its own thread after the
+    // abort, so its mock TaskManager can hold the execution-scope owner lock
+    // a moment longer than the thread manager above. A second owner is
+    // correctly refused; wait for the release instead of racing it.
+    let deadline = tokio::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    let (addr, _manager, server) = loop {
+        match spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            sessions.clone(),
+            Some(token.into()),
+            false,
+            workspace.clone(),
+        )
+        .await
+        {
+            Err(error)
+                if format!("{error:#}").contains("execution scope is already owned")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(20)).await;
+            }
+            started => {
+                break started?.context("loopback listener required for restarted lookup proof")?;
+            }
+        }
+    };
     // Startup recovery is complete. No Engine is installed in this Runtime.
     let before = file_bytes(&store_root)?;
     let response = client
@@ -4058,6 +4528,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
                 turn_id: "mock_cursor".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -4101,7 +4572,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
         .to_string();
 
     let _ =
-        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(2))
+        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(10))
             .await?;
 
     let resp_a = client
@@ -4149,6 +4620,114 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
 
     handle.abort();
     Ok(())
+}
+
+/// The SSE `id:` a browser `EventSource` resumes from, and the `Last-Event-ID`
+/// header it replays with, against the same durable cursor `since_seq` uses.
+#[tokio::test]
+async fn thread_event_frames_carry_the_id_a_reconnect_resumes_from() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+
+    // Every journal frame carries its durable seq as the SSE id.
+    let first = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(first).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    let first_seq = payload
+        .get("seq")
+        .and_then(Value::as_u64)
+        .context("missing seq in first frame")?;
+    let id = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("id:"))
+        .map(str::trim)
+        .context("SSE frames must carry an id, or nothing can resume")?
+        .to_string();
+    assert_eq!(
+        id.parse::<u64>()?,
+        first_seq,
+        "the id is the durable seq, not a frame counter"
+    );
+
+    // A second durable event, so a resume has somewhere to land.
+    let second_seq = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "approval.required",
+            json!({"approval_id": "resume-proof", "tool_name": "exec_command"}),
+        )
+        .await?
+        .seq;
+    assert!(second_seq > first_seq, "the second event is later");
+
+    // The header alone is enough: a browser cannot set a query cursor.
+    let resumed = client
+        .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+        .header("Last-Event-ID", &id)
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(resumed).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    assert_eq!(
+        payload.get("seq").and_then(Value::as_u64),
+        Some(second_seq),
+        "Last-Event-ID must resume past the acknowledged frame"
+    );
+
+    // An explicit `since_seq` outranks the header, so a deliberate
+    // replay-from-zero is never silently overridden by a stale id.
+    let explicit = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .header("Last-Event-ID", &id)
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(explicit).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    assert_eq!(
+        payload.get("seq").and_then(Value::as_u64),
+        Some(first_seq),
+        "the query cursor wins over the header"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[test]
+fn last_event_id_accepts_only_decimal_cursors() {
+    use super::last_event_id;
+
+    let mut headers = axum::http::HeaderMap::new();
+    assert_eq!(last_event_id(&headers), None, "absent header is no cursor");
+
+    headers.insert("last-event-id", "42".parse().unwrap());
+    assert_eq!(last_event_id(&headers), Some(42));
+
+    headers.insert("last-event-id", " 7 ".parse().unwrap());
+    assert_eq!(last_event_id(&headers), Some(7), "whitespace is trimmed");
+
+    // An opaque id from a proxy or an older client opens the stream from the
+    // durable head instead of refusing to open it at all.
+    headers.insert("last-event-id", "fev1_abcdef".parse().unwrap());
+    assert_eq!(last_event_id(&headers), None);
 }
 
 #[tokio::test]
@@ -4214,6 +4793,7 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
         backlog_rx,
         live,
         false,
+        CancellationToken::new(),
     )
     .take(2);
     let body =
@@ -4281,6 +4861,7 @@ async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Res
         rx,
         live,
         true,
+        CancellationToken::new(),
     )
     .take(4);
     let body = tokio::time::timeout(
@@ -4297,13 +4878,13 @@ async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Res
     assert_eq!(frames.len(), 4);
     assert_eq!(
         frames[0].1,
-        json!({"event":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
+        json!({"schema_version":RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,"event":"stream.progress","kind":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
     );
     assert_eq!(frames[1].1["seq"], required.seq);
     assert_eq!(frames[2].1["seq"], answered.seq);
     assert_eq!(
         frames[3].1,
-        json!({"event":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
+        json!({"schema_version":RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,"event":"stream.progress","kind":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
     );
     assert_eq!(
         runtime_threads
@@ -4383,6 +4964,7 @@ async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() 
         backlog,
         live,
         true,
+        CancellationToken::new(),
     ));
     assert_eq!(
         sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
@@ -4434,6 +5016,413 @@ async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() 
     Ok(())
 }
 
+/// One rendered frame of a thread event stream: its SSE `id:` (if any), event
+/// name and JSON payload.
+type RenderedThreadFrame = (Option<String>, String, Value);
+
+fn parse_thread_frame(raw: &str) -> Result<RenderedThreadFrame> {
+    let id = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("id:"))
+        .map(|id| id.trim().to_string());
+    let (event, payload) = parse_sse_frame(raw)?;
+    Ok((id, event, payload))
+}
+
+/// Renders a thread event stream that must end on its own; a hang fails.
+async fn render_thread_stream(
+    stream: impl futures_util::Stream<Item = Result<SseEvent, Infallible>> + Send + 'static,
+) -> Result<Vec<RenderedThreadFrame>> {
+    let body = tokio::time::timeout(
+        ci_scaled(Duration::from_secs(5)),
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX),
+    )
+    .await
+    .context("a server-ended thread stream must close by itself")??;
+    String::from_utf8(body.to_vec())?
+        .split("\n\n")
+        .filter(|raw| !raw.trim().is_empty())
+        .map(parse_thread_frame)
+        .collect()
+}
+
+/// Reads an HTTP thread stream to EOF; a hang fails.
+async fn read_thread_stream_to_eof(
+    response: reqwest::Response,
+) -> Result<Vec<RenderedThreadFrame>> {
+    let body = tokio::time::timeout(ci_scaled(Duration::from_secs(10)), response.text())
+        .await
+        .context("the server must close the stream after stream.end")??;
+    body.split("\n\n")
+        .filter(|raw| !raw.trim().is_empty() && !raw.trim_start().starts_with(':'))
+        .map(parse_thread_frame)
+        .collect()
+}
+
+async fn next_thread_frame<S>(stream: &mut S) -> Result<Value>
+where
+    S: futures_util::Stream<Item = Result<SseEvent, Infallible>> + Unpin,
+{
+    let Ok(event) = tokio::time::timeout(ci_scaled(Duration::from_secs(5)), stream.next())
+        .await
+        .context("thread stream stalled")?
+        .context("thread stream ended without stream.end")?;
+    sse_frame_payload(event).await
+}
+
+fn expected_stream_end(thread_id: &str, reason: &str, last_seq: u64) -> Value {
+    json!({
+        "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+        "event": "stream.end",
+        "kind": "stream.end",
+        "thread_id": thread_id,
+        "reason": reason,
+        "last_seq": last_seq,
+        "retryable": true,
+    })
+}
+
+#[tokio::test]
+async fn replay_failure_ends_stream_at_last_delivered_seq_and_resumes_from_it() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .context("thread creation should emit an event")?
+        .seq;
+    let first = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    let second = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 2}))
+        .await?;
+
+    // History delivers two events, then the durable read fails mid-replay.
+    let (backlog_tx, backlog) = mpsc::channel(2);
+    backlog_tx
+        .send(Ok(vec![first.clone(), second.clone()]))
+        .await?;
+    backlog_tx.send(Err("disk read failed".to_string())).await?;
+    drop(backlog_tx);
+    let (_live_tx, live) = tokio::sync::broadcast::channel(4);
+    let frames = render_thread_stream(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        false,
+        CancellationToken::new(),
+    ))
+    .await?;
+
+    assert_eq!(frames.len(), 3, "unexpected frames: {frames:?}");
+    assert_eq!(frames[0].0, Some(first.seq.to_string()));
+    assert_eq!(frames[0].2["previous_seq"], initial);
+    assert_eq!(frames[1].0, Some(second.seq.to_string()));
+    let (end_id, end_name, end_payload) = &frames[2];
+    assert_eq!(end_name, "stream.end");
+    assert_eq!(
+        end_id, &None,
+        "stream.end must not move a browser's Last-Event-ID"
+    );
+    assert_eq!(
+        end_payload,
+        &expected_stream_end(&thread.id, "replay_failed", second.seq),
+        "no seq, no error text: only the reason and the resume cursor"
+    );
+
+    // The resume rule: reconnect with since_seq = last_seq, or let a browser
+    // resend its Last-Event-ID; both land on the next event exactly once.
+    let third = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 3}))
+        .await?;
+    let last_seq = end_payload["last_seq"].as_u64().context("last_seq")?;
+    let client = crate::tls::reqwest_client();
+    for request in [
+        client.get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq={last_seq}",
+            thread.id
+        )),
+        client
+            .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+            .header("Last-Event-ID", last_seq.to_string()),
+    ] {
+        let resumed = request.send().await?.error_for_status()?;
+        let (id, _event, payload) = parse_thread_frame(&read_first_sse_frame(resumed).await?)?;
+        assert_eq!(payload["seq"], third.seq);
+        assert_eq!(payload["previous_seq"], last_seq);
+        assert_eq!(id, Some(third.seq.to_string()));
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_failure_over_http_sends_stream_end_then_eof() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    // A newline-terminated malformed record: the journal read fails closed
+    // after the stream has already been answered with 200.
+    let path = runtime_threads.events_path_for_test(&thread.id)?;
+    let mut journal = fs::OpenOptions::new().append(true).open(&path)?;
+    std::io::Write::write_all(&mut journal, b"{malformed-but-terminated}\n")?;
+    drop(journal);
+
+    let response = crate::tls::reqwest_client()
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codewhale-stream-end")
+            .context("every stream advertises its explicit end")?,
+        "1"
+    );
+    let frames = read_thread_stream_to_eof(response).await?;
+    // The failing batch is discarded whole, so nothing was delivered and the
+    // resume cursor is the requested one.
+    assert_eq!(
+        frames,
+        vec![(
+            None,
+            "stream.end".to_string(),
+            expected_stream_end(&thread.id, "replay_failed", 0)
+        )]
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn catch_up_failure_ends_stream_with_catch_up_failed() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .context("thread creation should emit an event")?
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (live_tx, live) = tokio::sync::broadcast::channel(1);
+    let mut stream = Box::pin(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        false,
+        CancellationToken::new(),
+    ));
+    let delivered = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    live_tx.send(delivered.clone())?;
+    assert_eq!(next_thread_frame(&mut stream).await?["seq"], delivered.seq);
+
+    // Two sends into a one-slot channel lag the receiver, forcing a durable
+    // catch-up; a closed replay hook makes that re-read fail.
+    let (hook_tx, hook_rx) = mpsc::unbounded_channel();
+    drop(hook_rx);
+    runtime_threads.set_replay_test_hook(hook_tx);
+    for n in [2, 3] {
+        let event = runtime_threads
+            .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": n}))
+            .await?;
+        live_tx.send(event)?;
+    }
+    assert_eq!(
+        next_thread_frame(&mut stream).await?,
+        expected_stream_end(&thread.id, "catch_up_failed", delivered.seq)
+    );
+    assert!(
+        tokio::time::timeout(ci_scaled(Duration::from_secs(5)), stream.next())
+            .await?
+            .is_none(),
+        "stream.end is the last frame"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn closed_live_source_still_ends_stream_explicitly() -> Result<()> {
+    // Unreachable in the product while the stream holds the manager that owns
+    // the sender; pinned so no future ownership change can make it silent.
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .context("thread creation should emit an event")?
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (live_tx, live) = tokio::sync::broadcast::channel(4);
+    let event = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    live_tx.send(event.clone())?;
+    drop(live_tx);
+    let frames = render_thread_stream(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        false,
+        CancellationToken::new(),
+    ))
+    .await?;
+    assert_eq!(frames.len(), 2, "unexpected frames: {frames:?}");
+    assert_eq!(frames[0].2["seq"], event.seq);
+    assert_eq!(
+        frames[1].2,
+        expected_stream_end(&thread.id, "runtime_shutdown", event.seq)
+    );
+    handle.abort();
+    Ok(())
+}
+
+/// A deliberate stop goes through the product's serve path: the open stream
+/// gets `stream.end {runtime_shutdown}` at its cursor, then the server drains.
+#[tokio::test]
+async fn runtime_shutdown_ends_open_streams_through_graceful_serve() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-stream-end-{}", Uuid::new_v4()));
+    let shutdown = RuntimeServerShutdown::default();
+    let (addr, runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            root.join("workspace"),
+            TestServerOverrides {
+                shutdown: Some(shutdown.clone()),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("Runtime socket unavailable for shutdown acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let event = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    let response = crate::tls::reqwest_client()
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0&progress=true",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+    let collector = tokio::spawn(collect_sse_frames(response, frame_tx));
+    // Wait until the stream is live, so shutdown interrupts a healthy stream.
+    tokio::time::timeout(ci_scaled(Duration::from_secs(5)), async {
+        while let Some((name, payload)) = frame_rx.recv().await {
+            if name == "stream.progress" && payload["state"] == "live" {
+                return;
+            }
+        }
+    })
+    .await
+    .context("stream never went live")?;
+
+    assert!(
+        shutdown.drain(ci_scaled(Duration::from_secs(10))).await,
+        "the server must drain once its streams have ended"
+    );
+    let frames = tokio::time::timeout(ci_scaled(Duration::from_secs(5)), collector)
+        .await
+        .context("stream stayed open after shutdown")???;
+    let ends = frames
+        .iter()
+        .filter(|(name, _)| name == "stream.end")
+        .count();
+    assert_eq!(
+        ends, 1,
+        "exactly one stream.end, and only at the end: {frames:?}"
+    );
+    let (name, payload) = frames.last().context("no frames")?;
+    assert_eq!(name, "stream.end");
+    assert_eq!(
+        payload,
+        &expected_stream_end(&thread.id, "runtime_shutdown", event.seq)
+    );
+
+    handle.abort();
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_events_pre_stream_failures_are_http_errors_not_sse() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream error acceptance")?;
+    let client = crate::tls::reqwest_client();
+    let missing = client
+        .get(format!("http://{addr}/v1/threads/thr_missing/events"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(
+        missing
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json")),
+        "an unknown thread is a JSON error, never an event stream"
+    );
+    assert!(missing.headers().get("x-codewhale-stream-end").is_none());
+    let body: Value = missing.json().await?;
+    assert!(body.to_string().contains("thr_missing"), "{body}");
+
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let too_long = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?replay_limit={}",
+            thread.id,
+            MAX_RUNTIME_EVENT_REPLAY_TAIL + 1
+        ))
+        .send()
+        .await?;
+    assert_eq!(too_long.status(), StatusCode::BAD_REQUEST);
+    handle.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
@@ -4471,6 +5460,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
                 turn_id: "engine_turn_api".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -4534,7 +5524,24 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         .json()
         .await?;
     assert_eq!(steer_resp["id"], turn_id);
-    assert_eq!(steer_resp["steer_count"], 1);
+    let deadline = tokio::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    while !runtime_threads
+        .events_since(&thread_id, None)?
+        .iter()
+        .any(|ev| ev.event == "turn.steered")
+    {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for the steer on {turn_id} to settle");
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        runtime_threads
+            .test_store()
+            .load_turn(&turn_id)?
+            .steer_count,
+        1
+    );
 
     let interrupt_resp: serde_json::Value = client
         .post(format!(
@@ -4548,7 +5555,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
     assert_eq!(interrupt_resp["id"], turn_id);
 
     let terminal =
-        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(3))
+        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(10))
             .await?;
     assert_eq!(terminal, "interrupted");
 
@@ -4785,9 +5792,68 @@ async fn stream_compat_mapping_handles_expected_runtime_events() -> Result<()> {
     assert!(text.contains("\"decision\":\"allow\""));
     assert!(!text.contains("approval-decision-secret"));
 
-    let unknown = RuntimeEventRecord {
+    // A resolution forced by a turn interrupt or turn teardown must
+    // surface the `cancelled` flag so clients clear the pending approval
+    // UI instead of reporting a refusal.
+    let approval_cancelled = RuntimeEventRecord {
         schema_version: 1,
         seq: 9,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "approval.decided".to_string(),
+        payload: json!({
+            "approval_id": "approval_test",
+            "decision": "deny",
+            "cancelled": true,
+        }),
+    };
+    let mapped = map_compat_stream_event(&approval_cancelled)
+        .context("missing cancelled approval.decided event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: approval.decided"));
+    assert!(
+        text.contains("\"cancelled\":true"),
+        "cancelled resolutions must project the flag through the compat stream: {text}"
+    );
+
+    // The compat stream must also keep surfacing `approval.timeout` (the
+    // decision-budget resolution, and replays of journals written by older
+    // builds that only recorded the legacy event).
+    let legacy_timeout = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 10,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "approval.timeout".to_string(),
+        payload: json!({
+            "approval_id": "approval_legacy",
+            "timeout_secs": 300,
+        }),
+    };
+    let mapped =
+        map_compat_stream_event(&legacy_timeout).context("missing approval.timeout event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: approval.timeout"));
+    assert!(text.contains("\"approval_id\":\"approval_legacy\""));
+    assert!(text.contains("\"timeout_secs\":300"));
+
+    let unknown = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 11,
         timestamp: chrono::Utc::now(),
         thread_id: "thr_test".to_string(),
         turn_id: Some("turn_test".to_string()),
@@ -4937,6 +6003,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
                 turn_id: "mock_stream".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -4987,7 +6054,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
         .to_string();
 
     let _ =
-        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(2))
+        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(10))
             .await?;
 
     // Verify that the persisted events include the expected turn lifecycle events.
@@ -5222,6 +6289,347 @@ async fn session_resume_thread_creates_thread_from_saved_session() -> Result<()>
 }
 
 #[tokio::test]
+async fn session_resume_thread_reuses_the_thread_that_already_holds_it() -> Result<()> {
+    // Resuming a conversation that is already open must hand back the thread
+    // holding it: minting a second one per visit is what made "continue this
+    // conversation" add a rail row for history the user already had open.
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    let session = json!({
+        "schema_version": 1,
+        "metadata": {
+            "id": "sess_reuse_resume",
+            "title": "Reused resume session",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:10:00Z",
+            "message_count": 2,
+            "total_tokens": 100,
+            "model": "deepseek-v4-pro",
+            "workspace": "/tmp/test",
+            "mode": "agent"
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [{ "type": "text", "text": "Hello, world!" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Hello! How can I help you?" }]
+            }
+        ],
+        "system_prompt": null
+    });
+    fs::write(
+        sessions_dir.join("sess_reuse_resume.json"),
+        serde_json::to_string_pretty(&session)?,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/sessions/sess_reuse_resume/resume-thread");
+
+    let first = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first: serde_json::Value = first.json().await?;
+    let thread_id = first["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+
+    let second = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second: serde_json::Value = second.json().await?;
+    assert_eq!(second["thread_id"], thread_id.as_str());
+    assert_eq!(second["session_id"], "sess_reuse_resume");
+    assert_eq!(second["message_count"], 2);
+
+    let threads: Vec<serde_json::Value> = client
+        .get(format!("http://{addr}/v1/threads"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        threads.len(),
+        1,
+        "resuming the same conversation twice must not add a second thread"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// A saved conversation fixture with a system prompt, written under `id`.
+fn write_resumable_session_fixture(sessions_dir: &std::path::Path, id: &str) -> Result<()> {
+    let session = json!({
+        "schema_version": 1,
+        "metadata": {
+            "id": id,
+            "title": "Resumable fixture",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:10:00Z",
+            "message_count": 2,
+            "total_tokens": 100,
+            "model": "deepseek-v4-pro",
+            "workspace": "/tmp/test",
+            "mode": "agent"
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [{ "type": "text", "text": "Hello, world!" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Hello! How can I help you?" }]
+            }
+        ],
+        "system_prompt": "You are the original conversation's system prompt."
+    });
+    fs::write(
+        sessions_dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&session)?,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_export_of_a_resumed_thread_leaves_the_source_document_untouched() -> Result<()> {
+    // A resumed thread is bound to the original saved session. Exporting it
+    // writes the thread's own document; rewriting the original from the
+    // thread's projection would drop what the projection does not carry.
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    write_resumable_session_fixture(&sessions_dir, "sess_export_source")?;
+
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let resumed = client
+        .post(format!(
+            "http://{addr}/v1/sessions/sess_export_source/resume-thread"
+        ))
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(resumed.status(), StatusCode::CREATED);
+    let resumed: serde_json::Value = resumed.json().await?;
+    let thread_id = resumed["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+    let source_path = sessions_dir.join("sess_export_source.json");
+    let source_before = fs::read(&source_path)?;
+
+    let exported = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?;
+    assert_eq!(exported.status(), StatusCode::CREATED);
+    let exported: serde_json::Value = exported.json().await?;
+    let expected_id = crate::runtime_threads::thread_session_id(&thread_id);
+    assert_eq!(exported["session_id"], expected_id.as_str());
+    assert_eq!(
+        fs::read(&source_path)?,
+        source_before,
+        "export must not rewrite the document the thread was resumed from"
+    );
+    assert_eq!(
+        runtime_threads.get_thread(&thread_id).await?.session_id,
+        Some(expected_id.clone())
+    );
+
+    // A second export updates the thread's own document, still not the source.
+    let again = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    let again: serde_json::Value = again.json().await?;
+    assert_eq!(again["session_id"], expected_id.as_str());
+    assert_eq!(fs::read(&source_path)?, source_before);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_resume_thread_mints_a_fresh_thread_when_the_document_grew() -> Result<()> {
+    // The thread holding a conversation shows its checkpointed prefix plus its
+    // own turns. Messages another writer appended after the bind are not in
+    // that thread, so resuming the grown document must not hand it back.
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    write_resumable_session_fixture(&sessions_dir, "sess_grown_resume")?;
+
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/sessions/sess_grown_resume/resume-thread");
+    let first = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first: serde_json::Value = first.json().await?;
+    let first_thread = first["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+
+    // The TUI keeps working on the same conversation and autosaves.
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let mut grown = manager.load_session("sess_grown_resume")?;
+    for (role, text) in [
+        (Role::User, "One more question from the terminal"),
+        (Role::Assistant, "And its answer"),
+    ] {
+        grown.messages.push(Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        });
+    }
+    grown.metadata.message_count = grown.messages.len();
+    manager.save_session(&grown)?;
+
+    let second = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second: serde_json::Value = second.json().await?;
+    let second_thread = second["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+    assert_ne!(second_thread, first_thread);
+    assert_eq!(second["message_count"], 4);
+    let detail = runtime_threads.get_thread_detail(&second_thread).await?;
+    let texts: Vec<String> = detail
+        .items
+        .iter()
+        .flat_map(|item| [Some(item.summary.clone()), item.detail.clone()])
+        .flatten()
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("One more question from the terminal")),
+        "the fresh thread must hold the appended messages: {texts:?}"
+    );
+
+    // Resuming again finds the fresh thread, whose checkpoint covers it all.
+    let third = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(third.status(), StatusCode::OK);
+    let third: serde_json::Value = third.json().await?;
+    assert_eq!(third["thread_id"], second_thread.as_str());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_resume_thread_ignores_an_archived_thread_holding_the_session() -> Result<()> {
+    // Archiving is how a conversation is taken off the rail. Handing the
+    // archived thread back to a client that asked to continue the conversation
+    // would move it somewhere the user cannot see it, so a new thread is the
+    // honest answer even though the binding exists.
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    let session = json!({
+        "schema_version": 1,
+        "metadata": {
+            "id": "sess_archived_reuse",
+            "title": "Archived holder",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:10:00Z",
+            "message_count": 2,
+            "total_tokens": 100,
+            "model": "deepseek-v4-pro",
+            "workspace": "/tmp/test",
+            "mode": "agent"
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [{ "type": "text", "text": "Hello, world!" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Hello! How can I help you?" }]
+            }
+        ],
+        "system_prompt": null
+    });
+    fs::write(
+        sessions_dir.join("sess_archived_reuse.json"),
+        serde_json::to_string_pretty(&session)?,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/sessions/sess_archived_reuse/resume-thread");
+
+    let first = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first: serde_json::Value = first.json().await?;
+    let archived_id = first["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+
+    client
+        .patch(format!("http://{addr}/v1/threads/{archived_id}"))
+        .json(&json!({ "archived": true }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let second = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second: serde_json::Value = second.json().await?;
+    assert_ne!(
+        second["thread_id"].as_str(),
+        Some(archived_id.as_str()),
+        "an archived thread is not somewhere to send the user back to"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_create_from_completed_thread_saves_messages() -> Result<()> {
     let root = std::env::temp_dir().join(format!("deepseek-thread-session-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
@@ -5335,19 +6743,178 @@ async fn session_create_from_completed_thread_saves_messages() -> Result<()> {
     );
     assert_eq!(detail["messages"][1]["role"], "assistant");
 
-    let manual_title: serde_json::Value = client
+    // Export is idempotent (#6144): a second POST updates the thread's own
+    // document in place instead of minting another one and leaving the first
+    // unreferenced.
+    let documents_before = std::fs::read_dir(root.join("sessions"))?
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    let again = client
         .post(format!("http://{addr}/v1/sessions"))
         .json(&json!({
             "thread_id": thread_id,
             "title": "Manual saved title"
         }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    let manual_title: serde_json::Value = again.json().await?;
     assert_eq!(manual_title["title"], "Manual saved title");
-    assert_ne!(manual_title["session_id"], saved_session_handle);
+    assert_eq!(manual_title["session_id"], saved_session_handle);
+    let documents_after = std::fs::read_dir(root.join("sessions"))?
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert_eq!(documents_after, documents_before);
+    assert_eq!(
+        session_manager
+            .load_session(&saved_session_handle)?
+            .metadata
+            .title,
+        "Manual saved title"
+    );
+    assert_eq!(
+        runtime_threads.get_thread(&thread_id).await?.session_id,
+        Some(saved_session_handle.clone())
+    );
+
+    // Deleting the document unbinds the thread, which keeps its turns.
+    let deleted = client
+        .delete(format!("http://{addr}/v1/sessions/{saved_session_handle}"))
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        runtime_threads.get_thread(&thread_id).await?.session_id,
+        None
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// A crash between saving the exported document and binding the thread left
+/// that document unreferenced, and the retry minted another. The export id is
+/// derived from the thread, so the retry finds and binds the one it wrote.
+#[tokio::test]
+async fn session_export_retry_after_a_crash_binds_the_document_it_wrote() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-export-retry-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let thread = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest {
+            workspace: Some(root.join("workspace")),
+            ..Default::default()
+        })
+        .await?;
+    let messages = [
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "export me".to_string(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "exported".to_string(),
+                cache_control: None,
+            }],
+        },
+    ];
+    runtime_threads
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+    // The first attempt got as far as the document, then died.
+    let expected_id = crate::runtime_threads::thread_session_id(&thread.id);
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    manager.save_session(
+        &crate::session_manager::create_saved_session_with_id_and_mode(
+            expected_id.clone(),
+            &messages,
+            "deepseek-v4-pro",
+            &root,
+            0,
+            None,
+            None,
+        ),
+    )?;
+    assert_eq!(
+        runtime_threads.get_thread(&thread.id).await?.session_id,
+        None
+    );
+
+    let retry = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread.id }))
+        .send()
+        .await?;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retry: serde_json::Value = retry.json().await?;
+    assert_eq!(retry["session_id"], expected_id);
+    // Later requests address the session by the id the server returned.
+    let session_id = retry["session_id"]
+        .as_str()
+        .expect("session_id is a string")
+        .to_string();
+    assert_eq!(
+        runtime_threads.get_thread(&thread.id).await?.session_id,
+        Some(expected_id.clone())
+    );
+    let documents = manager.list_sessions()?;
+    assert_eq!(documents.len(), 1, "no duplicate document: {documents:?}");
+
+    // Another thread may not rebind itself onto this thread's document.
+    let other = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest {
+            workspace: Some(root.join("workspace")),
+            ..Default::default()
+        })
+        .await?;
+    let conflict = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": other.id, "session_id": expected_id }))
+        .send()
+        .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        runtime_threads.get_thread(&other.id).await?.session_id,
+        None
+    );
+
+    // A session another process holds open cannot be deleted from here. The
+    // lease is an OS lock on its own open file description, which is exactly
+    // what a second process holding it looks like.
+    let lease_path = sessions_dir
+        .join(".late-usage")
+        .join(format!("{expected_id}.live"));
+    std::fs::create_dir_all(lease_path.parent().unwrap())?;
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lease_path)?;
+    assert!(crate::runtime_threads::try_lock_file_exclusive(&lease)?);
+    let refused = client
+        .delete(format!("http://{addr}/v1/sessions/{session_id}"))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(manager.session_document_exists(&expected_id));
+    drop(lease);
+    let deleted = client
+        .delete(format!("http://{addr}/v1/sessions/{session_id}"))
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 
     handle.abort();
     Ok(())
@@ -5366,6 +6933,134 @@ async fn session_create_from_thread_returns_404_for_missing_thread() -> Result<(
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// `PUT /v1/sessions` with no `session_id` persists the conversation's own id,
+/// not a fresh uuid, so one conversation keeps one document across saves.
+/// (A Runtime thread's engine runs under the thread id; the mock states the
+/// id so the test pins only the save contract. Snapshot ownership no longer
+/// depends on this binding — see the #6621 tests below.)
+#[tokio::test]
+async fn session_save_without_an_id_keeps_the_conversation_that_owns_the_snapshots() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-session-identity-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({
+            "model": "deepseek-v4-pro",
+            "mode": "agent",
+            "workspace": root.join("workspace")
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"]
+        .as_str()
+        .context("missing thread id")?
+        .to_string();
+
+    // A new conversation's id is generated inside the engine, so only a mock
+    // can state it. It stands in for the id the real engine stamps on every
+    // snapshot the conversation takes.
+    const CONVERSATION_ID: &str = "3f9c7b1e-58b4-4d2a-9f5a-8a1e0c6d2b70";
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread_id, harness.handle.clone())
+        .await?;
+    let mut rx_op = harness.rx_op;
+    tokio::spawn(async move {
+        while let Some(op) = rx_op.recv().await {
+            if let Op::GetSessionSnapshot { tx } = op {
+                let snapshot = crate::core::ops::SessionSnapshot {
+                    session_id: CONVERSATION_ID.to_string(),
+                    messages: vec![Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "One conversation, one id".to_string(),
+                            cache_control: None,
+                        }],
+                    }],
+                    total_tokens: 7,
+                    model: "deepseek-v4-pro".to_string(),
+                    model_provider: "deepseek".to_string(),
+                    model_provider_id: None,
+                    workspace: root.clone(),
+                    system_prompt: None,
+                    mode: "agent".to_string(),
+                };
+                if let Some(tx) = tx.lock().ok().and_then(|mut guard| guard.take()) {
+                    let _ = tx.send(snapshot);
+                }
+            }
+        }
+    });
+
+    let saved: serde_json::Value = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        saved["session_id"], CONVERSATION_ID,
+        "a save that names no session must persist the conversation's own id"
+    );
+
+    // The thread is bound to that one document.
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["thread"]["session_id"], CONVERSATION_ID);
+
+    // Saving again keeps the one document instead of collecting a new one per
+    // visit — the drift above was also how one conversation came to hold
+    // several session files.
+    let documents = || -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&sessions_dir)? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
+    };
+    let before = documents()?;
+    let resaved: serde_json::Value = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(resaved["session_id"], CONVERSATION_ID);
+    assert_eq!(
+        documents()?,
+        before,
+        "a second save writes the session it already owns, not another one"
+    );
+    assert!(
+        sessions_dir
+            .join(format!("{CONVERSATION_ID}.json"))
+            .exists()
+    );
 
     handle.abort();
     Ok(())
@@ -5478,7 +7173,204 @@ async fn undo_endpoint_404s_for_missing_thread() -> Result<()> {
 }
 
 #[tokio::test]
-async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<()> {
+async fn fork_at_turn_endpoint_cuts_at_the_named_turn() -> Result<()> {
+    // The anchor is a turn id, not a distance, and the fork keeps the turn it
+    // names: the branch point is the answer a person pointed at. Resolved one
+    // turn off, a three-turn thread still answers 201 with a plausible thread
+    // and the wrong prompt in the composer — which is what this pins.
+    let root = std::env::temp_dir().join(format!("deepseek-fork-at-turn-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({
+            "model": "deepseek-v4-pro",
+            "mode": "agent",
+            "workspace": root.join("workspace")
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"]
+        .as_str()
+        .context("missing thread id")?
+        .to_string();
+
+    let user = |text: &str| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let reply = |text: &str| Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    runtime_threads
+        .seed_thread_from_messages(
+            &thread_id,
+            &[
+                user("first"),
+                reply("one"),
+                user("second"),
+                reply("two"),
+                user("third"),
+                reply("three"),
+            ],
+        )
+        .await?;
+
+    // Name the anchor the way a client would: the turn id carrying "second".
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let anchor = detail["items"]
+        .as_array()
+        .context("missing items")?
+        .iter()
+        .find(|item| item["kind"] == "user_message" && item["detail"] == "second")
+        .and_then(|item| item["turn_id"].as_str())
+        .context("no turn carries the second prompt")?
+        .to_string();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": anchor }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let forked: serde_json::Value = resp.json().await?;
+    // The prompt that comes back is what was asked *next*: the branch keeps
+    // "second" and hands back "third" as the place to continue from.
+    assert_eq!(forked["original_user_text"], "third");
+    let forked_id = forked["thread"]["id"]
+        .as_str()
+        .context("missing forked thread id")?
+        .to_string();
+    assert_ne!(forked_id, thread_id, "forking must not mutate in place");
+
+    let forked_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{forked_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let forked_turns = forked_detail["turns"]
+        .as_array()
+        .context("missing forked turns")?
+        .iter()
+        .map(|turn| {
+            turn["input_summary"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        forked_turns,
+        vec!["first".to_string(), "second".to_string()]
+    );
+
+    // Naming the last turn keeps the whole conversation: the same rule read at
+    // the end of the thread, with nothing left to hand back.
+    let last_anchor = detail["items"]
+        .as_array()
+        .context("missing items")?
+        .iter()
+        .find(|item| item["kind"] == "user_message" && item["detail"] == "third")
+        .and_then(|item| item["turn_id"].as_str())
+        .context("no turn carries the third prompt")?
+        .to_string();
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": last_anchor }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let whole: serde_json::Value = resp.json().await?;
+    assert!(whole["original_user_text"].is_null());
+    let whole_id = whole["thread"]["id"]
+        .as_str()
+        .context("missing whole-thread fork id")?
+        .to_string();
+    let whole_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{whole_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        whole_detail["turns"]
+            .as_array()
+            .map_or(usize::MAX, Vec::len),
+        3
+    );
+
+    // The source keeps every turn: a fork is a sibling, not an undo.
+    let source_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        source_detail["turns"]
+            .as_array()
+            .map_or(usize::MAX, Vec::len),
+        3
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_at_turn_endpoint_rejects_a_non_user_turn() -> Result<()> {
+    // An assistant turn is not a fork point: cutting "before" it would
+    // silently keep the user prompt it answers, which is not what the picker
+    // said. The anchor must be refused rather than rounded to a neighbour.
+    let root = std::env::temp_dir().join(format!("deepseek-fork-bad-turn-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id =
+        create_seeded_thread(&addr, &runtime_threads, &root, "Please fork this turn").await?;
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": "turn_not_a_user_turn" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn patch_undo_endpoint_refuses_turns_it_cannot_prove() -> Result<()> {
     let root =
         std::env::temp_dir().join(format!("deepseek-patch-undo-endpoint-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
@@ -5502,19 +7394,34 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert!(resp.text().await?.contains("not available"));
 
+    // A seeded (imported) turn records nothing about what it did to the
+    // workspace, so a file undo cannot be proven either way: refused with a
+    // code that points the client at the conversation-only undo, and no
+    // fork is published.
     fs::create_dir_all(root.join("workspace"))?;
     let resp = client
         .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
         .json(&json!({}))
         .send()
         .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let refused: serde_json::Value = resp.json().await?;
+    assert_eq!(refused["error"]["code"], "restore_point_unavailable");
+    let threads: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(threads.as_array().map(Vec::len), Some(1), "{threads:#}");
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/undo"))
+        .json(&json!({}))
+        .send()
+        .await?;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let undone: serde_json::Value = resp.json().await?;
-    // The fresh workspace has no tool/pre-turn snapshots to roll back to,
-    // so the file-restore step reports nothing restored while the
-    // conversation undo still forks the thread.
-    assert_eq!(undone["patch_result"]["files_restored"], false);
-    assert!(undone["patch_result"]["summary"].is_string());
     assert_eq!(undone["original_user_text"], "Roll back the patch");
     assert_ne!(undone["thread"]["id"].as_str(), Some(thread_id.as_str()));
 
@@ -5522,8 +7429,68 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
     Ok(())
 }
 
+fn snapshot_receipt(
+    kind: crate::snapshot::WorkspaceSnapshotKind,
+    taken: &crate::snapshot::TakenSnapshot,
+    session_id: &str,
+) -> crate::snapshot::WorkspaceSnapshotRef {
+    crate::snapshot::WorkspaceSnapshotRef::new(kind, taken, session_id, None)
+}
+
+/// The receipts of a shell turn: its command runs from the pre-turn snapshot
+/// to the post-turn one, so the whole window is the turn's own span.
+fn shell_turn_receipts(
+    repo: &crate::snapshot::SnapshotRepo,
+    pre: &crate::snapshot::TakenSnapshot,
+    post: &crate::snapshot::TakenSnapshot,
+    session_id: &str,
+) -> Vec<crate::snapshot::WorkspaceSnapshotRef> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTurn, PreTurn};
+    let mut pre_receipt = snapshot_receipt(PreTurn, pre, session_id);
+    pre_receipt.tool_call_id = Some("user_shell_1".to_string());
+    let mut post_receipt = snapshot_receipt(PostTurn, post, session_id);
+    post_receipt.changed_paths = Some(changed_between(repo, pre, post));
+    vec![pre_receipt, post_receipt]
+}
+
+fn changed_between(
+    repo: &crate::snapshot::SnapshotRepo,
+    from: &crate::snapshot::TakenSnapshot,
+    to: &crate::snapshot::TakenSnapshot,
+) -> Vec<String> {
+    repo.changed_paths_between(&from.tree, &to.tree)
+        .expect("diff snapshots")
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn dropped_turn(
+    turn_id: &str,
+    may_change_files: bool,
+    snapshots: Vec<crate::snapshot::WorkspaceSnapshotRef>,
+) -> crate::runtime_threads::DroppedTurnSnapshots {
+    crate::runtime_threads::DroppedTurnSnapshots {
+        turn_id: turn_id.to_string(),
+        may_change_files,
+        snapshots,
+        declared_writes: Vec::new(),
+        unrun_tool_calls: std::collections::BTreeSet::new(),
+    }
+}
+
+fn git_missing() -> bool {
+    crate::dependencies::Git::command().is_none()
+}
+
+/// A patch-undo restores exactly what the dropped turn changed — every write
+/// of the turn, not only its last — and nothing else: later work on other
+/// files and other sessions' snapshots in the same workspace are untouched.
 #[test]
-fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
+fn patch_undo_helper_restores_only_the_dropped_turns_changes() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -5533,26 +7500,433 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
     let workspace = root.path().join("workspace");
     fs::create_dir_all(&workspace)?;
     let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
-    let file = workspace.join("a.txt");
+    let a = workspace.join("a.txt");
+    let other = workspace.join("other.txt");
+    fs::write(&a, "before")?;
+    fs::write(&other, "other-before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "first write")?;
+    repo.take_snapshot("tool:call-1", Some("thr_a"))?;
+    fs::write(&a, "second write")?;
+    fs::create_dir_all(workspace.join("made"))?;
+    fs::write(workspace.join("made/new.txt"), "created")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    // After the turn: another writer changes an unrelated file, and another
+    // session snapshots the workspace.
+    fs::write(&other, "later work")?;
+    repo.take_snapshot("pre-turn:9", Some("thr_other"))?;
 
-    fs::write(&file, "legacy")?;
-    repo.snapshot("pre-turn:legacy")?;
-    fs::write(&file, "current-before")?;
-    repo.snapshot_with_session("pre-turn:current", Some("session-current"))?;
-    fs::write(&file, "foreign-before")?;
-    repo.snapshot_with_session("pre-turn:foreign", Some("session-foreign"))?;
-    fs::write(&file, "current-after")?;
-
-    let restored = patch_undo_workspace_files(&workspace, Some("session-current"), true)
+    let turn = dropped_turn(
+        "turn_1",
+        true,
+        shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+    );
+    let restored = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), true)
         .expect("a trusted rollback should succeed");
     assert!(restored.files_restored, "{:?}", restored.summary);
-    assert_eq!(fs::read_to_string(&file)?, "current-before");
+    assert_eq!(fs::read_to_string(&a)?, "before", "both writes are undone");
+    assert!(!workspace.join("made/new.txt").exists());
+    assert!(
+        !workspace.join("made").exists(),
+        "the directory the turn created goes with it"
+    );
+    assert_eq!(fs::read_to_string(&other)?, "later work");
+    assert!(
+        restored
+            .snapshot_label
+            .as_deref()
+            .is_some_and(|label| label.starts_with("pre-turn:1")),
+        "{:?}",
+        restored.snapshot_label
+    );
 
-    fs::write(&file, "must-stay")?;
-    let unbound = patch_undo_workspace_files(&workspace, None, true)
-        .expect("an unbound thread has nothing to roll back, which is not a refusal");
-    assert!(!unbound.files_restored);
-    assert_eq!(fs::read_to_string(&file)?, "must-stay");
+    // Undoing again finds the files already at their pre-turn state.
+    let again = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), true)
+        .expect("already restored is provably nothing to do");
+    assert!(!again.files_restored);
+    Ok(())
+}
+
+/// A turn's changed file that someone edited after the turn is never
+/// clobbered: the undo is refused with a typed code and nothing changes.
+#[test]
+fn patch_undo_helper_refuses_to_overwrite_later_edits() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    fs::write(&a, "before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "turn")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    fs::write(&a, "user edit after the turn")?;
+
+    let turn = dropped_turn(
+        "turn_1",
+        true,
+        shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+    );
+    let err = patch_undo_workspace_files(&workspace, &[turn], true)
+        .expect_err("a later edit must not be overwritten");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert_eq!(err.code, Some(PATCH_UNDO_WORKSPACE_CHANGED));
+    assert!(err.message.contains("a.txt"), "{}", err.message);
+    assert_eq!(fs::read_to_string(&a)?, "user edit after the turn");
+    Ok(())
+}
+
+/// No recorded restore point, an unclosed window, or a pruned / retagged
+/// restore point: the undo fails honestly with a typed 409 instead of
+/// forking over changed files. A turn that ran no tools needs none.
+#[test]
+fn patch_undo_helper_fails_honestly_without_an_owned_restore_point() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::PreTurn;
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    fs::write(&a, "before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "after")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+
+    let cases = [
+        (
+            dropped_turn("legacy", true, Vec::new()),
+            PATCH_UNDO_NO_RESTORE_POINT,
+        ),
+        (
+            dropped_turn(
+                "unclosed",
+                true,
+                vec![snapshot_receipt(PreTurn, &pre, "thr_a")],
+            ),
+            PATCH_UNDO_NO_RESTORE_POINT,
+        ),
+        (
+            dropped_turn(
+                "retagged",
+                true,
+                shell_turn_receipts(&repo, &pre, &post, "thr_someone_else"),
+            ),
+            PATCH_UNDO_RESTORE_POINT_PRUNED,
+        ),
+    ];
+    for (turn, code) in cases {
+        let err = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), true)
+            .expect_err(&turn.turn_id);
+        assert_eq!(err.status, StatusCode::CONFLICT, "{}", turn.turn_id);
+        assert_eq!(err.code, Some(code), "{}: {}", turn.turn_id, err.message);
+        assert!(err.message.contains("/undo"), "{}", err.message);
+        assert_eq!(fs::read_to_string(&a)?, "after");
+    }
+
+    let chat_only = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn("chat", false, Vec::new())],
+        false,
+    )
+    .expect("a turn that ran no tools changed no files");
+    assert!(!chat_only.files_restored);
+
+    // A prune that drops the restore point's tree fails closed too.
+    let receipts = shell_turn_receipts(&repo, &pre, &post, "thr_a");
+    repo.prune_older_than(Duration::ZERO)?;
+    let err =
+        patch_undo_workspace_files(&workspace, &[dropped_turn("pruned", true, receipts)], true)
+            .expect_err("a pruned restore point cannot be restored");
+    assert_eq!(err.code, Some(PATCH_UNDO_RESTORE_POINT_PRUNED));
+    assert_eq!(fs::read_to_string(&a)?, "after");
+    Ok(())
+}
+
+/// A prune rebuilds the side repo's commit chain, rewriting every commit id
+/// while keeping trees; a recorded restore point still resolves.
+#[test]
+fn patch_undo_helper_survives_a_prune_that_rewrites_commit_ids() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    fs::write(&a, "ancient")?;
+    repo.take_snapshot("pre-turn:0", Some("thr_old"))?;
+    fs::write(&a, "before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "after")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    assert_eq!(repo.prune_keep_last_n(2)?, 1);
+    assert!(
+        repo.list(usize::MAX)?
+            .iter()
+            .all(|snapshot| snapshot.id != pre.id && snapshot.id != post.id),
+        "the prune rewrote the survivors' commit ids"
+    );
+
+    let restored = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn(
+            "turn_1",
+            true,
+            shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+        )],
+        true,
+    )
+    .expect("the tree still resolves the restore point");
+    assert!(restored.files_restored);
+    assert_eq!(fs::read_to_string(&a)?, "before");
+    Ok(())
+}
+
+/// One recorded receipt with the span data a recording engine reports.
+fn span_receipt(
+    kind: crate::snapshot::WorkspaceSnapshotKind,
+    taken: &crate::snapshot::TakenSnapshot,
+    call: Option<&str>,
+    write_paths: Option<&[&str]>,
+    changed: Option<Vec<String>>,
+) -> crate::snapshot::WorkspaceSnapshotRef {
+    let mut receipt = snapshot_receipt(kind, taken, "thr_a");
+    receipt.tool_call_id = call.map(str::to_string);
+    receipt.write_paths = write_paths.map(|paths| paths.iter().map(|p| p.to_string()).collect());
+    receipt.changed_paths = changed;
+    receipt
+}
+
+/// Attribution from the recorded spans: a path the turn's own declared
+/// write changed is restored; a path someone else changed while the turn
+/// ran — in a span where no tool of the turn was running, or inside a file
+/// tool's span but not a path it declared — refuses the undo instead of
+/// reverting their work. An undeclared (shell) span owns what it changed,
+/// and a span with no record of its changes fails closed.
+#[test]
+fn patch_undo_helper_attributes_changes_to_the_turns_own_tool_spans() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTool, PostTurn, PreTurn, Tool};
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let own = workspace.join("own.txt");
+    let sibling = workspace.join("sibling.txt");
+    fs::write(&own, "before")?;
+    fs::write(&sibling, "sibling-before")?;
+
+    // pre → tool(write own.txt) → post_tool → [another thread writes
+    // sibling.txt while the model thinks] → post_turn
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    let tool = repo.take_snapshot("tool:call-1", Some("thr_a"))?;
+    fs::write(&own, "turn")?;
+    let post_tool = repo.take_snapshot("post-tool:call-1", Some("thr_a"))?;
+    fs::write(&sibling, "sibling-during-turn")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    let receipts = |gap_writer: bool| {
+        let mut receipts = vec![
+            span_receipt(PreTurn, &pre, None, None, None),
+            span_receipt(
+                Tool,
+                &tool,
+                Some("call-1"),
+                Some(&["./own.txt"]),
+                Some(changed_between(&repo, &pre, &tool)),
+            ),
+            span_receipt(
+                PostTool,
+                &post_tool,
+                Some("call-1"),
+                None,
+                Some(changed_between(&repo, &tool, &post_tool)),
+            ),
+            span_receipt(
+                PostTurn,
+                &post,
+                None,
+                None,
+                Some(changed_between(&repo, &post_tool, &post)),
+            ),
+        ];
+        if !gap_writer {
+            // The same history with the sibling's write inside the file
+            // tool's span instead: still not a path the call declared.
+            receipts[2].changed_paths = Some(changed_between(&repo, &tool, &post));
+            receipts[3].changed_paths = Some(Vec::new());
+        }
+        receipts
+    };
+    for gap_writer in [true, false] {
+        let err = patch_undo_workspace_files(
+            &workspace,
+            &[dropped_turn("turn_1", true, receipts(gap_writer))],
+            true,
+        )
+        .expect_err("another writer's change must not be reverted");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(
+            err.code,
+            Some(PATCH_UNDO_WORKSPACE_CHANGED),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("sibling.txt"), "{}", err.message);
+        assert!(!err.message.contains("own.txt"), "{}", err.message);
+        assert_eq!(fs::read_to_string(&own)?, "turn");
+        assert_eq!(fs::read_to_string(&sibling)?, "sibling-during-turn");
+    }
+
+    // Without the sibling's write the turn's own change restores.
+    fs::write(&sibling, "sibling-before")?;
+    let clean_post = repo.take_snapshot("post-turn:2", Some("thr_a"))?;
+    let mut clean = receipts(true);
+    clean[3] = span_receipt(
+        PostTurn,
+        &clean_post,
+        None,
+        None,
+        Some(changed_between(&repo, &post_tool, &clean_post)),
+    );
+    let restored = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn("turn_1", true, clean.clone())],
+        true,
+    )
+    .expect("the turn's own write restores");
+    assert!(restored.files_restored, "{:?}", restored.summary);
+    assert_eq!(fs::read_to_string(&own)?, "before");
+
+    // An undeclared tool (a shell command) owns whatever changed in its span.
+    fs::write(&own, "turn")?;
+    let mut shell = clean.clone();
+    shell[1].write_paths = None;
+    let restored =
+        patch_undo_workspace_files(&workspace, &[dropped_turn("turn_1", true, shell)], true)
+            .expect("an undeclared span owns its changes");
+    assert!(restored.files_restored);
+    assert_eq!(fs::read_to_string(&own)?, "before");
+
+    // A span whose changes were never recorded cannot be attributed.
+    fs::write(&own, "turn")?;
+    let mut unknown = clean;
+    unknown[2].changed_paths = None;
+    let err =
+        patch_undo_workspace_files(&workspace, &[dropped_turn("turn_1", true, unknown)], true)
+            .expect_err("an unaccounted span fails closed");
+    assert_eq!(
+        err.code,
+        Some(PATCH_UNDO_NO_RESTORE_POINT),
+        "{}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&own)?, "turn");
+    Ok(())
+}
+
+/// A file tool that wrote a path the snapshots never hold (ignored, or
+/// outside the workspace) cannot be undone: refused with its own code even
+/// when the snapshots show nothing changed.
+#[test]
+fn patch_undo_helper_refuses_declared_writes_snapshots_cannot_hold() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTool, PostTurn, PreTurn, Tool};
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join(".gitignore"), "*.local\n")?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    let tool = repo.take_snapshot("tool:call-1", Some("thr_a"))?;
+    fs::write(workspace.join(".env.local"), "SECRET=changed")?;
+    let post_tool = repo.take_snapshot("post-tool:call-1", Some("thr_a"))?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    let receipts = |declared: &[&str]| {
+        vec![
+            span_receipt(PreTurn, &pre, None, None, None),
+            span_receipt(
+                Tool,
+                &tool,
+                Some("call-1"),
+                Some(declared),
+                Some(Vec::new()),
+            ),
+            span_receipt(
+                PostTool,
+                &post_tool,
+                Some("call-1"),
+                None,
+                Some(changed_between(&repo, &tool, &post_tool)),
+            ),
+            span_receipt(PostTurn, &post, None, None, Some(Vec::new())),
+        ]
+    };
+    let outside = root.path().join("outside.txt");
+    let outside = outside.to_string_lossy().into_owned();
+    for declared in [".env.local", "node_modules/pkg/index.js", outside.as_str()] {
+        let err = patch_undo_workspace_files(
+            &workspace,
+            &[dropped_turn("turn_1", true, receipts(&[declared]))],
+            true,
+        )
+        .expect_err(declared);
+        assert_eq!(err.status, StatusCode::CONFLICT, "{declared}");
+        assert_eq!(
+            err.code,
+            Some(PATCH_UNDO_PATH_NOT_SNAPSHOTTED),
+            "{declared}: {}",
+            err.message
+        );
+        assert!(err.message.contains(declared), "{}", err.message);
+    }
+    // The same declared write from a call recorded as failed wrote nothing.
+    let mut failed = dropped_turn("turn_1", true, receipts(&[".env.local"]));
+    failed.unrun_tool_calls.insert("call-1".to_string());
+    let result = patch_undo_workspace_files(&workspace, &[failed], true)
+        .expect("a failed call wrote nothing");
+    assert!(!result.files_restored);
+    // Declared through the turn's items rather than a receipt.
+    let mut from_items = dropped_turn("turn_1", true, receipts(&[]));
+    from_items.declared_writes.push(".env.local".to_string());
+    let err = patch_undo_workspace_files(&workspace, &[from_items], true)
+        .expect_err("an item-declared ignored write refuses too");
+    assert_eq!(err.code, Some(PATCH_UNDO_PATH_NOT_SNAPSHOTTED));
     Ok(())
 }
 
@@ -5562,6 +7936,9 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
 /// conversation either.
 #[test]
 fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -5574,12 +7951,19 @@ fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Resu
     let file = workspace.join("a.txt");
 
     fs::write(&file, "before")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
     fs::write(&file, "after")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    let turn = dropped_turn(
+        "turn_1",
+        true,
+        shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+    );
 
-    let err = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+    let err = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), false)
         .expect_err("an untrusted rollback must be refused");
     assert_eq!(err.status, StatusCode::CONFLICT);
+    assert_eq!(err.code, Some(PATCH_UNDO_UNTRUSTED));
     assert!(
         err.message.contains("outside trusted mode"),
         "got: {}",
@@ -5592,7 +7976,7 @@ fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Resu
     );
 
     // The identical call once trusted performs the rollback.
-    let restored = patch_undo_workspace_files(&workspace, Some("session-a"), true)
+    let restored = patch_undo_workspace_files(&workspace, &[turn], true)
         .expect("a trusted rollback should succeed");
     assert!(restored.files_restored, "{:?}", restored.summary);
     assert_eq!(fs::read_to_string(&file)?, "before");
@@ -5604,6 +7988,9 @@ fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Resu
 /// Undo useless in Ask / Auto-Review for no safety gain.
 #[test]
 fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -5616,11 +8003,20 @@ fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Res
     let file = workspace.join("a.txt");
 
     fs::write(&file, "only-state")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
-    // Nothing changed after the snapshot, so no target exists.
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    // The turn ran a tool but changed nothing.
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
 
-    let result = patch_undo_workspace_files(&workspace, Some("session-a"), false)
-        .expect("nothing to roll back is not a refusal");
+    let result = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn(
+            "turn_1",
+            true,
+            shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+        )],
+        false,
+    )
+    .expect("nothing to roll back is not a refusal");
     assert!(!result.files_restored);
     assert!(result.summary.is_some());
     assert_eq!(fs::read_to_string(&file)?, "only-state");
@@ -5660,7 +8056,12 @@ fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
 
     fs::write(&wanted, "wanted-before")?;
     fs::write(&other, "other-before")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    let taken = repo.take_snapshot("pre-turn:1", Some("session-a"))?;
+    let owned = [snapshot_receipt(
+        crate::snapshot::WorkspaceSnapshotKind::PreTurn,
+        &taken,
+        "session-a",
+    )];
 
     fs::write(&wanted, "wanted-after")?;
     fs::write(&other, "other-after")?;
@@ -5668,7 +8069,7 @@ fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
     let snapshot = repo.list(10)?.remove(0);
     let reverted = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &owned,
         &revert_request("wanted.txt", snapshot.id.as_str(), &sha256_of(&wanted)),
     )
     .expect("scoped revert should succeed");
@@ -5699,18 +8100,23 @@ fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<
     let file = workspace.join("a.txt");
 
     fs::write(&file, "v1")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    let taken = repo.take_snapshot("pre-turn:1", Some("session-a"))?;
+    let owned = [snapshot_receipt(
+        crate::snapshot::WorkspaceSnapshotKind::PreTurn,
+        &taken,
+        "session-a",
+    )];
     fs::write(&file, "v2")?;
 
     // A recorded path may arrive absolute; normalization reports it back
-    // workspace-relative so the GUI's change record stays consistent.
-    let snapshot = repo.list(10)?.remove(0);
+    // workspace-relative so the GUI's change record stays consistent. The
+    // restore point is named by the tree id its receipt recorded.
     let reverted = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &owned,
         &revert_request(
             &file.to_string_lossy(),
-            snapshot.id.as_str(),
+            taken.tree.as_str(),
             &sha256_of(&file),
         ),
     )
@@ -5726,6 +8132,7 @@ fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<
 /// the workspace untouched.
 #[test]
 fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTurn, Tool};
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -5742,18 +8149,24 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
     // then edits a.txt by hand.
     fs::write(&a, "a-before")?;
     fs::write(&b, "b-before")?;
-    let tool_a = repo.snapshot_with_session("tool:call-a", Some("session-a"))?;
+    let tool_a = repo.take_snapshot("tool:call-a", Some("session-a"))?;
     fs::write(&a, "a-after-tool")?;
-    let tool_b = repo.snapshot_with_session("tool:call-b", Some("session-a"))?;
+    let tool_b = repo.take_snapshot("tool:call-b", Some("session-a"))?;
     fs::write(&b, "b-after-tool")?;
     fs::write(&a, "a-user-edit")?;
+    let post = repo.take_snapshot("post-turn:1", Some("session-a"))?;
+    let mut owned = vec![
+        snapshot_receipt(Tool, &tool_a, "session-a"),
+        snapshot_receipt(Tool, &tool_b, "session-a"),
+        snapshot_receipt(PostTurn, &post, "session-a"),
+    ];
 
     // Restoring a.txt from tool B's snapshot would erase only the user edit;
     // the client must ask for tool A's snapshot and gets back a-before.
     let err = revert_file_from_snapshot(
         &workspace,
-        "session-a",
-        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&b)),
+        &owned,
+        &revert_request("a.txt", tool_a.id.as_str(), &sha256_of(&b)),
     )
     .expect_err("a hash from different bytes must refuse");
     assert_eq!(err.status, StatusCode::CONFLICT);
@@ -5766,8 +8179,8 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
 
     let reverted = revert_file_from_snapshot(
         &workspace,
-        "session-a",
-        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+        &owned,
+        &revert_request("a.txt", tool_a.id.as_str(), &sha256_of(&a)),
     )
     .expect("exact identity restores");
     assert_eq!(reverted.snapshot_label, "tool:call-a");
@@ -5781,8 +8194,8 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
     // Already matching: 409, nothing changed.
     let err = revert_file_from_snapshot(
         &workspace,
-        "session-a",
-        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+        &owned,
+        &revert_request("a.txt", tool_a.id.as_str(), &sha256_of(&a)),
     )
     .expect_err("nothing to revert");
     assert_eq!(err.status, StatusCode::CONFLICT);
@@ -5792,18 +8205,19 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
         err.message
     );
 
-    // A snapshot owned by another session, an unknown id, or a non-restore
-    // label are all refused with a refresh hint.
-    let foreign = repo.snapshot_with_session("tool:foreign", Some("session-b"))?;
-    let post = repo.snapshot_with_session("post-turn:1", Some("session-a"))?;
+    // A snapshot owned by another thread (even when the receipt list is
+    // tampered to name it under this thread's tag), a post-turn state, or an
+    // unknown id are all refused with a refresh hint.
+    let foreign = repo.take_snapshot("tool:foreign", Some("session-b"))?;
+    owned.push(snapshot_receipt(Tool, &foreign, "session-a"));
     for id in [
-        foreign.as_str(),
-        post.as_str(),
+        foreign.id.as_str(),
+        post.id.as_str(),
         "0123456789abcdef0123456789abcdef01234567",
     ] {
         let err = revert_file_from_snapshot(
             &workspace,
-            "session-a",
+            &owned,
             &revert_request("b.txt", id, &sha256_of(&b)),
         )
         .expect_err(id);
@@ -5815,15 +8229,14 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
         );
     }
     assert_eq!(fs::read_to_string(&b)?, "b-after-tool");
-    let _ = tool_b;
 
     // Directories and Git metadata are 400s before anything is compared.
     for path in ["", "src", ".git/config", "../escape.txt"] {
         fs::create_dir_all(workspace.join("src"))?;
         let err = revert_file_from_snapshot(
             &workspace,
-            "session-a",
-            &revert_request(path, tool_a.as_str(), "absent"),
+            &owned,
+            &revert_request(path, tool_a.id.as_str(), "absent"),
         )
         .expect_err(path);
         assert_eq!(err.status, StatusCode::BAD_REQUEST, "{path}");
@@ -5832,7 +8245,7 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
 }
 
 #[test]
-fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace() -> Result<()> {
+fn revert_file_helper_refuses_foreign_snapshots_and_paths_outside_the_workspace() -> Result<()> {
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -5844,22 +8257,22 @@ fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace()
     let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
     let file = workspace.join("a.txt");
 
-    // Only another session owns a snapshot, so this session has nothing it is
-    // allowed to revert.
+    // Only another thread recorded a restore point, so this thread owns
+    // nothing it is allowed to revert.
     fs::write(&file, "foreign-before")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-b"))?;
+    repo.take_snapshot("pre-turn:1", Some("session-b"))?;
     fs::write(&file, "foreign-after")?;
 
     let foreign = repo.list(10)?.remove(0);
     let err = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &[],
         &revert_request("a.txt", foreign.id.as_str(), &sha256_of(&file)),
     )
-    .expect_err("a foreign session's snapshot must not be restorable");
+    .expect_err("a foreign thread's snapshot must not be restorable");
     assert_eq!(err.status, StatusCode::CONFLICT);
     assert!(
-        err.message.contains("another session"),
+        err.message.contains("another thread"),
         "got: {}",
         err.message
     );
@@ -5867,7 +8280,7 @@ fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace()
 
     let traversal = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &[],
         &revert_request("../escape.txt", foreign.id.as_str(), "absent"),
     )
     .expect_err("traversal must be refused");
@@ -5919,10 +8332,16 @@ async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Res
 /// Route-level contract for the new destructive endpoint: malformed bodies
 /// are 422/400 before any thread state is read, an untrusted thread is a 409
 /// even with a well-formed request, and a trusted thread without a bound
-/// session is a 409 that names the reason. No file is touched in any case.
+/// restore point it owns is a 409 that names the reason. No file is touched in
+/// any case.
 #[tokio::test]
-async fn file_revert_route_validates_body_then_trust_then_session_binding() -> Result<()> {
+async fn file_revert_route_validates_body_then_trust_then_ownership() -> Result<()> {
+    // The route opens the snapshot store under the resolved home. Seal the
+    // process environment and own that home, so a concurrent test's temporary
+    // HOME (deleted when it ends) can never host or remove this store mid-request.
+    let _env = lock_test_env();
     let root = std::env::temp_dir().join(format!("deepseek-file-revert-gates-{}", Uuid::new_v4()));
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
         spawn_test_server_with_root(root.clone(), sessions_dir).await?
@@ -5964,7 +8383,8 @@ async fn file_revert_route_validates_body_then_trust_then_session_binding() -> R
     let text = resp.text().await?;
     assert!(text.contains("trusted mode"), "got: {text}");
 
-    // Trusted, but no bound session: still a 409 with the reason.
+    // Trusted, but the thread recorded no such restore point: still a 409
+    // with the reason.
     client
         .patch(format!("http://{addr}/v1/threads/{thread_id}"))
         .json(&json!({ "trust_mode": true }))
@@ -5974,7 +8394,7 @@ async fn file_revert_route_validates_body_then_trust_then_session_binding() -> R
     let resp = client.post(&url).json(&well_formed).send().await?;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let text = resp.text().await?;
-    assert!(text.contains("no bound session"), "got: {text}");
+    assert!(text.contains("refresh the change record"), "got: {text}");
     assert_eq!(fs::read_to_string(&file)?, "keep");
 
     handle.abort();
@@ -5985,7 +8405,12 @@ async fn file_revert_route_validates_body_then_trust_then_session_binding() -> R
 /// workspace, and admit again once it settles. Nothing is changed on refusal.
 #[tokio::test]
 async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
+    // The route opens the snapshot store under the resolved home. Seal the
+    // process environment and own that home, so a concurrent test's temporary
+    // HOME (deleted when it ends) can never host or remove this store mid-request.
+    let _env = lock_test_env();
     let root = std::env::temp_dir().join(format!("deepseek-restore-active-{}", Uuid::new_v4()));
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
         spawn_test_server_with_root(root.clone(), sessions_dir).await?
@@ -6052,12 +8477,10 @@ async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
         .json(&revert_body)
         .send()
         .await?;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let status = resp.status();
     let text = resp.text().await?;
-    assert!(
-        text.contains("no bound session") || text.contains("refresh the change record"),
-        "got: {text}"
-    );
+    assert_eq!(status, StatusCode::CONFLICT, "got: {text}");
+    assert!(text.contains("refresh the change record"), "got: {text}");
     assert_eq!(fs::read_to_string(&file)?, "live");
 
     handle.abort();
@@ -6152,6 +8575,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
                 turn_id: "mock_active_session_save".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -6222,7 +8646,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
 
     let _ = finish_tx.send(());
     let terminal =
-        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(2))
+        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(10))
             .await?;
     assert_eq!(terminal, "completed");
 
@@ -6552,9 +8976,12 @@ async fn session_detail_route_serves_a_bounded_redacted_peek_on_request() -> Res
     Ok(())
 }
 
+/// An unknown id is a 404 that leaves nothing behind: no live lease or lock
+/// file is created for an id with nothing to delete. A malformed id is a
+/// 400, not a liveness conflict.
 #[tokio::test]
 async fn session_delete_returns_404_for_missing_id() -> Result<()> {
-    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+    let Some((addr, sessions_dir, handle)) = spawn_server_with_saved_sessions(&[]).await? else {
         return Ok(());
     };
     let client = crate::tls::reqwest_client();
@@ -6563,6 +8990,17 @@ async fn session_delete_returns_404_for_missing_id() -> Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    for sidecar in ["nonexistent-id.live", "nonexistent-id.lock"] {
+        assert!(
+            !sessions_dir.join(".late-usage").join(sidecar).exists(),
+            "an unknown id must not litter {sidecar}"
+        );
+    }
+    let malformed = client
+        .delete(format!("http://{addr}/v1/sessions/not.a.session"))
+        .send()
+        .await?;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     handle.abort();
     Ok(())
 }
@@ -6651,6 +9089,52 @@ fn cors_layer_skips_invalid_origins() {
     ];
     // Should not panic.
     let _ = cors_layer(&extras);
+}
+
+#[tokio::test]
+async fn cors_layer_exposes_stream_capabilities_for_allowed_origins() -> Result<()> {
+    use axum::handler::Handler;
+
+    let handler = (|| async {
+        (
+            [
+                ("x-codewhale-stream-end", "1"),
+                ("x-codewhale-event-progress", "1"),
+            ],
+            "event: stream.end\n\n",
+        )
+    })
+    .layer(cors_layer(&["http://localhost:5173".to_string()]));
+    for origin in ["http://localhost:1420", "http://localhost:5173"] {
+        let request = Request::builder()
+            .uri("/events")
+            .header("Origin", origin)
+            .body(axum::body::Body::empty())?;
+        let response = handler.clone().call(request, ()).await;
+        assert_eq!(response.headers()["access-control-allow-origin"], origin);
+        for capability in ["x-codewhale-stream-end", "x-codewhale-event-progress"] {
+            assert_eq!(response.headers()[capability], "1");
+            assert!(
+                response.headers()["access-control-expose-headers"]
+                    .to_str()?
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case(capability)),
+                "{capability} must be readable cross-origin"
+            );
+        }
+    }
+    let request = Request::builder()
+        .uri("/events")
+        .header("Origin", "http://malicious.example")
+        .body(axum::body::Body::empty())?;
+    let rejected = handler.call(request, ()).await;
+    assert!(
+        rejected
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+    Ok(())
 }
 
 /// #562 / whalescale#256 — `PATCH /v1/threads/{id}` accepts the new
@@ -6854,6 +9338,107 @@ async fn list_threads_archived_only_filter_matches_only_archived() -> Result<()>
     Ok(())
 }
 
+/// The exact-ID filter must run before the result limit so an owned older
+/// thread remains visible even when newer threads belong to other callers.
+#[tokio::test]
+async fn list_thread_summary_filters_ids_before_limit() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let mut owned_ids = Vec::new();
+
+    for _ in 0..2 {
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        owned_ids.push(
+            created["id"]
+                .as_str()
+                .context("missing thread id")?
+                .to_string(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for _ in 0..8 {
+        client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let recent: serde_json::Value = client
+        .get(format!(
+            "http://{addr}/v1/threads/summary?limit=8&include_archived=true"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let recent_ids: Vec<&str> = recent
+        .as_array()
+        .context("summary must be an array")?
+        .iter()
+        .filter_map(|thread| thread["id"].as_str())
+        .collect();
+    assert!(
+        owned_ids
+            .iter()
+            .all(|id| !recent_ids.contains(&id.as_str()))
+    );
+
+    let mut filtered_url = reqwest::Url::parse(&format!(
+        "http://{addr}/v1/threads/summary?limit=8&include_archived=true"
+    ))?;
+    filtered_url
+        .query_pairs_mut()
+        .append_pair("thread_ids", &owned_ids.join(","));
+    let filtered: serde_json::Value = client
+        .get(filtered_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let filtered_ids: Vec<&str> = filtered
+        .as_array()
+        .context("filtered summary must be an array")?
+        .iter()
+        .filter_map(|thread| thread["id"].as_str())
+        .collect();
+    assert_eq!(filtered_ids.len(), owned_ids.len());
+    assert!(
+        owned_ids
+            .iter()
+            .all(|id| filtered_ids.contains(&id.as_str()))
+    );
+
+    let mut oversized_url =
+        reqwest::Url::parse(&format!("http://{addr}/v1/threads/summary?limit=8"))?;
+    oversized_url
+        .query_pairs_mut()
+        .append_pair("thread_ids", &vec!["fixture-id"; 201].join(","));
+    let rejected = client.get(oversized_url).send().await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let at_limit = format!(
+        "http://{addr}/v1/threads/summary?limit=8&thread_ids={}",
+        vec!["fixture-id"; 200].join(",")
+    );
+    assert_eq!(client.get(at_limit).send().await?.status(), StatusCode::OK);
+
+    handle.abort();
+    Ok(())
+}
+
 /// #564 / whalescale#261 — `GET /v1/usage` aggregates per-turn token +
 /// cost data. With no threads the response is well-formed and totals are
 /// zero with empty buckets (never a 404).
@@ -6967,6 +9552,125 @@ async fn thread_usage_endpoint_scopes_totals_to_one_thread() -> Result<()> {
     Ok(())
 }
 
+/// `GET /v1/threads/{id}/receipt` and its per-turn form sit behind the same
+/// bearer boundary as every `/v1` route, answer with the shared receipt
+/// shape, and 404 an unknown thread or a turn from elsewhere.
+#[tokio::test]
+async fn thread_receipt_routes_require_auth_and_return_the_receipt_shape() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-receipt-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let token = "receipt-test-token".to_string();
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_and_token(root, sessions_dir, Some(token.clone())).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .bearer_auth(&token)
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let id = created["id"].as_str().expect("thread id").to_string();
+
+    for path in [
+        format!("/v1/threads/{id}/receipt"),
+        format!("/v1/threads/{id}/turns/turn_x/receipt"),
+    ] {
+        let anonymous = client.get(format!("http://{addr}{path}")).send().await?;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    let receipt: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{id}/receipt"))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["schema_id"], "codewhale.receipt/v1");
+    assert_eq!(receipt["source"]["kind"], "thread");
+    assert_eq!(receipt["source"]["id"], id);
+    assert_eq!(receipt["actions"], json!([]));
+    assert_eq!(receipt["totals"]["commands"], 0);
+    assert!(receipt["not_recorded"].is_array());
+
+    let foreign_turn = client
+        .get(format!(
+            "http://{addr}/v1/threads/{id}/turns/turn_x/receipt"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(foreign_turn.status(), StatusCode::NOT_FOUND);
+    let missing = client
+        .get(format!("http://{addr}/v1/threads/thr_missing/receipt"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// The four canonical thread-history controls mutate or inspect shared store
+/// state, so they sit behind the same bearer + workspace-scope middleware as
+/// every other `/v1` route: anonymous and wrong-token posts are refused before
+/// the handler runs. Authorized coverage lives in
+/// `runtime_store_convergence.rs`.
+#[tokio::test]
+async fn thread_history_operation_routes_require_auth() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-history-auth-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let token = "history-auth-test-token".to_string();
+    let Some((addr, _threads, handle)) =
+        spawn_test_server_with_root_and_token(root, sessions_dir, Some(token.clone())).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    for path in [
+        "/v1/thread-history/operations/lookup",
+        "/v1/thread-history/operations/recover",
+        "/v1/thread-history/mutate",
+        "/v1/thread-history/import",
+    ] {
+        let anonymous = client
+            .post(format!("http://{addr}{path}"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let wrong = client
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth("not-the-runtime-token")
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{path}");
+        // The token gate admits the request; the handler then rejects the
+        // empty body itself, which is the same 4xx the route gave when these
+        // were reachable without auth — anything but 401 proves we reached it.
+        let authorized = client
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth(&token)
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    handle.abort();
+    Ok(())
+}
+
 /// `GET /v1/approvals` serves the account-wide approval history behind the
 /// approvals log: decided rows carry their outcome + decision time, pending
 /// asks read "pending" with no decision time, newest ask first. A corrupt
@@ -7000,6 +9704,8 @@ async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<(
             tool_call_id: "tool-1".into(),
             tool_name: "exec_shell".into(),
             created_at: at(10),
+            target: Some("api.example.com".into()),
+            summary: Some("curl api.example.com".into()),
         },
     )?;
     store.append(
@@ -7009,6 +9715,9 @@ async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<(
             tool_call_id: "tool-1".into(),
             outcome: ApprovalOutcome::Denied,
             created_at: at(11),
+            decided_by: Some(crate::approval_log::ApprovalDecider::User),
+            grant_id: None,
+            matched_label: None,
         },
     )?;
     store.append(
@@ -7018,6 +9727,8 @@ async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<(
             tool_call_id: "tool-2".into(),
             tool_name: "write_file".into(),
             created_at: at(12),
+            target: None,
+            summary: None,
         },
     )?;
     let corrupt_dir = store.log_path("sess-corrupt")?;
@@ -7039,6 +9750,12 @@ async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<(
     assert_eq!(rows[1]["approval_id"], "tool-1");
     assert_eq!(rows[1]["tool_name"], "exec_shell");
     assert_eq!(rows[1]["outcome"], "denied");
+    assert_eq!(rows[1]["decided_by"], "user");
+    assert_eq!(rows[1]["target"], "api.example.com");
+    assert_eq!(rows[1]["summary"], "curl api.example.com");
+    assert!(rows[0].get("target").is_none());
+    assert!(rows[0].get("summary").is_none());
+    assert!(rows[0].get("decided_by").is_none());
     assert_eq!(rows[1]["asked_at"], "2026-09-10T10:00:00Z");
     assert_eq!(rows[1]["decided_at"], "2026-09-10T11:00:00Z");
 
@@ -7095,6 +9812,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
     let store = runtime_threads.test_store();
     let now = Utc::now();
     let mut turn = TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: 2,
         id: "turn_cost_merge".to_string(),
@@ -7111,6 +9829,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
             ..Usage::default()
         }),
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
@@ -7127,8 +9846,8 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         routed_usage: vec![crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: ApiProvider::Deepseek.as_str().to_string(),
+                provider: ProviderKind::Deepseek,
+                provider_identity: ProviderKind::Deepseek.as_str().to_string(),
                 model: "deepseek-v4-flash".to_string(),
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
                 endpoint_fingerprint: None,
@@ -7149,12 +9868,15 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
+        workspace_snapshots: Vec::new(),
     };
     // Mirror `TurnRecord::persist_effective_route` (private to the runtime
     // threads module): persist the route envelope onto the turn so the
     // recorded-time pricer sees a complete dispatch record.
-    turn.effective_provider = Some(ApiProvider::Deepseek.as_str().to_string());
-    turn.effective_provider_id = Some(ApiProvider::Deepseek.as_str().to_string());
+    turn.effective_provider = Some(ProviderKind::Deepseek.as_str().to_string());
+    turn.effective_provider_id = Some(ProviderKind::Deepseek.as_str().to_string());
     turn.effective_billing_surface =
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string());
     turn.effective_endpoint_fingerprint = None;
@@ -7290,6 +10012,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
     let store = runtime_threads.test_store();
     let now = Utc::now();
     let mut turn = TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: 2,
         id: "turn_cny_reasons".to_string(),
@@ -7306,6 +10029,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
             ..Usage::default()
         }),
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
@@ -7322,8 +10046,8 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         routed_usage: vec![crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: ApiProvider::Deepseek.as_str().to_string(),
+                provider: ProviderKind::Deepseek,
+                provider_identity: ProviderKind::Deepseek.as_str().to_string(),
                 model: "deepseek-v4-flash".to_string(),
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
                 endpoint_fingerprint: None,
@@ -7344,9 +10068,12 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
+        workspace_snapshots: Vec::new(),
     };
-    turn.effective_provider = Some(ApiProvider::Openai.as_str().to_string());
-    turn.effective_provider_id = Some(ApiProvider::Openai.as_str().to_string());
+    turn.effective_provider = Some(ProviderKind::Openai.as_str().to_string());
+    turn.effective_provider_id = Some(ProviderKind::Openai.as_str().to_string());
     turn.effective_billing_surface = Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE.to_string());
     turn.effective_endpoint_fingerprint = None;
     turn.effective_billing_mode = Some(crate::cost_status::RouteBillingMode::Metered);
@@ -7392,6 +10119,107 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
     assert!(cost.coverage_recorded);
     assert!(!cost.coverage_is_legacy_unknown());
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn watch_client_token_refuses_runtime_mutations_and_upgrades() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let Some((addr, _, handle)) = spawn_test_server_with_root_and_token(
+        root.path().to_path_buf(),
+        root.path().join("sessions"),
+        Some("watch-scope-fixture-master".to_string()),
+    )
+    .await?
+    else {
+        bail!("the owned client-token HTTP fixture could not bind");
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let info: Value = client
+        .get(format!("{base}/v1/runtime/info"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(info["capabilities"]["client_token_intents"], true);
+    let mint = |body: Value| {
+        client
+            .post(format!("{base}/v1/auth/client-tokens"))
+            .bearer_auth("watch-scope-fixture-master")
+            .json(&body)
+    };
+    let watch: Value = mint(json!({"device_id": "read-device", "label": "cwc-seat:drive"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(watch["intent"], "watch");
+    let watch_token = watch["token"].as_str().context("watch token")?;
+    let reads = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .send()
+        .await?;
+    assert_eq!(reads.status(), StatusCode::OK);
+    for (method, path) in [
+        (Method::POST, "/v1/threads"),
+        (Method::PUT, "/v1/workspace/files"),
+        (Method::DELETE, "/v1/memory"),
+        (Method::POST, "/v1/approvals/not-pending"),
+    ] {
+        let refused = client
+            .request(method, format!("{base}{path}"))
+            .bearer_auth(watch_token)
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let upgrade = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .header(header::UPGRADE, "websocket")
+        .send()
+        .await?;
+    assert_eq!(upgrade.status(), StatusCode::FORBIDDEN);
+    let drive: Value = mint(json!({"device_id": "write-device", "intent": "drive"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(drive["intent"], "drive");
+    let created = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth(drive["token"].as_str().context("drive token")?)
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let invalid = mint(json!({"device_id": "bad-device", "intent": "admin"}))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let revoked = client
+        .delete(format!(
+            "{base}/v1/auth/client-tokens/{}",
+            watch["id"].as_str().context("watch id")?
+        ))
+        .bearer_auth("watch-scope-fixture-master")
+        .send()
+        .await?;
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    let expired_read = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .send()
+        .await?;
+    assert_eq!(expired_read.status(), StatusCode::UNAUTHORIZED);
     handle.abort();
     Ok(())
 }
@@ -7713,6 +10541,64 @@ async fn mobile_runtime_router_starts_without_duplicate_method_routes() -> Resul
     // Axum panics during `build_router` when a method/path pair is registered
     // twice, so reaching the running server is the regression assertion.
     handle.abort();
+    Ok(())
+}
+
+#[test]
+fn mobile_stream_statuses_use_selected_locale() -> Result<()> {
+    use codewhale_localization::{Locale, MessageId, tr};
+
+    for &locale in Locale::shipped_complete() {
+        let html = mobile_html(locale);
+        let script = html
+            .split_once("<script>")
+            .context("mobile script")?
+            .1
+            .split_once("boot().catch")
+            .context("mobile startup")?
+            .0;
+        let runtime = rquickjs::Runtime::new()?;
+        let context = rquickjs::Context::full(&runtime)?;
+        context.with(|ctx| -> Result<()> {
+            ctx.eval::<(), _>(script)?;
+            for (expression, message) in [
+                (
+                    "streamEndStatus('replay_failed')",
+                    MessageId::MobileStreamReplayFailed,
+                ),
+                (
+                    "streamEndStatus('catch_up_failed')",
+                    MessageId::MobileStreamCatchUpFailed,
+                ),
+                (
+                    "streamEndStatus('runtime_shutdown')",
+                    MessageId::MobileStreamRuntimeShutdown,
+                ),
+                (
+                    "streamEndStatus('future_reason')",
+                    MessageId::MobileStreamEnded,
+                ),
+                ("streamMessages.closed", MessageId::MobileStreamClosed),
+                (
+                    "streamMessages.reconnecting",
+                    MessageId::MobileStreamReconnecting,
+                ),
+                ("streamMessages.connected", MessageId::MobileStreamConnected),
+            ] {
+                let actual: String = ctx.eval(expression)?;
+                assert_eq!(actual, tr(locale, message), "{}: {message:?}", locale.tag());
+                if locale != Locale::En {
+                    assert_ne!(
+                        actual,
+                        tr(Locale::En, message),
+                        "{}: {message:?}",
+                        locale.tag()
+                    );
+                }
+            }
+            Ok(())
+        })?;
+    }
     Ok(())
 }
 
@@ -8214,6 +11100,9 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
     };
+    // Settle the server's startup item-index warm-up, so the read counts below
+    // measure this route and not a background pass over the directory.
+    runtime_threads.warm_item_index()?;
     let client = crate::tls::reqwest_client();
 
     const THREADS: usize = 8;
@@ -8317,6 +11206,125 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     Ok(())
 }
 
+/// The default listing carries no `search`, and it must not walk the items
+/// directory at all.
+///
+/// This route used to call `get_thread_detail` for every row, and detail is a
+/// whole-store walk: `list_turns_for_thread` scans every turn record and
+/// `list_items_for_turns_map` scans every item record, because an item's
+/// filename carries only the item id. Listing `T` threads therefore cost
+/// `T x (all_turns + all_items)` reads — seconds-per-thread, and the reason a
+/// 72-thread rail went blank. The next fix made that one pass per directory,
+/// and the one after it read each row's preview out of the row's own newest
+/// turn, so no item file is read by directory walk at all. The bound asserted
+/// here is that zero, so any return to a store-wide item read fails loudly.
+#[tokio::test]
+async fn thread_summary_listing_never_walks_the_items_directory() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    // Settle the server's startup item-index warm-up, so the read counts below
+    // measure this route and not a background pass over the directory.
+    runtime_threads.warm_item_index()?;
+    let client = crate::tls::reqwest_client();
+
+    const THREADS: usize = 8;
+    const TURNS_PER_THREAD: usize = 4;
+    const ITEMS_PER_TURN: usize = 4;
+    const PREVIEW_TOKEN: &str = "listingreadsstoreonce";
+
+    for index in 0..THREADS {
+        let thread: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let id = thread["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+        seed_summary_search_transcript(
+            runtime_threads.test_store(),
+            &id,
+            index,
+            TURNS_PER_THREAD,
+            ITEMS_PER_TURN,
+            PREVIEW_TOKEN,
+        )?;
+    }
+
+    let total_turns = (THREADS * TURNS_PER_THREAD) as u64;
+    let total_items = (THREADS * TURNS_PER_THREAD * ITEMS_PER_TURN) as u64;
+    let per_thread_file_reads = THREADS as u64 * (total_turns + total_items);
+
+    runtime_threads.reset_whole_store_scan_file_reads();
+    let listed: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/summary?limit={THREADS}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let (turn_files, item_files) = runtime_threads.whole_store_scan_file_reads();
+    let rows = listed.as_array().context("summary should be an array")?;
+
+    assert_eq!(
+        rows.len(),
+        THREADS,
+        "every thread must still be listed; got {listed}"
+    );
+    assert_eq!(
+        turn_files, total_turns,
+        "the page still reads every turn record exactly once: read {turn_files} of \
+         {total_turns} turn files, while reading one thread's detail per row would have \
+         been {per_thread_file_reads} reads in total"
+    );
+    assert_eq!(
+        item_files, 0,
+        "a page must not read the items directory at all: read {item_files} item files, \
+         while one pass over the directory would have been {total_items} and one detail \
+         read per row {per_thread_file_reads}"
+    );
+    assert!(
+        rows.iter().all(|row| row["preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains(PREVIEW_TOKEN))),
+        "reading each row's own turn must still fill every preview; got {listed}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["latest_turn_status"] == "completed"),
+        "one pass must still report each thread's newest turn status; got {listed}"
+    );
+    assert!(
+        rows.iter().all(|row| row["pending_attention_count"] == 0),
+        "one pass must still read attention from live state; got {listed}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// The summary resolves git metadata once per distinct workspace, so the
+/// resolve list must collapse repeated workspaces instead of keeping one entry
+/// per row: every entry costs up to five blocking `git` processes.
+#[test]
+fn thread_summary_resolves_git_metadata_once_per_distinct_workspace() {
+    let repo = PathBuf::from("/srv/repo");
+    let other = PathBuf::from("/srv/other");
+    let rows = vec![
+        repo.clone(),
+        repo.clone(),
+        other.clone(),
+        repo.clone(),
+        other.clone(),
+    ];
+    assert_eq!(distinct_paths(rows), vec![repo, other]);
+}
+
 fn seed_summary_search_transcript(
     store: &crate::runtime_threads::RuntimeThreadStore,
     thread_id: &str,
@@ -8350,12 +11358,14 @@ fn seed_summary_search_transcript(
                 detail: Some(text),
                 metadata: None,
                 artifact_refs: Vec::new(),
+                artifacts: Vec::new(),
                 started_at: Some(created_at),
                 ended_at: Some(created_at),
             })?;
             item_ids.push(item_id);
         }
         store.save_turn(&TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens: None,
             schema_version: 2,
             id: turn_id.clone(),
@@ -8368,6 +11378,7 @@ fn seed_summary_search_transcript(
             duration_ms: Some(0),
             usage: None,
             model_request_diagnostics: None,
+            operation_activity: None,
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: None,
@@ -8389,6 +11400,9 @@ fn seed_summary_search_transcript(
             item_ids,
             steer_count: 0,
             agent_mail_message_id: None,
+            artifacts: Vec::new(),
+            workspace: None,
+            workspace_snapshots: Vec::new(),
         })?;
         latest_turn_id = Some(turn_id);
     }
@@ -8700,6 +11714,144 @@ async fn skills_endpoint_includes_enabled_field() -> Result<()> {
 }
 
 #[tokio::test]
+async fn unicode_skill_activation_matches_api_load_and_owned_lifecycle() -> Result<()> {
+    use crate::tools::spec::{ToolContext, ToolSpec as _};
+
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("workspace");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+    let _userprofile = EnvVarGuard::set("USERPROFILE", &home);
+    let _state_home = EnvVarGuard::set("CODEWHALE_HOME", &root);
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let (original_dir, _) = create_managed_skill(&workspace, "技能")?;
+    create_managed_skill(&workspace, "分析")?;
+    create_managed_skill(&workspace, "skill")?;
+    let a = crate::skills::normalize_skill_name_for_lookup("技能");
+    let b = crate::skills::normalize_skill_name_for_lookup("分析");
+    assert_ne!(a, b);
+    let state_path = root.join("skills_state.toml");
+    let initial = b"disabled = [\"skill\"]\n";
+    fs::write(&state_path, initial)?;
+    let (addr, _threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        root.join("sessions"),
+        None,
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("isolated skill API fixture requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let context = ToolContext::new(&workspace).with_skills_config(
+        workspace.join(".codewhale/skills"),
+        crate::skills::SkillDiscoveryMode::Compatible,
+    );
+    let tool = crate::tools::skill::LoadSkillTool;
+
+    let before: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for name in [a.as_str(), b.as_str(), "skill"] {
+        let entry = before["skills"]
+            .as_array()
+            .context("skills")?
+            .iter()
+            .find(|skill| skill["name"] == name)
+            .context("discovered identity")?;
+        assert_eq!(entry["enabled"], false);
+    }
+    assert!(
+        tool.execute(json!({"name":"技能"}), &context)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(&state_path)?,
+        initial,
+        "listing/loading must not migrate state"
+    );
+
+    let raw_toggle = client
+        .post(format!("http://{addr}/v1/skills/技能"))
+        .json(&json!({"enabled":true}))
+        .send()
+        .await?;
+    assert_eq!(
+        raw_toggle.status(),
+        StatusCode::NOT_FOUND,
+        "toggle accepts exact catalog IDs only"
+    );
+    for name in [a.as_str(), "skill"] {
+        client
+            .post(format!("http://{addr}/v1/skills/{name}"))
+            .json(&json!({"enabled":true}))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    let after: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for (name, enabled) in [(a.as_str(), true), (b.as_str(), false), ("skill", true)] {
+        let entry = after["skills"]
+            .as_array()
+            .context("skills")?
+            .iter()
+            .find(|skill| skill["name"] == name)
+            .context("discovered identity")?;
+        assert_eq!(entry["enabled"], enabled);
+    }
+    for name in [a.as_str(), "技能", "skill"] {
+        let loaded = tool.execute(json!({"name":name}), &context).await?;
+        assert!(loaded.success);
+    }
+    assert!(
+        tool.execute(json!({"name":"分析"}), &context)
+            .await
+            .is_err()
+    );
+    let audit: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/{a}/audit"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(audit["skills"][0]["name"], a);
+    assert!(original_dir.join("SKILL.md").is_file());
+    assert!(
+        !workspace.join(".codewhale/skills").join(&a).exists(),
+        "no directory rename"
+    );
+    client
+        .delete(format!("http://{addr}/v1/skills/{a}?scope=project"))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        !original_dir.exists(),
+        "owned resolver must use the shared canonical identity"
+    );
+    assert!(workspace.join(".codewhale/skills/分析/SKILL.md").is_file());
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn skills_endpoint_exposes_safe_plugin_provenance_and_shared_toggle() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
@@ -8822,6 +11974,7 @@ fn resolve_skills_scenario() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workspace = tmp.path();
         let local_skills = workspace.join(".agents").join("skills");
+        crate::test_support::trust_workspace(workspace);
         fs::create_dir_all(&local_skills).expect("create skills dir");
 
         let config = Config::default();
@@ -8835,9 +11988,16 @@ fn resolve_skills_scenario() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workspace = tmp.path();
         let local_skills = workspace.join("skills");
+        crate::test_support::trust_workspace(workspace);
         fs::create_dir_all(&local_skills).expect("create skills dir");
 
-        let config = Config::default();
+        let config = Config {
+            skills: Some(crate::config::SkillsConfig {
+                flat_workspace_root: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let resolved = resolve_skills_dir(&config, workspace);
 
         let expected = fs::canonicalize(&local_skills).expect("canonical local skills");
@@ -8851,6 +12011,7 @@ fn resolve_skills_scenario() {
         let codewhale_skills = workspace.join(".codewhale").join("skills");
         fs::create_dir_all(&agents_skills).expect("create agents skills dir");
         fs::create_dir_all(&codewhale_skills).expect("create codewhale skills dir");
+        crate::test_support::trust_workspace(workspace);
 
         let config = Config {
             skills: Some(crate::config::SkillsConfig {
@@ -8937,21 +12098,25 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
     .expect("write override skill");
 
     let bundled_skill = crate::skills::Skill {
+        legacy_activation_name: None,
         name: "delegate".to_string(),
         description: String::new(),
         localized_descriptions: std::collections::HashMap::new(),
         invocation: crate::skills::SkillInvocation::ModelAndUser,
         aliases: Vec::new(),
+        argument_hint: None,
         body: String::new(),
         path: bundled_skill_path,
         source: crate::skills::SkillSource::Native,
     };
     let override_skill = crate::skills::Skill {
+        legacy_activation_name: None,
         name: "delegate".to_string(),
         description: String::new(),
         localized_descriptions: std::collections::HashMap::new(),
         invocation: crate::skills::SkillInvocation::ModelAndUser,
         aliases: Vec::new(),
+        argument_hint: None,
         body: String::new(),
         path: override_skill_path,
         source: crate::skills::SkillSource::Native,
@@ -8973,9 +12138,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
 #[test]
 fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -9001,13 +12164,59 @@ fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
     );
 }
 
+/// An untrusted workspace's skill dirs must not become the resolved skills
+/// dir: discovery would search it and bypass the workspace-trust gate.
+#[test]
+fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = crate::test_support::SealedHome::at(tmp.path());
+    let codewhale_only = Config {
+        skills: Some(crate::config::SkillsConfig {
+            scan_codewhale_only: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for (relative, config) in [
+        (".agents/skills", Config::default()),
+        (
+            "skills",
+            Config {
+                skills: Some(crate::config::SkillsConfig {
+                    flat_workspace_root: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
+        (".codewhale/skills", codewhale_only),
+    ] {
+        let workspace = tmp
+            .path()
+            .join(format!("ws-{}", relative.replace('/', "-")));
+        let local_skills = workspace.join(relative);
+        fs::create_dir_all(&local_skills).expect("create skills dir");
+
+        assert_eq!(
+            resolve_skills_dir(&config, &workspace),
+            config.skills_dir(),
+            "untrusted {relative} must not be resolved as the skills dir"
+        );
+
+        crate::test_support::trust_workspace(&workspace);
+        assert_eq!(
+            resolve_skills_dir(&config, &workspace),
+            fs::canonicalize(&local_skills).expect("canonical skills"),
+            "trusted {relative} resolves as before"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn resolve_skills_dir_rejects_codewhale_only_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -9446,6 +12655,34 @@ async fn get_provider_models(
 ) -> serde_json::Value {
     client
         .get(format!("http://{addr}/v1/providers/{provider}/models"))
+        .send()
+        .await
+        .expect("GET /v1/providers/{id}/models should not fail at transport level")
+        .error_for_status()
+        .expect("GET /v1/providers/{id}/models should return 200")
+        .json()
+        .await
+        .expect("GET /v1/providers/{id}/models should return valid JSON")
+}
+
+/// Helper: GET `/v1/providers/{id}/models` for one exact configured identity —
+/// the read a client performs with the `model_provider_id` the provider
+/// catalog published.
+async fn get_provider_models_with_identity(
+    client: &reqwest::Client,
+    addr: &SocketAddr,
+    provider: &str,
+    model_provider_id: &str,
+) -> serde_json::Value {
+    client
+        .get({
+            let mut url =
+                reqwest::Url::parse(&format!("http://{addr}/v1/providers/{provider}/models"))
+                    .expect("provider models URL");
+            url.query_pairs_mut()
+                .append_pair("model_provider_id", model_provider_id);
+            url
+        })
         .send()
         .await
         .expect("GET /v1/providers/{id}/models should not fail at transport level")
@@ -9943,7 +13180,9 @@ async fn provider_catalog_and_switch_preserve_each_listed_route_identity() -> Re
             );
         }
     }
-    for invalid in ["deepseek-cn", "antigravity", "not-a-provider"] {
+    let legacy_alias = get_provider_models(&client, &addr, "deepseek-cn").await;
+    assert_eq!(legacy_alias["provider"], "deepseek-cn");
+    for invalid in ["deepseek-cn-unknown", "antigravity", "not-a-provider"] {
         let response = client
             .get(format!("http://{addr}/v1/providers/{invalid}/models"))
             .send()
@@ -10134,9 +13373,13 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
         .find(|entry| entry["id"] == "deepseek-v4-pro")
         .context("DeepSeek text model entry")?;
     assert_eq!(text_only["image_input"], "unsupported");
-    // A reasoning-capable model does not imply a published effort ladder.
-    assert_eq!(text_only["reasoning_effort"], "unknown");
-    assert_eq!(text_only["reasoning_effort_levels"], json!([]));
+    // The effort ladder is the one the catalog row publishes (#6396).
+    assert_eq!(text_only["reasoning_effort"], "supported");
+    assert!(
+        text_only["reasoning_effort_levels"]
+            .as_array()
+            .is_some_and(|levels| !levels.is_empty())
+    );
 
     let config_before = get_config(&client, &addr).await;
     let response = client
@@ -10164,30 +13407,71 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
 fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries() {
     let _lock = crate::test_support::lock_test_env();
     let root = tempfile::tempdir().unwrap();
-    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", root.path());
-    let config = Config {
+    let canonical_home = root
+        .path()
+        .canonicalize()
+        .expect("canonical private fixture home");
+    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", &canonical_home);
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
+    let mut config = Config {
         provider: Some("openai-codex".to_string()),
         ..Config::default()
     };
-    let cache_path = root.path().join("models_cache.json");
-    let cache = json!({
-        "fetched_at": chrono::Utc::now(),
-        "models": [
-            {"slug": "gpt-6-astra", "supported_reasoning_levels": [
-                {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
-                {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"},
-                {"effort": "unexpected-private-value"}
-            ]},
-            {"slug": "gpt-5.5", "supported_reasoning_levels": [{"effort": "high"}, {"effort": "xhigh"}]},
-            {"slug": "no-reasoning", "supported_reasoning_levels": []},
-            {"slug": "optional-reasoning", "supported_reasoning_levels": [{"effort": "none"}, {"effort": "minimal"}, {"effort": "low"}]},
-            {"slug": "no-effort-metadata"},
-            {"slug": "unrecognized-efforts", "supported_reasoning_levels": [{"effort": "future-value"}]}
+    let access_token = crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        [
+            (
+                "gpt-6-astra",
+                None,
+                vec![
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                    "unexpected-private-value",
+                ],
+            ),
+            ("gpt-5.5", None, vec!["high", "xhigh"]),
+            ("no-reasoning", Some(false), vec![]),
+            ("optional-reasoning", None, vec!["none", "minimal", "low"]),
+            ("no-effort-metadata", None, vec![]),
+            ("unrecognized-efforts", None, vec!["future-value"]),
         ]
-    });
-    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
-    let astra =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+        .into_iter()
+        .map(
+            |(id, reasoning, efforts)| crate::codex_model_cache::CodexModelMetadata {
+                id: id.into(),
+                display_name: None,
+                context_window: None,
+                reasoning,
+                efforts: efforts.into_iter().map(str::to_string).collect(),
+            },
+        )
+        .collect(),
+    )
+    .unwrap();
+    // Locate the one snapshot actually created by the account-scoped helper;
+    // an external CODEX_HOME cache is not an account roster authority.
+    let catalog_path = crate::models_dev_live::cache_path().unwrap();
+    let snapshots: Vec<_> = fs::read_dir(catalog_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("chatgpt-plan-"))
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    let cache_path = &snapshots[0];
+    let astra = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         astra.reasoning_effort,
         codewhale_config::route::CapabilityState::Supported
@@ -10196,7 +13480,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         astra.reasoning_effort_levels,
         ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
-    assert_eq!(astra.reasoning_effort_source, Some("codex_cli_cache"));
+    assert_eq!(astra.reasoning_effort_source, Some("chatgpt_plan_api"));
     // The relay preserves the same model facts without elevating them into
     // a tool-execution or account-entitlement receipt.
     let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
@@ -10213,15 +13497,19 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         relayed_astra["reasoningEffortLevels"],
         json!(astra.reasoning_effort_levels)
     );
-    assert_eq!(relayed_astra["reasoningEffortSource"], "codex_cli_cache");
+    assert_eq!(relayed_astra["reasoningEffortSource"], "chatgpt_plan_api");
     assert_eq!(relay["runtime"]["capabilities"]["tool_execution"], false);
     assert!(!relay.to_string().contains("test-token"));
-    let older =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-5.5".to_string());
+    assert!(!relay.to_string().contains(&access_token));
+    let older = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-5.5".to_string(),
+    );
     assert_eq!(older.reasoning_effort_levels, ["high", "xhigh"]);
     let unsupported = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "no-reasoning".to_string(),
     );
     assert_eq!(
@@ -10231,7 +13519,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     assert!(unsupported.reasoning_effort_levels.is_empty());
     let optional = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "optional-reasoning".to_string(),
     );
     assert_eq!(optional.reasoning_effort_levels, ["low"]);
@@ -10240,8 +13528,11 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         codewhale_config::route::CapabilityState::Supported
     );
     for id in ["no-effort-metadata", "unrecognized-efforts"] {
-        let unknown =
-            provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, id.to_string());
+        let unknown = provider_model_entry_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+            id.to_string(),
+        );
         assert_eq!(
             unknown.reasoning_effort,
             codewhale_config::route::CapabilityState::Unknown
@@ -10250,7 +13541,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     }
     let missing = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "unknown-model".to_string(),
     );
     assert_eq!(
@@ -10260,20 +13551,27 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     assert!(missing.reasoning_effort_levels.is_empty());
     let mut custom = config.clone();
     custom
-        .provider_config_for_mut(ApiProvider::OpenaiCodex)
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::OpenaiCodex))
+        .unwrap()
         .base_url = Some("https://proxy.example.test/v1".to_string());
-    let proxy =
-        provider_model_entry_for_api(&custom, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+    let proxy = provider_model_entry_for_api(
+        &custom,
+        &(custom).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         proxy.reasoning_effort,
         codewhale_config::route::CapabilityState::Unknown
     );
     assert!(proxy.reasoning_effort_levels.is_empty());
-    let mut stale = cache;
+    let mut stale: Value = serde_json::from_slice(&fs::read(cache_path).unwrap()).unwrap();
     stale["fetched_at"] = json!(chrono::Utc::now() - chrono::Duration::hours(48));
-    fs::write(&cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
-    let stale =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+    fs::write(cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let stale = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         stale.reasoning_effort,
         codewhale_config::route::CapabilityState::Unknown
@@ -10348,15 +13646,22 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
             default_text_model: Some("deepseek-v4-pro".to_string()),
             ..Config::default()
         };
-        let provider_config = config.provider_config_for_mut(ApiProvider::Deepseek);
+        let provider_config = config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Deepseek))
+            .unwrap();
         provider_config.base_url = Some(official_base_url.to_string());
         provider_config.model = Some("deepseek-v4-pro".to_string());
 
         assert!(
-            !config.provider_uses_custom_endpoint(ApiProvider::Deepseek),
+            !config.provider_uses_custom_endpoint(
+                &config.test_identity_for_kind(ProviderKind::Deepseek)
+            ),
             "official DeepSeek endpoint must retain the shared model catalog: {official_base_url}"
         );
-        let models = provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Deepseek);
+        let models = provider_models_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
+        );
         assert!(
             models
                 .iter()
@@ -10370,29 +13675,42 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
         default_text_model: Some("private-deepseek-deployment".to_string()),
         ..Config::default()
     };
-    let provider_config = custom.provider_config_for_mut(ApiProvider::Deepseek);
+    let provider_config = custom
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+        .unwrap();
     provider_config.base_url = Some("https://deepseek-proxy.example.test/v1".to_string());
     provider_config.model = Some("private-deepseek-deployment".to_string());
 
-    assert!(custom.provider_uses_custom_endpoint(ApiProvider::Deepseek));
+    assert!(
+        custom
+            .provider_uses_custom_endpoint(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+    );
     assert_eq!(
-        provider_models_for_api(&custom, ApiProvider::Deepseek, ApiProvider::Deepseek),
+        provider_models_for_api(
+            &custom,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         vec!["private-deepseek-deployment".to_string()],
         "a real custom endpoint must expose only its explicitly configured model namespace"
     );
 
     custom.default_text_model = Some("deepseek-v4-flash-vision-exp".to_string());
-    custom.provider_config_for_mut(ApiProvider::Deepseek).model =
-        Some("deepseek-v4-flash-vision-exp".to_string());
+    custom
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+        .unwrap()
+        .model = Some("deepseek-v4-flash-vision-exp".to_string());
     assert_eq!(
-        provider_models_for_api(&custom, ApiProvider::Deepseek, ApiProvider::Deepseek),
+        provider_models_for_api(
+            &custom,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         vec!["deepseek-v4-flash-vision-exp".to_string()],
         "a custom proxy may legitimately reuse a first-party model id"
     );
     assert_eq!(
         provider_model_image_input_for_api(
             &custom,
-            ApiProvider::Deepseek,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek),
             "deepseek-v4-flash-vision-exp",
         ),
         codewhale_config::route::CapabilityState::Unknown,
@@ -10775,6 +14093,426 @@ api_key = "local-test-key"
 }
 
 #[tokio::test]
+async fn provider_catalog_lists_configured_named_custom_routes() -> Result<()> {
+    // A user-defined `[providers.<name>]` route is first-class in the TUI
+    // picker and in this API's own model catalog, but `GET /v1/providers`
+    // walked only the built-in enum — so a route configured in the TUI never
+    // reached the GUI provider picker at all. This pins the whole path a GUI
+    // client needs: the route is listed as (generic kind, exact id), the pair
+    // it reports is the pair the switch endpoint accepts, and switching to it
+    // persists the route name the config actually selects.
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-provider-named-custom-route-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "deepseek"
+default_text_model = "deepseek-v4-pro"
+
+[providers.deepseek]
+api_key = "fixture-key"
+
+[providers.bigmodel-cn]
+kind = "openai-compatible"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key = "fixture-key"
+model = "glm-5.3"
+
+[providers.not-a-routable-route]
+base_url = "http://127.0.0.1:18191/v1"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let providers = get_providers(&client, &addr).await;
+    assert_eq!(providers["current"], "deepseek");
+    assert_eq!(
+        providers["current_provider_id"], "deepseek",
+        "the active route's exact id travels with the generic one"
+    );
+
+    let catalog = providers["providers"]
+        .as_array()
+        .context("providers array")?;
+    let route_entries: Vec<_> = catalog
+        .iter()
+        .filter(|entry| entry["model_provider_id"] == "bigmodel-cn")
+        .collect();
+    assert_eq!(
+        route_entries.len(),
+        1,
+        "a configured route must be listed exactly once: {providers}"
+    );
+    let route = route_entries[0];
+    assert_eq!(route["id"], "custom");
+    assert_eq!(route["display_name"], "bigmodel-cn (custom)");
+    assert_eq!(route["default_model"], "glm-5.3");
+    assert_eq!(
+        route["has_model_catalog"], true,
+        "the flag must describe what this route's own model endpoint returns"
+    );
+    let unavailable: Vec<_> = catalog
+        .iter()
+        .filter(|entry| entry["model_provider_id"] == "not-a-routable-route")
+        .collect();
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(
+        unavailable[0]["display_name"],
+        "not-a-routable-route (unavailable)"
+    );
+    assert_eq!(unavailable[0]["has_model_catalog"], false);
+    assert_eq!(unavailable[0]["credentialState"], "legacy");
+    assert_eq!(unavailable[0]["credentialWritable"], false);
+    // Every admitted built-in carries its own exact id, including inactive
+    // entries. None may borrow the selected route's id.
+    for entry in catalog {
+        if entry["id"] != "deepseek" && entry["id"] != "custom" {
+            assert_eq!(
+                entry["model_provider_id"], entry["id"],
+                "an inactive provider must carry its own exact id: {entry}"
+            );
+        }
+    }
+    let unavailable_models = client
+        .get(format!(
+            "http://{addr}/v1/providers/custom/models?model_provider_id=not-a-routable-route"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unavailable_models.status(), StatusCode::BAD_REQUEST);
+
+    // The route's model catalog is reachable with the identity the catalog
+    // just published — no other spelling is needed by a client.
+    let models = get_provider_models_with_identity(&client, &addr, "custom", "bigmodel-cn").await;
+    let model_ids: Vec<_> = models["models"]
+        .as_array()
+        .context("models array")?
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .collect();
+    assert_eq!(model_ids, vec!["glm-5.3"]);
+
+    // Switching with that same pair selects and persists the route.
+    let (status, body) = post_switch_provider(
+        &client,
+        &addr,
+        "custom",
+        &json!({ "model_provider_id": "bigmodel-cn" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "switch should succeed, body: {body}"
+    );
+    assert_eq!(body["provider"], "bigmodel-cn");
+    assert_eq!(body["model"], "glm-5.3");
+
+    let persisted = fs::read_to_string(&config_file)?;
+    assert!(
+        persisted.contains("provider = \"bigmodel-cn\""),
+        "the selected route name is what the config selects. Actual config:\n{persisted}"
+    );
+
+    // Now active, the route is still listed once — as the active entry rather
+    // than duplicated beside it — and it keeps naming itself: an active route
+    // that fell back to the unconfigured `custom` placeholder would show the
+    // user a name they never chose and tell a client its catalog is empty.
+    let providers = get_providers(&client, &addr).await;
+    assert_eq!(providers["current"], "custom");
+    assert_eq!(providers["current_provider_id"], "bigmodel-cn");
+    let catalog = providers["providers"]
+        .as_array()
+        .context("providers array")?;
+    let active_entries: Vec<_> = catalog
+        .iter()
+        .filter(|entry| entry["model_provider_id"] == "bigmodel-cn")
+        .collect();
+    assert_eq!(
+        active_entries.len(),
+        1,
+        "the active route is listed once: {providers}"
+    );
+    assert_eq!(active_entries[0]["display_name"], "bigmodel-cn (custom)");
+    assert_eq!(active_entries[0]["has_model_catalog"], true);
+    assert_eq!(active_entries[0]["default_model"], "glm-5.3");
+
+    // The config-key path the GUI's config panel uses accepts the same
+    // route name, because that is what the persistent `provider` key holds.
+    let (status, body) = post_set_config(&client, &addr, "provider", "bigmodel-cn", true).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "set provider should succeed: {body}"
+    );
+    let config_after = get_config(&client, &addr).await;
+    assert_eq!(config_after["provider"], "bigmodel-cn");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_provider_names_a_custom_route_instead_of_denying_it() -> Result<()> {
+    // Addressing a configured route by its own name in the path is the obvious
+    // mistake; the refusal must point at the pair that works rather than claim
+    // the route does not exist.
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-switch-named-route-hint-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "deepseek"
+
+[providers.bigmodel-cn]
+kind = "openai-compatible"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+model = "glm-5.3"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_switch_provider(&client, &addr, "bigmodel-cn", &json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("bigmodel-cn") && message.contains("model_provider_id"),
+        "the refusal must name the working pair, got: {message}"
+    );
+
+    // A pair that contradicts itself fails closed rather than picking one half:
+    // the path says generic `custom`, the body names a built-in route.
+    let (status, body) = post_switch_provider(
+        &client,
+        &addr,
+        "custom",
+        &json!({ "model_provider_id": "deepseek" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("custom") && message.contains("deepseek"),
+        "a contradictory pair must be refused by name, got: {message}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_base_url_writes_the_field_the_active_route_reads() -> Result<()> {
+    // `GET /v1/config` reports the active route's endpoint as `base_url`, so a
+    // client reads it and writes it back. The write used to land in a root
+    // `active_route_base_url` key that no reader resolves: it reported success,
+    // the file gained a dead key, and the endpoint never moved. Each route shape
+    // owns exactly one endpoint slot, and the write has to find it.
+    let root = std::env::temp_dir().join(format!("codewhale-config-base-url-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "volcengine"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.volcengine]
+api_key = "fixture-key"
+base_url = "http://127.0.0.1:2/v1"
+model = "glm-5.2"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let before = get_config(&client, &addr).await;
+    assert_eq!(
+        before["base_url"], "http://127.0.0.1:2/v1",
+        "a built-in reports its own table's endpoint"
+    );
+
+    let (status, body) = post_set_config(
+        &client,
+        &addr,
+        "base_url",
+        "https://moved.example.test/v1",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "write should succeed, body: {body}");
+    let resp = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let after = get_config(&client, &addr).await;
+    assert_eq!(
+        after["base_url"], "https://moved.example.test/v1",
+        "the written value is what the route now reads"
+    );
+    let persisted = fs::read_to_string(&config_file)?;
+    assert!(
+        persisted.contains("[providers.volcengine]"),
+        "the built-in keeps its endpoint in its own table:\n{persisted}"
+    );
+    assert!(
+        persisted.contains("https://moved.example.test/v1"),
+        "the endpoint moved on disk:\n{persisted}"
+    );
+    assert!(
+        !persisted.contains("active_route_base_url"),
+        "no dead key may be written:\n{persisted}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_base_url_moves_the_root_route_endpoint() -> Result<()> {
+    // DeepSeek owns the root slot; writing it must be visible to the same read
+    // that reports it, and to nothing else.
+    let root =
+        std::env::temp_dir().join(format!("codewhale-config-base-url-root-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(
+        &config_file,
+        "provider = \"deepseek\"\napi_key = \"fixture-key\"\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(
+        &client,
+        &addr,
+        "base_url",
+        "https://root-moved.example.test/v1",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "write should succeed, body: {body}");
+    client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+
+    let after = get_config(&client, &addr).await;
+    assert_eq!(after["base_url"], "https://root-moved.example.test/v1");
+    let persisted = fs::read_to_string(&config_file)?;
+    assert!(
+        persisted.contains("base_url = \"https://root-moved.example.test/v1\""),
+        "the root route keeps its endpoint at the root:\n{persisted}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_base_url_refuses_a_named_route_with_guidance() -> Result<()> {
+    // Keep the existing selector while adopting the canonical named-table
+    // writer: the endpoint moves only in that exact table, after reload.
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-config-base-url-custom-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "bigmodel-cn"
+
+[providers.bigmodel-cn]
+kind = "openai-compatible"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key = "fixture-key"
+model = "glm-5.3"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(
+        &client,
+        &addr,
+        "base_url",
+        "https://moved.example.test/v1",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "named-table write should succeed");
+    assert_eq!(body["persisted"], true);
+    assert_eq!(body["requires_reload"], true);
+    let before_reload = get_config(&client, &addr).await;
+    assert_eq!(
+        before_reload["base_url"],
+        "https://open.bigmodel.cn/api/paas/v4"
+    );
+    let persisted = fs::read_to_string(&config_file)?;
+    let saved: toml::Value = toml::from_str(&persisted)?;
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["base_url"].as_str(),
+        Some("https://moved.example.test/v1")
+    );
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["model"].as_str(),
+        Some("glm-5.3")
+    );
+    assert!(saved.get("base_url").is_none());
+    assert!(
+        !persisted.contains("active_route_base_url"),
+        "no dead endpoint key may be written"
+    );
+    let (status, _) = post_set_config(&client, &addr, "provider", "missing-route", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(fs::read_to_string(&config_file)?, persisted);
+    let reload = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(reload.status(), StatusCode::OK);
+    let after_reload = get_config(&client, &addr).await;
+    assert_eq!(after_reload["provider"], "bigmodel-cn");
+    assert_eq!(after_reload["base_url"], "https://moved.example.test/v1");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn reload_config_reads_from_config_path_and_updates_in_memory_state() -> Result<()> {
     // Fix #2 + reload behavior: This test proves that reload reads from the
     // `--config` path (not default discovery) and actually updates the
@@ -10978,6 +14716,51 @@ model = "glm-2"
 }
 
 #[tokio::test]
+async fn switch_provider_rolls_back_a_selection_the_runtime_cannot_apply() -> Result<()> {
+    // The reload after the write fails (the runtime's profile is not in the
+    // file), so the switch is not applied in memory: the file must not keep
+    // it either, or the next start silently adopts a provider the caller was
+    // told failed.
+    let root = std::env::temp_dir().join(format!("codewhale-switch-rollback-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "deepseek"
+default_text_model = "deepseek-v4-pro"
+
+[providers.volcengine]
+api_key = "ark-test"
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+model = "glm-2"
+"#,
+    )?;
+    let before = fs::read_to_string(&config_file)?;
+
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server_with_config_path_and_profile(
+        config_file.clone(),
+        "absent-profile".to_string(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) =
+        post_switch_provider(&client, &addr, "volcengine", &serde_json::json!({})).await;
+    assert!(!status.is_success(), "the switch cannot apply: {body}");
+    assert_eq!(
+        fs::read_to_string(&config_file)?,
+        before,
+        "a switch the runtime refused must not stay persisted"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn switch_provider_with_explicit_model_arg_persists_model() -> Result<()> {
     // When the user explicitly chooses a model (e.g. `/provider volcengine
     // glm-2.5` or a model-picker selection), the switch endpoint MUST
@@ -11173,8 +14956,8 @@ model = "glm-2"
     // Validating the root alias instead of the selection returned 500 here.
     let reloaded = Config::load(Some(config_file.clone()), None)?;
     assert_eq!(
-        reloaded.api_provider(),
-        crate::config::ApiProvider::Deepseek
+        reloaded.active_provider_identity().unwrap().provider,
+        crate::config::ProviderKind::Deepseek
     );
     assert_eq!(reloaded.default_model(), "deepseek-v4-pro");
 
@@ -11270,6 +15053,160 @@ model = "glm-2"
     assert!(
         persisted.contains("provider = \"volcengine\""),
         "root `provider` key must be updated on disk. Actual config:\n{persisted}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_provider_rejected_by_reload_leaves_the_config_file_unchanged() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-switch-provider-rejected-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "lm-studio"
+
+[providers.lm-studio]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:18181/v1"
+model = "local-model"
+api_key = "local-test-key"
+"#,
+    )?;
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let thread = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest {
+            model: Some("local-model".to_string()),
+            model_provider: Some("lm-studio".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread.id, harness.handle.clone())
+        .await?;
+
+    // The loaded thread's route is removed on disk outside this runtime, so
+    // any reload now rejects it.
+    let edited = r#"provider = "deepseek"
+
+[providers.volcengine]
+api_key = "ark-test"
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+model = "glm-2"
+"#;
+    fs::write(&config_file, edited)?;
+
+    let client = crate::tls::reqwest_client();
+    let (status, body) =
+        post_switch_provider(&client, &addr, "volcengine", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("Config reload rejected"),
+        "{body}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_file)?,
+        edited,
+        "a switch the API reported as rejected must not remain in config.toml"
+    );
+
+    drop(harness);
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn switch_provider_waiting_for_config_lock_keeps_the_async_worker_running() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(&config_file, "provider = \"deepseek\"\n")?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_config_path(config_file.clone())
+        .await?
+        .context("loopback Runtime API server must be available")?;
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let safety_timeout = ci_scaled(Duration::from_secs(3));
+    let locker = std::thread::spawn(move || {
+        codewhale_config::with_config_write_lock(&config_file, |_| {
+            let _ = entered_tx.send(());
+            // A reverted synchronous implementation must fail promptly,
+            // rather than leave this current-thread runtime deadlocked.
+            let _ = release_rx.recv_timeout(safety_timeout);
+            Ok(())
+        })
+    });
+    entered_rx.await?;
+
+    let client = crate::tls::reqwest_client();
+    let switch_client = client.clone();
+    let request = tokio::spawn(async move {
+        post_switch_provider(&switch_client, &addr, "deepseek", &json!({})).await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The helper serves on a separate product-stack current-thread runtime.
+    // Probe that same server, not a timer on this test's client runtime:
+    // a blocking config save must not prevent an unrelated health request.
+    let started = std::time::Instant::now();
+    let health = client.get(format!("http://{addr}/health")).send().await;
+    let elapsed = started.elapsed();
+    let was_waiting = !request.is_finished();
+    let _ = release_tx.send(());
+    locker.join().expect("config lock holder must finish")?;
+    let (status, body) = request.await?;
+    handle.abort();
+
+    assert!(
+        elapsed < ci_scaled(Duration::from_secs(1)),
+        "the serving async worker must run while the provider switch waits for a filesystem lock: {elapsed:?}"
+    );
+    assert_eq!(health?.status(), StatusCode::OK);
+    assert!(
+        was_waiting,
+        "the real switch must await the held config lock"
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_provider_that_fails_to_load_removes_the_config_file_it_created() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-switch-provider-load-failure-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    // No config file yet, and a profile the saved file will not define, so
+    // the reload after the save fails to load.
+    let config_file = root.join("absent-config.toml");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path_and_profile(config_file.clone(), "missing".into())
+            .await?
+    else {
+        return Ok(());
+    };
+
+    let client = crate::tls::reqwest_client();
+    let (status, body) =
+        post_switch_provider(&client, &addr, "deepseek", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.to_string().contains("Failed to reload config"),
+        "{body}"
+    );
+    assert!(
+        !config_file.exists(),
+        "a refused switch must leave no config file behind, not an empty one"
     );
 
     handle.abort();
@@ -11695,7 +15632,7 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
     // The persisted value is the normalized wire id (lowercase), not the
     // display spelling of DEFAULT_VOLCENGINE_FLASH_MODEL.
     let expected_wire = crate::config::normalize_model_name_for_provider(
-        crate::config::ApiProvider::Volcengine,
+        crate::config::ProviderKind::Volcengine,
         target_model,
     )
     .expect("volcengine flash model should normalize");
@@ -11703,10 +15640,13 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
         config_body.contains(&format!("model = \"{expected_wire}\"")),
         "volcengine model should be written to the provider table as its wire id"
     );
-    assert!(
-        config_body.contains("default_text_model = \"deepseek-v4-pro\""),
-        "switching provider model must not overwrite DeepSeek's root default_text_model"
+    let saved: toml::Value = toml::from_str(&config_body)?;
+    assert_eq!(
+        saved["providers"]["deepseek"]["model"].as_str(),
+        Some("deepseek-v4-pro"),
+        "switching provider model must preserve DeepSeek's migrated model table"
     );
+    assert!(saved.get("default_text_model").is_none());
 
     let reload_resp = client
         .post(format!("http://{addr}/v1/config/reload"))
@@ -11914,7 +15854,7 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
         .header("Access-Control-Request-Method", "POST")
         .header(
             "Access-Control-Request-Headers",
-            "authorization, content-type, accept, x-codewhale-runtime-token, x-deepseek-runtime-token",
+            "authorization, content-type, accept, if-match, x-codewhale-runtime-token, x-deepseek-runtime-token",
         )
         .send()
         .await?;
@@ -11941,6 +15881,7 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
         "accept",
         "authorization",
         "content-type",
+        "if-match",
         "x-codewhale-runtime-token",
         "x-deepseek-runtime-token",
     ]
@@ -11949,6 +15890,23 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
     .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(advertised, expected);
+
+    // Every method a `/v1` route is mounted on must be advertised, or the
+    // browser blocks it at preflight (PUT saves keys, files, sessions, goals).
+    let advertised_methods = allowed
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .map(str::to_ascii_uppercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_methods = ["DELETE", "GET", "OPTIONS", "PATCH", "POST", "PUT"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(advertised_methods, expected_methods);
 
     let unapproved = client
         .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
@@ -12909,6 +16867,131 @@ async fn memory_search_query_filters_results() -> Result<()> {
 }
 
 #[tokio::test]
+async fn memory_all_scope_includes_workspace_notes() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("cw-memory-all-{}", Uuid::new_v4()));
+    let _lock = lock_test_env();
+    let home = root.join("home");
+    fs::create_dir_all(&home)?;
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo)?;
+    run_test_git(&repo, &["init", "-b", "main"])?;
+    run_test_git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/memory-scope.git",
+        ],
+    )?;
+    let Some((addr, _rt, handle)) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        root.join("sessions"),
+        None,
+        false,
+        repo,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    for (text, scope) in [
+        ("global cedar note", "global"),
+        ("workspace cedar note", "workspace"),
+    ] {
+        let created = client
+            .post(format!("http://{addr}/v1/memory"))
+            .json(&json!({ "text": text, "scope": scope }))
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+
+    // Omitted scope means "all": global plus this repository's notes, with
+    // and without a search query.
+    for url in [
+        format!("http://{addr}/v1/memory"),
+        format!("http://{addr}/v1/memory?scope=all"),
+        format!("http://{addr}/v1/memory?q=cedar"),
+    ] {
+        let listed: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let scopes = listed["entries"]
+            .as_array()
+            .context("entries array")?
+            .iter()
+            .filter_map(|entry| entry["scope"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            scopes,
+            ["global", "workspace"].into_iter().collect(),
+            "{url}: {listed}"
+        );
+    }
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_workspace_scope_without_a_remote_is_a_client_error() -> Result<()> {
+    // A workspace with no origin remote has no workspace memory: asking for
+    // that scope is the caller's error, as it already is for create.
+    let root = std::env::temp_dir().join(format!("cw-memory-no-remote-{}", Uuid::new_v4()));
+    let _lock = lock_test_env();
+    let home = root.join("home");
+    fs::create_dir_all(&home)?;
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+    let plain = root.join("plain");
+    fs::create_dir_all(&plain)?;
+    let Some((addr, _rt, handle)) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        root.join("sessions"),
+        None,
+        false,
+        plain,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    client
+        .post(format!("http://{addr}/v1/memory"))
+        .json(&json!({ "text": "global cedar note", "scope": "global" }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let listed = client
+        .get(format!("http://{addr}/v1/memory?scope=workspace"))
+        .send()
+        .await?;
+    assert_eq!(listed.status(), StatusCode::BAD_REQUEST);
+    let cleared = client
+        .delete(format!("http://{addr}/v1/memory?scope=workspace"))
+        .send()
+        .await?;
+    assert_eq!(cleared.status(), StatusCode::BAD_REQUEST);
+    let all: serde_json::Value = client
+        .get(format!("http://{addr}/v1/memory"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(all["total"], 1, "global memory stays listed: {all}");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_server_management_crud() -> Result<()> {
     let root = std::env::temp_dir().join(format!("codewhale-mcp-mgmt-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
@@ -13253,10 +17336,254 @@ fn create_managed_skill(root_dir: &std::path::Path, name: &str) -> Result<(PathB
 }
 
 #[tokio::test]
-async fn skill_lifecycle_uninstall_removes_installed_skill() -> Result<()> {
+async fn skill_detail_returns_body_and_routing_metadata() -> Result<()> {
+    let _env = lock_test_env();
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
     let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    // A skill with routing metadata and a body a client can activate.
+    let skill_dir = workspace
+        .join(".codewhale")
+        .join("skills")
+        .join("activatable");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: activatable\ndescription: Activate me\naliases-for: activate-me\nargument-hint: <target>\n---\nDo the thing.\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/activatable"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(detail["name"], "activatable");
+    assert_eq!(detail["description"], "Activate me");
+    assert_eq!(detail["source"], "native");
+    assert_eq!(detail["invocation"], "model+user");
+    assert_eq!(detail["aliases"][0], "activate-me");
+    assert!(
+        detail["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("Do the thing.")),
+        "detail body must carry the SKILL.md instructions, got {:?}",
+        detail["body"]
+    );
+    assert!(
+        detail["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("SKILL.md")),
+        "native skill detail must name its SKILL.md path"
+    );
+    // The alias resolves to the same body, so a client can activate by either
+    // spelling without a second lookup table.
+    let by_alias: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/activate-me"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(by_alias["name"], "activatable");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_detail_404s_for_unknown_skill() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .get(format!("http://{addr}/v1/skills/no-such-skill"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_list_rows_carry_routing_metadata() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    let skill_dir = workspace.join(".codewhale").join("skills").join("listed");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: listed\ndescription: Listed skill\ninvocation: explicit-only\n---\nbody\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let listed = list["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .find(|sk| sk["name"] == "listed")
+        .expect("listed skill present");
+    assert_eq!(listed["invocation"], "explicit-only");
+    assert_eq!(listed["is_bundled"], false);
+    // A custom skill has no curated tier; the field is present but null.
+    assert!(listed["bundled_tier"].is_null());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn listed_tier_belongs_to_the_bundled_copy_only() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    // A bundled name at the bundled path: the shipped skill, grouped.
+    let bundled = workspace.join(".codewhale").join("skills").join("help");
+    fs::create_dir_all(&bundled)?;
+    fs::write(
+        bundled.join("SKILL.md"),
+        "---\nname: help\ndescription: Shipped\n---\nbody\n",
+    )?;
+    // A bundled *name* somewhere else: a community skill that shares the name
+    // of a shipped one. It is not the shipped copy, so it is not in the
+    // shipped tier either — the two fields have to agree.
+    let impostor = workspace.join(".agents").join("skills").join("pdf");
+    fs::create_dir_all(&impostor)?;
+    fs::write(
+        impostor.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Mine, not the shipped one\n---\nbody\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let rows = list["skills"].as_array().expect("skills array");
+    let row = |name: &str| {
+        rows.iter()
+            .find(|sk| sk["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be listed"))
+    };
+    assert_eq!(row("help")["is_bundled"], true);
+    assert_eq!(row("help")["bundled_tier"], "tools");
+    assert_eq!(row("pdf")["is_bundled"], false);
+    assert!(
+        row("pdf")["bundled_tier"].is_null(),
+        "a non-bundled copy of a bundled name must not claim the shipped tier: {}",
+        row("pdf")["bundled_tier"]
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_info_advertises_skill_detail_capability() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let info: serde_json::Value = client
+        .get(format!("http://{addr}/v1/runtime/info"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        info["capabilities"]["skill_detail"], true,
+        "runtime/info must advertise skill_detail capability"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_lifecycle_uninstall_removes_installed_skill() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    // Project skills load only in a trusted workspace; a sealed config path
+    // lets the server's threads read the same trust record.
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
     let sessions_dir = root.join("sessions");
     fs::create_dir_all(&root)?;
 
@@ -13614,6 +17941,9 @@ async fn skill_lifecycle_endpoints_require_auth_when_token_is_set() -> Result<()
         ("POST", "/v1/skills/any/update"),
         ("DELETE", "/v1/skills/any"),
         ("POST", "/v1/skills/any/trust"),
+        // The detail route hands back a SKILL.md body, so it is as sensitive
+        // as the listing plus the file it names.
+        ("GET", "/v1/skills/any"),
     ] {
         let resp = client
             .request(
@@ -13758,6 +18088,216 @@ async fn runtime_info_advertises_plugin_management_capability() -> Result<()> {
         info["capabilities"]["plugin_management"], true,
         "runtime/info must advertise plugin_management capability"
     );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_info_advertises_terminal_capabilities() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let info: serde_json::Value = client
+        .get(format!("http://{addr}/v1/runtime/info"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    // A GPUI client gates its terminal pane on these. They are true where the
+    // routes serve bytes and false where they answer 501 (Windows, OpenHarmony)
+    // — the flag must not claim a capability the build cannot serve, so assert
+    // the routes' own gate rather than `true`.
+    let expected = cfg!(all(unix, not(target_env = "ohos")));
+    for capability in [
+        "terminal_stream",
+        "terminal_input",
+        "terminal_resize",
+        "terminal_kill",
+    ] {
+        assert_eq!(
+            info["capabilities"][capability], expected,
+            "runtime/info must advertise {capability}={expected}"
+        );
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_routes_serve_a_live_engine_session_over_http() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&workspace)?;
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace.clone(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/terminal/pane");
+
+    // The agent's terminal tools own session creation; stand in for that
+    // producer on the same workspace the server was started with, which is
+    // what makes this the Engine's own shell rather than a second one.
+    let _session = crate::tools::terminal_session::get_or_create(
+        "pane",
+        &workspace,
+        crate::sandbox::SandboxPolicy::DangerFullAccess,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    // Input and command output through the route, without direct session
+    // access. Start output on its own line even if the shell paints a prompt.
+    let write: serde_json::Value = client
+        .post(format!("{base}/input"))
+        .json(&serde_json::json!({
+            "data": "printf '\\nterminal-route-proof\\n'\n",
+            "encoding": "text"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(write["written"].as_u64().unwrap_or_default() > 0);
+
+    let read_chunk = |base: String, client: reqwest::Client| async move {
+        let chunk: serde_json::Value = client
+            .get(format!("{base}/output?cursor=0&format=text"))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(chunk)
+    };
+
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        let data = chunk["data"].as_str().unwrap_or_default();
+        if data
+            .lines()
+            .any(|line| line.trim() == "terminal-route-proof")
+        {
+            // Wait for the command's output, not its echoed input. Reads are
+            // non-consuming, but the shell can append its prompt between them.
+            let again = read_chunk(base.clone(), client.clone())
+                .await
+                .expect("terminal output route answers");
+            assert!(
+                again["data"].as_str().unwrap_or_default().starts_with(data),
+                "a repeated read must retain every byte already observed"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "route never delivered the shell's output: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Resize is checked through the shell, not the handler: `stty size` reads
+    // the kernel's window, so a handler that only stored the numbers fails.
+    client
+        .post(format!("{base}/resize"))
+        .json(&serde_json::json!({"rows": 40, "cols": 100}))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/input"))
+        .json(&serde_json::json!({"data": "stty size\n", "encoding": "text"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        let data = chunk["data"].as_str().unwrap_or_default();
+        if data.contains("40 100") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resize never reached the shell: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Kill, then learn the truth from the stream rather than the ack.
+    client
+        .post(format!("{base}/kill"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        if chunk["running"] == serde_json::json!(false) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "killed session still reports running: {chunk}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_output_for_an_unknown_session_is_not_found_and_creates_nothing() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/terminal");
+
+    // The route exists and answers for a name that has no live session: the
+    // Engine attaches to shells it owns, it does not conjure one per request.
+    let missing = client
+        .get(format!("{base}/no-such-session/output"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // An over-long name is rejected as a miss too, so the registry is never
+    // asked to allocate for it.
+    let long_name = "n".repeat(200);
+    let oversized = client
+        .get(format!("{base}/{long_name}/output"))
+        .send()
+        .await?;
+    assert_eq!(oversized.status(), reqwest::StatusCode::NOT_FOUND);
 
     handle.abort();
     Ok(())
@@ -13923,6 +18463,93 @@ async fn plugin_api_404s_for_unknown_selector() -> Result<()> {
         .await?;
     assert_eq!(trust.status(), StatusCode::NOT_FOUND);
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dsh_package_preview_then_exact_install_over_http() -> Result<()> {
+    let _home = crate::test_support::SealedHome::new();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&root)?;
+    let package = tmp.path().join("dsh-package");
+    fs::create_dir_all(&package)?;
+    fs::write(
+        package.join("package.json"),
+        r#"{"name": "@demo/docs-dsh", "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}"#,
+    )?;
+    fs::write(
+        package.join("cordis.patch.yml"),
+        "- insert:\n  - id: docs\n    name: '@deepseek-ai/dsh-mcp-client'\n    config: {serverName: docs, transport: streamable-http, url: 'https://docs.example.invalid/mcp'}\n",
+    )?;
+    let Some((addr, handle)) = spawn_plugin_api_server(root, workspace).await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let mut preview_response = client
+        .post(format!("http://{addr}/v1/apps/plugins/import/dsh/preview"))
+        .json(&serde_json::json!({"path": package.display().to_string()}))
+        .send()
+        .await?;
+    if !preview_response.status().is_success() {
+        let status = preview_response.status();
+        let mut diagnostic = Vec::new();
+        while let Some(chunk) = preview_response.chunk().await? {
+            let remaining = 1024 - diagnostic.len();
+            diagnostic.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if diagnostic.len() == 1024 {
+                break;
+            }
+        }
+        anyhow::bail!(
+            "DSH fixture preview {status}: {}",
+            String::from_utf8_lossy(&diagnostic)
+        );
+    }
+    let preview: serde_json::Value = preview_response.json().await?;
+    assert_eq!(preview["conversion"]["plugin_name"], "docs-dsh");
+    assert_eq!(
+        preview["conversion"]["network_hosts"],
+        serde_json::json!(["docs.example.invalid"])
+    );
+    let plugins: serde_json::Value = client
+        .get(format!("http://{addr}/v1/apps/plugins"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        !plugins["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "docs-dsh"),
+        "preview installs nothing"
+    );
+
+    let installed = client
+        .post(format!("http://{addr}/v1/apps/plugins/install"))
+        .json(&serde_json::json!({
+            "source": preview["install_source"],
+            "expected_content_hash": preview["content_hash"],
+        }))
+        .send()
+        .await?;
+    assert_eq!(installed.status(), StatusCode::CREATED);
+    let installed: serde_json::Value = installed.json().await?;
+    assert_eq!(installed["name"], "docs-dsh");
+    assert_eq!(installed["plugin"]["enabled"], false);
+    assert_ne!(installed["plugin"]["trust_status"], "trusted");
+
+    let refused = client
+        .post(format!("http://{addr}/v1/apps/plugins/import/dsh/preview"))
+        .json(&serde_json::json!({"path": tmp.path().join("missing").display().to_string()}))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     handle.abort();
     Ok(())
 }
@@ -14268,7 +18895,9 @@ vendor = "{vendor}"
         )?;
         let old_config = manager.read_config().clone();
         let old_vendor = old_config.openrouter_vendor()?;
-        let old_client = if old_config.api_provider() == crate::config::ApiProvider::Openrouter {
+        let old_client = if old_config.active_provider_identity().unwrap().provider
+            == crate::config::ProviderKind::Openrouter
+        {
             Some(crate::client::CodewhaleClient::new(&old_config)?)
         } else {
             None
@@ -14292,6 +18921,41 @@ vendor = "{vendor}"
 }
 
 #[test]
+fn oauth_pass_through_provider_lists_catalog_models_without_a_live_listing() {
+    let _env = crate::test_support::lock_test_env();
+    let _live = crate::provider_lake::lock_live_snapshot();
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+    crate::provider_catalog_live::reset_cache_for_test();
+    crate::provider_lake::clear_live_snapshot();
+    let mut config = Config {
+        provider: Some("deepseek".into()),
+        ..Default::default()
+    };
+    // Before the OAuth opt-in, a pass-through provider with no live listing
+    // offers only its configured model.
+    assert!(
+        provider_models_for_api(&config, &(config).test_identity_for_kind(ProviderKind::Xai))
+            .is_empty()
+    );
+
+    config
+        .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Xai))
+        .unwrap()
+        .auth_mode = Some("oauth".into());
+    assert!(crate::provider_lake::live_catalog_unavailable(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::Xai)
+    ));
+    let models =
+        provider_models_for_api(&config, &(config).test_identity_for_kind(ProviderKind::Xai));
+    assert!(
+        models.iter().any(|model| model == "grok-4.7"),
+        "OAuth xAI must fall back to the bundled catalog: {models:?}"
+    );
+}
+
+#[test]
 fn api_provider_default_and_model_list_follow_exact_local_catalog() {
     use codewhale_config::catalog::{
         CatalogOffering, CatalogRefreshError, CatalogSource, ProviderCatalogDelta,
@@ -14304,18 +18968,24 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
     crate::provider_catalog_live::reset_cache_for_test();
     crate::provider_lake::clear_live_snapshot();
-    let provider = ApiProvider::Ollama;
+    let provider = ProviderKind::Ollama;
     let endpoint = "http://localhost:11455/v1";
     let mut config = Config {
         provider: Some("ollama".into()),
         ..Default::default()
     };
-    config.provider_config_for_mut(provider).base_url = Some(endpoint.into());
+    config
+        .provider_config_for_mut(&config.test_identity_for_kind(provider))
+        .unwrap()
+        .base_url = Some(endpoint.into());
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         ""
     );
-    assert!(!provider_models_for_api(&config, provider, provider).contains(&"unknown".to_string()));
+    assert!(
+        !provider_models_for_api(&config, &(config).test_identity_for_kind(provider))
+            .contains(&"unknown".to_string())
+    );
     assert!(runtime_request_model(&config, None).is_err());
     assert_eq!(
         runtime_request_model(&config, Some("auto")).unwrap(),
@@ -14348,11 +19018,11 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         },
     );
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         "local-default:tag"
     );
     assert_eq!(
-        provider_models_for_api(&config, provider, provider),
+        provider_models_for_api(&config, &(config).test_identity_for_kind(provider)),
         vec!["local-default:tag"]
     );
     assert_eq!(
@@ -14360,12 +19030,15 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         "local-default:tag"
     );
     let mut other = config.clone();
-    other.provider_config_for_mut(provider).base_url = Some("http://localhost:11456/v1".into());
+    other
+        .provider_config_for_mut(&other.test_identity_for_kind(provider))
+        .unwrap()
+        .base_url = Some("http://localhost:11456/v1".into());
     assert_eq!(
-        provider_default_model_for_api(&other, provider, provider),
+        provider_default_model_for_api(&other, &(other).test_identity_for_kind(provider)),
         ""
     );
-    assert!(provider_models_for_api(&other, provider, provider).is_empty());
+    assert!(provider_models_for_api(&other, &(other).test_identity_for_kind(provider)).is_empty());
     crate::provider_catalog_live::record_failure_if_current(
         &ticket,
         "ollama",
@@ -14373,13 +19046,18 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         CatalogRefreshError::Network,
     );
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         ""
     );
     assert!(runtime_request_model(&config, None).is_err());
-    config.set_provider_model_override(provider, Some("chosen:tag".into()));
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(provider),
+            Some("chosen:tag".into()),
+        )
+        .unwrap();
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         "chosen:tag"
     );
     crate::provider_catalog_live::reset_cache_for_test();
@@ -14435,7 +19113,7 @@ async fn api_config_reports_local_default_availability_without_blocking_config_r
     let fetched_at = now_unix();
     let fingerprint = base_url_fingerprint(endpoint);
     let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
-        ApiProvider::Ollama,
+        ProviderKind::Ollama,
         "ollama",
         endpoint,
     );
@@ -14786,7 +19464,7 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
     let temp = tempfile::tempdir()?;
     let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path().join("home"));
     let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
-    let _proxy = EnvVarGuard::set("NO_PROXY", "*");
+    let _proxy = EnvVarGuard::set("NO_PROXY", "*,127.0.0.1");
     let path = temp.path().join("config.toml");
     fs::write(
         &path,
@@ -14826,7 +19504,7 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
             "input_summary": "silent settlement fixture", "created_at": Utc::now()
         }))?;
         manager.test_store().save_turn(&turn)?;
-        let mock = crate::core::engine::mock_engine_handle();
+        let mut mock = crate::core::engine::mock_engine_handle();
         manager
             .install_test_engine(&thread.id, mock.handle.clone())
             .await?;
@@ -14892,7 +19570,12 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
                 ExternalApprovalDecision::Allow { remember: false }
             );
         } else {
-            assert!(manager.cancel_user_input(&thread.id, "request").await?);
+            let (canceled, consumed) = tokio::join!(
+                manager.cancel_user_input(&thread.id, "request"),
+                mock.recv_user_input_cancellation(),
+            );
+            assert!(canceled?);
+            assert_eq!(consumed.as_deref(), Some("request"));
         }
         let settled = manager.get_thread_detail(&thread.id).await?;
         assert!(settled.pending_approvals.is_empty());
@@ -14939,13 +19622,15 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     let mut config = Config {
         provider: Some("deepseek".into()),
         default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
-        api_key: Some("synthetic-image-key".into()),
         ..Default::default()
-    };
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
-    );
+    }
+    .with_legacy_root(Some("synthetic-image-key".into()), None);
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(ProviderKind::Deepseek),
+            Some("deepseek-v4-flash-vision-exp".into()),
+        )
+        .unwrap();
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
@@ -14971,7 +19656,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
         json!({"prompt":"look", "images":[{"mime":"image/png", "dataBase64":"garbage"}]}),
         json!({"prompt":"", "images":[good.clone()]}),
         json!({"prompt":"look", "model":"auto", "images":[good.clone()]}),
-        json!({"prompt":"look", "model":"deepseek-v4-flash", "images":[good.clone()]}),
+        json!({"prompt":"look", "model":"deepseek-v4-pro", "images":[good.clone()]}),
         json!({"prompt":"look", "images":[{"mime":"image/png", "dataBase64":good.data_base64, "path":"/private/host-only"}]}),
     ] {
         let response = client.post(&url).json(&body).send().await?;
@@ -15033,6 +19718,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
             turn_id: "image-http-fixture".into(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -15060,13 +19746,15 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
     let mut config = Config {
         provider: Some("deepseek".into()),
         default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
-        api_key: Some("synthetic-image-key".into()),
         ..Default::default()
-    };
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
-    );
+    }
+    .with_legacy_root(Some("synthetic-image-key".into()), None);
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(ProviderKind::Deepseek),
+            Some("deepseek-v4-flash-vision-exp".into()),
+        )
+        .unwrap();
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
@@ -15086,7 +19774,7 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
         json!({"prompt":"look", "images":[{"mime":"image/png","dataBase64":"garbage"}]}),
         json!({"prompt":"", "images":[good.clone()]}),
         json!({"prompt":"look", "model":"auto", "images":[good.clone()]}),
-        json!({"prompt":"look", "model":"deepseek-v4-flash", "images":[good]}),
+        json!({"prompt":"look", "model":"deepseek-v4-pro", "images":[good]}),
         json!({"prompt":"look", "images":[runtime_image_fixture_bytes(4 * 1024 * 1024 + 1)]}),
     ] {
         let response = client
@@ -15193,14 +19881,15 @@ async fn runtime_image_named_catalog_resolves_and_echoes_exact_configured_identi
             StatusCode::BAD_REQUEST
         );
     }
-    let legacy: Value = client
+    let legacy = client
         .get(format!("http://{addr}/v1/providers/custom/models"))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
-    assert!(legacy.get("model_provider_id").is_none());
+    assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        get_config(&client, &addr).await["provider"],
+        "vision-personal"
+    );
     server.abort();
     Ok(())
 }
@@ -15340,13 +20029,17 @@ fn output_cap_catalog_reports_exact_transport_support() {
     let _env = crate::test_support::lock_test_env();
     let config = Config::default();
     assert_eq!(
-        provider_model_output_token_limit_for_api(&config, ApiProvider::OpenaiCodex, "gpt-5.5"),
+        provider_model_output_token_limit_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+            "gpt-5.5"
+        ),
         CapabilityState::Unsupported
     );
     assert_eq!(
         provider_model_output_token_limit_for_api(
             &config,
-            ApiProvider::Deepseek,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
             "deepseek-v4-pro"
         ),
         CapabilityState::Supported
@@ -15402,6 +20095,113 @@ async fn output_cap_compatibility_stream_rejects_before_thread_creation() -> Res
             .is_empty()
     );
     server.abort();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_file_put_keeps_the_edited_files_mode() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("files-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("files test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // An executable script keeps its bits (set-user-id is never carried
+    // over); an owner-only file stays owner-only.
+    for (name, before, after) in [("deploy.sh", 0o4755, 0o755), ("secret.env", 0o600, 0o600)] {
+        let path = workspace.join(name);
+        fs::write(&path, "old\n")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(before))?;
+        let read: Value = client
+            .get(format!("{base}/v1/workspace/files/read?path={name}"))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        client
+            .put(format!("{base}/v1/workspace/files"))
+            .bearer_auth("files-token")
+            .json(&json!({
+                "path": name,
+                "content": "new\n",
+                "expected_revision": read["revision"],
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(fs::read_to_string(&path)?, "new\n");
+        let mode = fs::symlink_metadata(&path)?.permissions().mode() & 0o7777;
+        assert_eq!(mode, after, "{name}: {mode:o}");
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn workspace_file_concurrent_creates_preserve_the_first_publication() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let relative = Path::new("notes/new.txt");
+    fs::write(tmp.path().join("unrelated.txt"), b"keep me\n")?;
+
+    // Admit both creators while the destination is absent, before either
+    // publishes. This makes the stale-create race independent of scheduling.
+    let files = [
+        crate::fleet::files::WorkspaceFile::open_shared(tmp.path(), relative, true)?,
+        crate::fleet::files::WorkspaceFile::open_shared(tmp.path(), relative, true)?,
+    ];
+    assert!(!tmp.path().join(relative).exists());
+    let payloads = [
+        b"first creator\n".as_slice(),
+        b"second creator\n".as_slice(),
+    ];
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .into_iter()
+            .zip(payloads)
+            .map(|(file, bytes)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    workspace::publish_workspace_file(&file, bytes, true)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("creator worker must not panic"))
+            .collect::<Vec<_>>()
+    });
+
+    let winners: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| result.is_ok().then_some(index))
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one create may publish");
+    let error = results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .unwrap();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert!(error.message.contains("read it before overwriting"));
+    assert_eq!(fs::read(tmp.path().join(relative))?, payloads[winners[0]]);
+    assert_eq!(fs::read(tmp.path().join("unrelated.txt"))?, b"keep me\n");
     Ok(())
 }
 
@@ -15950,6 +20750,652 @@ async fn session_artifacts_list_and_bounded_read() -> Result<()> {
     Ok(())
 }
 
+/// Restores the process-wide test artifact root on drop.
+struct TestArtifactRoot {
+    previous: Option<PathBuf>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TestArtifactRoot {
+    fn drop(&mut self) {
+        crate::artifacts::set_test_artifact_sessions_root(self.previous.take());
+    }
+}
+
+fn test_artifact_root(root: &Path) -> TestArtifactRoot {
+    let guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    TestArtifactRoot {
+        previous: crate::artifacts::set_test_artifact_sessions_root(Some(root.to_path_buf())),
+        _guard: guard,
+    }
+}
+
+/// The documented file ref id: `file_` plus 32 hex of SHA-256(path).
+fn turn_file_artifact_id(path: &str) -> String {
+    format!(
+        "file_{}",
+        &crate::hashing::sha256_hex(path.as_bytes())[..32]
+    )
+}
+
+fn file_ref_json(path: &str, change: &str, revision: Option<&str>, size: Option<u64>) -> Value {
+    json!({
+        "id": turn_file_artifact_id(path),
+        "kind": "file",
+        "path": path,
+        "change": change,
+        "size": size,
+        "revision": revision,
+        "source": "workspace_changed_during_turn",
+        "recorded_at": Utc::now(),
+    })
+}
+
+/// The turn artifact routes list a turn's refs only through its own thread,
+/// and read each ref from wherever its recorded revision still lives: the
+/// workspace, the post-turn snapshot, or the session artifact directory —
+/// including a spill from an engine session that has no SavedSession index.
+#[tokio::test]
+async fn turn_artifact_routes_list_and_read_by_reference() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
+    let artifact_root = tmp.path().join("artifact-sessions");
+    let _artifacts = test_artifact_root(&artifact_root);
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("README.md"), "fixture\n")?;
+    let rev = |bytes: &[u8]| crate::hashing::sha256_hex(bytes);
+
+    // The turn: page.html written as v1 (then edited after the turn),
+    // current.md written and untouched since.
+    // Turn records name snapshots by tree id: a prune rewrites commit ids.
+    let pre = crate::core::turn::pre_turn_snapshot(&workspace, 1, 0, None, None)
+        .context("pre-turn snapshot")?
+        .tree
+        .as_str()
+        .to_string();
+    fs::write(workspace.join("page.html"), "<p>v1</p>\n")?;
+    fs::write(workspace.join("current.md"), "current\n")?;
+    let post = crate::core::turn::post_turn_snapshot(&workspace, 1, 0, None, None)
+        .context("post-turn snapshot")?
+        .tree
+        .as_str()
+        .to_string();
+    fs::write(workspace.join("page.html"), "<p>v2</p>\n")?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(workspace.join("README.md"), workspace.join("link.md"))?;
+
+    // A spill from an unbound runtime engine: bytes under the writer's
+    // artifact root, no SavedSession JSON anywhere.
+    let spill_dir = artifact_root.join("engine-random-session/artifacts");
+    fs::create_dir_all(&spill_dir)?;
+    fs::write(spill_dir.join("art_call_big.txt"), "big output\n")?;
+    // Bytes that no longer match what the turn recorded.
+    fs::write(spill_dir.join("art_call_forged.txt"), "rewritten\n")?;
+
+    let (addr, runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("turn-artifacts-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("turn artifact test requires a loopback listener")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let other = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    let spill = |id: &str, revision: &str| {
+        json!({
+            "id": id, "kind": "tool_output", "path": format!("artifacts/{id}.txt"),
+            "size": 11, "revision": revision, "session_id": "engine-random-session",
+            "source": "tool_output_spill", "recorded_at": Utc::now(),
+        })
+    };
+    let mut refs = vec![
+        file_ref_json("page.html", "created", Some(&rev(b"<p>v1</p>\n")), Some(10)),
+        file_ref_json("current.md", "created", Some(&rev(b"current\n")), Some(8)),
+        file_ref_json("gone.md", "deleted", None, None),
+        file_ref_json(
+            "huge.bin",
+            "created",
+            Some(&rev(b"x")),
+            Some(17 * 1024 * 1024),
+        ),
+        file_ref_json("lost.md", "updated", Some(&rev(b"never stored")), Some(12)),
+        spill("art_call_big", &rev(b"big output\n")),
+        spill("art_call_forged", &rev(b"other")),
+        spill("art_call_pruned", &rev(b"x")),
+    ];
+    if cfg!(unix) {
+        refs.push(file_ref_json(
+            "link.md",
+            "updated",
+            Some(&rev(b"fixture\n")),
+            Some(8),
+        ));
+    }
+    // An intermediate revision one item recorded before a later write.
+    let mut early_page =
+        file_ref_json("page.html", "created", Some(&rev(b"<p>v0</p>\n")), Some(10));
+    early_page["source"] = json!("tool_mutation");
+    let item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_page", "turn_id": "turn_artifacts_route", "kind": "tool_call",
+        "status": "completed", "summary": "write", "artifacts": [early_page],
+    }))?;
+    let store = runtime_threads.test_store();
+    store.save_item(&item)?;
+    let turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_artifacts_route", "thread_id": thread.id, "status": "completed",
+        "input_summary": "build", "created_at": Utc::now(), "item_ids": ["item_page"],
+        "artifacts": refs,
+        "workspace": {
+            "state": "settled", "pre_turn_snapshot_id": pre, "post_turn_snapshot_id": post,
+        },
+    }))?;
+    store.save_turn(&turn)?;
+
+    let client = crate::tls::reqwest_client();
+    let base = format!(
+        "http://{addr}/v1/threads/{}/turns/turn_artifacts_route/artifacts",
+        thread.id
+    );
+    let get = |url: String| client.get(url).bearer_auth("turn-artifacts-token").send();
+    assert_eq!(
+        client.get(&base).send().await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let listing: Value = get(base.clone()).await?.error_for_status()?.json().await?;
+    assert_eq!(listing["turn_id"], "turn_artifacts_route");
+    assert_eq!(listing["workspace"]["state"], "settled");
+    assert_eq!(listing["artifacts"][0]["path"], "page.html");
+    assert!(listing.get("item_artifacts").is_none());
+    let foreign = format!(
+        "http://{addr}/v1/threads/{}/turns/turn_artifacts_route/artifacts",
+        other.id
+    );
+    assert_eq!(get(foreign).await?.status(), StatusCode::NOT_FOUND);
+    let missing = format!(
+        "http://{addr}/v1/threads/{}/turns/turn_nope/artifacts",
+        thread.id
+    );
+    assert_eq!(get(missing).await?.status(), StatusCode::NOT_FOUND);
+
+    let file_id = turn_file_artifact_id;
+    let read = |id: String, query: &str| get(format!("{base}/{id}{query}"));
+
+    // Still current in the workspace.
+    let body: Value = read(file_id("current.md"), "")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(body["source"], "workspace");
+    assert_eq!(body["current"], true);
+    assert_eq!(body["content"], "current\n");
+    assert_eq!(body["revision"], rev(b"current\n"));
+
+    // Edited after the turn: served from the post-turn snapshot.
+    let body: Value = read(file_id("page.html"), "?offset=3&limit=2")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(body["source"], "snapshot");
+    assert_eq!(body["current"], false);
+    assert_eq!(body["size"], 10);
+    assert_eq!(body["content"], "v1");
+    assert_eq!(body["truncated"], true);
+
+    // An item's intermediate revision is selectable, and is honestly gone.
+    let response = read(
+        file_id("page.html"),
+        &format!("?revision={}", rev(b"<p>v0</p>\n")),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let message = response.text().await?;
+    assert!(message.contains(&rev(b"<p>v2</p>\n")), "{message}");
+    let response = read(file_id("page.html"), &format!("?revision={}", rev(b"nope"))).await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let mut statuses = vec![
+        (file_id("lost.md"), StatusCode::CONFLICT),
+        (file_id("gone.md"), StatusCode::GONE),
+        (file_id("huge.bin"), StatusCode::PAYLOAD_TOO_LARGE),
+        ("art_call_forged".to_string(), StatusCode::CONFLICT),
+        ("art_call_pruned".to_string(), StatusCode::GONE),
+        ("file_unknown".to_string(), StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        statuses.push((file_id("link.md"), StatusCode::FORBIDDEN));
+    }
+    for (id, expected) in statuses {
+        assert_eq!(read(id.clone(), "").await?.status(), expected, "{id}");
+    }
+
+    // The spill is readable through the turn although no SavedSession
+    // indexes its engine session.
+    let body: Value = read("art_call_big".to_string(), "")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(body["source"], "session_artifact");
+    assert_eq!(body["content"], "big output\n");
+    assert_eq!(body["artifact"]["kind"], "tool_output");
+    assert!(body["current"].is_null());
+
+    handle.abort();
+    Ok(())
+}
+
+/// One tool call's changes, read from the workspace restore points the engine
+/// recorded around it: a shell command's own writes belong to that command,
+/// every path and revision comes from the span's own two trees rather than
+/// from the work tree as it is now, and a call the engine never bounded — or
+/// whose closing snapshot was lost — says so instead of handing back an empty
+/// list that would read as "this call changed nothing".
+#[tokio::test]
+async fn call_change_route_reads_one_calls_workspace_span() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("kept.md"), "kept\n")?;
+    let rev = |bytes: &[u8]| crate::hashing::sha256_hex(bytes);
+    // The model endpoint's own id for the call, verbatim: the shape a gateway
+    // really hands back, `|` and all. A record-id charset check would refuse it
+    // and answer "no such call" for a call the turn plainly recorded, so this
+    // literal is the regression this test exists for.
+    const SHELL_CALL: &str =
+        "call_01_f3d82rL5aT1NDbpsh4w63727|f8912d4c-2f79-46eb-91d4-9ed4998156f9";
+    // A call whose receipts survived while the trees they name did not: the
+    // side repo keeps only its newest snapshots, so an older turn's span is
+    // regularly unreachable.
+    const PRUNED_CALL: &str = "call_00_prunedForTest";
+    // A call on a workspace whose snapshot store does not exist at all: the
+    // receipts survived, the whole store did not.
+    const STORELESS_CALL: &str = "call_00_storelessForTest";
+
+    let (addr, runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("call-changes-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("call change test requires a loopback listener")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    // The call's own span: its `tool:` receipt before the command ran and its
+    // `post-tool` partner after. `out.md` is the command's own write;
+    // `script.py` is a path it modified. Afterwards the work tree moves on
+    // again — the route must report the span, not what is on disk now.
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    fs::write(workspace.join("script.py"), "print('v1')\n")?;
+    let tool = repo.take_snapshot(&format!("tool:{SHELL_CALL}"), Some(&thread.id))?;
+    fs::write(workspace.join("out.md"), "written by the command\n")?;
+    fs::write(workspace.join("script.py"), "print('v2')\n")?;
+    let post_tool = repo.take_snapshot(&format!("post-tool:{SHELL_CALL}"), Some(&thread.id))?;
+    fs::write(workspace.join("out.md"), "edited long after the call\n")?;
+    fs::write(workspace.join("after.md"), "after the span\n")?;
+
+    // A second thread on its own workspace, which never had a snapshot store.
+    let storeless_workspace = tmp.path().join("storeless-workspace");
+    fs::create_dir_all(&storeless_workspace)?;
+    let storeless_thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(storeless_workspace),
+            ..Default::default()
+        })
+        .await?;
+
+    let store = runtime_threads.test_store();
+    let shell_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_shell", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": SHELL_CALL, "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&shell_item)?;
+    // A call the engine judged read-only: the turn has its item, and no
+    // restore point was ever taken for it.
+    let read_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_read", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": "call_read", "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&read_item)?;
+    let pruned_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_pruned", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "bash started",
+        "metadata": { "tool_use_id": PRUNED_CALL, "tool_name": "bash" },
+    }))?;
+    store.save_item(&pruned_item)?;
+    // A call whose closing snapshot was lost: the opening receipt is recorded
+    // and the span will never resolve.
+    let half_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_half", "turn_id": "turn_call_half", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": "call_half", "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&half_item)?;
+    let storeless_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_storeless", "turn_id": "turn_storeless", "kind": "command_execution",
+        "status": "completed", "summary": "bash started",
+        "metadata": { "tool_use_id": STORELESS_CALL, "tool_name": "bash" },
+    }))?;
+    store.save_item(&storeless_item)?;
+
+    let turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_call_changes", "thread_id": thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_shell", "item_read", "item_pruned"],
+        "workspace_snapshots": [
+            {
+                "kind": "tool", "snapshot_id": tool.id.as_str(), "tree_id": tool.tree.as_str(),
+                "session_id": thread.id, "tool_call_id": SHELL_CALL,
+                "write_paths": null,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": post_tool.id.as_str(),
+                "tree_id": post_tool.tree.as_str(), "session_id": thread.id,
+                "tool_call_id": SHELL_CALL, "changed_paths": ["out.md", "script.py"],
+            },
+            {
+                "kind": "tool", "snapshot_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "tree_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "session_id": thread.id, "tool_call_id": PRUNED_CALL,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": "feedfacefeedfacefeedfacefeedfacefeedface",
+                "tree_id": "feedfacefeedfacefeedfacefeedfacefeedface",
+                "session_id": thread.id, "tool_call_id": PRUNED_CALL,
+                "changed_paths": ["gone.txt"],
+            },
+        ],
+        "workspace": { "state": "settled" },
+    }))?;
+    store.save_turn(&turn)?;
+    let half_turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_call_half", "thread_id": thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_half"],
+        "workspace_snapshots": [{
+            "kind": "tool", "snapshot_id": tool.id.as_str(), "tree_id": tool.tree.as_str(),
+            "session_id": thread.id, "tool_call_id": "call_half",
+        }],
+        "workspace": { "state": "unavailable", "reason": "snapshot_failed" },
+    }))?;
+    store.save_turn(&half_turn)?;
+    // The same pair of receipts, on a workspace whose store is gone rather
+    // than merely pruned: one answer, not an internal error.
+    let storeless_turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_storeless", "thread_id": storeless_thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_storeless"],
+        "workspace_snapshots": [
+            {
+                "kind": "tool", "snapshot_id": "aa".repeat(20), "tree_id": "aa".repeat(20),
+                "session_id": storeless_thread.id, "tool_call_id": STORELESS_CALL,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": "bb".repeat(20), "tree_id": "bb".repeat(20),
+                "session_id": storeless_thread.id, "tool_call_id": STORELESS_CALL,
+                "changed_paths": ["gone.txt"],
+            },
+        ],
+        "workspace": { "state": "settled" },
+    }))?;
+    store.save_turn(&storeless_turn)?;
+
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let url = |thread_id: &str, turn_id: &str, call: &str| {
+        format!("{base}/v1/threads/{thread_id}/turns/{turn_id}/calls/{call}/changes")
+    };
+    let get = |thread_id: &str,
+               turn_id: &str,
+               call: &str|
+     -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>,
+    > {
+        let client = client.clone();
+        let url = url(thread_id, turn_id, call);
+        Box::pin(async move {
+            Ok(client
+                .get(url)
+                .bearer_auth("call-changes-token")
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        })
+    };
+
+    // The item's persisted lifecycle owns the wait: an opening receipt with
+    // no partner is normal while queued or running, not a permanent loss.
+    let mut active_turn = half_turn.clone();
+    active_turn.id = "turn_call_active".to_string();
+    active_turn.status = RuntimeTurnStatus::InProgress;
+    active_turn.item_ids = vec!["item_active".to_string()];
+    active_turn.workspace = None;
+    store.save_turn(&active_turn)?;
+    let mut active_item = half_item.clone();
+    active_item.id = "item_active".to_string();
+    active_item.turn_id = active_turn.id.clone();
+    for status in [
+        TurnItemLifecycleStatus::Queued,
+        TurnItemLifecycleStatus::InProgress,
+    ] {
+        active_item.status = status;
+        store.save_item(&active_item)?;
+        let pending = get(&thread.id, &active_turn.id, "call_half").await?;
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["reason"], Value::Null);
+        assert_eq!(pending["files"].as_array().unwrap().len(), 0);
+    }
+    active_turn
+        .workspace_snapshots
+        .push(serde_json::from_value(json!({
+            "kind": "post_tool", "snapshot_id": post_tool.id.as_str(),
+            "tree_id": post_tool.tree.as_str(), "session_id": thread.id,
+            "tool_call_id": "call_half", "changed_paths": ["out.md", "script.py"],
+        }))?);
+    active_turn.status = RuntimeTurnStatus::Completed;
+    active_item.status = TurnItemLifecycleStatus::Completed;
+    store.save_item(&active_item)?;
+    store.save_turn(&active_turn)?;
+    let settled = get(&thread.id, &active_turn.id, "call_half").await?;
+    assert_eq!(settled["state"], "captured");
+    assert_eq!(settled["reason"], Value::Null);
+    assert_eq!(settled["files"].as_array().unwrap().len(), 2);
+
+    let body = get(&thread.id, "turn_call_changes", SHELL_CALL).await?;
+    assert_eq!(body["state"], "captured");
+    assert_eq!(body["reason"], Value::Null);
+    assert_eq!(body["tool_name"], "exec_shell");
+    assert_eq!(body["truncated"], false);
+    let files = body["files"].as_array().expect("files");
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        ["out.md", "script.py"],
+        "the span's own paths, in git's order: {files:?}"
+    );
+
+    let created = &files[0];
+    assert_eq!(created["change"], "created");
+    assert_eq!(created["added"], 1);
+    assert_eq!(created["removed"], 0);
+    // The span's end, not the work tree's newer bytes.
+    assert_eq!(created["revision"], rev(b"written by the command\n"));
+    assert_eq!(created["size"].as_u64(), Some(23));
+    assert_eq!(
+        created["restore_snapshot_id"],
+        tool.tree.as_str(),
+        "the revert point is the call's own `tool:` receipt"
+    );
+    assert!(
+        created["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+written by the command"),
+        "{}",
+        created["diff"]
+    );
+    assert_eq!(created["diff_truncated"], false);
+
+    let modified = &files[1];
+    assert_eq!(modified["change"], "updated");
+    assert_eq!(modified["added"], 1);
+    assert_eq!(modified["removed"], 1);
+    let patch = modified["diff"].as_str().unwrap();
+    assert!(patch.contains("-print('v1')"), "{patch}");
+    assert!(patch.contains("+print('v2')"), "{patch}");
+    assert!(
+        !body.to_string().contains("after.md"),
+        "a write after the span is not the call's: {body}"
+    );
+
+    // A call the turn recorded but the engine never bounded: known, and not
+    // reported as "changed nothing".
+    let unbounded = get(&thread.id, "turn_call_changes", "call_read").await?;
+    assert_eq!(unbounded["state"], "unavailable");
+    assert_eq!(unbounded["reason"], "call_not_bounded");
+    assert_eq!(unbounded["files"].as_array().unwrap().len(), 0);
+
+    // A span whose trees have been pruned is a fact about the store, not a
+    // failure of the read: the receipt's own path list is what a client keeps.
+    let pruned = get(&thread.id, "turn_call_changes", PRUNED_CALL).await?;
+    assert_eq!(pruned["state"], "unavailable");
+    assert_eq!(pruned["reason"], "snapshots_pruned");
+    assert_eq!(pruned["files"].as_array().unwrap().len(), 0);
+
+    // A workspace with no snapshot store at all answers the same way: the
+    // receipts cannot be resolved, and that is not a server failure.
+    let storeless: Value = client
+        .get(url(&storeless_thread.id, "turn_storeless", STORELESS_CALL))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(storeless["state"], "unavailable");
+    assert_eq!(storeless["reason"], "snapshots_pruned");
+
+    // A span whose closing receipt is gone will never resolve, and says why.
+    let half = get(&thread.id, "turn_call_half", "call_half").await?;
+    assert_eq!(half["state"], "unavailable");
+    assert_eq!(half["reason"], "post_snapshot_missing");
+
+    // A corrupt item cannot turn a known call into an unavailable span.
+    let item_path = tmp
+        .path()
+        // This harness roots the Runtime store at <root>/runtime/runtime.
+        .join("runtime")
+        .join("runtime")
+        .join("runtime")
+        .join("items")
+        .join(format!("{}.json", half_item.id));
+    let saved_item = fs::read(&item_path)?;
+    fs::write(&item_path, b"invalid runtime item JSON\n")?;
+    let response = client
+        .get(url(&thread.id, "turn_call_half", "call_half"))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await;
+    fs::write(&item_path, saved_item)?;
+    let response = response?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = response.json().await?;
+    assert!(
+        error.to_string().contains("Failed to parse item"),
+        "{error}"
+    );
+
+    // A call this turn never ran, an unknown turn, and a turn of another
+    // thread are 404s rather than empty answers.
+    for (thread_id, turn_id, call) in [
+        (thread.id.as_str(), "turn_call_changes", "call_never"),
+        (thread.id.as_str(), "turn_missing", "call_shell"),
+        (thread.id.as_str(), "turn_call_half", "call_shell"),
+        ("thread_missing", "turn_call_changes", SHELL_CALL),
+    ] {
+        let status = client
+            .get(url(thread_id, turn_id, call))
+            .bearer_auth("call-changes-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{thread_id}/{turn_id}/{call}"
+        );
+    }
+    let status = client
+        .get(format!(
+            "{}?limit=0",
+            url(&thread.id, "turn_call_changes", SHELL_CALL)
+        ))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A store is present, but git cannot read its metadata. Preserve the
+    // operational failure rather than telling clients these trees were pruned.
+    let head = repo.git_dir().join("HEAD");
+    let saved_head = fs::read(&head)?;
+    fs::write(&head, b"invalid snapshot repository metadata\n")?;
+    let response = client
+        .get(url(&thread.id, "turn_call_changes", SHELL_CALL))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await;
+    fs::write(&head, saved_head)?;
+    let response = response?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = response.json().await?;
+    assert!(
+        error.to_string().contains("snapshot tree lookup failed"),
+        "{error}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // /v1/jobs: client-owned shell jobs on the thread's shared ShellManager.
 // ---------------------------------------------------------------------------
@@ -16286,19 +21732,43 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
     let tmp = tempfile::tempdir()?;
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
     let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+    let _provider_keys: Vec<_> = ProviderKind::Deepseek
+        .provider()
+        .env_vars()
+        .iter()
+        .copied()
+        .map(crate::test_support::EnvVarGuard::remove)
+        .collect();
     fs::create_dir_all(tmp.path().join("cwhome"))?;
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace)?;
+    let config_path = tmp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "provider = \"deepseek\"\n[providers.deepseek]\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+    )?;
+    let secret_path = tmp.path().join("cwhome/secrets/secrets.json");
+    let live_config = Arc::new(parking_lot::RwLock::new(Config::default()));
 
-    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
-        tmp.path().join("runtime"),
-        tmp.path().join("sessions"),
-        Some("keys-token".to_string()),
-        false,
-        workspace.clone(),
-    )
-    .await?
-    .context("secrets test requires a loopback listener")?;
+    // No literal DeepSeek key in the live config: the older harness kept one
+    // at the top level, where it silently outranked the store. Since #6394
+    // that key is a `[providers.deepseek]` literal and the write refuses.
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("keys-token".to_string()),
+            false,
+            workspace.clone(),
+            TestServerOverrides {
+                config_path: Some(config_path.clone()),
+                config_handle: Some(live_config.clone()),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("secrets test requires a loopback listener")?;
     let client = crate::tls::reqwest_client();
     let base = format!("http://{addr}");
 
@@ -16332,22 +21802,38 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         .status();
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // A key written for the *active* provider reports configured through the
-    // live store even though the test route is a keyless local endpoint —
-    // saving a key declares the api-key contract, exactly as `auth set` would.
-    let receipt: Value = client
-        .put(format!("{base}/v1/providers/deepseek/key"))
+    // An unsupported write is a client error before opening a secret backend
+    // or changing either config copy. No opaque setter error is reclassified.
+    let config_before = fs::read(&config_path)?;
+    assert!(!secret_path.exists());
+    let refused = client
+        .put(format!("{base}/v1/providers/openai-codex/key"))
         .bearer_auth("keys-token")
-        .json(&json!({ "key": "sk-test-active-route-key" }))
+        .json(&json!({ "key": "synthetic-unsupported-codex-key" }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
-    assert_eq!(receipt["provider"], "deepseek");
-    assert_eq!(receipt["stored"], true);
-    assert!(!receipt.to_string().contains("sk-test-active-route-key"));
-    assert_eq!(receipt["credentialState"], "configured");
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let refused: Value = refused.json().await?;
+    assert_eq!(
+        refused["error"]["message"],
+        codewhale_config::credentials::OPENAI_CODEX_API_KEY_REFUSAL
+    );
+    assert!(
+        !refused
+            .to_string()
+            .contains("synthetic-unsupported-codex-key")
+    );
+    assert_eq!(fs::read(&config_path)?, config_before);
+    assert!(!secret_path.exists());
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode, None);
+        assert_eq!(
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::OpenaiCodex))
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            None
+        );
+    }
 
     // A key written for a *non-active* provider is the harder case: the
     // readiness catalog only probes the secret store for it when the
@@ -16386,6 +21872,96 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         .expect("openai is listed");
     assert_eq!(openai["credentialState"], "configured");
 
+    // Before the active provider has a saved key, its local route must stay
+    // keyless. An unconditional live root marker changes this to "missing".
+    let deepseek = providers["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "deepseek")
+        .expect("deepseek is listed");
+    assert_eq!(deepseek["credentialState"], "local");
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode, None);
+        assert_eq!(
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Deepseek))
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            None
+        );
+        assert_eq!(
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Openai))
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            Some("api_key")
+        );
+    }
+    let saved = codewhale_config::ConfigStore::load(Some(config_path.clone()))?;
+    assert_eq!(saved.config.auth_mode, None);
+    assert_eq!(
+        saved.config.providers.openai.auth_mode.as_deref(),
+        Some("api_key")
+    );
+    assert_eq!(saved.config.providers.openai_codex.auth_mode, None);
+
+    // A key written for the *active* provider reports configured through the
+    // live store even though the test route is a keyless local endpoint —
+    // saving a key declares the api-key contract, exactly as `auth set` would.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/deepseek/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-active-route-key" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "deepseek");
+    assert_eq!(receipt["stored"], true);
+    assert!(!receipt.to_string().contains("sk-test-active-route-key"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
+        assert_eq!(
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Deepseek))
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            Some("api_key")
+        );
+    }
+    let saved = codewhale_config::ConfigStore::load(Some(config_path.clone()))?;
+    assert_eq!(saved.config.auth_mode.as_deref(), Some("api_key"));
+    assert_eq!(
+        saved.config.providers.deepseek.auth_mode.as_deref(),
+        Some("api_key")
+    );
+
+    // A real backend read failure still reports a server error and leaves
+    // the last committed metadata and damaged backend bytes untouched.
+    let config_before = fs::read(&config_path)?;
+    fs::write(&secret_path, b"not valid secret-store JSON")?;
+    let failed = client
+        .put(format!("{base}/v1/providers/openrouter/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "synthetic-failed-storage-key" }))
+        .send()
+        .await?;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let failed = failed.text().await?;
+    assert!(failed.contains("credential write failed"));
+    assert!(!failed.contains("synthetic-failed-storage-key"));
+    assert_eq!(fs::read(&config_path)?, config_before);
+    assert_eq!(fs::read(&secret_path)?, b"not valid secret-store JSON");
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
+        assert_eq!(
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Openrouter))
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            None
+        );
+    }
+
     handle.abort();
     Ok(())
 }
@@ -16396,11 +21972,21 @@ async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
     let _env_lock = crate::test_support::lock_test_env();
     let tmp = tempfile::tempdir()?;
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
-    // Crash dumps resolve under the user home (`<home>/.codewhale/crashes`),
-    // independent of the codewhale-home override that governs logs.
+    // An explicit profile owns both logs and crashes, even when ambient
+    // legacy crash files exist outside it.
     let _user_home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("userhome"));
-    let logs = tmp.path().join("cwhome/logs");
-    let crashes = tmp.path().join("userhome/.codewhale/crashes");
+    let logs = tmp.path().join("cwhome").join("logs");
+    let crashes = tmp.path().join("cwhome").join("crashes");
+    let ambient_crashes = tmp
+        .path()
+        .join("userhome")
+        .join(".deepseek")
+        .join("crashes");
+    fs::create_dir_all(&ambient_crashes)?;
+    fs::write(
+        ambient_crashes.join("ambient-only.log"),
+        "not in this profile",
+    )?;
     fs::create_dir_all(&logs)?;
     fs::create_dir_all(&crashes)?;
     fs::write(logs.join("tui-20990101-1.log"), "line one\nline two\n")?;
@@ -16464,6 +22050,8 @@ async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
+    assert_eq!(crashes_list["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(crashes_list["sources"][0]["dir"], json!(crashes));
     assert!(
         crashes_list["sources"][0]["files"]
             .as_array()
@@ -16480,6 +22068,14 @@ async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
         .json()
         .await?;
     assert_eq!(crash["content"], "Panic: boom\n");
+
+    let status = client
+        .get(format!("{base}/v1/crashes/ambient-only.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Traversal and missing files fail closed.
     let status = client
@@ -17012,6 +22608,27 @@ async fn git_routes_drive_a_real_workspace_repo() -> Result<()> {
         f["path"] == "tracked.txt" && f["status"] == "modified" && f["staged"] == false
     }));
 
+    // Repository-configured diff drivers and clean filters must not run for
+    // these reads; the helper would replace the content with a sentinel.
+    #[cfg(unix)]
+    let helper_config = {
+        use std::os::unix::fs::PermissionsExt as _;
+        let helper = tmp.path().join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\necho HELPER-RAN\n")?;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+        let helper = helper.display().to_string();
+        fs::create_dir_all(workspace.join(".git/info"))?;
+        fs::write(
+            workspace.join(".git/info/attributes"),
+            "tracked.txt diff=conv filter=x\n",
+        )?;
+        let keys = ["diff.conv.textconv", "diff.external", "filter.x.clean"];
+        for key in keys {
+            git(&["config", key, &helper])?;
+        }
+        keys
+    };
+
     // The diff reads serve the same worktree change: a unified patch for one
     // file, the whole tree with a numstat inventory, and the changes list.
     let file_diff: Value = client
@@ -17077,6 +22694,16 @@ async fn git_routes_drive_a_real_workspace_repo() -> Result<()> {
     );
     assert!(tree["diff"].as_str().unwrap().contains("+v2"));
     assert_eq!(tree["truncated"], false);
+    #[cfg(unix)]
+    {
+        for read in [&file_diff, &tree] {
+            assert!(!read.to_string().contains("HELPER-RAN"), "{read}");
+        }
+        for key in helper_config {
+            git(&["config", "--unset", key])?;
+        }
+        fs::remove_file(workspace.join(".git/info/attributes"))?;
+    }
 
     // Diff path validation shares the file-route confinement.
     for (path, want) in [
@@ -17150,6 +22777,322 @@ async fn git_routes_drive_a_real_workspace_repo() -> Result<()> {
             .status();
         assert_eq!(status, want, "{route} {body}");
     }
+
+    handle.abort();
+    Ok(())
+}
+
+/// #6647: optional preconditions on git writes. A matching `expect` writes;
+/// a stale HEAD, index or file answers 409 `git_state_changed` with the
+/// current state and writes nothing; no `expect` keeps the old behaviour.
+#[tokio::test]
+async fn git_write_preconditions_reject_stale_state() -> Result<()> {
+    use crate::dependencies::{ExternalTool as _, Git};
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let git = |args: &[&str]| {
+        let output = Git::output(args, &workspace)?;
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok::<_, anyhow::Error>(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    git(&["init", "-b", "main"])?;
+    git(&["config", "user.email", "runtime-api@example.test"])?;
+    git(&["config", "user.name", "Runtime API Test"])?;
+    git(&["config", "core.autocrlf", "false"])?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("git-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("git test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let read = || async {
+        client
+            .get(format!("{base}/v1/git"))
+            .bearer_auth("git-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let post = |route: &'static str, body: Value| {
+        let request = client
+            .post(format!("{base}{route}"))
+            .bearer_auth("git-token")
+            .json(&body);
+        async move {
+            let response = request.send().await?;
+            let status = response.status();
+            // Axum's own extractor rejections (422) answer in plain text.
+            let text = response.text().await?;
+            let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+            Ok::<_, anyhow::Error>((status, body))
+        }
+    };
+    let rev_of = |detail: &Value, path: &str| -> String {
+        detail["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == path)
+            .and_then(|row| row["rev"].as_str())
+            .unwrap_or_else(|| panic!("no rev for {path} in {detail}"))
+            .to_string()
+    };
+
+    // (g) Unborn: head null matches a fresh repository, then goes stale.
+    fs::write(workspace.join("tracked.txt"), "v1\n")?;
+    let detail = read().await?;
+    assert_eq!(detail["head_oid"], Value::Null);
+    assert_eq!(detail["index_token"].as_str().unwrap().len(), 64);
+    let (status, staged) = post(
+        "/v1/git/stage",
+        json!({ "paths": ["tracked.txt"], "expect": { "head": null, "files": { "tracked.txt": rev_of(&detail, "tracked.txt") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "initial", "expect": { "head": null, "index": staged["current"]["index_token"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "again", "all": true, "expect": { "head": null } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "git_state_changed");
+    assert_eq!(body["stale"], json!(["head"]));
+
+    // (a) The read exposes every token.
+    fs::write(workspace.join("new.rs"), "fn main() {}\n")?;
+    let detail = read().await?;
+    let head = detail["head_oid"].as_str().unwrap().to_string();
+    assert_eq!(head.len(), 40);
+    assert!(head.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(detail["index_token"].as_str().unwrap().len(), 64);
+    assert_eq!(detail["revision"].as_str().unwrap().len(), 64);
+    for row in detail["files"].as_array().unwrap() {
+        assert!(
+            row["rev"].as_str().is_some_and(|rev| rev.len() == 66),
+            "{row}"
+        );
+    }
+    let changes: Value = client
+        .get(format!("{base}/v1/changes"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(changes["index_token"], detail["index_token"]);
+    assert_eq!(changes["revision"], detail["revision"]);
+    assert_eq!(changes["files"], detail["files"]);
+
+    // (b) Matching preconditions: stage, then commit chained from `current`.
+    let (status, staged) = post(
+        "/v1/git/stage",
+        json!({ "paths": ["new.rs"], "expect": { "head": head, "files": { "new.rs": rev_of(&detail, "new.rs") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    assert_eq!(staged["status"]["staged"], 1);
+    assert_ne!(staged["current"]["index_token"], detail["index_token"]);
+    let (status, committed) = post(
+        "/v1/git/commit",
+        json!({ "message": "add new.rs", "expect": { "head": head, "index": staged["current"]["index_token"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(git(&["rev-parse", "HEAD~1"])?.trim(), head);
+    let head = committed["current"]["head_oid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // (c) A file rewritten after the read is not staged.
+    fs::write(workspace.join("new2.rs"), "one\n")?;
+    let detail = read().await?;
+    fs::write(workspace.join("new2.rs"), "two\n")?;
+    let index_before = git(&["ls-files", "--stage"])?;
+    let (status, body) = post(
+        "/v1/git/stage",
+        json!({ "paths": ["new2.rs"], "expect": { "head": head, "files": { "new2.rs": rev_of(&detail, "new2.rs") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "git_state_changed");
+    assert_eq!(body["error"]["status"], 409);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("new2.rs changed"),
+        "{body}"
+    );
+    assert_eq!(body["stale"], json!(["files"]));
+    assert_eq!(body["stale_paths"], json!(["new2.rs"]));
+    assert_ne!(
+        rev_of(&body["current"], "new2.rs"),
+        rev_of(&detail, "new2.rs")
+    );
+    assert_eq!(
+        git(&["ls-files", "--stage"])?,
+        index_before,
+        "nothing staged"
+    );
+
+    // (d) Discard never destroys an edit made after the read.
+    fs::write(workspace.join("tracked.txt"), "v2\n")?;
+    let detail = read().await?;
+    fs::write(workspace.join("tracked.txt"), "v2\nexternal edit\n")?;
+    let (status, body) = post(
+        "/v1/git/discard",
+        json!({ "paths": ["tracked.txt"], "expect": { "head": head, "files": { "tracked.txt": rev_of(&detail, "tracked.txt") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["stale_paths"], json!(["tracked.txt"]));
+    assert_eq!(
+        fs::read_to_string(workspace.join("tracked.txt"))?,
+        "v2\nexternal edit\n"
+    );
+    // The refreshed token from `current` then discards exactly that state.
+    let (status, body) = post(
+        "/v1/git/discard",
+        json!({ "paths": ["tracked.txt"], "expect": { "files": { "tracked.txt": rev_of(&body["current"], "tracked.txt") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fs::read_to_string(workspace.join("tracked.txt"))?, "v1\n");
+
+    // (e) Stale HEAD: an external commit lands between read and commit.
+    let detail = read().await?;
+    fs::write(workspace.join("other.txt"), "o\n")?;
+    git(&["add", "other.txt"])?;
+    git(&["commit", "-m", "external"])?;
+    let external = git(&["rev-parse", "HEAD"])?.trim().to_string();
+    fs::write(workspace.join("mine.txt"), "m\n")?;
+    git(&["add", "mine.txt"])?;
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "mine", "expect": { "head": detail["head_oid"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["stale"].as_array().unwrap().contains(&json!("head")));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("HEAD moved")
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"])?.trim(), external);
+    assert_eq!(body["current"]["head_oid"], external.as_str());
+
+    // (f) Stale index: an external `git add` after the read.
+    let detail = read().await?;
+    let count_before = git(&["rev-list", "--count", "HEAD"])?;
+    fs::write(workspace.join("sneak.txt"), "s\n")?;
+    git(&["add", "sneak.txt"])?;
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "mine", "expect": { "head": detail["head_oid"], "index": detail["index_token"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["stale"], json!(["index"]));
+    assert_eq!(git(&["rev-list", "--count", "HEAD"])?, count_before);
+
+    // Whole-tree revision guards stage-all against an unseen file.
+    let detail = read().await?;
+    fs::write(workspace.join("late.txt"), "late\n")?;
+    let (status, body) = post(
+        "/v1/git/stage",
+        json!({ "all": true, "expect": { "revision": detail["revision"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["stale"], json!(["revision"]));
+    assert!(!git(&["ls-files"])?.contains("late.txt"));
+    let (status, body) = post(
+        "/v1/git/stage",
+        json!({ "all": true, "expect": { "revision": body["current"]["revision"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(git(&["ls-files"])?.contains("late.txt"));
+
+    // Literal pathspecs: `*` names a file called `*`, never a glob.
+    fs::write(workspace.join("glob-a.txt"), "a\n")?;
+    git(&["restore", "--staged", ":/"])?;
+    let (status, body) = post("/v1/git/stage", json!({ "paths": ["glob-*"] })).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(!git(&["diff", "--cached", "--name-only"])?.contains("glob-a.txt"));
+
+    // (h) Absent preconditions, and an empty `expect`, keep working.
+    let (status, body) = post("/v1/git/stage", json!({ "paths": ["glob-a.txt"] })).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        "/v1/git/unstage",
+        json!({ "paths": ["glob-a.txt"], "expect": {} }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // (i) Malformed preconditions are refused before git runs.
+    let detail = read().await?;
+    for (route, body, want) in [
+        (
+            "/v1/git/commit",
+            json!({ "message": "m", "expect": { "head": "abc" } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": ["glob-a.txt", "mine.txt"], "expect": { "files": { "glob-a.txt": rev_of(&detail, "glob-a.txt") } } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/commit",
+            json!({ "message": "m", "expect": { "files": { "glob-a.txt": rev_of(&detail, "glob-a.txt") } } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "all": true, "expect": { "files": { "glob-a.txt": rev_of(&detail, "glob-a.txt") } } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": ["glob-a.txt"], "expect": { "unknown": 1 } }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let (status, response) = post(route, body.clone()).await?;
+        assert_eq!(status, want, "{route} {body}: {response}");
+        if status == StatusCode::BAD_REQUEST {
+            assert_eq!(response["error"]["status"], 400);
+            assert!(response["error"]["message"].is_string());
+        }
+    }
+    assert!(!git(&["diff", "--cached", "--name-only"])?.contains("glob-a.txt"));
 
     handle.abort();
     Ok(())
@@ -17539,14 +23482,30 @@ async fn threads_running_lists_active_turns_and_clears_on_settle() -> Result<()>
         sleep(Duration::from_millis(20)).await;
     }
 
-    let settled: serde_json::Value = client
-        .get(format!("{base}/v1/threads/running"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(settled, serde_json::json!([]));
+    // The listing above is read from the durable store, and the engine still
+    // owns this record: it can persist its own status after the write above,
+    // which puts the turn back in flight and made a single read flaky on a
+    // loaded macOS runner. That is not a defect — the engine is entitled to
+    // finish its turn. What must hold is that a settled turn stops being
+    // listed, so poll for that instead of assuming the first read is final.
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(5));
+    loop {
+        let settled: serde_json::Value = client
+            .get(format!("{base}/v1/threads/running"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if settled == serde_json::json!([]) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a settled turn must leave the running list: {settled}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
 
     handle.abort();
     Ok(())
@@ -17680,7 +23639,7 @@ api_key = "refresh-fixture-key"
         "custom/models/refresh?model_provider_id=",
         "custom/models/refresh?model_provider_id=missing",
         "openai/models/refresh?model_provider_id=second",
-        "deepseek-cn/models/refresh",
+        "deepseek-cn-unknown/models/refresh",
         "custom/models/refresh?base_url=https://untrusted.invalid",
     ] {
         assert_eq!(
@@ -18181,12 +24140,21 @@ async fn mcp_server_management_blocks_credential_retargeting() -> Result<()> {
     Ok(())
 }
 
+/// Like `error_for_status`, but keeps the server's `ApiError` body so a hosted
+/// failure names the refusing handler instead of only its status.
+async fn mcp_test_success(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let url = response.url().clone();
+    let body = response.text().await.unwrap_or_default();
+    bail!("{status} for {url}: {body}")
+}
+
 async fn mcp_test_revision(client: &reqwest::Client, base: &str) -> Result<String> {
-    let listing: Value = client
-        .get(base)
-        .send()
+    let listing: Value = mcp_test_success(client.get(base).send().await?)
         .await?
-        .error_for_status()?
         .json()
         .await?;
     Ok(format!(
@@ -18492,5 +24460,1546 @@ async fn jobs_api_pty_resize_raw_input_and_nonblocking_poll() -> Result<()> {
         .await?;
     assert_eq!(tail["data"], "");
     handle.abort();
+    Ok(())
+}
+
+#[test]
+fn the_mobile_page_follows_agents_by_name() {
+    // #6565 / #6474: the mobile page never subscribed to agent events.
+    let html = super::MOBILE_HTML;
+    for event in [
+        "\"agent.spawned\"",
+        "\"agent.progress\"",
+        "\"agent.completed\"",
+    ] {
+        assert!(html.contains(event), "subscribes to {event}");
+    }
+    assert!(html.contains("id=\"agents\""), "has an agents strip");
+    assert!(
+        html.contains("payload.agent_name"),
+        "names agents by their name"
+    );
+    assert!(
+        html.contains("if (name === \"agent.completed\")"),
+        "eventText renders completion"
+    );
+    assert!(
+        html.contains("state.agents.clear()"),
+        "a new thread starts a new strip"
+    );
+    assert!(
+        !html.contains("\"Sub-agent \" + payload.agent_id"),
+        "never shows the raw id"
+    );
+}
+
+/// #6621: a Runtime thread owns the workspace restore points recorded on its
+/// own turns, for every kind of thread, through the HTTP API and with real
+/// engines built by `ensure_engine_loaded` (only the model client is
+/// scripted), so the production `EngineConfig` / `SyncSession` identity path
+/// is the one under test.
+mod thread_snapshot_ownership {
+    use super::*;
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    struct Fixture {
+        root: PathBuf,
+        workspace: PathBuf,
+        addr: SocketAddr,
+        threads: SharedRuntimeThreadManager,
+        server: tokio::task::JoinHandle<()>,
+        mock: Arc<MockLlmClient>,
+        client: reqwest::Client,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// `None` when git or a loopback listener is unavailable.
+    async fn fixture(root: &FsPath, overrides: TestServerOverrides) -> Result<Option<Fixture>> {
+        if crate::dependencies::Git::command().is_none() {
+            return Ok(None);
+        }
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace)?;
+        // The directory the Runtime's fork and resume paths read saved
+        // sessions from, as production wires it.
+        let sessions_dir = crate::session_manager::default_sessions_dir()?;
+        let Some((addr, threads, server)) =
+            spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+                root.to_path_buf(),
+                sessions_dir,
+                None,
+                false,
+                workspace.clone(),
+                overrides,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        threads.set_test_model_client(mock.clone());
+        Ok(Some(Fixture {
+            root: root.to_path_buf(),
+            workspace,
+            addr,
+            threads,
+            server,
+            mock,
+            client: crate::tls::reqwest_client(),
+        }))
+    }
+
+    impl Fixture {
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.addr)
+        }
+
+        async fn create_thread(&self) -> Result<String> {
+            let created: Value = self
+                .client
+                .post(self.url("/v1/threads"))
+                .json(&json!({
+                    "model": "deepseek-v4-pro",
+                    "mode": "agent",
+                    "workspace": self.workspace,
+                    "trust_mode": true,
+                    "auto_approve": true,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(created["id"].as_str().context("thread id")?.to_string())
+        }
+
+        /// Run one real turn whose model writes each `(path, content)` with
+        /// `write_file`, then answers. Returns the settled turn record.
+        async fn write_turn(&self, thread_id: &str, writes: &[(&str, &str)]) -> Result<Value> {
+            for (path, content) in writes {
+                let call_id = format!("call_{}", &Uuid::new_v4().simple().to_string()[..12]);
+                self.mock.push_turn(canned::tool_call_turn(
+                    &call_id,
+                    "write_file",
+                    &json!({ "path": path, "content": content }).to_string(),
+                ));
+            }
+            self.mock.push_turn(canned::simple_text_turn("done"));
+            let started: Value = self
+                .client
+                .post(self.url(&format!("/v1/threads/{thread_id}/turns")))
+                .json(&json!({ "prompt": format!("write {writes:?}") }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let turn_id = started["turn"]["id"]
+                .as_str()
+                .context("turn id")?
+                .to_string();
+            let status = wait_for_terminal_turn_status(
+                &self.client,
+                self.addr,
+                thread_id,
+                &turn_id,
+                Duration::from_secs(60),
+            )
+            .await?;
+            let turn = self.turn(thread_id, &turn_id).await?;
+            assert_eq!(status, "completed", "{turn:#}");
+            Ok(turn)
+        }
+
+        async fn detail(&self, thread_id: &str) -> Result<Value> {
+            Ok(self
+                .client
+                .get(self.url(&format!("/v1/threads/{thread_id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        }
+
+        async fn turn(&self, thread_id: &str, turn_id: &str) -> Result<Value> {
+            self.detail(thread_id).await?["turns"]
+                .as_array()
+                .and_then(|turns| turns.iter().find(|turn| turn["id"] == turn_id))
+                .cloned()
+                .context("turn not in thread detail")
+        }
+
+        async fn patch_undo(&self, thread_id: &str, depth: usize) -> Result<reqwest::Response> {
+            Ok(self
+                .client
+                .post(self.url(&format!("/v1/threads/{thread_id}/patch-undo")))
+                .json(&json!({ "depth": depth }))
+                .send()
+                .await?)
+        }
+
+        /// Patch-undo that must restore files; returns the fork's id.
+        async fn undo_restoring(&self, thread_id: &str, depth: usize) -> Result<String> {
+            let resp = self.patch_undo(thread_id, depth).await?;
+            let status = resp.status();
+            let body: Value = resp.json().await?;
+            assert_eq!(status, StatusCode::CREATED, "{body:#}");
+            assert_eq!(body["patch_result"]["files_restored"], true, "{body:#}");
+            Ok(body["thread"]["id"]
+                .as_str()
+                .context("fork id")?
+                .to_string())
+        }
+
+        async fn thread_count(&self) -> Result<usize> {
+            let threads: Value = self
+                .client
+                .get(self.url("/v1/threads?include_archived=true"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(threads.as_array().map_or(0, Vec::len))
+        }
+
+        fn read(&self, path: &str) -> Option<String> {
+            fs::read_to_string(self.workspace.join(path)).ok()
+        }
+    }
+
+    fn receipts(turn: &Value) -> Vec<Value> {
+        turn["workspace_snapshots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn receipt_kinds(turn: &Value) -> Vec<String> {
+        receipts(turn)
+            .iter()
+            .map(|receipt| receipt["kind"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("codewhale-6621-{name}-{}", Uuid::new_v4()))
+    }
+
+    /// The issue's reproduction: a fresh HTTP thread writes a new file and
+    /// overwrites an existing one (two writes, one turn), and patch-undo
+    /// restores both — the new file deleted, the old one back to its exact
+    /// bytes — and reports it. The turn record carries the restore points,
+    /// tagged with the thread's own id.
+    #[tokio::test]
+    async fn fresh_thread_patch_undo_restores_its_own_turn() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("fresh");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("a.txt"), "original bytes\n")?;
+        let thread_id = fx.create_thread().await?;
+        let turn = fx
+            .write_turn(
+                &thread_id,
+                &[("new.txt", "created"), ("a.txt", "overwritten")],
+            )
+            .await?;
+        assert_eq!(fx.read("new.txt").as_deref(), Some("created"));
+        assert_eq!(fx.read("a.txt").as_deref(), Some("overwritten"));
+        assert_eq!(
+            receipt_kinds(&turn),
+            [
+                "pre_turn",
+                "tool",
+                "post_tool",
+                "tool",
+                "post_tool",
+                "post_turn"
+            ],
+            "{turn:#}"
+        );
+        // Each receipt after the first records what changed in the span it
+        // closes: the write happened inside its own tool span.
+        let changed: Vec<Value> = receipts(&turn)
+            .iter()
+            .map(|receipt| receipt["changed_paths"].clone())
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                Value::Null,
+                json!([]),
+                json!(["new.txt"]),
+                json!([]),
+                json!(["a.txt"]),
+                json!([]),
+            ],
+            "{turn:#}"
+        );
+        assert!(
+            receipts(&turn)
+                .iter()
+                .all(|receipt| receipt["session_id"] == thread_id.as_str()),
+            "every restore point is tagged with the thread's own id: {turn:#}"
+        );
+        // The saved-session binding is untouched by any of this.
+        assert!(fx.detail(&thread_id).await?["thread"]["session_id"].is_null());
+
+        let fork = fx.undo_restoring(&thread_id, 0).await?;
+        assert_eq!(fx.read("new.txt"), None, "the created file is removed");
+        assert_eq!(
+            fx.read("a.txt").as_deref(),
+            Some("original bytes\n"),
+            "both writes of the turn are undone, not only the last"
+        );
+        assert_ne!(fork, thread_id);
+        Ok(())
+    }
+
+    /// `depth = 1` drops two turns and restores the workspace to before the
+    /// older one. A chained undo on the returned fork restores the turn that
+    /// fork inherited.
+    #[tokio::test]
+    async fn multi_turn_and_chained_undo_restore_whole_turns() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("depth");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("a.txt"), "v0")?;
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[("a.txt", "v1")]).await?;
+        fx.write_turn(&thread_id, &[("a.txt", "v2"), ("b.txt", "b")])
+            .await?;
+
+        fx.undo_restoring(&thread_id, 1).await?;
+        assert_eq!(fx.read("a.txt").as_deref(), Some("v0"));
+        assert_eq!(fx.read("b.txt"), None);
+
+        // Redo both by hand, then undo one turn at a time.
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[("a.txt", "w1")]).await?;
+        fx.write_turn(&thread_id, &[("a.txt", "w2")]).await?;
+        let fork = fx.undo_restoring(&thread_id, 0).await?;
+        assert_eq!(fx.read("a.txt").as_deref(), Some("w1"));
+        fx.undo_restoring(&fork, 0).await?;
+        assert_eq!(
+            fx.read("a.txt").as_deref(),
+            Some("v0"),
+            "the fork owns the turn it inherited"
+        );
+        Ok(())
+    }
+
+    /// `POST /fork` and `fork-at-turn` clone the turn records, so each fork
+    /// restores the turns it inherited.
+    #[tokio::test]
+    async fn forks_restore_inherited_turns() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("fork");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let thread_id = fx.create_thread().await?;
+        let first = fx.write_turn(&thread_id, &[("one.txt", "1")]).await?;
+        fx.write_turn(&thread_id, &[("two.txt", "2")]).await?;
+
+        let forked: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/threads/{thread_id}/fork")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let fork_id = forked["id"].as_str().context("fork id")?.to_string();
+        fx.undo_restoring(&fork_id, 0).await?;
+        assert_eq!(fx.read("two.txt"), None);
+        assert_eq!(fx.read("one.txt").as_deref(), Some("1"));
+
+        // Put two.txt back so the original thread's state is consistent,
+        // then branch after the first turn and undo that retained turn.
+        fs::write(fx.workspace.join("two.txt"), "2")?;
+        let branched: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/threads/{thread_id}/fork-at-turn")))
+            .json(&json!({ "turn_id": first["id"] }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let branch_id = branched["thread"]["id"]
+            .as_str()
+            .context("branch id")?
+            .to_string();
+        // two.txt came from a turn the branch dropped, and changed nothing
+        // one.txt holds, so undoing the retained first turn removes one.txt
+        // and leaves two.txt alone.
+        fx.undo_restoring(&branch_id, 0).await?;
+        assert_eq!(fx.read("one.txt"), None);
+        assert_eq!(fx.read("two.txt").as_deref(), Some("2"));
+
+        // A turn this Runtime ran without any tool provably changed nothing:
+        // the undo forks and says so.
+        fx.write_turn(&branch_id, &[]).await?;
+        let resp = fx.patch_undo(&branch_id, 0).await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = resp.json().await?;
+        assert_eq!(body["patch_result"]["files_restored"], false, "{body:#}");
+        assert_eq!(fx.read("two.txt").as_deref(), Some("2"));
+        Ok(())
+    }
+
+    /// Ownership survives engine eviction and a full Runtime restart: the
+    /// engine is rebuilt under the same thread id, a later turn is tagged with
+    /// it too, and the earlier turn still restores.
+    #[tokio::test]
+    async fn ownership_survives_eviction_and_restart() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("restart");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(
+            &root,
+            TestServerOverrides {
+                max_active_threads: Some(1),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let a = fx.create_thread().await?;
+        fx.write_turn(&a, &[("a.txt", "from a")]).await?;
+        // Loading B's engine evicts A's.
+        let b = fx.create_thread().await?;
+        fx.write_turn(&b, &[("b.txt", "from b")]).await?;
+        let second = fx.write_turn(&a, &[("a2.txt", "a again")]).await?;
+        assert!(
+            receipts(&second)
+                .iter()
+                .all(|receipt| receipt["session_id"] == a.as_str()),
+            "a rebuilt engine keeps the thread's identity: {second:#}"
+        );
+        fx.undo_restoring(&a, 0).await?;
+        assert_eq!(fx.read("a2.txt"), None);
+
+        // Restart: stop this Runtime and open another on the same root.
+        let workspace = fx.workspace.clone();
+        drop(fx);
+        let deadline = tokio::time::Instant::now() + ci_scaled(Duration::from_secs(20));
+        let fx = loop {
+            match fixture(&root, TestServerOverrides::default()).await {
+                Ok(Some(fx)) => break fx,
+                Ok(None) => return Ok(()),
+                Err(err) if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!("runtime not reopened yet: {err:#}");
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        assert_eq!(fx.workspace, workspace);
+        let after_restart = fx.write_turn(&b, &[("b2.txt", "b again")]).await?;
+        assert!(
+            receipts(&after_restart)
+                .iter()
+                .all(|receipt| receipt["session_id"] == b.as_str()),
+            "{after_restart:#}"
+        );
+        fx.undo_restoring(&b, 0).await?;
+        assert_eq!(fx.read("b2.txt"), None);
+        fx.undo_restoring(&b, 1).await?;
+        assert_eq!(fx.read("b.txt"), None, "a pre-restart turn restores");
+        assert_eq!(fx.read("a.txt").as_deref(), Some("from a"));
+        Ok(())
+    }
+
+    /// Saving the thread under any session document — the conversation's own
+    /// id, an explicit other id, or a fresh `POST /v1/sessions` uuid — never
+    /// changes which snapshots the thread owns. A thread resumed from a saved
+    /// session has no recorded restore points for its imported turns, and its
+    /// patch-undo fails honestly without forking or touching files.
+    #[tokio::test]
+    async fn save_and_resume_keep_ownership_honest() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("sessions");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[("saved.txt", "one")]).await?;
+
+        let created: Value = fx
+            .client
+            .post(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let minted = created["session_id"]
+            .as_str()
+            .or_else(|| created["id"].as_str())
+            .context("minted session id")?
+            .to_string();
+        let own: Value = fx
+            .client
+            .put(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        // A nameless save updates the document the thread is bound to.
+        assert_eq!(own["session_id"], minted.as_str());
+        fx.client
+            .put(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id, "session_id": "explicit-doc-6621" }))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(
+            fx.detail(&thread_id).await?["thread"]["session_id"],
+            "explicit-doc-6621"
+        );
+
+        // A turn after the rebinding is still tagged with the thread id.
+        let later = fx.write_turn(&thread_id, &[("later.txt", "two")]).await?;
+        assert!(
+            receipts(&later)
+                .iter()
+                .all(|receipt| receipt["session_id"] == thread_id.as_str()),
+            "{later:#}"
+        );
+        fx.undo_restoring(&thread_id, 1).await?;
+        assert_eq!(fx.read("saved.txt"), None);
+        assert_eq!(fx.read("later.txt"), None);
+
+        // Resume the first (no longer held) document into a new thread.
+        fs::write(fx.workspace.join("saved.txt"), "restored by hand")?;
+        let resumed: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/sessions/{minted}/resume-thread")))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let resumed_id = resumed["thread_id"].as_str().context("resumed thread")?;
+        assert_ne!(resumed_id, thread_id);
+        let before = fx.thread_count().await?;
+        let resp = fx.patch_undo(resumed_id, 0).await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{body:#}\n{:#}",
+            fx.detail(resumed_id).await?
+        );
+        assert_eq!(
+            body["error"]["code"], "restore_point_unavailable",
+            "{body:#}"
+        );
+        assert_eq!(fx.read("saved.txt").as_deref(), Some("restored by hand"));
+        assert_eq!(
+            fx.thread_count().await?,
+            before,
+            "a refused undo forks nothing"
+        );
+        Ok(())
+    }
+
+    /// Two threads in one workspace: neither can revert the other's snapshot
+    /// (nor a TUI session's), and one thread's undo leaves the other's later
+    /// writes in place.
+    #[tokio::test]
+    async fn threads_cannot_restore_each_others_snapshots() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("cross");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let a = fx.create_thread().await?;
+        let b = fx.create_thread().await?;
+        let b_turn = fx.write_turn(&b, &[("b.txt", "from b")]).await?;
+        let a_turn = fx.write_turn(&a, &[("a.txt", "from a")]).await?;
+        let a_tool = receipts(&a_turn)
+            .into_iter()
+            .find(|receipt| receipt["kind"] == "tool")
+            .context("a tool receipt")?;
+
+        let repo = crate::snapshot::SnapshotRepo::open_or_init(&fx.workspace)?;
+        let tui = repo.take_snapshot("tool:tui-call", Some("tui-session-6621"))?;
+        let listed_a = repo
+            .list(usize::MAX)?
+            .into_iter()
+            .find(|snapshot| snapshot.tree.as_str() == a_tool["tree_id"])
+            .context("a's tool snapshot is listed")?;
+        for foreign in [
+            listed_a.id.as_str().to_string(),
+            a_tool["snapshot_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            a_tool["tree_id"].as_str().unwrap_or_default().to_string(),
+            tui.id.as_str().to_string(),
+        ] {
+            let resp = fx
+                .client
+                .post(fx.url(&format!("/v1/threads/{b}/file-revert")))
+                .json(&json!({
+                    "path": "a.txt",
+                    "snapshot_id": foreign,
+                    "expected_hash": sha256_of(&fx.workspace.join("a.txt")),
+                }))
+                .send()
+                .await?;
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{foreign}");
+            assert_eq!(fx.read("a.txt").as_deref(), Some("from a"));
+        }
+
+        // B's undo rolls back b.txt only; A's later write survives.
+        fx.undo_restoring(&b, 0).await?;
+        assert_eq!(fx.read("b.txt"), None);
+        assert_eq!(fx.read("a.txt").as_deref(), Some("from a"));
+        let _ = b_turn;
+        Ok(())
+    }
+
+    /// File-revert with the tool restore point from the thread's own turn
+    /// record, on a fresh thread with no saved-session binding.
+    #[tokio::test]
+    async fn fresh_thread_file_revert_uses_its_turn_record() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("revert");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("kept.txt"), "before")?;
+        let thread_id = fx.create_thread().await?;
+        let turn = fx
+            .write_turn(&thread_id, &[("kept.txt", "after"), ("made.txt", "new")])
+            .await?;
+        let tools: Vec<Value> = receipts(&turn)
+            .into_iter()
+            .filter(|receipt| receipt["kind"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 2, "{turn:#}");
+        let url = fx.url(&format!("/v1/threads/{thread_id}/file-revert"));
+
+        let stale = fx
+            .client
+            .post(&url)
+            .json(&json!({
+                "path": "kept.txt",
+                "snapshot_id": tools[0]["snapshot_id"],
+                "expected_hash": "absent",
+            }))
+            .send()
+            .await?;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(fx.read("kept.txt").as_deref(), Some("after"));
+
+        let reverted: Value = fx
+            .client
+            .post(&url)
+            .json(&json!({
+                "path": "kept.txt",
+                "snapshot_id": tools[0]["snapshot_id"],
+                "expected_hash": sha256_of(&fx.workspace.join("kept.txt")),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(reverted["action"], "modified");
+        assert_eq!(fx.read("kept.txt").as_deref(), Some("before"));
+
+        let removed: Value = fx
+            .client
+            .post(&url)
+            .json(&json!({
+                "path": "made.txt",
+                "snapshot_id": tools[1]["tree_id"],
+                "expected_hash": sha256_of(&fx.workspace.join("made.txt")),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(removed["action"], "removed");
+        assert_eq!(fx.read("made.txt"), None);
+        Ok(())
+    }
+
+    /// An undo that cannot restore files fails honestly: snapshots disabled,
+    /// a legacy seeded turn with tool calls and no receipts, a restore point
+    /// pruned from the store, and an untrusted thread. Each is a 409 with a
+    /// code, no fork, and unchanged files.
+    #[tokio::test]
+    async fn undo_that_cannot_restore_files_is_refused() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("honest");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let config = Config {
+            snapshots: Some(crate::config::SnapshotsConfig {
+                enabled: false,
+                ..crate::config::SnapshotsConfig::default()
+            }),
+            ..Config::default()
+        }
+        .with_legacy_root(
+            Some("runtime-api-test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+        );
+        let Some(fx) = fixture(
+            &root,
+            TestServerOverrides {
+                config: Some(config),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let refused = |fx: &Fixture, thread: String, code: &'static str| {
+            let fx_url = fx.url(&format!("/v1/threads/{thread}/patch-undo"));
+            let client = fx.client.clone();
+            async move {
+                let resp = client.post(fx_url).json(&json!({})).send().await?;
+                let status = resp.status();
+                let body: Value = resp.json().await?;
+                assert_eq!(status, StatusCode::CONFLICT, "{body:#}");
+                assert_eq!(body["error"]["code"], code, "{body:#}");
+                anyhow::Ok(())
+            }
+        };
+
+        // Snapshots off: the turn wrote a file and recorded no restore point.
+        let off = fx.create_thread().await?;
+        let turn = fx.write_turn(&off, &[("off.txt", "written")]).await?;
+        assert!(receipts(&turn).is_empty(), "{turn:#}");
+        let before = fx.thread_count().await?;
+        refused(&fx, off.clone(), "restore_point_unavailable").await?;
+        assert_eq!(fx.read("off.txt").as_deref(), Some("written"));
+        assert_eq!(fx.thread_count().await?, before);
+
+        // A legacy turn that ran a tool before receipts existed.
+        let legacy = fx.create_thread().await?;
+        fx.threads
+            .seed_thread_from_messages(
+                &legacy,
+                &[
+                    Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "write legacy.txt".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            execution_id: None,
+                            id: "call_legacy".to_string(),
+                            name: "write_file".to_string(),
+                            input: json!({ "path": "legacy.txt", "content": "x" }),
+                            caller: None,
+                            thought_signature: None,
+                        }],
+                    },
+                ],
+            )
+            .await?;
+        refused(&fx, legacy, "restore_point_unavailable").await?;
+        assert_eq!(fx.thread_count().await?, before + 1);
+        drop(fx);
+
+        // Snapshots on again: a pruned restore point and an untrusted thread.
+        let root = test_root("honest-on");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let pruned = fx.create_thread().await?;
+        fx.write_turn(&pruned, &[("pruned.txt", "p")]).await?;
+        crate::snapshot::SnapshotRepo::open_or_init(&fx.workspace)?
+            .prune_older_than(Duration::ZERO)?;
+        refused(&fx, pruned, "restore_point_pruned").await?;
+        assert_eq!(fx.read("pruned.txt").as_deref(), Some("p"));
+
+        let untrusted = fx.create_thread().await?;
+        fx.write_turn(&untrusted, &[("u.txt", "u")]).await?;
+        fx.client
+            .patch(fx.url(&format!("/v1/threads/{untrusted}")))
+            .json(&json!({ "trust_mode": false, "auto_approve": false }))
+            .send()
+            .await?
+            .error_for_status()?;
+        let before = fx.thread_count().await?;
+        refused(&fx, untrusted, "restore_requires_trust").await?;
+        assert_eq!(fx.read("u.txt").as_deref(), Some("u"));
+        assert_eq!(fx.thread_count().await?, before);
+        let _ = &fx.root;
+        Ok(())
+    }
+
+    /// Run one turn from pre-pushed model steps and return it settled.
+    async fn scripted_turn(fx: &Fixture, thread_id: &str, prompt: &str) -> Result<Value> {
+        let started: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/threads/{thread_id}/turns")))
+            .json(&json!({ "prompt": prompt }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let turn_id = started["turn"]["id"]
+            .as_str()
+            .context("turn id")?
+            .to_string();
+        let status = wait_for_terminal_turn_status(
+            &fx.client,
+            fx.addr,
+            thread_id,
+            &turn_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        let turn = fx.turn(thread_id, &turn_id).await?;
+        assert_eq!(status, "completed", "{turn:#}");
+        Ok(turn)
+    }
+
+    /// Another writer changes a different file while thread A's turn runs
+    /// (here: while the model is thinking, between tool calls). A's
+    /// patch-undo must not revert that file as if the turn had written it:
+    /// it refuses with `workspace_changed_since_turn`, forks nothing and
+    /// changes nothing. Without the other writer the same kind of turn
+    /// restores.
+    #[tokio::test]
+    async fn a_concurrent_writers_change_is_never_undone_as_the_turns() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("concurrent");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("sibling.txt"), "sibling before")?;
+        let thread_id = fx.create_thread().await?;
+        fx.mock.push_turn(canned::tool_call_turn(
+            "call_own_write",
+            "write_file",
+            &json!({ "path": "own.txt", "content": "from the turn" }).to_string(),
+        ));
+        let sibling = fx.workspace.join("sibling.txt");
+        fx.mock.push_factory(move |_| {
+            fs::write(&sibling, "another thread's edit").expect("concurrent write");
+            canned::simple_text_turn("done")
+        });
+        let turn = scripted_turn(&fx, &thread_id, "write own.txt").await?;
+        assert_eq!(fx.read("own.txt").as_deref(), Some("from the turn"));
+
+        let before = fx.thread_count().await?;
+        let resp = fx.patch_undo(&thread_id, 0).await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:#}\n{turn:#}");
+        assert_eq!(
+            body["error"]["code"], "workspace_changed_since_turn",
+            "{body:#}"
+        );
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("sibling.txt"), "{message}");
+        assert_eq!(
+            fx.read("sibling.txt").as_deref(),
+            Some("another thread's edit")
+        );
+        assert_eq!(fx.read("own.txt").as_deref(), Some("from the turn"));
+        assert_eq!(
+            fx.thread_count().await?,
+            before,
+            "a refused undo forks nothing"
+        );
+
+        // A shell command's writes are the turn's own: the engine bounds the
+        // call with its own snapshots, so the undo restores them.
+        let shell_thread: Value = fx
+            .client
+            .post(fx.url("/v1/threads"))
+            .json(&json!({
+                "model": "deepseek-v4-pro",
+                "mode": "agent",
+                "workspace": fx.workspace,
+                "trust_mode": true,
+                "auto_approve": true,
+                "allow_shell": true,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let shell_thread = shell_thread["id"]
+            .as_str()
+            .context("thread id")?
+            .to_string();
+        fx.mock.push_turn(canned::tool_call_turn(
+            "call_shell_write",
+            "bash",
+            &json!({ "command": "printf shell > shell.txt" }).to_string(),
+        ));
+        fx.mock.push_turn(canned::simple_text_turn("done"));
+        let shell_turn = scripted_turn(&fx, &shell_thread, "run a command").await?;
+        assert_eq!(
+            fx.read("shell.txt").as_deref(),
+            Some("shell"),
+            "{shell_turn:#}\n{:#}",
+            fx.detail(&shell_thread).await?["items"]
+        );
+        assert!(
+            receipt_kinds(&shell_turn).contains(&"post_tool".to_string()),
+            "{shell_turn:#}"
+        );
+        fx.undo_restoring(&shell_thread, 0).await?;
+        assert_eq!(fx.read("shell.txt"), None);
+        assert_eq!(
+            fx.read("sibling.txt").as_deref(),
+            Some("another thread's edit")
+        );
+        Ok(())
+    }
+
+    /// A turn whose file tool writes a gitignored file changed something no
+    /// snapshot holds. Its patch-undo is a `409 path_not_snapshotted`, never
+    /// a `201` claiming there was nothing to restore; no fork, file intact.
+    #[tokio::test]
+    async fn undo_of_a_write_to_an_ignored_path_is_refused() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("ignored");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join(".gitignore"), ".env.local\n")?;
+        fs::write(fx.workspace.join(".env.local"), "TOKEN=old\n")?;
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[(".env.local", "TOKEN=new\n")])
+            .await?;
+        let before = fx.thread_count().await?;
+        let resp = fx.patch_undo(&thread_id, 0).await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:#}");
+        assert_eq!(body["error"]["code"], "path_not_snapshotted", "{body:#}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(".env.local")),
+            "{body:#}"
+        );
+        assert_eq!(fx.read(".env.local").as_deref(), Some("TOKEN=new\n"));
+        assert_eq!(fx.thread_count().await?, before);
+        Ok(())
+    }
+
+    /// A turn with more file-modifying tool calls than the snapshot count
+    /// cap still undoes: the count prune keeps the turn's own pre-turn and
+    /// post-turn restore points (cap lowered to 3 for this workspace so the
+    /// turn does not need fifty writes).
+    #[tokio::test]
+    async fn a_turn_with_more_writes_than_the_snapshot_cap_still_undoes() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("burst");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        crate::core::turn::test_max_snapshots::set(&fx.workspace, 3);
+        fs::write(fx.workspace.join("f0.txt"), "original")?;
+        let thread_id = fx.create_thread().await?;
+        let writes: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("f{i}.txt"), format!("write {i}")))
+            .collect();
+        let writes: Vec<(&str, &str)> = writes
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        fx.write_turn(&thread_id, &writes).await?;
+        let listed =
+            crate::snapshot::SnapshotRepo::open_or_init(&fx.workspace)?.list(usize::MAX)?;
+        assert!(
+            listed.len() < 12,
+            "the cap pruned the tool snapshots: {}",
+            listed.len()
+        );
+
+        fx.undo_restoring(&thread_id, 0).await?;
+        assert_eq!(fx.read("f0.txt").as_deref(), Some("original"));
+        for i in 1..5 {
+            assert_eq!(fx.read(&format!("f{i}.txt")), None);
+        }
+        Ok(())
+    }
+
+    /// A thread resumed from saved document X is bound to X; saving it
+    /// without naming a document updates X rather than writing a second
+    /// document under another name.
+    #[tokio::test]
+    async fn nameless_save_of_a_resumed_thread_updates_its_document() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("resave");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[]).await?;
+        let created: Value = fx
+            .client
+            .post(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let document = created["session_id"]
+            .as_str()
+            .or_else(|| created["id"].as_str())
+            .context("saved session id")?
+            .to_string();
+        let manager = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir()?,
+        )?;
+        let messages_before = manager.load_session(&document)?.messages.len();
+
+        let resumed: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/sessions/{document}/resume-thread")))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let resumed_id = resumed["thread_id"]
+            .as_str()
+            .context("resumed thread")?
+            .to_string();
+        assert_eq!(
+            fx.detail(&resumed_id).await?["thread"]["session_id"],
+            document.as_str()
+        );
+        fx.write_turn(&resumed_id, &[]).await?;
+        let documents_before = manager.list_sessions()?.len();
+
+        let saved: Value = fx
+            .client
+            .put(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": resumed_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(saved["session_id"], document.as_str(), "{saved:#}");
+        assert_eq!(
+            manager.list_sessions()?.len(),
+            documents_before,
+            "no second document"
+        );
+        assert!(
+            manager.load_session(&document)?.messages.len() > messages_before,
+            "the resumed turn was saved into the bound document"
+        );
+        assert_eq!(
+            fx.detail(&resumed_id).await?["thread"]["session_id"],
+            document.as_str()
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn switch_provider_away_and_back_keeps_the_root_default_with_its_route() -> Result<()> {
+    // Device-test regression: `provider = "openai"` with the model only in the
+    // root `default_text_model`. Switching to a pass-through route used to leave
+    // the alias at the root, so that route inherited `gpui-fixture`, the
+    // provider list advertised OpenAI's catalog default (`gpt-5.6`), and the
+    // desktop model chip landed there.
+    let root = std::env::temp_dir().join(format!("codewhale-switch-root-alias-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "openai"
+default_text_model = "gpui-fixture"
+
+[providers.openai]
+api_key = "sk-test"
+base_url = "http://127.0.0.1:9/v1"
+
+[providers.openrouter]
+api_key = "sk-or-test"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, away) =
+        post_switch_provider(&client, &addr, "openrouter", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {away}");
+    assert_ne!(
+        away["model"].as_str(),
+        Some("gpui-fixture"),
+        "openrouter must not inherit openai's root default: {away}"
+    );
+    let persisted = fs::read_to_string(&config_file)?;
+    assert!(
+        !persisted.contains("default_text_model"),
+        "the alias must move off the root. Actual config:\n{persisted}"
+    );
+
+    let providers: serde_json::Value = client
+        .get(format!("http://{addr}/v1/providers"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["id"] == "openai"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        openai["default_model"].as_str(),
+        Some("gpui-fixture"),
+        "the inactive openai entry must keep its configured model, not the catalog default: {openai}"
+    );
+
+    let (status, back) =
+        post_switch_provider(&client, &addr, "openai", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {back}");
+    assert_eq!(back["model"].as_str(), Some("gpui-fixture"), "body: {back}");
+    assert_eq!(get_config(&client, &addr).await["model"], "gpui-fixture");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_provider_does_not_resurrect_a_shadowed_legacy_root_model() -> Result<()> {
+    // Review regression (#6693): the legacy root `model` was shadowed by
+    // `default_text_model`. Moving only the alias off the root let the
+    // pass-through openrouter route resolve `deepseek-v4-flash`.
+    let root = std::env::temp_dir().join(format!("codewhale-switch-legacy-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"model = "deepseek-v4-flash"
+default_text_model = "gpui-fixture"
+provider = "openai"
+
+[providers.openai]
+api_key = "sk-test"
+base_url = "http://127.0.0.1:9/v1"
+
+[providers.openrouter]
+api_key = "sk-or-test"
+"#,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, away) =
+        post_switch_provider(&client, &addr, "openrouter", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {away}");
+    // OpenRouter normalizes the stale value to `deepseek/deepseek-v4-flash`.
+    assert!(
+        !away["model"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("deepseek-v4-flash"),
+        "body: {away}"
+    );
+    assert_ne!(away["model"].as_str(), Some("gpui-fixture"), "body: {away}");
+
+    let (status, back) =
+        post_switch_provider(&client, &addr, "openai", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {back}");
+    assert_eq!(back["model"].as_str(), Some("gpui-fixture"), "body: {back}");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_export_keeps_execution_identity_and_rejects_invalid_item_correlation() -> Result<()>
+{
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions = dir.path().join("sessions");
+    let (addr, runtime, handle) = spawn_test_server_with_root(root.clone(), sessions.clone())
+        .await?
+        .context("execution identity export requires the local API fixture")?;
+    let thread = runtime.create_thread(Default::default()).await?;
+    let original: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"export exact executions"}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"same-wire","execution_id":"host-first","name":"read_file","input":{"path":"one"},"caller":{"type":"subagent","tool_id":"parent"},"thought_signature":"signature"}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"same-wire","execution_id":"host-first","content":"one","content_blocks":[{"type":"text","text":"rich"}]}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"same-wire","execution_id":"host-second","name":"read_file","input":{"path":"two"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"same-wire","execution_id":"host-second","content":"two"}]}
+    ]))?;
+    runtime
+        .seed_thread_from_messages(&thread.id, &original)
+        .await?;
+    let detail = runtime.get_thread_detail(&thread.id).await?;
+    assert_eq!(messages_from_thread_detail(&detail)?, original);
+
+    // A completed live item contains both sides. It must not become only a
+    // result when the same thread is saved through the API's projection.
+    let mut coalesced = detail.clone();
+    let result_index = coalesced
+        .items
+        .iter()
+        .position(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_result_for"] == "host-first")
+        })
+        .context("result item")?;
+    let result_item = coalesced.items.remove(result_index);
+    let call = coalesced
+        .items
+        .iter_mut()
+        .find(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_use_id"] == "host-first")
+        })
+        .context("call item")?;
+    let metadata = call.metadata.as_mut().unwrap();
+    metadata["tool_input"] = json!(call.detail.clone().unwrap());
+    metadata["tool_result_for"] = json!("host-first");
+    metadata["content_blocks"] = result_item.metadata.as_ref().unwrap()["content_blocks"].clone();
+    call.detail = result_item.detail;
+    for turn in &mut coalesced.turns {
+        turn.item_ids.retain(|id| id != &result_item.id);
+    }
+    assert_eq!(messages_from_thread_detail(&coalesced)?, original);
+
+    let client = crate::tls::reqwest_client();
+    let exported = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({"thread_id":thread.id}))
+        .send()
+        .await?;
+    assert_eq!(exported.status(), StatusCode::CREATED);
+    let exported: Value = exported.json().await?;
+    let id = exported["session_id"].as_str().context("session id")?;
+    let manager = crate::session_manager::SessionManager::new(sessions.clone())?;
+    let saved = manager.load_session(id)?;
+    assert_eq!(saved.messages, original);
+    assert_eq!(
+        saved.journal.as_ref().context("journal")?.to_messages(),
+        original
+    );
+    let display: Value = client
+        .get(format!("http://{addr}/v1/sessions/{id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        display["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .all(|block| block.get("execution_id").is_none()),
+        "detail stays display-only"
+    );
+
+    // Corrupt an identity in the existing durable record. The export must
+    // report the error, without overwriting its prior valid saved document.
+    let mut broken = detail
+        .items
+        .iter()
+        .find(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_use_id"] == "host-first")
+        })
+        .context("first call")?
+        .clone();
+    broken.metadata.as_mut().unwrap()["execution_id"] = json!("");
+    fs::write(
+        root.join("runtime/runtime/items")
+            .join(format!("{}.json", broken.id)),
+        serde_json::to_vec(&broken)?,
+    )?;
+    let saved_path = sessions.join(format!("{id}.json"));
+    let before = fs::read(&saved_path)?;
+    let refused = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({"thread_id":thread.id}))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        refused
+            .text()
+            .await?
+            .contains("Invalid stored tool execution identity")
+    );
+    assert_eq!(fs::read(saved_path)?, before);
+    handle.abort();
+    Ok(())
+}
+
+/// The two halves a client needs to settle workspace trust, over HTTP.
+///
+/// The write is asserted through the *response* rather than a second request,
+/// because the response's `workspace_trusted` is the gate's verdict read back
+/// inside the same request: the handler writes with `config::set_workspace_trust`
+/// and re-reads with `config::is_workspace_trusted`, so a `true` here is proof the
+/// record landed where that gate looks. A second GET cannot add to that proof in
+/// this harness and would only be flaky — `unsealed_test_state_root` hands a
+/// thread that resolves the config through `with_test_env_lock` a root keyed by
+/// *its own* thread id, so two requests served by different blocking workers
+/// legitimately resolve two different test config files (verified by probe).
+/// `workspace_bootstrap_status_reports_the_trust_gate` covers the projection
+/// deterministically on one thread.
+#[tokio::test]
+async fn workspace_trust_is_reported_and_written_through_the_api() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-workspace-trust-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&sessions_dir)?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace.clone(),
+            TestServerOverrides::default(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let expected_workspace = fs::canonicalize(&workspace)?;
+
+    let before: serde_json::Value = client
+        .get(format!("http://{addr}/v1/workspace/status"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        before["workspace_trusted"],
+        json!(false),
+        "a workspace nothing has vouched for must report untrusted: {before}"
+    );
+
+    let granted: serde_json::Value = client
+        .post(format!("http://{addr}/v1/workspace/trust"))
+        .json(&json!({ "trusted": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        granted["workspace_trusted"],
+        json!(true),
+        "the write must land where the gate reads it back: {granted}"
+    );
+    assert_eq!(
+        granted["workspace"]
+            .as_str()
+            .and_then(|path| fs::canonicalize(path).ok()),
+        Some(expected_workspace.clone()),
+        "the route trusts the server's own workspace, never a caller-supplied one"
+    );
+    // The named document is checked rather than taken on faith: a client shows
+    // this path to the user as the record of their decision.
+    let granted_config = granted["config_path"]
+        .as_str()
+        .context("the response must name the document it wrote")?;
+    let record: toml::Value = toml::from_str(&fs::read_to_string(granted_config)?)?;
+    assert_eq!(
+        record["projects"][expected_workspace.to_string_lossy().as_ref()]["trust_level"].as_str(),
+        Some("trusted"),
+        "the named document must carry the record the gate reads: {granted_config}"
+    );
+
+    // A switch, not a one-way latch: revoking has to reverse it too, and the
+    // verdict it reports is the read-back rather than an echo of the request.
+    let revoked: serde_json::Value = client
+        .post(format!("http://{addr}/v1/workspace/trust"))
+        .json(&json!({ "trusted": false }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(revoked["workspace_trusted"], json!(false));
+    let revoked_config = revoked["config_path"]
+        .as_str()
+        .context("the revoke response must name its document")?;
+    let record: toml::Value = toml::from_str(&fs::read_to_string(revoked_config)?)?;
+    assert_eq!(
+        record["projects"][expected_workspace.to_string_lossy().as_ref()]["trust_level"].as_str(),
+        Some("untrusted"),
+        "revoking must rewrite the same record: {revoked_config}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// A malformed body is refused before anything is written.
+///
+/// `deny_unknown_fields` is part of the contract, not decoration: this route
+/// records a security decision, and a typo in the field name must fail loudly
+/// rather than silently revoke the workspace's trust (the `false` default a
+/// permissive parse would supply).
+#[tokio::test]
+async fn workspace_trust_route_refuses_malformed_bodies() -> Result<()> {
+    let root =
+        std::env::temp_dir().join(format!("codewhale-workspace-trust-body-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&sessions_dir)?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace.clone(),
+            TestServerOverrides::default(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Trust it first, so a write that slipped through would be visible as a
+    // changed record rather than as a config file nobody reads.
+    let granted: serde_json::Value = client
+        .post(format!("http://{addr}/v1/workspace/trust"))
+        .json(&json!({ "trusted": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let config_path = granted["config_path"]
+        .as_str()
+        .context("the response must name the document it wrote")?
+        .to_string();
+    let before = fs::read(&config_path)?;
+
+    for body in [json!({}), json!({ "trusted": true, "extra": 1 })] {
+        let refused = client
+            .post(format!("http://{addr}/v1/workspace/trust"))
+            .json(&body)
+            .send()
+            .await?;
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a malformed body must be refused before any write: {body}"
+        );
+    }
+
+    assert_eq!(
+        fs::read(&config_path)?,
+        before,
+        "a refused request must leave the document byte-identical: {config_path}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// `GET /v1/workspace/status` reports the gate's verdict, not a constant.
+///
+/// Run on one thread and sealed, so the write and the read below resolve the
+/// same config document: this is the deterministic half of the pair above. The
+/// route is the same function the handler spawns, so what is proven here is what
+/// the HTTP read serves.
+#[test]
+fn workspace_bootstrap_status_reports_the_trust_gate() -> Result<()> {
+    let _home = crate::test_support::SealedHome::new();
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("project");
+    fs::create_dir_all(&workspace)?;
+
+    assert!(
+        !collect_workspace_status(&workspace).workspace_trusted,
+        "a fresh workspace must report untrusted"
+    );
+
+    crate::config::set_workspace_trust(&workspace, true)?;
+    assert!(
+        collect_workspace_status(&workspace).workspace_trusted,
+        "the status projection must follow the gate"
+    );
+
+    crate::config::set_workspace_trust(&workspace, false)?;
+    assert!(
+        !collect_workspace_status(&workspace).workspace_trusted,
+        "revoking must be visible to the status projection too"
+    );
     Ok(())
 }

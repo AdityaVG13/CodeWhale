@@ -1,5 +1,7 @@
 # Prompt-cache stability (the pinned prefix)
 
+> 阅读简体中文版：[zh_hans/CACHE.md](zh_hans/CACHE.md)。
+
 Provider prompt caches (DeepSeek KV cache, Anthropic `cache_control`) only pay
 off when the **byte prefix** of a request matches the previous one: the system
 prompt, then the tool catalog, then `messages[0..n-1]`. Any change to those
@@ -18,9 +20,8 @@ Concretely:
   (which changes the project-context pack, a directory listing, a skills scan)
   cannot move the pinned prefix under the model's feet mid-turn.
 - **History only grows.** Volatile facts the model must see (LSP diagnostics,
-  steer input, subagent completions, `<recommended_plugins>` on a matching
-  user turn) are appended to the message list, never spliced into the frozen
-  prefix. Workspace drift is delivered the same way:
+  steer input, subagent completions) are appended to the message list, never
+  spliced into the frozen prefix. Workspace drift is delivered the same way:
   at the start of each **new user turn** (never mid-tool-loop) the engine
   recomposes the volatile contributors and, if anything differs from what the
   model last saw, appends **one** `<context_update>` user-role message with a
@@ -99,46 +100,6 @@ change, a project-file change) into the prefix — append it as a user-role
 message instead. A later request must be `previous ⊕ suffix` unless a logged
 header change or a history reset explains the difference.
 
-## Fork-prefix inheritance (subagents)
-
-A forked subagent (`fork_context=true`) on the same route/model extends the
-parent's cached prefix instead of cold-starting: it adopts the parent's
-exact system bytes and sends the longest byte-equal head of the parent's
-wire tool block on its first request. The rest of its grant stays deferred
-and activates on demand, so truncation costs cache bytes, never capability.
-
-Contract details:
-
-- **Hot proof required.** The turn loop snapshots each final request's
-  header plus a hit count carried forward across append-only requests;
-  the gate (`resolve_fork_inherit`, pure) admits only a provably hot
-  (`>0` hits), same-route head. Spawns execute before the current
-  request's usage lands, so without the carry every mid-turn spawn
-  would read cold.
-- **Wire-canonical comparison.** Both sides canonicalize through
-  `tool_to_api_json` (the chat-API shape); internal-only flags
-  (`defer_loading`, `allowed_callers`) never reach the wire and cannot
-  false-negative the match.
-- **Graceful tiers.** `inherited_full` (whole head) prices shared
-  history as hits; `inherited_prefix` (partial head) still prices the
-  system plus matched tools. Fresh spawns, grandchildren, resumes,
-  route skew, and cold prefixes stay cold with distinct reasons.
-- **KV-cache effect:** frozen-prefix extension. The child's first
-  request is `parent-head ⊕ suffix` (framing + task); nothing volatile
-  is spliced into the prefix.
-
-Measured child first-response (same-binary A/B, DeepSeek, unique
-histories; DeepSeek counts hits in 64-token blocks): true cold 0/9421
-hits; primed cold 4736/9389; prefix k=3 5504/9941; full k=6
-8576/13251. Trial readout: `CODEWHALE_FORK_TRIAL=1` mirrors the
-decision, prefix span, history-divergence point, and cache split to
-stderr as JSON lines; `CODEWHALE_FORK_INHERIT=off` is the control arm.
-
-Known follow-ups (measured, not implemented): fork transcripts freeze
-at turn 1 (the live tail never rides, capping wins at system+tools);
-framing blocks sit ahead of where the tail would; v1 is single-level
-(grandchildren carry ~40KB all-miss transcripts today).
-
 ## Deferred: full reconstructability (Layer 3)
 
 DeepSeek Harness derives every request from an append-only session log via a
@@ -147,3 +108,15 @@ managed. Codewhale now pins the header and delivers drift as `<context_update>`
 appends; the remaining step is to make the session log the single source of
 truth with a pure projection (and to persist the context-update baseline with
 it). That is a follow-up lane, not part of this change.
+
+
+### Fork prefix inheritance
+
+A first-level fork may reuse a parent header only when the actual captured client declares Chat Completions, its model/provider/route key and endpoint fingerprint match, the actual opaque route receipt (including credential generation and upstream vendor) matches, and a positive cache-hit receipt reports parent cache use. Unknown actual route receipts or other wire protocols, resume forks and grandchildren start cold. Only already-active policy-filtered child tools participate; deferred parent tools are not automatically activated. The child preserves every policy-filtered active tool; inherited tool order never grants a tool or replaces the current eager toolbox. Role/task framing remains in the child history, and the actual selected header is recorded in its protected transcript. The parent header is frozen when the child runtime is captured at spawn. A route replacement retires the inherited header before the next request. Directory soundings and skill bodies stay in tool-result history. This is source behavior; provider cache savings require a live receipt.
+
+
+### Fork trial diagnostics
+
+`CODEWHALE_FORK_INHERIT=off` disables fork inheritance for the process; inheritance otherwise remains enabled behind the route, protocol and hot-parent guards above. Set `CODEWHALE_FORK_TRIAL=1` before starting Codewhale to emit default-off JSON diagnostics to stderr: a classified first-fork decision and the child's first settled model response. The response reports provider input/cache-hit/cache-miss fields with missing values kept null, whether usage was reported and whether the stream failed. Component sizes measure the provider-neutral request serialization, not final HTTP wire bytes or tokens. The diagnostic contains no prompt, message, tool schema or credential text. Unknown or alternate-model wire clients remain cold and do not produce a classified decision record. These observations do not prove cache savings; compare actual provider receipts under the same binary and route. Both environment settings are process-pinned.
+
+A matched fork may retain parent-specific header instructions while the resolved child role, task and skill instructions follow in a recorded system-role context message. Concrete routing and permissions remain independently enforced by the client and ChildAuthority. Instruction interaction quality and cache savings need live qualification; the matching gate does not prove them.

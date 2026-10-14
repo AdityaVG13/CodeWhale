@@ -31,22 +31,108 @@ export interface DocTask {
 
 export const DOC_TASKS: DocTask[] = [
   {
+    "id": "preview-request",
+    "label": {
+      "en": "Inspect the outbound request",
+      "zh": "检查出站请求"
+    },
+    "description": {
+      "en": "Read a redacted request manifest without sending or changing session state.",
+      "zh": "读取脱敏请求清单，不发送请求也不修改会话状态。"
+    },
+    "href": "/docs/trust",
+    "topicId": "trust",
+    "keywords": {
+      "en": "preview-request preview_request dryrun prompt payload manifest offline",
+      "zh": "请求 提示 预览 清单 离线"
+    }
+  },
+  {
+    "id": "language-server",
+    "label": {
+      "en": "Read language-server diagnostics",
+      "zh": "读取语言服务器诊断"
+    },
+    "description": {
+      "en": "Return LSP errors after edits and configure custom servers by file extension.",
+      "zh": "修改后返回 LSP 错误，并按文件扩展名配置自定义服务器。"
+    },
+    "href": "/docs/tools",
+    "topicId": "tools",
+    "keywords": {
+      "en": "lsp diagnostics type errors language server php custom",
+      "zh": "语言服务器 诊断 类型 错误"
+    }
+  },
+  {
+    "id": "execution-policy",
+    "label": {
+      "en": "Inspect execution policy rules",
+      "zh": "检查执行策略规则"
+    },
+    "description": {
+      "en": "Read rule sources, matchers and scope; understand allow, ask and deny precedence.",
+      "zh": "查看规则来源、匹配器与作用域，了解 allow、ask 和 deny 的优先级。"
+    },
+    "href": "/docs/sandbox",
+    "topicId": "sandbox",
+    "keywords": {
+      "en": "exec-policy execpolicy permissions rules prefix deny ask allow",
+      "zh": "执行策略 权限 规则 拒绝 审批"
+    }
+  },
+  {
+    "id": "manage-skills",
+    "label": {
+      "en": "Manage reusable skills",
+      "zh": "管理可复用技能"
+    },
+    "description": {
+      "en": "Find SKILL.md folders, import into owned roots and control invocation.",
+      "zh": "查找 SKILL.md 文件夹、导入自有目录并控制调用。"
+    },
+    "href": "/docs/skills",
+    "topicId": "skills",
+    "keywords": {
+      "en": "skills trust skill.md invocation install claude agents",
+      "zh": "技能 信任 安装 调用"
+    }
+  },
+  {
+    "id": "move-from-claude-code",
+    "label": {
+      "en": "Move from Claude Code",
+      "zh": "从 Claude Code 迁移"
+    },
+    "description": {
+      "en": "Keep compatible instructions and skills, and review a settings import plan.",
+      "zh": "保留兼容指令与技能，并审阅设置导入方案。"
+    },
+    "href": "/docs/claude-code",
+    "topicId": "claude-code",
+    "keywords": {
+      "en": "claude code alternative import-claude plugin settings migration",
+      "zh": "Claude Code 替代 迁移 导入 插件 设置"
+    }
+  },
+
+  {
     id: "install",
-    label: { en: "Install on macOS, Linux, or Windows", zh: "在 macOS、Linux 或 Windows 上安装" },
+    label: { en: "Install Codewhale", zh: "安装 Codewhale" },
     description: {
-      en: "Start with GitHub release binaries; npm, Cargo, Homebrew, Docker, and China mirrors are alternatives.",
-      zh: "优先使用 GitHub Releases 二进制；npm、Cargo、Homebrew、Docker 与中国镜像为其他安装方式。",
+      en: "One command on macOS or Linux; npm, Cargo, release binaries, and the Homebrew tap on Linux also work.",
+      zh: "在 macOS 或 Linux 上只需一条命令；也可以用 npm、Cargo、发布版二进制文件，或在 Linux 上用 Homebrew tap 安装。",
     },
     href: "/install",
     topicId: "install",
-    keywords: { en: "download setup brew cargo docker termux binary", zh: "下载 安装 二进制 镜像" },
+    keywords: { en: "download setup brew npm cargo docker termux binary windows", zh: "下载 安装 二进制 镜像" },
   },
   {
-    id: "first-session",
-    label: { en: "Open a first session without a key", zh: "不用密钥打开第一个会话" },
+    id: "first-task",
+    label: { en: "Start your first task", zh: "开始第一个任务" },
     description: {
-      en: "Start the runtime, look around in read-only Plan mode, then connect a provider.",
-      zh: "启动 Runtime，在只读的 Plan 模式里看看，再连接提供商。",
+      en: "Open Codewhale in a project, look around in Plan, then let it edit in Work.",
+      zh: "在项目中打开 Codewhale，先在 Plan 里了解项目，再让它在 Work 里动手修改。",
     },
     href: "/docs/guide",
     topicId: "guide",
@@ -54,142 +140,186 @@ export const DOC_TASKS: DocTask[] = [
   },
   {
     id: "connect-provider",
-    label: { en: "Connect a provider key (BYOK)", zh: "连接提供商密钥（BYOK）" },
+    label: { en: "Connect a provider", zh: "连接模型提供商" },
     description: {
-      en: "DeepSeek, OpenAI, Anthropic, OpenRouter, or a local runtime — your key, your bill.",
-      zh: "DeepSeek、OpenAI、Anthropic、OpenRouter 或本地运行时——你的密钥，你的账单。",
-    },
-    href: "/models",
-    topicId: "providers",
-    keywords: { en: "api key model switch ollama vllm sglang openai-compatible", zh: "密钥 模型 切换 本地模型" },
-  },
-  {
-    id: "choose-mode",
-    label: { en: "Choose Plan, Work, or Operate", zh: "选择 Plan、Work 或 Operate" },
-    description: {
-      en: "Read-only planning, execution, or Fleet orchestration — and the approval posture beside it.",
-      zh: "只读规划、执行或 Fleet 编排——以及旁边独立的审批姿态。",
-    },
-    href: "/docs/modes",
-    topicId: "modes",
-    keywords: { en: "mode tab shift+tab ask auto-review full access", zh: "模式 审批 权限" },
-  },
-  {
-    id: "approve-commands",
-    label: { en: "Decide which commands may run", zh: "决定哪些命令可以执行" },
-    description: {
-      en: "Approval posture, the OS sandbox per platform, and why an approval is not a sandbox.",
-      zh: "审批姿态、各平台的 OS 沙箱，以及为什么批准不等于沙箱。",
-    },
-    href: "/docs/sandbox",
-    topicId: "sandbox",
-    keywords: { en: "permission approval seatbelt bwrap policy", zh: "权限 审批 沙箱" },
-  },
-  {
-    id: "sign-in",
-    label: { en: "Sign in to a Codewhale account", zh: "登录 Codewhale 账户" },
-    description: {
-      en: "The optional account, where its session lives, and what needs no account at all.",
-      zh: "可选的账户、会话存放位置，以及哪些操作完全不需要账户。",
+      en: "Save a key for DeepSeek, OpenAI, Anthropic, OpenRouter, or another provider — or run a local model with no key.",
+      zh: "为 DeepSeek、OpenAI、Anthropic、OpenRouter 等提供商保存密钥，或者不用密钥运行本地模型。",
     },
     href: "/docs/auth",
     topicId: "auth",
-    keywords: { en: "login account keys vault profile logout register", zh: "登录 账户 密钥库 注册" },
+    keywords: { en: "api key byok auth set login account ollama vllm sglang local", zh: "密钥 登录 账户 本地模型" },
   },
   {
-    id: "cloud-computer",
-    label: { en: "Dispatch a task to a cloud computer", zh: "把任务派发到云端计算机" },
+    id: "choose-model",
+    label: { en: "Choose or switch models", zh: "选择或切换模型" },
     description: {
-      en: "Propose, confirm, and track a Daytona cloud agent against an explicit forge.",
-      zh: "向明确指定的代码托管平台提议、确认并跟踪一个 Daytona 云端 Agent。",
+      en: "Supported providers, switching mid-session, and local runners.",
+      zh: "支持的提供商、在会话中切换模型，以及本地运行器。",
     },
-    href: "/docs/computers",
-    topicId: "computers",
-    keywords: { en: "daytona dispatch cloud agent remote github cnb gitee", zh: "云端 派发 远程 计算机" },
+    href: "/models",
+    topicId: "providers",
+    keywords: { en: "model switch provider openai-compatible", zh: "模型 切换 提供商" },
   },
   {
-    id: "parallel-agents",
-    label: { en: "Run sub-agents in parallel", zh: "并行运行子 Agent" },
+    id: "set-approvals",
+    label: { en: "Decide what runs without asking", zh: "决定哪些操作无需询问" },
     description: {
-      en: "Roles, context forking, worktree isolation, and the concurrency caps.",
-      zh: "角色、上下文分叉、工作树隔离与并发上限。",
+      en: "Plan, Work, or Operate; Ask, Auto-Review, or Full Access; and how to answer a prompt.",
+      zh: "Plan、Work 或 Operate；Ask、Auto-Review 或 Full Access；以及如何回应审批提示。",
     },
-    href: "/docs/subagents",
-    topicId: "subagents",
-    keywords: { en: "agent worker scout reviewer worktree concurrency", zh: "子代理 并行 角色 工作树" },
+    href: "/docs/modes",
+    topicId: "modes",
+    keywords: { en: "mode tab shift+tab ask auto-review full access permission", zh: "模式 审批 权限" },
   },
   {
-    id: "mcp-server",
-    label: { en: "Connect an MCP server", zh: "连接一个 MCP 服务器" },
+    id: "review-changes",
+    label: { en: "Review what changed", zh: "查看改动" },
     description: {
-      en: "Consume tools over stdio or HTTP/SSE, or expose Codewhale as a server.",
-      zh: "通过 stdio 或 HTTP/SSE 使用工具，或把 Codewhale 暴露为服务器。",
+      en: "See every edit, roll files back to an earlier turn, and get a code review before you push.",
+      zh: "查看每一处修改，把文件回滚到之前的回合，并在推送前做代码审查。",
     },
-    href: "/docs/mcp",
-    topicId: "mcp",
-    keywords: { en: "model context protocol tools stdio sse", zh: "工具 协议 服务器" },
+    href: "/docs/review",
+    topicId: "review",
+    keywords: { en: "diff undo restore rollback snapshot code review", zh: "差异 撤销 回滚 快照 审查" },
   },
   {
-    id: "hooks",
-    label: { en: "Run something before or after a tool", zh: "在工具执行前后运行自定义逻辑" },
+    id: "receipts",
+    label: { en: "See what a session did", zh: "查看会话做了什么" },
     description: {
-      en: "Lifecycle hooks for tool execution, mode changes, and session events.",
-      zh: "工具执行、模式切换和会话事件的生命周期钩子。",
+      en: "Read a session receipt of commands, file changes, tools and approval decisions.",
+      zh: "阅读会话收据，查看命令、文件修改、工具与审批决策。",
     },
-    href: "/docs/hooks",
-    topicId: "hooks",
-    keywords: { en: "hook lifecycle pre post event", zh: "钩子 生命周期 事件" },
+    href: "/docs/review",
+    topicId: "review",
+    keywords: { en: "receipt receipts audit tool approval command file export", zh: "收据 推送 导出" },
   },
   {
-    id: "fleet",
-    label: { en: "Write a Workflow for a Fleet", zh: "为 fleet 编写 Workflow" },
+    id: "watch-sessions",
+    label: { en: "Watch each session at a glance", zh: "一眼查看每个会话" },
     description: {
-      en: "Durable task execution, roster management, and Workflow authoring.",
-      zh: "持久任务执行、成员管理和 Workflow 编写。",
+      en: "Turn on pet mode in each terminal to see which session is working, waiting for you, done, or failed.",
+      zh: "在每个终端开启 Pet 模式，看清哪个会话在工作、在等你、已完成或失败。",
+    },
+    href: "/docs/pet",
+    topicId: "pet",
+    keywords: { en: "pet whale status glance terminals sessions inspect f5", zh: "鲸鱼 状态 终端 会话 查看" },
+  },
+  {
+    id: "run-workflow",
+    label: { en: "Run a workflow", zh: "运行 Workflow" },
+    description: {
+      en: "Write a repeatable Workflow, run it as a Lane, and watch or stop it from any terminal.",
+      zh: "编写可重复的 Workflow，把它作为 Lane 运行，并在任何终端查看或停止它。",
     },
     href: "/docs/fleet",
     topicId: "fleet",
-    keywords: { en: "fleet workflow lane operate durable", zh: "编排 持久 工作流" },
+    keywords: { en: "fleet workflow lane operate durable tasks.json", zh: "编排 持久 工作流" },
   },
   {
-    id: "browser-client",
-    label: { en: "Use the browser client", zh: "使用浏览器客户端" },
+    id: "parallel-agents",
+    label: { en: "Run agents in parallel", zh: "并行运行 Agent" },
     description: {
-      en: "Run the embedded web client on loopback with its one-time bootstrap.",
-      zh: "在本机回环地址运行内置网页客户端，了解一次性引导。",
+      en: "Roles, separate worktrees for parallel edits, and how to watch sub-agents.",
+      zh: "角色、为并行修改准备的独立工作树，以及如何查看子 Agent。",
     },
-    href: "/docs/web",
-    topicId: "web",
-    keywords: { en: "web ui localhost loopback", zh: "网页 客户端 本机" },
+    href: "/docs/subagents",
+    topicId: "subagents",
+    keywords: { en: "agent explore reviewer implement worktree concurrency subagents", zh: "子代理 并行 角色 工作树" },
+  },
+  {
+    id: "mcp-server",
+    label: { en: "Connect tools with MCP", zh: "用 MCP 连接工具" },
+    description: {
+      en: "Add a local or remote MCP server, sign in with OAuth, or serve Codewhale over MCP.",
+      zh: "添加本地或远程 MCP 服务器、用 OAuth 登录，或把 Codewhale 作为 MCP 服务器提供。",
+    },
+    href: "/docs/mcp",
+    topicId: "mcp",
+    keywords: { en: "model context protocol tools stdio http oauth", zh: "工具 协议 服务器" },
+  },
+  {
+    id: "code-mode",
+    label: { en: "Try code mode", zh: "试用代码模式" },
+    description: {
+      en: "Let the model compose several tool calls — MCP and plugin tools included — in one short program, under the same approvals as direct calls. Experimental, on by default.",
+      zh: "让模型在一段简短的程序中组合多个工具调用（包括 MCP 和插件工具），审批流程与直接调用相同。实验性功能，默认开启。",
+    },
+    href: "/docs/mcp",
+    topicId: "mcp",
+    keywords: { en: "code_mode execute_tools javascript experimental", zh: "代码模式 实验" },
+  },
+  {
+    id: "hooks",
+    label: { en: "Run commands on events", zh: "在事件发生时运行命令" },
+    description: {
+      en: "Block a risky command, add context, or get notified when Codewhale waits for you.",
+      zh: "拦下危险命令、补充上下文，或在 Codewhale 等你回应时收到提醒。",
+    },
+    href: "/docs/hooks",
+    topicId: "hooks",
+    keywords: { en: "hook lifecycle tool_call_before session_start event", zh: "钩子 生命周期 事件" },
+  },
+  {
+    id: "sandbox",
+    label: { en: "Limit what commands can touch", zh: "限制命令的访问范围" },
+    description: {
+      en: "See which OS sandbox your platform has and turn on bubblewrap on Linux.",
+      zh: "了解你的平台有哪种操作系统沙箱，并在 Linux 上开启 bubblewrap。",
+    },
+    href: "/docs/sandbox",
+    topicId: "sandbox",
+    keywords: { en: "sandbox seatbelt bwrap bubblewrap workspace-write", zh: "沙箱 隔离" },
   },
   {
     id: "automate",
-    label: { en: "Automate with the Runtime API", zh: "用运行时 API 做自动化" },
+    label: { en: "Automate with the Runtime API", zh: "用 Runtime API 自动化" },
     description: {
-      en: "The public HTTP API for integrations, bridges, and scripts.",
-      zh: "用于集成、桥接和脚本的公开 HTTP API。",
+      en: "Run one-shot jobs in CI, or drive threads and approvals over the local HTTP API.",
+      zh: "在 CI 中运行一次性任务，或通过本地 HTTP API 驱动线程和审批。",
     },
     href: "/docs/runtime-api",
     topicId: "runtime-api",
-    keywords: { en: "http api exec acp integration", zh: "接口 集成 脚本" },
+    keywords: { en: "http api exec ci acp integration sse", zh: "接口 集成 脚本" },
+  },
+  {
+    id: "browser-client",
+    label: { en: "Open the browser client", zh: "打开浏览器客户端" },
+    description: {
+      en: "Work in a local browser tab, or continue a session from the web app with /rc.",
+      zh: "在本机浏览器标签页中工作，或用 /rc 在网页应用中继续会话。",
+    },
+    href: "/docs/web",
+    topicId: "web",
+    keywords: { en: "web ui localhost loopback remote control rc", zh: "网页 客户端 本机 远程" },
+  },
+  {
+    id: "cloud-computer",
+    label: { en: "Send a task to the cloud", zh: "把任务发送到云端" },
+    description: {
+      en: "Preview: quote and run a cloud agent through your account.",
+      zh: "预览版：通过你的账户为云端 Agent 报价并运行。",
+    },
+    href: "/docs/computers",
+    topicId: "computers",
+    keywords: { en: "dispatch cloud agent quote account", zh: "云端 派发 远程" },
   },
   {
     id: "troubleshoot",
-    label: { en: "Fix a failing install or session", zh: "修复失败的安装或会话" },
+    label: { en: "Fix a problem", zh: "排查问题" },
     description: {
-      en: "Common incidents, diagnostics, the operations runbook, and Docker notes.",
-      zh: "常见问题、诊断、运维手册和 Docker 说明。",
+      en: "Diagnose in one command, then fix install, key, network, and stuck-turn problems.",
+      zh: "用一条命令诊断，再解决安装、密钥、网络和回合卡住等问题。",
     },
     href: "/docs/troubleshooting",
     topicId: "troubleshooting",
-    keywords: { en: "error crash doctor diagnose recover", zh: "错误 崩溃 诊断 恢复" },
+    keywords: { en: "error crash doctor diagnose recover resume docker", zh: "错误 崩溃 诊断 恢复" },
   },
   {
     id: "trust",
-    label: { en: "Understand what leaves your machine", zh: "了解哪些数据会离开你的机器" },
+    label: { en: "See what leaves your machine", zh: "了解哪些数据会离开本机" },
     description: {
-      en: "The hosted-provider boundary, the sandbox, telemetry field by field, and how to turn it off.",
-      zh: "托管提供商边界、沙箱、逐项说明的遥测，以及如何关闭。",
+      en: "What a provider receives, what usage counting sends, and how to turn it off.",
+      zh: "提供商会收到什么、用量统计发送什么，以及如何关闭。",
     },
     href: "/docs/trust",
     topicId: "trust",

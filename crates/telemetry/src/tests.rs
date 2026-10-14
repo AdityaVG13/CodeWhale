@@ -471,8 +471,8 @@ fn every_legitimately_recorded_event_survives_the_drain() {
     );
 
     // Dialect kinds (`deepseek-anthropic`, the Model Studio plan variants) are
-    // absent from `ProviderKind::ALL`, which is the 37-row *catalog* subset,
-    // but `ApiProvider::kind()` yields them for real routes. Narrowing the
+    // absent from the selectable `ProviderKind::ALL` catalog subset,
+    // but captured intrinsic kinds include them for real routes. Narrowing the
     // provider bound to the catalog would drop those users' `session_end`.
     for kind in [
         codewhale_config::ProviderKind::DeepseekAnthropic,
@@ -510,6 +510,61 @@ fn a_non_uuid_install_id_on_disk_is_replaced_rather_than_sent() {
         "a non-UUID install id was carried onto the wire: {:?}",
         record.install_id
     );
+}
+
+/// Audit R05-09: only a canonical v4 id with a past `rotated_at` survives a
+/// read. A v1 (MAC + clock), nil, braced, uppercase, or padded id is replaced,
+/// and so is a future timestamp that would otherwise never rotate.
+#[test]
+fn a_non_canonical_or_future_dated_install_id_is_rotated() {
+    let now = envelope::now_rfc3339();
+    let future = (chrono::Utc::now() + chrono::Duration::days(3650))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let canonical = "3f2a9c1e-0000-4000-8000-000000000001";
+    for (install_id, rotated_at) in [
+        ("6ba7b810-9dad-11d1-80b4-00c04fd430c8", now.as_str()),
+        ("00000000-0000-0000-0000-000000000000", now.as_str()),
+        ("{3f2a9c1e-0000-4000-8000-000000000001}", now.as_str()),
+        ("3F2A9C1E-0000-4000-8000-000000000001", now.as_str()),
+        (" 3f2a9c1e-0000-4000-8000-000000000001 ", now.as_str()),
+        (canonical, future.as_str()),
+    ] {
+        let home = temp_home();
+        let root = root_of(&home);
+        buffer::ensure_dir(&root).expect("create telemetry root");
+        std::fs::write(
+            buffer::install_id_path(&root),
+            serde_json::json!({
+                "schema_version": 1,
+                "install_id": install_id,
+                "rotated_at": rotated_at,
+            })
+            .to_string(),
+        )
+        .expect("plant install id");
+
+        let record = envelope::read_or_create_install_id(&root).expect("read install id");
+        assert_ne!(record.install_id, install_id, "kept {install_id:?}");
+        let minted = uuid::Uuid::parse_str(&record.install_id).expect("minted uuid");
+        assert_eq!(minted.get_version(), Some(uuid::Version::Random));
+    }
+
+    // The canonical, past-dated form is kept.
+    let home = temp_home();
+    let root = root_of(&home);
+    buffer::ensure_dir(&root).expect("create telemetry root");
+    let kept = envelope::InstallId {
+        schema_version: 1,
+        install_id: canonical.to_string(),
+        rotated_at: now.clone(),
+    };
+    std::fs::write(
+        buffer::install_id_path(&root),
+        serde_json::to_string(&kept).unwrap(),
+    )
+    .expect("plant canonical id");
+    let record = envelope::read_or_create_install_id(&root).expect("read install id");
+    assert_eq!(record.install_id, canonical);
 }
 
 // ------------------------------------------------------------- panic sites --
@@ -691,6 +746,31 @@ fn decision_matrix_is_exhaustive() {
             "{surface:?} uses default-on without inferring acceptance"
         );
     }
+}
+
+#[test]
+fn every_surface_spelling_parses_back_to_its_variant() {
+    // `Surface::parse` is the only place a name becomes a variant, and an
+    // embedder declares itself by name, so the round trip has to be exact in
+    // both directions. A value that can be spelled must parse; a variant must
+    // not be reachable under a second spelling.
+    for surface in Surface::ALL {
+        assert_eq!(
+            Surface::parse(surface.as_str()),
+            Some(*surface),
+            "{surface:?} does not parse back from its own wire spelling"
+        );
+    }
+    assert_eq!(
+        Surface::parse("TUI"),
+        None,
+        "parsing is exact, not case-folded"
+    );
+    assert_eq!(Surface::parse(" vscode-extension "), None, "no trimming");
+    assert_eq!(Surface::parse("vscode"), None);
+    assert_eq!(Surface::parse("ide"), None);
+    assert_eq!(Surface::parse(""), None);
+    assert_eq!(Surface::parse("desktop"), Some(Surface::Desktop));
 }
 
 #[test]

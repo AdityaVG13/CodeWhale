@@ -42,7 +42,7 @@ pub(crate) fn dispatch_hotbar_slot(
         return Ok(Some(HotbarDispatch::Handled));
     }
 
-    action.dispatch(app).map(Some)
+    action.dispatch(app, config).map(Some)
 }
 
 pub(crate) fn queued_ui_to_session(msg: &QueuedMessage) -> QueuedSessionMessage {
@@ -89,22 +89,26 @@ pub(crate) fn paint_user_turn_cell(
     content: String,
 ) -> usize {
     if message.history_echoed
-        && let Some(idx) = app
-            .history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, cell)| match cell {
-                HistoryCell::User { content } if content == &message.display => Some(idx),
-                _ => None,
-            })
+        && let Some(idx) = echoed_user_turn_cell(app, &message.display)
     {
         app.history[idx] = HistoryCell::User { content };
-        app.needs_redraw = true;
+        app.bump_history_cell(idx);
         return idx;
     }
     app.add_message(HistoryCell::User { content });
     app.history.len().saturating_sub(1)
+}
+
+/// The newest transcript cell that queue-time echo painted for `display`.
+pub(crate) fn echoed_user_turn_cell(app: &App, display: &str) -> Option<usize> {
+    app.history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, cell)| match cell {
+            HistoryCell::User { content } if content == display => Some(idx),
+            _ => None,
+        })
 }
 
 pub(crate) fn enqueue_offline_message(app: &mut App, message: QueuedMessage) {
@@ -132,15 +136,7 @@ pub(crate) fn push_assistant_message(
             cache_control: None,
         });
     }
-    for (id, name, input) in tool_uses {
-        blocks.push(ContentBlock::ToolUse {
-            id,
-            name,
-            input,
-            caller: None,
-            thought_signature: None,
-        });
-    }
+    blocks.extend(tool_uses);
 
     let has_sendable_content = blocks.iter().any(|block| {
         matches!(
@@ -360,15 +356,10 @@ pub(crate) fn queued_message_content_for_app(
     cwd: Option<PathBuf>,
     git_cache: &mut crate::tui::git_mention::GitMentionCache,
 ) -> Result<String> {
-    if let Some(authority) = message.skill_provenance.as_ref() {
-        if authority.workspace != app.workspace {
-            anyhow::bail!("Queued plugin skill belongs to a different workspace and was denied");
-        }
-        crate::plugins::registry::verify_plugin_component_authority(
-            authority,
-            crate::plugins::activation::PluginActivationCapability::Skills,
-        )
-        .map_err(anyhow::Error::msg)?;
+    if let Some(provenance) = message.skill_provenance.as_ref() {
+        provenance
+            .verify_for(&app.workspace, Some(app.extension_plugin_view().as_ref()))
+            .map_err(anyhow::Error::msg)?;
     }
     // Pass the process CWD explicitly so the resolver's two-pass logic can
     // honor the user's launch directory when it differs from `--workspace`
@@ -605,7 +596,8 @@ pub(crate) fn prepare_user_dispatch(
     if let Some(note) = paused_dispatch.note() {
         content.push_str(note);
     }
-    let (app_route_identity, route_config) = app_scoped_runtime_config(app, config);
+    let (app_route_identity, route_config) =
+        app_scoped_runtime_config(app, config).map_err(anyhow::Error::msg)?;
 
     let should_auto_resolve = auto_router::should_resolve_auto_model_selection(app);
     let auto_router_context = auto_router::recent_auto_router_context(&app.api_messages);
@@ -621,7 +613,6 @@ pub(crate) fn prepare_user_dispatch(
         tool_evidence: app.tool_evidence.clone(),
         history_len: app.history.len(),
         history_revisions_len: app.history_revisions.len(),
-        history_version: app.history_version,
         api_messages_len: app.api_messages.len(),
         last_send_at: app.last_send_at,
     };
@@ -714,23 +705,124 @@ pub(crate) fn start_user_dispatch(
         }
     };
     app.dispatch_in_flight = true;
+    // #6800: a local cancel (Esc, stall recovery) trips this token so the
+    // dispatch fails back to the composer at once instead of holding
+    // `dispatch_in_flight` — and queueing every new send — for the full
+    // `DISPATCH_TASK_BOUND` while it waits on engine admission.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    app.dispatch_cancel = Some(cancel.clone());
+    // Supervised: `spawned_dispatch_execute` owns the whole dispatch future,
+    // so its completion callback always arrives — on success, on a panic, on
+    // a local cancel, or when the dispatch exceeds its bound (#6184).
     tokio::spawn(spawned_dispatch_execute(
         prepare,
         recovery,
         engine_handle.clone(),
         completion_permit,
+        cancel,
     ));
     Ok(())
 }
+
+/// Longest a dispatch may spend routing and waiting for engine admission
+/// before it is failed back to the composer (#6184). An engine whose op
+/// mailbox never frees (a wedged turn) used to hold the dispatch — and the
+/// user's message — forever.
+pub(crate) const DISPATCH_TASK_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) async fn spawned_dispatch_execute(
     prepare: UserDispatchPrepare,
     recovery: DispatchRecovery,
     engine_handle: EngineHandle,
     completion_permit: tokio::sync::mpsc::OwnedPermit<crate::tui::app::DispatchApplyFn>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
-    let apply = spawned_dispatch_inner(prepare, recovery, engine_handle).await;
+    let apply = supervised_dispatch(
+        prepare,
+        recovery,
+        DISPATCH_TASK_BOUND,
+        cancel,
+        |prepare, recovery| spawned_dispatch_inner(prepare, recovery, engine_handle),
+    )
+    .await;
     completion_permit.send(apply);
+}
+
+/// Run one dispatch future under supervision. A dropped JoinHandle used to
+/// turn a panic or a hang into a dispatch that never reported back: the
+/// completion permit was dropped, `dispatch_in_flight` stayed set and the
+/// message sat in limbo. Every outcome now yields a callback; a panic or an
+/// overrun also leaves a log line and a `crashes/` record. A tripped `cancel`
+/// token abandons the dispatch and fails it back through the same error
+/// closure, so the unsent message returns to the composer exactly as on any
+/// other dispatch failure (#6800).
+pub(crate) async fn supervised_dispatch<F, Fut>(
+    prepare: UserDispatchPrepare,
+    recovery: DispatchRecovery,
+    bound: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+    run: F,
+) -> crate::tui::app::DispatchApplyFn
+where
+    F: FnOnce(UserDispatchPrepare, DispatchRecovery) -> Fut,
+    Fut: std::future::Future<Output = crate::tui::app::DispatchApplyFn>,
+{
+    use futures_util::FutureExt as _;
+    let fallback = prepare.clone();
+    let started = std::time::Instant::now();
+    let supervised = std::panic::AssertUnwindSafe(run(prepare, recovery)).catch_unwind();
+    let outcome = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return build_dispatch_error_closure(
+                fallback,
+                recovery,
+                "Message dispatch was cancelled before it reached the engine".to_string(),
+            );
+        }
+        outcome = tokio::time::timeout(bound, supervised) => outcome,
+    };
+    match outcome {
+        Ok(Ok(apply)) => apply,
+        Ok(Err(panic)) => {
+            let detail = crate::utils::panic_message(&*panic);
+            crate::utils::record_caught_panic("user-dispatch", &detail);
+            build_dispatch_error_closure(
+                fallback,
+                recovery,
+                format!("Message dispatch hit an internal error: {detail}"),
+            )
+        }
+        Err(_elapsed) => {
+            crate::core::engine::turn_heartbeat::report_stall(
+                &crate::core::engine::turn_heartbeat::StallReport {
+                    source: "ui",
+                    phase: "while dispatching the message (route planning / engine admission)"
+                        .to_string(),
+                    detail: Some(format!(
+                        "{} / {}",
+                        fallback
+                            .app_route_identity
+                            .compatibility()
+                            .map_or(fallback.app_route_identity.key.as_str(), |row| row.label),
+                        fallback.app_model
+                    )),
+                    turn_id: None,
+                    provider_request: None,
+                    since_progress: started.elapsed(),
+                    bound: Some(bound),
+                },
+            );
+            build_dispatch_error_closure(
+                fallback,
+                recovery,
+                format!(
+                    "Message dispatch stalled for {}s before the engine accepted it; your message was restored. Press Esc to cancel the running turn, then retry.",
+                    bound.as_secs()
+                ),
+            )
+        }
+    }
 }
 
 /// Keep classifier receipts owned until the UI admits the operation to Engine.
@@ -812,6 +904,7 @@ pub(crate) async fn spawned_dispatch_inner(
         batch: Some(initial_routed_usage.clone()),
     };
     let op = Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: prepare.content.clone(),
         images: Vec::new(),
@@ -835,6 +928,8 @@ pub(crate) async fn spawned_dispatch_inner(
         hook_executor: prepare.hook_executor.clone(),
         verbosity: prepare.verbosity.clone(),
         provenance: prepare.provenance,
+        // Interactive TUI submissions do not correlate submissions.
+        submission_id: None,
     });
     // Reserve capacity off the render thread, but do not let Engine start
     // until the completion callback has installed the UI's acceptance state.
@@ -905,6 +1000,10 @@ pub(crate) fn build_dispatch_success_closure(
             // last_send_at was already anchored in the sync prepare phase so
             // the tail-flash starts together with the visible user cell.
             app.last_submitted_prompt = Some(prepare.message.display.clone());
+            app.unanswered_submission = Some(crate::tui::app::UnansweredSubmission {
+                message: prepare.message.clone(),
+                history_cell: prepare.history_cell,
+            });
             app.clear_receipt();
             app.tool_evidence.clear();
 
@@ -987,9 +1086,10 @@ pub(crate) fn build_dispatch_success_closure(
     )
 }
 
-/// Missing-credential / auth preflight failures must keep the transcript echo.
-/// The user already submitted; rolling the HistoryCell::User back and restoring
-/// the composer hides the turn and makes first-run feel broken.
+/// Missing-credential / auth preflight failures. The message never reached a
+/// model, so it returns to the composer with a transcript line saying why
+/// (`keep_unsent_message_for_connect`) rather than as an echo that has to be
+/// typed again — which lost the text and then showed it twice (#6566).
 pub(crate) fn is_missing_credential_dispatch_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("api key not found")
@@ -1028,27 +1128,26 @@ pub(crate) fn build_dispatch_error_closure(
             app.receipt_text = prepare.snapshot.receipt_text.clone();
             app.receipt_started_at = prepare.snapshot.receipt_started_at;
             app.tool_evidence = prepare.snapshot.tool_evidence.clone();
-            let keep_user_echo = is_missing_credential_dispatch_error(&error);
-            if keep_user_echo {
-                // Echo first: keep HistoryCell::User painted in prepare. Drop only
-                // the unsent api_messages append and loading chrome.
-                app.truncate_api_messages(prepare.snapshot.api_messages_len);
-                app.last_send_at = prepare.snapshot.last_send_at;
-            } else {
-                app.history.truncate(prepare.snapshot.history_len);
-                app.prune_transcript_index_state(prepare.snapshot.history_len);
-                app.history_revisions
-                    .truncate(prepare.snapshot.history_revisions_len);
-                app.history_version = prepare.snapshot.history_version;
-                app.truncate_api_messages(prepare.snapshot.api_messages_len);
-                app.last_send_at = prepare.snapshot.last_send_at;
-            }
+            let missing_credential = is_missing_credential_dispatch_error(&error);
+            // Nothing was sent, so the optimistic echo goes too. A message
+            // that is not in the transcript can be sent again without
+            // appearing twice (#6566).
+            app.history.truncate(prepare.snapshot.history_len);
+            app.prune_transcript_index_state(prepare.snapshot.history_len);
+            app.history_revisions
+                .truncate(prepare.snapshot.history_revisions_len);
+            // Never rewind the version: a cache keyed by (version, len) that
+            // saw the rolled-back echo would match a different cell that
+            // later lands at the same version and length.
+            app.history_version = app.history_version.wrapping_add(1);
+            app.truncate_api_messages(prepare.snapshot.api_messages_len);
+            app.last_send_at = prepare.snapshot.last_send_at;
             app.needs_redraw = true;
 
             match recovery {
                 DispatchRecovery::Immediate => {
-                    if keep_user_echo {
-                        keep_failed_immediate_submit_echo(app, prepare.message, &error);
+                    if missing_credential {
+                        keep_unsent_message_for_connect(app, prepare.message, &error);
                     } else {
                         restore_failed_immediate_submit(
                             app,
@@ -1072,8 +1171,8 @@ pub(crate) fn build_dispatch_error_closure(
                     ));
                 }
                 DispatchRecovery::Initial => {
-                    if keep_user_echo {
-                        keep_failed_immediate_submit_echo(app, prepare.message, &error);
+                    if missing_credential {
+                        keep_unsent_message_for_connect(app, prepare.message, &error);
                     } else {
                         let initial_error = app
                             .tr(MessageId::DispatchFailedInitial)
@@ -1192,17 +1291,22 @@ pub(crate) async fn steer_user_message(
     if let Some(note) = paused_note.as_deref() {
         content.push_str(note);
     }
+    // Send exactly what the engine will store. `turn_loop` commits a steer as
+    // `pending.commit().trim()`, so a composer newline or an appended note
+    // left the held copy differing from the record by whitespace alone --
+    // `accepted_steer_index` then never matched, the steer was never
+    // promoted, and the "sending into this turn" card kept showing a message
+    // the transcript had already delivered. Trimming here keeps that match an
+    // exact comparison, which is the stronger invariant.
+    let content = content.trim().to_string();
     let message_index = app.api_messages.len();
 
-    // A foreground shell blocks the turn loop that consumes steer input.
-    // Ask the shared shell manager to detach it before enqueueing the steer so
-    // the loop can leave the foreground wait and process this message (#4930).
-    if active_foreground_shell_running(app)
-        && let Err(err) = request_active_foreground_shell_background(app)
-    {
+    // A shell wait blocks the turn boundary that consumes steer input. Release
+    // only this session's live waits; the owned commands keep running (#6909).
+    if let Err(err) = request_active_shell_wait_detach(app) {
         restore_steer_paused_state(app, &paused_snapshot);
         engine_handle.set_paused(paused_snapshot.paused);
-        return Err(err.context("could not move foreground shell to /jobs before steering"));
+        return Err(err.context("could not release shell wait before steering"));
     }
 
     if let Err(err) = engine_handle.steer(content.clone()).await {

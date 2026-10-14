@@ -1,4 +1,5 @@
 import { DOC_TOPICS, REPO_DOCS_BASE, docTopicHref } from "./docs-map";
+import { computerUse } from "./i18n/dictionaries/en/computer-use";
 import { DISCORD_URL, REPO_URL } from "./i18n/links";
 import { IDENTITY_PHRASE, SITE_NAME, SITE_URL } from "./page-meta";
 
@@ -29,7 +30,13 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     path: "/runtime",
     title: "Runtime & Integrations",
     description:
-      "Local Runtime API, HTTP/SSE, baseline ACP stdio adapter, MCP servers, and the Phase 0 VS Code companion.",
+      "Local Runtime API over HTTP/SSE, ACP stdio over the existing Engine, MCP servers, an early VS Code companion, and a community VS Code GUI.",
+  },
+  {
+    // The page's own English copy, so the index cannot drift from it (W01-03).
+    path: "/computer-use",
+    title: computerUse.title,
+    description: computerUse.metaDescription,
   },
   {
     path: "/constitution",
@@ -63,6 +70,36 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     description: "The pull-request workflow: scoped issue, fork, test the change, explain the result.",
   },
   {
+    path: "/changelog",
+    title: "Changelog",
+    description:
+      "Codewhale release record: the latest published release, the unreleased source candidate, and the notes for each version, drawn from CHANGELOG.md in the repository.",
+  },
+  {
+    path: "/plugins",
+    title: "Plugins and marketplace",
+    description:
+      "Preview Computer Use for selected desktop apps, and install reviewed plugins from the Codewhale catalog, a GitHub repository, or a tarball.",
+  },
+  {
+    path: "/ratatui",
+    title: "Codewhale Ratatui",
+    description:
+      "Explore Codewhale’s reusable Ratatui components. Compare terminal themes and widths, inspect real rendered previews, and use the Rust examples in your app.",
+  },
+  {
+    path: "/signin",
+    title: "Sign in",
+    description:
+      "Access your Codewhale account and the app’s development preview. Connect to a terminal session from your browser with /rc.",
+  },
+  {
+    path: "/signup",
+    title: "Create account",
+    description:
+      "Create a Codewhale account to keep your conversations and connected providers together. Using the terminal needs no account.",
+  },
+  {
     path: "/legal/terms",
     title: "Terms of service",
     description: "Terms that govern your use of Codewhale, a Shannon Labs product.",
@@ -74,49 +111,29 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
   },
 ];
 
-function topicSitePath(topic: (typeof DOC_TOPICS)[number]): string | null {
-  if (topic.sitePath) return `/${topic.sitePath}`;
-  if (topic.hasPage) return `/docs/${topic.slug}`;
-  return null;
-}
-
-/** Plain-text /llms.txt body generated from the docs registry and sitemap extras. */
 export function buildLlmsTxt(): string {
-  const covered = new Set<string>();
-  const lines: string[] = [
-    `# ${SITE_NAME}`,
-    "",
-    `> ${IDENTITY_PHRASE}`,
-    "",
-    `${SITE_NAME} is a terminal-native coding agent for hosted and local models.`,
-    `Official site: ${SITE_URL}`,
-    `Source: ${REPO_URL}`,
-    "",
-    "## Documentation",
-    "",
+  const lines = [
+    `# ${SITE_NAME}`, "", `> ${IDENTITY_PHRASE}`, "",
+    "Read, edit and test a project with a hosted or local model. Modes, approvals and sandbox policy control tool access.",
+    "Install: `npm install -g codewhale`", "",
+    "## Agent entry points", "",
+    `- [Feature catalogue](${SITE_URL}/en/features): Source capabilities, status, surfaces and documentation.`,
+    `- [Feature JSON](${SITE_URL}/features.json): The generated feature registry, including its source hash.`,
+    `- [Full documentation](${SITE_URL}/llms-full.txt): Every documentation topic as plain text.`,
+    `- [Runtime API](${SITE_URL}/docs-markdown/runtime-api.md): HTTP/SSE API and ACP integration.`,
+    `- [MCP](${SITE_URL}/docs-markdown/mcp.md): Connect tools or run codewhale mcp-server / codewhale serve --mcp. Default server tools are read-only file_read and search.`,
+    "", "## Documentation", "",
   ];
-
   for (const topic of DOC_TOPICS) {
-    const path = topicSitePath(topic);
-    if (!path) continue;
-    covered.add(path);
-    const href = `${SITE_URL}${docTopicHref(topic, "en")}`;
-    lines.push(`- [${topic.label.en}](${href}): ${topic.description.en}`);
+    lines.push(`- [${topic.label.en}](${SITE_URL}/docs-markdown/${topic.slug}.md): ${topic.description.en}`);
   }
-
-  lines.push("", "## Pages", "");
+  lines.push("", "## Optional", "");
+  for (const topic of DOC_TOPICS) {
+    lines.push(`- [${topic.label.en} on the site](${topic.hasPage ? `${SITE_URL}${docTopicHref(topic, "en")}` : `${REPO_DOCS_BASE}/${Array.isArray(topic.repoSource) ? topic.repoSource[0] : topic.repoSource}`}): ${topic.description.en}`);
+  }
   for (const page of EXTRA_PAGES) {
-    if (covered.has(page.path)) continue;
     lines.push(`- [${page.title}](${SITE_URL}/en${page.path}): ${page.description}`);
   }
-
-  lines.push("", "## Source documents", "");
-  for (const topic of DOC_TOPICS) {
-    if (topic.hasPage) continue;
-    const source = Array.isArray(topic.repoSource) ? topic.repoSource[0] : topic.repoSource;
-    lines.push(`- [${topic.label.en}](${REPO_DOCS_BASE}/${source}): ${topic.description.en}`);
-  }
-
-  lines.push("", "## Optional", "", `- [GitHub](${REPO_URL})`, `- [Discord](${DISCORD_URL})`, "");
+  lines.push(`- [GitHub](${REPO_URL})`, `- [Discord](${DISCORD_URL})`, "");
   return lines.join("\n");
 }

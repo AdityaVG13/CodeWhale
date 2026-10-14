@@ -91,7 +91,10 @@ pub(crate) fn collect_pending_terminal_events(
 fn observe_terminal_attention(event: &Event) {
     match event {
         Event::FocusGained => crate::tui::notifications::set_terminal_focused(true),
-        Event::FocusLost => crate::tui::notifications::set_terminal_focused(false),
+        Event::FocusLost => {
+            crate::tui::notifications::set_terminal_focused(false);
+            crate::tui::hover_layer::clear_pointer();
+        }
         _ => {}
     }
 }
@@ -445,20 +448,33 @@ pub(crate) fn pause_terminal(
     // silently ignore the pop. Matches the shutdown and panic paths.
     pop_keyboard_enhancement_flags(terminal.backend_mut());
     disable_alternate_scroll_mode(terminal.backend_mut());
-    execute!(terminal.backend_mut(), DisableFocusChange)?;
-    disable_raw_mode()?;
+    // Every teardown step is attempted even when an earlier one fails: one
+    // failed write must not leave mouse capture or raw mode on for the child
+    // (U03-09). The first failure is still returned so the caller refuses the
+    // handoff.
+    let mut first_error: Option<io::Error> = None;
+    let mut attempt = |result: io::Result<()>| {
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    };
+    attempt(execute!(terminal.backend_mut(), DisableFocusChange));
+    attempt(disable_raw_mode());
     if use_alt_screen {
-        leave_alt_screen(terminal.backend_mut())?;
+        attempt(leave_alt_screen(terminal.backend_mut()));
         #[cfg(windows)]
         crate::logging::restore_verbose_state();
     }
     if use_mouse_capture {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        attempt(execute!(terminal.backend_mut(), DisableMouseCapture));
     }
     if use_bracketed_paste {
         disable_bracketed_paste_mode(terminal.backend_mut());
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn resume_terminal(
@@ -740,6 +756,24 @@ pub(crate) fn next_unfocused(unfocused: bool, evt: &Event) -> bool {
     }
 }
 
+/// Whether focus loss may defer frame emission at all (#6311).
+///
+/// Only GTK/VTE terminals (MATE, GNOME Terminal, Tilix, Terminator, ...)
+/// queue damage while occluded and replay it on return; they all export
+/// `VTE_VERSION`. Everywhere else an unfocused window is usually still
+/// visible (side-by-side macOS/Windows windows, split panes), so freezing
+/// frames on `FocusLost` made streaming output look stuck until the user
+/// clicked, scrolled or typed back into the terminal.
+///
+/// `VTE_VERSION` only proves VTE is the *immediate* terminal when no
+/// multiplexer sits in between: tmux started from GNOME Terminal inherits it,
+/// yet tmux reports `FocusLost` for a still-visible split pane. Inside tmux
+/// (`TMUX` set) frames keep flowing.
+pub(crate) fn focus_loss_defers_frames(vte_version: Option<&str>, tmux: Option<&str>) -> bool {
+    let inside_tmux = tmux.is_some_and(|v| !v.trim().is_empty());
+    !inside_tmux && vte_version.is_some_and(|v| !v.trim().is_empty())
+}
+
 pub(crate) fn terminal_pause_has_live_owner(app: &App) -> bool {
     app.active_cell.as_ref().is_some_and(|active| {
         active.entries().iter().any(|cell| {
@@ -761,6 +795,253 @@ pub(crate) fn active_poll_ms(app: &App) -> u64 {
 
 pub(crate) fn idle_poll_ms(app: &App) -> u64 {
     if app.low_motion { 120 } else { UI_IDLE_POLL_MS }
+}
+
+/// How long the screen must have been unchanged, with no input and no engine
+/// event, before the idle loop relaxes to [`UI_QUIESCENT_POLL_MS`] (#6728).
+pub(crate) const UI_QUIESCENT_AFTER: Duration = Duration::from_secs(5);
+
+/// Idle poll once the UI is quiescent. Input, resize and mouse events do not
+/// wait for it: they arrive over the input pump's channel and return the loop
+/// at once. It only bounds how late a source the loop merely *polls* (an
+/// engine event, a background-task cell, the control socket, a remote
+/// control event) is noticed while nothing else is happening: at most this
+/// interval, instead of [`UI_IDLE_POLL_MS`].
+///
+/// Known limits: the loop is still polled, not woken. Nothing wakes it from an
+/// engine event, a remote-control event, a background-task cell (prompt
+/// suggestion, fleet or constitution draft, workspace context) or the control
+/// socket, so each of those can land up to this long late once the UI has been
+/// quiet for [`UI_QUIESCENT_AFTER`]. Waking from those writers would remove the
+/// bound and is not done here.
+pub(crate) const UI_QUIESCENT_POLL_MS: u64 = 250;
+
+/// What the loop knows about itself that [`App`] alone does not say.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IdleFacts {
+    /// Live sub-agents (`running_agent_count(app) > 0`).
+    pub(crate) has_running_agents: bool,
+    /// A spinner, the underwater scene, or a launch animation wants frames.
+    pub(crate) animation_active: bool,
+    /// Durable tasks queued, running or waiting.
+    pub(crate) durable_tasks_active: bool,
+    /// A terminal event is already buffered for this iteration.
+    pub(crate) input_pending: bool,
+    /// A sub-agent list refresh is waiting for room in the engine mailbox.
+    pub(crate) pending_engine_op: bool,
+}
+
+/// Whether the UI has nothing to do *right now*: no turn, no live work, no
+/// animation, no pending redraw, no toast about to expire, no modal ticking.
+/// Pure on purpose. A state that is not listed here keeps the 48 ms poll, so
+/// the list errs towards "busy".
+pub(crate) fn ui_state_is_quiescent(app: &App, facts: &IdleFacts, now: Instant) -> bool {
+    let toast_live = |toast: &StatusToast| toast.ttl_ms.is_some() && !toast.is_expired(now);
+    !(app.is_loading
+        || app.is_compacting
+        || app.is_purging
+        || app.turn_started_at.is_some()
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || facts.has_running_agents
+        || facts.animation_active
+        || facts.durable_tasks_active
+        || facts.input_pending
+        || facts.pending_engine_op
+        || app.needs_redraw
+        || !app.view_stack.is_empty()
+        || app.onboarding != OnboardingState::None
+        || app.redaction_gate
+        || !app.queued_messages.is_empty()
+        || app.queued_draft.is_some()
+        || app.mcp_login.is_some()
+        || !app.mcp_retries.is_empty()
+        || app.quit_armed_until.is_some()
+        || app.receipt_started_at.is_some()
+        || app.viewport.selection_autoscroll.is_some()
+        || app.status_toasts.iter().any(toast_live)
+        || app.sticky_status.as_ref().is_some_and(toast_live))
+}
+
+/// The idle poll for this iteration: [`idle_poll_ms`] normally, relaxed to
+/// [`UI_QUIESCENT_POLL_MS`] once the UI has been quiescent (see
+/// [`ui_state_is_quiescent`]) and quiet for [`UI_QUIESCENT_AFTER`]. `quiet_for`
+/// is measured by the loop from the last terminal event, engine event or busy
+/// state, so any of those restores the short poll on the next iteration.
+pub(crate) fn idle_poll_duration(
+    app: &App,
+    facts: &IdleFacts,
+    now: Instant,
+    quiet_for: Duration,
+) -> Duration {
+    if quiet_for >= UI_QUIESCENT_AFTER && ui_state_is_quiescent(app, facts, now) {
+        Duration::from_millis(UI_QUIESCENT_POLL_MS.max(idle_poll_ms(app)))
+    } else {
+        Duration::from_millis(idle_poll_ms(app))
+    }
+}
+
+#[cfg(test)]
+mod idle_poll_tests {
+    use super::*;
+
+    fn quiet_app() -> App {
+        let mut app =
+            crate::tui::test_support::test_app_with_options(crate::tui::app::TuiOptions {
+                skip_onboarding: true,
+                start_in_agent_mode: true,
+                ..crate::tui::test_support::test_tui_options(std::path::PathBuf::from("."))
+            });
+        app.needs_redraw = false;
+        app.low_motion = false;
+        app
+    }
+
+    fn at(app: &App, facts: &IdleFacts, quiet_secs: u64) -> Duration {
+        idle_poll_duration(app, facts, Instant::now(), Duration::from_secs(quiet_secs))
+    }
+
+    const FAST: Duration = Duration::from_millis(UI_IDLE_POLL_MS);
+    const SLOW: Duration = Duration::from_millis(UI_QUIESCENT_POLL_MS);
+
+    #[test]
+    fn a_settled_ui_relaxes_only_after_the_quiet_period() {
+        let app = quiet_app();
+        let facts = IdleFacts::default();
+        assert!(ui_state_is_quiescent(&app, &facts, Instant::now()));
+        assert_eq!(
+            at(&app, &facts, 0),
+            FAST,
+            "fresh activity keeps the fast poll"
+        );
+        assert_eq!(at(&app, &facts, 4), FAST, "inside the quiet period");
+        assert_eq!(at(&app, &facts, UI_QUIESCENT_AFTER.as_secs()), SLOW);
+        assert_eq!(at(&app, &facts, 600), SLOW);
+    }
+
+    #[test]
+    fn the_relaxed_poll_is_never_shorter_than_the_reduced_motion_poll() {
+        let mut app = quiet_app();
+        app.low_motion = true;
+        let facts = IdleFacts::default();
+        assert_eq!(at(&app, &facts, 1), Duration::from_millis(120));
+        assert_eq!(at(&app, &facts, 60), SLOW);
+        assert!(SLOW >= Duration::from_millis(120));
+    }
+
+    #[test]
+    fn any_live_state_keeps_the_fast_poll_however_long_it_has_been_quiet() {
+        let now = Instant::now();
+        let long = Duration::from_secs(3_600);
+        let busy = |app: &App, facts: &IdleFacts, why: &str| {
+            assert!(!ui_state_is_quiescent(app, facts, now), "{why}");
+            assert_eq!(idle_poll_duration(app, facts, now, long), FAST, "{why}");
+        };
+
+        let facts = IdleFacts::default();
+        let mut app = quiet_app();
+        app.is_loading = true;
+        busy(&app, &facts, "a turn is loading");
+
+        let mut app = quiet_app();
+        app.is_compacting = true;
+        busy(&app, &facts, "compacting");
+
+        let mut app = quiet_app();
+        app.is_purging = true;
+        busy(&app, &facts, "purging");
+
+        let mut app = quiet_app();
+        app.turn_started_at = Some(now);
+        busy(&app, &facts, "a turn has started");
+
+        let mut app = quiet_app();
+        app.runtime_turn_status = Some("in_progress".to_string());
+        busy(&app, &facts, "the runtime reports a turn in progress");
+
+        let mut app = quiet_app();
+        app.needs_redraw = true;
+        busy(&app, &facts, "a redraw is owed");
+
+        let mut app = quiet_app();
+        app.quit_armed_until = Some(now + Duration::from_secs(2));
+        busy(&app, &facts, "the quit prompt is armed");
+
+        let mut app = quiet_app();
+        app.receipt_started_at = Some(now);
+        busy(&app, &facts, "a receipt is on screen and expires on a tick");
+
+        let mut app = quiet_app();
+        app.push_status_toast("saved", StatusToastLevel::Info, Some(4_000));
+        app.needs_redraw = false;
+        busy(&app, &facts, "a timed toast is showing");
+
+        let app = quiet_app();
+        for (facts, why) in [
+            (
+                IdleFacts {
+                    has_running_agents: true,
+                    ..IdleFacts::default()
+                },
+                "a sub-agent is running",
+            ),
+            (
+                IdleFacts {
+                    animation_active: true,
+                    ..IdleFacts::default()
+                },
+                "something is animating",
+            ),
+            (
+                IdleFacts {
+                    durable_tasks_active: true,
+                    ..IdleFacts::default()
+                },
+                "a durable task is live",
+            ),
+            (
+                IdleFacts {
+                    input_pending: true,
+                    ..IdleFacts::default()
+                },
+                "input is already buffered",
+            ),
+            (
+                IdleFacts {
+                    pending_engine_op: true,
+                    ..IdleFacts::default()
+                },
+                "an engine op is waiting for mailbox room",
+            ),
+        ] {
+            busy(&app, &facts, why);
+        }
+    }
+
+    #[test]
+    fn an_expired_toast_and_a_standing_error_do_not_hold_the_fast_poll() {
+        let mut app = quiet_app();
+        let facts = IdleFacts::default();
+        let mut expired = StatusToast::new("old", StatusToastLevel::Info, Some(1));
+        expired.created_at = Instant::now() - Duration::from_secs(60);
+        app.status_toasts.push_back(expired);
+        // A sticky error without a lifetime ("no model connected") is a
+        // static line, not something that ticks.
+        app.sticky_status = Some(StatusToast::new("no model", StatusToastLevel::Error, None));
+        assert!(ui_state_is_quiescent(&app, &facts, Instant::now()));
+        assert_eq!(at(&app, &facts, 30), SLOW);
+    }
+
+    #[test]
+    fn a_queued_message_or_open_modal_is_not_quiescent() {
+        let facts = IdleFacts::default();
+        let mut app = quiet_app();
+        app.queued_draft = Some(QueuedMessage::new("later".to_string(), None));
+        assert!(!ui_state_is_quiescent(&app, &facts, Instant::now()));
+
+        let mut app = quiet_app();
+        app.onboarding = OnboardingState::Welcome;
+        assert!(!ui_state_is_quiescent(&app, &facts, Instant::now()));
+    }
 }
 
 #[cfg(test)]
@@ -920,8 +1201,8 @@ mod screen_mode_tests {
     #[cfg(not(windows))]
     #[test]
     fn switching_screens_recomputes_mouse_capture() {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
         );
         app.screen_mode = ScreenMode::Inline;
         app.mouse_capture_preference = true;
@@ -956,8 +1237,8 @@ mod screen_mode_tests {
 
     #[test]
     fn switching_screens_recomputes_derived_composer_arrows_only() {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
         );
         app.composer_arrows_scroll_explicit = false;
 
@@ -1004,5 +1285,82 @@ mod screen_mode_tests {
         let mut backend = backend;
         backend.set_terminal_size(Size::new(80, 24));
         assert_eq!(inline_viewport_rows(&backend), 24);
+    }
+}
+
+/// The terminal UI's implementation of the runtime's one terminal port
+/// (`crate::host_terminal`). The composition root installs it for every host
+/// this binary launches, so runtime code (the shell tools, the dispatcher)
+/// reaches raw mode only through it and never links crossterm.
+struct TuiHostTerminal;
+
+impl crate::host_terminal::HostTerminal for TuiHostTerminal {
+    fn suspend_raw_mode(&self) -> bool {
+        let was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        if was_enabled {
+            let _ = disable_raw_mode();
+        }
+        was_enabled
+    }
+
+    fn resume_raw_mode(&self) {
+        let _ = enable_raw_mode();
+    }
+
+    fn notify_model(&self, title: &str, body: Option<&str>) -> &'static str {
+        crate::tui::notifications::notify_model(title, body)
+    }
+
+    fn set_terminal_focused(&self, focused: bool) {
+        crate::tui::notifications::set_terminal_focused(focused);
+    }
+
+    fn apply_notification_settings(&self, config: &crate::config::NotificationsConfig) {
+        let _ = crate::tui::notifications::apply_settings(config);
+    }
+
+    fn begin_turn_chrome(&self) {
+        crate::tui::notifications::set_taskbar_progress_busy();
+        crate::tui::notifications::start_title_animation("codewhale");
+    }
+}
+
+/// Install the TUI as the process's terminal host. Idempotent: the first
+/// install wins.
+pub(crate) fn install_host_terminal() {
+    let _ = crate::host_terminal::install(Box::new(TuiHostTerminal));
+}
+
+#[cfg(test)]
+mod host_terminal_tests {
+    use super::TuiHostTerminal;
+    use crate::host_terminal::HostTerminal;
+    use crate::notify::DeliveryOutcome;
+    use crate::tui::notifications::{configured_method, install_configured_method};
+
+    /// The `notify` tool reaches delivery only through the installed host:
+    /// the TUI's host must hand the model's text to the delivery path that
+    /// honors the installed method, so `method = "off"` stays silent.
+    #[test]
+    fn tui_host_routes_the_notify_tool_through_the_installed_method() {
+        let _lock = crate::test_support::lock_test_env();
+        let previous_method = configured_method();
+        let config = |text: &str| -> crate::config::Config {
+            toml::from_str(text).expect("notifications config should parse")
+        };
+        // Settings reach the host the way the composition root sends them;
+        // `condition = "always"` so the attention policy (checked first)
+        // lets the call reach the method check whatever the runner's focus.
+        TuiHostTerminal.apply_notification_settings(
+            &config("[notifications]\nmethod = \"off\"\ncondition = \"always\"\n")
+                .notifications_config(),
+        );
+
+        let receipt = TuiHostTerminal.notify_model("done", None);
+
+        TuiHostTerminal
+            .apply_notification_settings(&config("[notifications]\n").notifications_config());
+        install_configured_method(previous_method);
+        assert_eq!(receipt, DeliveryOutcome::SuppressedByMethod.receipt());
     }
 }

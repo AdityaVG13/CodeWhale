@@ -16,7 +16,6 @@ use super::spec::{
 };
 use crate::dependencies::ExternalTool;
 
-const MAX_OUTPUT_CHARS: usize = 40_000;
 const DEFAULT_LOG_MAX_COUNT: u64 = 20;
 const MAX_LOG_MAX_COUNT: u64 = 200;
 const DEFAULT_UNIFIED: u64 = 3;
@@ -131,7 +130,7 @@ impl ToolSpec for GitLogTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -140,8 +139,6 @@ impl ToolSpec for GitLogTool {
             "author": author,
             "since": since,
             "until": until,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -218,11 +215,8 @@ impl ToolSpec for GitShowTool {
         let stat = optional_bool(&input, "stat", true)?;
         let unified = optional_u64(&input, "unified", DEFAULT_UNIFIED)?.min(MAX_UNIFIED);
 
-        let mut args = vec![
-            "show".to_string(),
-            "--no-color".to_string(),
-            "--no-ext-diff".to_string(),
-        ];
+        let mut args = vec!["show".to_string(), "--no-color".to_string()];
+        args.extend(crate::dependencies::Git::REVIEW_DIFF_ARGS.map(String::from));
         if patch {
             args.push(format!("--unified={unified}"));
         } else {
@@ -238,7 +232,11 @@ impl ToolSpec for GitShowTool {
         }
 
         let command_str = format_command(&git_ctx.working_dir, &args);
-        let output = run_git_command_async(git_ctx.working_dir.clone(), args).await?;
+        let working_dir = git_ctx.working_dir.clone();
+        let output =
+            tokio::task::spawn_blocking(move || super::git::run_git_command(&working_dir, &args))
+                .await
+                .map_err(|e| ToolError::execution_failed(format!("git task panicked: {e}")))??;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Ok(ToolResult::error(format!(
@@ -253,7 +251,7 @@ impl ToolSpec for GitShowTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -262,8 +260,6 @@ impl ToolSpec for GitShowTool {
             "patch": patch,
             "stat": stat,
             "unified": if patch { Some(unified) } else { None },
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -359,8 +355,11 @@ impl ToolSpec for GitBlameTool {
         let end_line = start_line.saturating_add(max_lines.saturating_sub(1));
         let porcelain = optional_bool(&input, "porcelain", false)?;
 
+        // Blame reads the working-tree file, so it runs under the review
+        // command (no clean filters) and skips textconv drivers.
         let mut args = vec![
             "blame".to_string(),
+            "--no-textconv".to_string(),
             "--date=iso".to_string(),
             format!("-L{start_line},{end_line}"),
         ];
@@ -372,7 +371,11 @@ impl ToolSpec for GitBlameTool {
         args.push(pathspec.display().to_string());
 
         let command_str = format_command(working_dir, &args);
-        let output = run_git_command_async(working_dir.to_path_buf(), args).await?;
+        let blame_dir = working_dir.to_path_buf();
+        let output =
+            tokio::task::spawn_blocking(move || super::git::run_git_command(&blame_dir, &args))
+                .await
+                .map_err(|e| ToolError::execution_failed(format!("git task panicked: {e}")))??;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Ok(ToolResult::error(format!(
@@ -387,7 +390,7 @@ impl ToolSpec for GitBlameTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": working_dir,
@@ -396,8 +399,6 @@ impl ToolSpec for GitBlameTool {
             "start_line": start_line,
             "max_lines": max_lines,
             "porcelain": porcelain,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -414,9 +415,17 @@ impl ToolSpec for GitBlameTool {
 /// or push. The execution envelope classes this as bounded fetch — shell plus
 /// network authority, not write authority.
 ///
-/// Known limitation: shares the existing git tools' no-timeout behavior; a
-/// hung remote is bounded by the caller's wall clock, not the tool.
+/// Never interactive and always bounded: the spawn carries the shared no-prompt
+/// environment (`GIT_TERMINAL_PROMPT=0`, BatchMode ssh), so a remote that wants
+/// credentials, a passphrase or a host-key confirmation fails fast instead of
+/// prompting on `/dev/tty` inside the raw-mode TUI; and the child runs under
+/// [`GIT_FETCH_TIMEOUT`] with `kill_on_drop`, so a remote that never answers
+/// ends the call with a clear error instead of freezing the turn.
 pub struct GitFetchTool;
+
+/// Upper bound on one `git_fetch`. Generous enough for a first fetch of a
+/// large repository; short enough that a silent remote cannot pass for a hang.
+const GIT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[async_trait]
 impl ToolSpec for GitFetchTool {
@@ -444,7 +453,7 @@ impl ToolSpec for GitFetchTool {
                 "refspecs": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional refspecs to fetch (e.g. pull/123/head). Empty fetches the remote's defaults."
+                    "description": "Optional refspecs to fetch (e.g. pull/123/head); a `src:dst` destination must be under refs/remotes/. Empty fetches the remote's defaults."
                 },
                 "path": {
                     "type": "string",
@@ -474,11 +483,32 @@ impl ToolSpec for GitFetchTool {
         let git_ctx = resolve_git_context(context, optional_str(&input, "path")?)?;
         require_configured_remote(&git_ctx.working_dir, remote).await?;
 
-        let mut args = vec!["fetch".to_string(), remote.to_string()];
+        // Remote-tracking refs only (#6561 D03-01): a default fetch
+        // auto-follows tags into refs/tags/, and `tagOpt`/`pruneTags`
+        // config can add or delete local tags. The flags override both.
+        let mut args = vec![
+            "fetch".to_string(),
+            "--no-tags".to_string(),
+            "--no-prune-tags".to_string(),
+            remote.to_string(),
+        ];
         args.extend(refspecs.clone());
 
         let command_str = format_command(&git_ctx.working_dir, &args);
-        let output = run_git_command_async(git_ctx.working_dir.clone(), args).await?;
+        let Some(output) =
+            run_git_command_bounded(&git_ctx.working_dir, &args, GIT_FETCH_TIMEOUT).await?
+        else {
+            let seconds = GIT_FETCH_TIMEOUT.as_secs();
+            return Ok(ToolResult::error(format!(
+                "git fetch from remote '{remote}' timed out after {seconds}s and was stopped; \
+                 the remote did not finish answering. No refs were changed by this call."
+            ))
+            .with_metadata(json!({
+                "command": command_str,
+                "timed_out": true,
+                "timeout_secs": seconds,
+            })));
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Ok(ToolResult::error(format!(
@@ -499,14 +529,12 @@ impl ToolSpec for GitFetchTool {
         } else {
             format!("{stdout}\n{stderr}")
         };
-        let (content, truncated, omitted_chars) = truncate_with_note(&combined, MAX_OUTPUT_CHARS);
+        let content = combined;
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
             "remote": remote,
             "refspecs": refspecs,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -614,7 +642,7 @@ impl ToolSpec for GitMergeTreeTool {
         }
 
         let conflicts = !output.status.success();
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -622,8 +650,6 @@ impl ToolSpec for GitMergeTreeTool {
             "theirs": theirs,
             "base": base,
             "conflicts": conflicts,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -769,8 +795,26 @@ fn validate_git_refspec(refspec: &str) -> Result<(), ToolError> {
             "git refspec '{refspec}' must have at most one ':'"
         )));
     }
-    for side in parts {
+    for side in &parts {
         validate_git_refspec_side(refspec, side)?;
+    }
+    // `git fetch <remote> tag <name>` is shorthand for
+    // `refs/tags/<name>:refs/tags/<name>`, a local tag write.
+    if refspec == "tag" {
+        return Err(ToolError::invalid_input(
+            "git refspec 'tag' is not accepted: the `tag <name>` form writes a local tag; \
+             fetch refs/tags/<name> into FETCH_HEAD or under refs/remotes/ instead",
+        ));
+    }
+    // The tool updates remote-tracking refs only: a destination under
+    // `refs/heads/` or `refs/tags/` (or a bare name git would resolve there)
+    // could rewrite local branches and tags.
+    if let Some(dst) = parts.get(1)
+        && (!dst.starts_with("refs/remotes/") || dst.split('/').any(|part| part == ".."))
+    {
+        return Err(ToolError::invalid_input(format!(
+            "git refspec '{refspec}' must write under refs/remotes/; omit the destination to fetch into FETCH_HEAD"
+        )));
     }
     Ok(())
 }
@@ -835,20 +879,10 @@ fn pathspec_from(working_dir: &Path, resolved: &Path) -> PathBuf {
     }
 }
 
+/// History reads share the read-only runner in `git.rs`, which disables the
+/// workspace's fsmonitor, hooks and filters.
 fn run_git_command(working_dir: &Path, args: &[String]) -> Result<Output, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Git::command() else {
-        return Err(ToolError::not_available(
-            "git is not installed or not in PATH",
-        ));
-    };
-    cmd.args(args).current_dir(working_dir);
-    cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ToolError::not_available("git is not installed or not in PATH")
-        } else {
-            ToolError::execution_failed(format!("Failed to run git: {e}"))
-        }
-    })
+    super::git::run_git_command(working_dir, args)
 }
 
 /// Async wrapper that offloads the blocking `git` invocation onto a
@@ -862,6 +896,39 @@ async fn run_git_command_async(
         .map_err(|e| ToolError::execution_failed(format!("git task panicked: {e}")))?
 }
 
+/// Run git under a hard deadline. `Ok(None)` means the deadline passed and the
+/// child was killed, so a timed-out fetch never lingers.
+///
+/// git runs contained ([`crate::process_tree::contained_output`]) and the whole
+/// tree is killed at the deadline or when the call is cancelled: git hands the
+/// network to a transport child (`git-remote-http`, `ssh`) that survives a
+/// SIGKILL to git alone and would otherwise keep the stalled connection open
+/// indefinitely.
+async fn run_git_command_bounded(
+    working_dir: &Path,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<Option<Output>, ToolError> {
+    let Some(mut cmd) = crate::dependencies::Git::tokio_command() else {
+        return Err(ToolError::not_available(
+            "git is not installed or not in PATH",
+        ));
+    };
+    cmd.args(args).current_dir(working_dir);
+    match tokio::time::timeout(timeout, crate::process_tree::contained_output(&mut cmd)).await {
+        Ok(Ok(output)) => Ok(Some(output)),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(ToolError::not_available(
+            "git is not installed or not in PATH",
+        )),
+        Ok(Err(e)) => Err(ToolError::execution_failed(format!(
+            "Failed to run git: {e}"
+        ))),
+        // The elapsed deadline dropped the contained run, which killed git's
+        // whole tree.
+        Err(_) => Ok(None),
+    }
+}
+
 fn format_command(working_dir: &Path, args: &[String]) -> String {
     format!(
         "git -C {} {}",
@@ -871,34 +938,6 @@ fn format_command(working_dir: &Path, args: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool, usize) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false, 0);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    (format!("{truncated}{note}"), true, omitted_chars)
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 #[cfg(test)]
@@ -972,6 +1011,37 @@ mod tests {
         assert!(result.success);
         assert!(result.content.contains("diff --git"));
         assert!(result.content.contains("+two"));
+    }
+
+    #[tokio::test]
+    async fn git_show_returns_a_large_patch_whole() {
+        // #6508: no 40,000-character per-tool cut; the end of the patch
+        // reaches the caller.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        fs::write(tmp.path().join("file.txt"), "one\n").expect("write");
+        commit_all(tmp.path(), "first");
+        fs::write(
+            tmp.path().join("file.txt"),
+            format!("{}FINAL LINE\n", "line of patch\n".repeat(4_000)),
+        )
+        .expect("write");
+        commit_all(tmp.path(), "second");
+
+        let result = GitShowTool
+            .execute(
+                json!({ "rev": "HEAD", "stat": false }),
+                &ToolContext::new(tmp.path()),
+            )
+            .await
+            .expect("execute");
+        assert!(result.success);
+        assert!(result.content.chars().count() > 40_000);
+        assert!(result.content.contains("+FINAL LINE"));
+        assert!(!result.content.contains("output truncated"));
     }
 
     #[tokio::test]
@@ -1143,6 +1213,36 @@ mod tests {
                 "{refspec}: {err}"
             );
         }
+        for refspec in [
+            "+main:refs/heads/main",
+            "v1:refs/tags/v1",
+            "main:other",
+            "main:refs/remotes/../heads/main",
+        ] {
+            let err = validate_git_refspec(refspec)
+                .expect_err("a destination outside refs/remotes/ must be refused");
+            assert!(
+                err.to_string().contains("refs/remotes/"),
+                "{refspec}: {err}"
+            );
+        }
+        // `tag <name>` arrives as two array elements, each a plain rev.
+        let err = GitFetchTool
+            .execute(json!({ "refspecs": ["tag", "v1"] }), &ctx)
+            .await
+            .expect_err("the tag shorthand writes a local tag");
+        assert!(
+            matches!(err, ToolError::InvalidInput { .. }) && err.to_string().contains("tag"),
+            "{err}"
+        );
+        for refspec in [
+            "pull/123/head",
+            "refs/tags/v1",
+            "refs/heads/x:refs/remotes/origin/x",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ] {
+            validate_git_refspec(refspec).expect(refspec);
+        }
         let err = GitFetchTool
             .execute(json!({ "refspecs": "pull/1/head" }), &ctx)
             .await
@@ -1160,6 +1260,9 @@ mod tests {
         init_git_repo(origin.path());
         fs::write(origin.path().join("file.txt"), "one\n").expect("write");
         commit_all(origin.path(), "first");
+        // An annotated tag on fetched history: a default `git fetch`
+        // auto-follows it into the local refs/tags/ namespace.
+        run_git(origin.path(), &["tag", "-a", "v1", "-m", "v1"]);
 
         let work = tempdir().expect("tempdir");
         init_git_repo(work.path());
@@ -1180,6 +1283,12 @@ mod tests {
             .expect("execute");
         assert!(result.success, "{}", result.content);
 
+        // #6561 D03-01: remote-tracking refs only, so no local tag appeared.
+        let tags = crate::dependencies::Git::output(&["tag", "--list"], work.path())
+            .expect("git should spawn");
+        assert!(tags.status.success());
+        assert_eq!(String::from_utf8_lossy(&tags.stdout).trim(), "");
+
         // The refs arrived, but nothing was checked out: the work tree has no
         // file.txt and no local branch moved.
         let refs = crate::dependencies::Git::output(&["branch", "-r"], work.path())
@@ -1188,6 +1297,125 @@ mod tests {
         let refs = String::from_utf8_lossy(&refs.stdout);
         assert!(refs.contains("origin/"), "{refs}");
         assert!(!work.path().join("file.txt").exists());
+    }
+
+    /// A loopback HTTP "remote" that answers every request with `response`.
+    /// Returns its URL.
+    fn spawn_fake_http_remote(response: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/repo.git")
+    }
+
+    fn init_repo_with_remote(root: &Path, url: &str) {
+        init_git_repo(root);
+        run_git(root, &["remote", "add", "origin", url]);
+        // Isolate from the developer's credential helpers and askpass so the
+        // only thing standing between git and a prompt is our environment.
+        run_git(root, &["config", "credential.helper", ""]);
+        run_git(root, &["config", "core.askPass", ""]);
+    }
+
+    #[tokio::test]
+    async fn git_fetch_fails_fast_when_remote_requires_credentials() {
+        if !git_available() {
+            return;
+        }
+        let url = spawn_fake_http_remote(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"codewhale\"\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let work = tempdir().expect("tempdir");
+        init_repo_with_remote(work.path(), &url);
+
+        let ctx = ToolContext::new(work.path());
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            GitFetchTool.execute(json!({ "remote": "origin" }), &ctx),
+        )
+        .await
+        .expect("git_fetch must not wait on a credential prompt")
+        .expect("execute");
+        assert!(!result.success, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("git fetch failed for remote 'origin'"),
+            "{}",
+            result.content
+        );
+        // Git names the refusal to prompt rather than blocking on /dev/tty.
+        let lower = result.content.to_lowercase();
+        assert!(
+            lower.contains("terminal prompts disabled") || lower.contains("authentication"),
+            "{}",
+            result.content
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn git_fetch_runner_kills_a_remote_that_never_answers() {
+        if !git_available() {
+            return;
+        }
+        // Accept one connection and hand it back, never answering.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/repo.git", listener.local_addr().expect("addr"));
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = accepted_tx.send(stream);
+            }
+        });
+        let work = tempdir().expect("tempdir");
+        init_repo_with_remote(work.path(), &url);
+
+        let started = std::time::Instant::now();
+        let outcome = run_git_command_bounded(
+            work.path(),
+            &["fetch".to_string(), "origin".to_string()],
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("git spawns");
+        assert!(outcome.is_none(), "a silent remote must hit the deadline");
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+
+        // The connection belongs to git's transport child, not git itself.
+        // It must close too: a lingering helper would hold the stall open.
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            let mut stream = accepted_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("git connected to the fake remote");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue, // the request itself
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("transport child outlived the deadline: {e}"),
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        drop(accepted_rx);
     }
 
     #[tokio::test]
@@ -1243,5 +1471,28 @@ mod tests {
             .expect("git should spawn");
         assert!(output.status.success());
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A cancelled call kills git's whole tree, not only at the deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_bounded_git_run_kills_what_git_started() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        let pid_file = tmp.path().join("hang.pid");
+        let args = [
+            "-c".to_string(),
+            "alias.hang=!sleep 300 & echo $! > hang.pid; wait".to_string(),
+            "hang".to_string(),
+        ];
+        let run = run_git_command_bounded(tmp.path(), &args, std::time::Duration::from_secs(600));
+        let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),
+            "a process git started outlived the cancelled call"
+        );
     }
 }

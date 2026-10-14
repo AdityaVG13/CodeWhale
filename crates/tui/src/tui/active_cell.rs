@@ -328,6 +328,7 @@ mod tests {
             duration_ms: None,
             stale_elapsed_since_output_ms: None,
             source: ExecSource::Assistant,
+            description: None,
             interaction: None,
             output_summary: None,
         }))
@@ -338,6 +339,7 @@ mod tests {
             entries: vec![ExploringEntry {
                 label: label.to_string(),
                 status: ToolStatus::Running,
+                error: None,
             }],
         }))
     }

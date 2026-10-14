@@ -3,6 +3,13 @@
 //! Automations are local-first recurring jobs that enqueue standard background
 //! tasks. This module stores automation definitions and run history under
 //! `~/.codewhale/automations` (or `DEEPSEEK_AUTOMATIONS_DIR` override).
+//!
+//! Deleting an automation keeps its terminal run history: terminal runs
+//! (completed, failed, canceled) are moved under `<root>/archive/<id>/` before
+//! the live paths are removed. The archive is bounded — it retains the most
+//! recent [`ARCHIVE_RETAINED_TERMINAL_RUNS`] terminal runs per automation and
+//! deletes older ones — and lives outside the `automations/`, `runs/`, and
+//! `triggers/` trees, so live listings and scheduler scans never see it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -35,6 +42,10 @@ const DEFAULT_AUTOMATION_ALLOW_SHELL: bool = false;
 const DEFAULT_AUTOMATION_TRUST_MODE: bool = false;
 const DEFAULT_AUTOMATION_AUTO_APPROVE: bool = false;
 const DEFAULT_AUTOMATION_DELIVERY_MODE: AutomationDeliveryMode = AutomationDeliveryMode::Task;
+/// Terminal runs retained in `<root>/archive/<automation_id>/` when an
+/// automation is deleted; older archived runs are removed (newest-first by
+/// `ended_at`, falling back to `created_at`).
+const ARCHIVE_RETAINED_TERMINAL_RUNS: usize = 50;
 pub const AUTOMATION_WATCHER_NO_REPORT_SENTINEL: &str = "NOTHING_TO_REPORT";
 const MAX_HOURLY_SEARCH_STEPS: usize = 24 * 21;
 const MAX_CRON_SEARCH_MINUTES: usize = 60 * 24 * 366 * 5;
@@ -186,6 +197,9 @@ pub struct AutomationRecord {
     /// Bound by the trusted service, independently of visibility ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_scope: Option<String>,
+    /// Increments on every definition mutation; absent on legacy records (0).
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl AutomationRecord {
@@ -307,6 +321,57 @@ pub struct UpdateAutomationRequest {
     pub auto_approve: Option<bool>,
     pub delivery_mode: Option<AutomationDeliveryMode>,
     pub status: Option<AutomationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct RevisionConflict {
+    pub current: u64,
+}
+
+impl std::fmt::Display for RevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Automation revision conflict: current revision is {}",
+            self.current
+        )
+    }
+}
+
+impl std::error::Error for RevisionConflict {}
+
+fn check_expected_revision(record: &AutomationRecord, expected: Option<u64>) -> Result<()> {
+    match expected {
+        Some(expected) if expected != record.revision => Err(RevisionConflict {
+            current: record.revision,
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+pub const IDEMPOTENCY_TTL_HOURS: i64 = 24;
+pub const IDEMPOTENCY_MAX_ENTRIES: usize = 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdempotencyEntry {
+    key: String,
+    fingerprint: String,
+    status: u16,
+    body: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub enum IdempotencyLookup {
+    Miss,
+    Replay {
+        status: u16,
+        body: serde_json::Value,
+    },
+    KeyReused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -992,6 +1057,7 @@ pub struct AutomationManager {
     automations_dir: PathBuf,
     runs_dir: PathBuf,
     triggers_dir: PathBuf,
+    archive_dir: PathBuf,
 }
 
 impl AutomationManager {
@@ -1073,17 +1139,21 @@ impl AutomationManager {
         let automations_dir = root.join("automations");
         let runs_dir = root.join("runs");
         let triggers_dir = root.join("triggers");
+        let archive_dir = root.join("archive");
         fs::create_dir_all(&automations_dir)
             .with_context(|| format!("Failed to create {}", automations_dir.display()))?;
         fs::create_dir_all(&runs_dir)
             .with_context(|| format!("Failed to create {}", runs_dir.display()))?;
         fs::create_dir_all(&triggers_dir)
             .with_context(|| format!("Failed to create {}", triggers_dir.display()))?;
+        fs::create_dir_all(&archive_dir)
+            .with_context(|| format!("Failed to create {}", archive_dir.display()))?;
         Ok(Self {
             execution_scope: None,
             automations_dir,
             runs_dir,
             triggers_dir,
+            archive_dir,
         })
     }
 
@@ -1188,6 +1258,24 @@ impl AutomationManager {
             .join(format!("{run_id}.json")))
     }
 
+    /// Terminal-run archive for one automation. Lives beside — never inside —
+    /// the live `runs/` tree so `list_runs` and scheduler scans cannot see it.
+    fn archive_dir_for(&self, automation_id: &str) -> Result<PathBuf> {
+        ensure_safe_storage_id("automation id", automation_id)?;
+        Ok(self.archive_dir.join(automation_id))
+    }
+
+    /// Archived run file name: the same sortable `{stamp}-{run_id}.json` shape
+    /// as live runs, so legacy-named runs are normalized when archived.
+    fn archive_run_path(&self, run: &AutomationRunRecord) -> Result<PathBuf> {
+        ensure_safe_storage_id("run id", &run.id)?;
+        Ok(self.archive_dir_for(&run.automation_id)?.join(format!(
+            "{}-{}.json",
+            run_file_stamp(run.created_at),
+            run.id
+        )))
+    }
+
     pub fn create_automation(&self, req: CreateAutomationRequest) -> Result<AutomationRecord> {
         validate_name_and_prompt(&req.name, &req.prompt)?;
         let schedule = AutomationSchedule::parse_rrule(&req.rrule)?;
@@ -1220,6 +1308,7 @@ impl AutomationManager {
             updated_at: now,
             next_run_at,
             last_run_at: None,
+            revision: 1,
         };
 
         self.save_automation(&record)?;
@@ -1282,6 +1371,7 @@ impl AutomationManager {
         req: UpdateAutomationRequest,
     ) -> Result<AutomationRecord> {
         let mut existing = self.get_automation(id)?;
+        check_expected_revision(&existing, req.expected_revision)?;
         let adopting = existing.execution_scope.is_none()
             && self.execution_scope.is_some()
             && req.status != Some(AutomationStatus::Paused);
@@ -1357,8 +1447,84 @@ impl AutomationManager {
         }
 
         existing.updated_at = Utc::now();
+        existing.revision = existing.revision.saturating_add(1);
         self.save_automation_unlocked(&existing)?;
         Ok(existing)
+    }
+
+    fn idempotency_path(&self) -> Result<PathBuf> {
+        Ok(self
+            .automations_dir
+            .parent()
+            .context("automation root")?
+            .join("idempotency.json"))
+    }
+
+    fn read_idempotency_unlocked(&self, now: DateTime<Utc>) -> Result<Vec<IdempotencyEntry>> {
+        let path = self.idempotency_path()?;
+        let mut entries: Vec<IdempotencyEntry> = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(entries) => entries,
+                Err(parse_error) => {
+                    let quarantine = path.with_file_name(format!(
+                        "idempotency.corrupt-{}.json",
+                        now.format("%Y%m%dT%H%M%S%.3f")
+                    ));
+                    fs::rename(&path, &quarantine)
+                        .with_context(|| format!("quarantine corrupt {}", path.display()))?;
+                    anyhow::bail!(
+                        "idempotency store {} was unparseable ({parse_error}); moved to {}",
+                        path.display(),
+                        quarantine.display()
+                    );
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        let cutoff = now - Duration::hours(IDEMPOTENCY_TTL_HOURS);
+        entries.retain(|entry| entry.created_at > cutoff);
+        Ok(entries)
+    }
+
+    pub fn idempotency_lookup(&self, key: &str, fingerprint: &str) -> Result<IdempotencyLookup> {
+        self.with_transaction(|| {
+            let entries = self.read_idempotency_unlocked(Utc::now())?;
+            Ok(match entries.into_iter().find(|entry| entry.key == key) {
+                None => IdempotencyLookup::Miss,
+                Some(entry) if entry.fingerprint == fingerprint => IdempotencyLookup::Replay {
+                    status: entry.status,
+                    body: entry.body,
+                },
+                Some(_) => IdempotencyLookup::KeyReused,
+            })
+        })
+    }
+
+    pub fn idempotency_store(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        self.with_transaction(|| {
+            let now = Utc::now();
+            let mut entries = self.read_idempotency_unlocked(now)?;
+            entries.retain(|entry| entry.key != key);
+            entries.push(IdempotencyEntry {
+                key: key.to_string(),
+                fingerprint: fingerprint.to_string(),
+                status,
+                body,
+                created_at: now,
+            });
+            if entries.len() > IDEMPOTENCY_MAX_ENTRIES {
+                let excess = entries.len() - IDEMPOTENCY_MAX_ENTRIES;
+                entries.drain(..excess);
+            }
+            write_json_atomic(&self.idempotency_path()?, &entries)
+        })
     }
 
     pub fn pause_automation(&self, id: &str) -> Result<AutomationRecord> {
@@ -1381,21 +1547,51 @@ impl AutomationManager {
         )
     }
 
+    /// Delete an automation, keeping its terminal run history. Terminal runs
+    /// (completed, failed, canceled) are archived under `<root>/archive/<id>/`
+    /// — bounded to the most recent [`ARCHIVE_RETAINED_TERMINAL_RUNS`] per
+    /// automation — before the live paths are removed. Deleting is refused
+    /// while any run is still queued or running: an in-flight occurrence has
+    /// already crossed the admission boundary, so its definition and run
+    /// binding must stay intact for recovery to settle it.
     pub fn delete_automation(&self, id: &str) -> Result<AutomationRecord> {
         self.with_transaction(|| {
             let existing = self.get_automation(id)?;
-            let path = self.automation_path(id)?;
-            fs::remove_file(&path)
-                .with_context(|| format!("Failed to delete automation {}", path.display()))?;
-            // A claimed occurrence has already crossed the admission boundary.
-            // Keep its binding through deletion so recovery cannot lose or repeat it.
-            for run in self.list_runs_with_visibility(id, None, true)? {
-                if !matches!(
+            let runs = self.list_runs_with_visibility(id, None, true)?;
+            if let Some(active) = runs.iter().find(|run| {
+                matches!(
                     run.status,
                     AutomationRunStatus::Queued | AutomationRunStatus::Running
-                ) {
-                    self.delete_run(&run)?;
-                }
+                )
+            }) {
+                bail!(
+                    "Refusing to delete automation {id}: run {} is still active",
+                    active.id
+                );
+            }
+
+            // Archive before removing live receipts, and remove the
+            // definition last. A crash or cleanup failure leaves the
+            // definition available to retry; retained archive copies survive
+            // even when some live receipts have already been removed.
+            let terminal: Vec<AutomationRunRecord> = runs
+                .into_iter()
+                .filter(|run| {
+                    matches!(
+                        run.status,
+                        AutomationRunStatus::Completed
+                            | AutomationRunStatus::Failed
+                            | AutomationRunStatus::Canceled
+                    )
+                })
+                .collect();
+            for run in &terminal {
+                write_json_atomic(&self.archive_run_path(run)?, run)?;
+            }
+            self.enforce_archive_retention(id)?;
+
+            for run in &terminal {
+                self.delete_run(run)?;
             }
             let runs_dir = self.runs_dir_for(id)?;
             if runs_dir.try_exists()? && fs::read_dir(&runs_dir)?.next().is_none() {
@@ -1406,8 +1602,58 @@ impl AutomationManager {
                     )
                 })?;
             }
+            let path = self.automation_path(id)?;
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete automation {}", path.display()))?;
             Ok(existing)
         })
+    }
+
+    /// Terminal runs archived for a deleted automation (see
+    /// [`Self::delete_automation`]), newest-first by `ended_at` (falling back
+    /// to `created_at`).
+    pub fn list_archived_runs(&self, automation_id: &str) -> Result<Vec<AutomationRunRecord>> {
+        Ok(self
+            .read_archive_entries(automation_id)?
+            .into_iter()
+            .map(|(_, run)| run)
+            .collect())
+    }
+
+    /// Archived runs paired with their file paths, newest-first by `ended_at`
+    /// (falling back to `created_at`).
+    fn read_archive_entries(
+        &self,
+        automation_id: &str,
+    ) -> Result<Vec<(PathBuf, AutomationRunRecord)>> {
+        let dir = self.archive_dir_for(automation_id)?;
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let run = read_run_file(&path)?;
+            entries.push((path, run));
+        }
+        entries.sort_by_key(|(_, run)| std::cmp::Reverse(run.ended_at.unwrap_or(run.created_at)));
+        Ok(entries)
+    }
+
+    /// Drop archived terminal runs beyond the per-automation retention budget,
+    /// keeping the most recent [`ARCHIVE_RETAINED_TERMINAL_RUNS`].
+    fn enforce_archive_retention(&self, automation_id: &str) -> Result<()> {
+        let entries = self.read_archive_entries(automation_id)?;
+        for (path, _) in entries.into_iter().skip(ARCHIVE_RETAINED_TERMINAL_RUNS) {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete archived run {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn list_runs(
@@ -1725,8 +1971,9 @@ impl AutomationManager {
             }
             bind_run_dispatch(&mut run, &current, task_data_dir, true)?;
             self.save_run(&run)?;
-            // The durable claim is the point of no return. Pause/delete after
-            // this point affects future occurrences, not this admitted work.
+            // The durable claim is the point of no return. Pausing after
+            // this point affects future occurrences, not this admitted work
+            // (deleting an automation with an admitted run is refused).
             // No task can start before the binding above is durable.
             self.advance_automation_after_slot(
                 &mut current,
@@ -2043,6 +2290,20 @@ fn new_run_record(
     }
 }
 
+/// The posture an automation's `auto_approve` bit stands for, in the wire
+/// spelling a task request carries.
+///
+/// A scheduled run fires with no session to inherit from, so the only authority
+/// it has is its own record — and stating it explicitly keeps the scheduled
+/// task from re-deriving a posture out of a legacy bit on every later change to
+/// what that bit means.
+fn automation_posture(auto_approve: bool) -> String {
+    crate::runtime_policy::approval_wire(crate::core::authority::posture_from_auto_approve(
+        auto_approve,
+    ))
+    .to_string()
+}
+
 fn automation_task_request(automation: &AutomationRecord) -> NewTaskRequest {
     NewTaskRequest {
         prompt: automation.prompt.clone(),
@@ -2055,6 +2316,7 @@ fn automation_task_request(automation: &AutomationRecord) -> NewTaskRequest {
         allow_shell: Some(automation.task_allow_shell()),
         trust_mode: Some(automation.task_trust_mode()),
         auto_approve: Some(automation.task_auto_approve()),
+        permission_posture: Some(automation_posture(automation.task_auto_approve())),
         owner_session_id: None,
     }
 }
@@ -2157,12 +2419,22 @@ pub async fn run_now_shared(
     automation_id: &str,
     task_manager: &SharedTaskManager,
 ) -> Result<AutomationRunRecord> {
+    run_now_shared_if(automations, automation_id, None, task_manager).await
+}
+
+pub async fn run_now_shared_if(
+    automations: &SharedAutomationManager,
+    automation_id: &str,
+    expected_revision: Option<u64>,
+    task_manager: &SharedTaskManager,
+) -> Result<AutomationRunRecord> {
     automations.lock().await.bind_task_manager(task_manager)?;
     let task_manager = Arc::clone(task_manager);
     let task_data_dir = task_manager.data_dir();
-    run_now_with(
+    run_now_inner(
         automations,
         automation_id,
+        expected_revision,
         &task_data_dir,
         move |_, mut run| async move {
             enqueue_run_task(&mut run, &task_manager).await;
@@ -2172,10 +2444,25 @@ pub async fn run_now_shared(
     .await
 }
 
-/// Keep the process-wide dispatch claim over the await, never the manager mutex.
+#[cfg(test)]
 async fn run_now_with<F, Fut>(
     automations: &SharedAutomationManager,
     automation_id: &str,
+    task_data_dir: &Path,
+    enqueue: F,
+) -> Result<AutomationRunRecord>
+where
+    F: FnOnce(AutomationRecord, AutomationRunRecord) -> Fut,
+    Fut: Future<Output = AutomationRunRecord>,
+{
+    run_now_inner(automations, automation_id, None, task_data_dir, enqueue).await
+}
+
+/// Keep the process-wide dispatch claim over the await, never the manager mutex.
+async fn run_now_inner<F, Fut>(
+    automations: &SharedAutomationManager,
+    automation_id: &str,
+    expected_revision: Option<u64>,
     task_data_dir: &Path,
     enqueue: F,
 ) -> Result<AutomationRunRecord>
@@ -2191,6 +2478,7 @@ where
         let manager = automations.lock().await;
         manager.with_transaction(|| {
             let mut automation = manager.get_automation(automation_id)?;
+            check_expected_revision(&automation, expected_revision)?;
             manager.adopt_for_run(&mut automation)?;
             let now = Utc::now();
             let mut run = new_run_record(&automation.id, now, now);
@@ -2205,6 +2493,24 @@ where
         .await
         .finish_scheduled_run(&run, Utc::now())?;
     Ok(run)
+}
+
+/// Run a scheduler store operation on the blocking pool (#6149), holding the
+/// manager lock exactly as the inline call did: the whole-store scans (every
+/// automation or run record read and parsed) and the per-record claim,
+/// recovery, and receipt transactions, which wait on the cross-process
+/// `state.lock` and read/write JSON. Known limit: opening `dispatch.lock`
+/// (one small file open whose non-blocking guard must outlive the awaits)
+/// and the in-memory scope checks stay inline.
+async fn with_manager_blocking<T, F>(automations: &SharedAutomationManager, scan: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&AutomationManager) -> Result<T> + Send + 'static,
+{
+    let manager = Arc::clone(automations).lock_owned().await;
+    tokio::task::spawn_blocking(move || scan(&manager))
+        .await
+        .context("automation store scan task failed")?
 }
 
 async fn scheduler_tick_shared(
@@ -2240,7 +2546,8 @@ where
     };
     // Repair admitted work before collecting a new occurrence, including claims
     // whose definitions were edited/deleted or whose final enqueue save tore.
-    let pending = automations.lock().await.collect_pending_runs()?;
+    let pending =
+        with_manager_blocking(automations, AutomationManager::collect_pending_runs).await?;
     for run in pending.into_iter().filter(|run| {
         run.dispatch
             .as_ref()
@@ -2255,7 +2562,12 @@ where
         }
         // A single damaged admission is quarantined to its diagnostic; it must
         // not take down recovery of every pending run behind it.
-        if let Err(error) = automations.lock().await.recover_schedule_advance(&run) {
+        let recovered = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.recover_schedule_advance(&run)
+        })
+        .await;
+        if let Err(error) = recovered {
             tracing::warn!(
                 "automation schedule recovery failed for run {}: {error:#}",
                 run.id
@@ -2263,10 +2575,11 @@ where
             continue;
         }
         let run = enqueue(run).await;
-        if let Err(error) = automations
-            .lock()
-            .await
-            .finish_scheduled_run(&run, Utc::now())
+        if let Err(error) = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.finish_scheduled_run(&run, Utc::now())
+        })
+        .await
         {
             tracing::warn!(
                 "automation run {} receipt could not be persisted: {error:#}",
@@ -2275,7 +2588,8 @@ where
         }
     }
     let now = Utc::now();
-    let due = automations.lock().await.collect_due_runs(now)?;
+    let due =
+        with_manager_blocking(automations, move |manager| manager.collect_due_runs(now)).await?;
     for (observed, proposed) in due {
         if !automations
             .lock()
@@ -2284,29 +2598,35 @@ where
         {
             continue;
         }
-        let run =
-            match automations
-                .lock()
-                .await
-                .claim_scheduled_run(&observed, proposed, task_data_dir)
-            {
-                Ok(run) => run,
-                Err(error) => {
-                    // One automation's claim failure (for example a corrupt
-                    // receipt in its own dedup history) quarantines that
-                    // automation, not the tick: later due work still dispatches.
-                    tracing::warn!(
-                        "automation {} occurrence claim failed: {error:#}",
-                        observed.id
-                    );
-                    continue;
-                }
-            };
+        let claimed = with_manager_blocking(automations, {
+            let observed = observed.clone();
+            let task_data_dir = task_data_dir.to_path_buf();
+            move |manager| manager.claim_scheduled_run(&observed, proposed, &task_data_dir)
+        })
+        .await;
+        let run = match claimed {
+            Ok(run) => run,
+            Err(error) => {
+                // One automation's claim failure (for example a corrupt
+                // receipt in its own dedup history) quarantines that
+                // automation, not the tick: later due work still dispatches.
+                tracing::warn!(
+                    "automation {} occurrence claim failed: {error:#}",
+                    observed.id
+                );
+                continue;
+            }
+        };
         let Some(run) = run else {
             continue;
         };
         let run = enqueue(run).await;
-        if let Err(error) = automations.lock().await.finish_scheduled_run(&run, now) {
+        if let Err(error) = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.finish_scheduled_run(&run, now)
+        })
+        .await
+        {
             tracing::warn!(
                 "automation run {} receipt could not be persisted: {error:#}",
                 run.id
@@ -2371,7 +2691,10 @@ where
         Err(error) => return Err(error).context("claim delayed-trigger dispatch"),
     };
     let now = Utc::now();
-    let candidates = automations.lock().await.collect_due_triggers(now)?;
+    let candidates = with_manager_blocking(automations, move |manager| {
+        manager.collect_due_triggers(now)
+    })
+    .await?;
     for candidate in candidates {
         let scope = if candidate.status == DelayedTriggerStatus::Dispatching {
             candidate
@@ -2389,68 +2712,74 @@ where
         {
             continue;
         }
-        let claimed = {
-            let manager = automations.lock().await;
-            match manager.with_transaction(|| {
-                let mut current = manager.get_trigger(&candidate.trigger_id)?;
-                if current.status == DelayedTriggerStatus::Dispatching {
-                    if !manager.eligible_scope(
-                        current
-                            .dispatch
-                            .as_ref()
-                            .and_then(|d| d.execution_scope.as_deref()),
-                    ) {
+        let claim = with_manager_blocking(automations, {
+            let trigger_id = candidate.trigger_id.clone();
+            let task_data_dir = task_data_dir.to_path_buf();
+            move |manager| {
+                manager.with_transaction(|| {
+                    let mut current = manager.get_trigger(&trigger_id)?;
+                    if current.status == DelayedTriggerStatus::Dispatching {
+                        if !manager.eligible_scope(
+                            current
+                                .dispatch
+                                .as_ref()
+                                .and_then(|d| d.execution_scope.as_deref()),
+                        ) {
+                            return Ok(None);
+                        }
+                        if current.dispatch.is_none() || current.task_id.is_none() {
+                            bail!("Claimed delayed trigger has no durable task binding");
+                        }
+                        return Ok(Some(current));
+                    }
+                    if !manager.eligible_scope(current.execution_scope.as_deref())
+                        || current.status != DelayedTriggerStatus::Pending
+                        || current.fire_at > now
+                        || current.owner_session_id.is_none()
+                    {
                         return Ok(None);
                     }
-                    if current.dispatch.is_none() || current.task_id.is_none() {
-                        bail!("Claimed delayed trigger has no durable task binding");
-                    }
-                    return Ok(Some(current));
-                }
-                if !manager.eligible_scope(current.execution_scope.as_deref())
-                    || current.status != DelayedTriggerStatus::Pending
-                    || current.fire_at > now
-                    || current.owner_session_id.is_none()
-                {
-                    return Ok(None);
-                }
-                current.schema_version = CURRENT_TRIGGER_SCHEMA_VERSION;
-                current.status = DelayedTriggerStatus::Dispatching;
-                current.task_id = Some(crate::task_manager::TaskManager::new_task_id());
-                current.dispatch = Some(AutomationDispatch {
-                    execution_scope: current.execution_scope.clone(),
-                    request: NewTaskRequest {
-                        prompt: current.message.clone(),
-                        name: None,
-                        model: None,
-                        model_provider: None,
-                        model_provider_id: None,
-                        workspace: current.workspace.clone(),
-                        mode: Some("agent".into()),
-                        allow_shell: Some(false),
-                        trust_mode: Some(false),
-                        auto_approve: Some(false),
-                        owner_session_id: current.owner_session_id.clone(),
-                    },
-                    task_data_dir: task_data_dir.canonicalize()?,
-                    accepted: false,
-                    delivery_mode: AutomationDeliveryMode::Task,
-                    suppress_report: false,
-                    schedule: None,
-                });
-                manager.save_trigger_unlocked(&current)?;
-                Ok(Some(current))
-            }) {
-                Ok(claimed) => claimed,
-                Err(error) => {
-                    // One damaged trigger record quarantines to a diagnostic;
-                    // the remaining due triggers still fire this pass.
-                    tracing::warn!(
-                        "delayed trigger {} claim failed: {error:#}",
-                        candidate.trigger_id
-                    );
-                    continue;
-                }
+                    current.schema_version = CURRENT_TRIGGER_SCHEMA_VERSION;
+                    current.status = DelayedTriggerStatus::Dispatching;
+                    current.task_id = Some(crate::task_manager::TaskManager::new_task_id());
+                    current.dispatch = Some(AutomationDispatch {
+                        execution_scope: current.execution_scope.clone(),
+                        request: NewTaskRequest {
+                            prompt: current.message.clone(),
+                            name: None,
+                            model: None,
+                            model_provider: None,
+                            model_provider_id: None,
+                            workspace: current.workspace.clone(),
+                            mode: Some("agent".into()),
+                            allow_shell: Some(false),
+                            trust_mode: Some(false),
+                            auto_approve: Some(false),
+                            permission_posture: Some(automation_posture(false)),
+                            owner_session_id: current.owner_session_id.clone(),
+                        },
+                        task_data_dir: task_data_dir.canonicalize()?,
+                        accepted: false,
+                        delivery_mode: AutomationDeliveryMode::Task,
+                        suppress_report: false,
+                        schedule: None,
+                    });
+                    manager.save_trigger_unlocked(&current)?;
+                    Ok(Some(current))
+                })
+            }
+        })
+        .await;
+        let claimed = match claim {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                // One damaged trigger record quarantines to a diagnostic;
+                // the remaining due triggers still fire this pass.
+                tracing::warn!(
+                    "delayed trigger {} claim failed: {error:#}",
+                    candidate.trigger_id
+                );
+                continue;
             }
         };
         let Some(trigger) = claimed else {
@@ -2466,7 +2795,12 @@ where
                 continue;
             }
         };
-        if let Err(error) = automations.lock().await.save_trigger(&trigger) {
+        if let Err(error) = with_manager_blocking(automations, {
+            let trigger = trigger.clone();
+            move |manager| manager.save_trigger(&trigger)
+        })
+        .await
+        {
             tracing::warn!(
                 "delayed trigger {} receipt could not be persisted: {error:#}",
                 trigger.trigger_id
@@ -2560,7 +2894,8 @@ async fn reconcile_run_statuses_shared(
         Err(error) if dispatch_lock_busy(&error) => return Ok(()),
         Err(error) => return Err(error).context("claim automation reconciliation"),
     };
-    let pending = automations.lock().await.collect_pending_runs()?;
+    let pending =
+        with_manager_blocking(automations, AutomationManager::collect_pending_runs).await?;
     for mut run in pending {
         // Shared storage is not shared ownership. A receipt admitted under
         // another execution scope is reconciled by that scope's owner; this
@@ -2577,18 +2912,28 @@ async fn reconcile_run_statuses_shared(
         let Some(task_id) = run.task_id.clone() else {
             continue;
         };
-        let lookup = (|| {
-            if let Some(dispatch) = &run.dispatch {
-                check_dispatch_store(dispatch, task_manager)?;
+        // The bound task record is a JSON read under the task store: keep it
+        // off the Tokio worker like the scans above (#6149).
+        let lookup = tokio::task::spawn_blocking({
+            let dispatch = run.dispatch.clone();
+            let task_id = task_id.clone();
+            let task_manager = Arc::clone(task_manager);
+            move || {
+                if let Some(dispatch) = &dispatch {
+                    check_dispatch_store(dispatch, &task_manager)?;
+                }
+                let task = task_manager.read_bound_task(&task_id)?;
+                if let Some(task) = &task
+                    && let Some(dispatch) = &dispatch
+                {
+                    crate::task_manager::validate_bound_task_request(task, &dispatch.request)?;
+                }
+                Ok::<_, anyhow::Error>(task)
             }
-            let task = task_manager.read_bound_task(&task_id)?;
-            if let Some(task) = &task
-                && let Some(dispatch) = &run.dispatch
-            {
-                crate::task_manager::validate_bound_task_request(task, &dispatch.request)?;
-            }
-            Ok::<_, anyhow::Error>(task)
-        })();
+        })
+        .await
+        .context("automation task lookup failed")
+        .and_then(|lookup| lookup);
         let task = match lookup {
             Ok(Some(task)) => task,
             Ok(None) => {
@@ -2615,10 +2960,11 @@ async fn reconcile_run_statuses_shared(
                         "Automation reconciliation unavailable: bound task {task_id} is missing"
                     ));
                 }
-                if let Err(error) = automations
-                    .lock()
-                    .await
-                    .finish_scheduled_run(&run, Utc::now())
+                if let Err(error) = with_manager_blocking(automations, {
+                    let run = run.clone();
+                    move |manager| manager.finish_scheduled_run(&run, Utc::now())
+                })
+                .await
                 {
                     tracing::warn!(
                         "automation run {} receipt could not be persisted: {error:#}",
@@ -2629,10 +2975,11 @@ async fn reconcile_run_statuses_shared(
             }
             Err(error) => {
                 run.error = Some(format!("Automation reconciliation unavailable: {error:#}"));
-                if let Err(error) = automations
-                    .lock()
-                    .await
-                    .finish_scheduled_run(&run, Utc::now())
+                if let Err(error) = with_manager_blocking(automations, {
+                    let run = run.clone();
+                    move |manager| manager.finish_scheduled_run(&run, Utc::now())
+                })
+                .await
                 {
                     tracing::warn!(
                         "automation run {} receipt could not be persisted: {error:#}",
@@ -2684,10 +3031,11 @@ async fn reconcile_run_statuses_shared(
         run.schema_version = CURRENT_RUN_SCHEMA_VERSION;
         dispatch.accepted = true;
         dispatch.suppress_report = watcher_noop;
-        if let Err(error) = automations
-            .lock()
-            .await
-            .finish_scheduled_run(&run, Utc::now())
+        if let Err(error) = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.finish_scheduled_run(&run, Utc::now())
+        })
+        .await
         {
             tracing::warn!(
                 "automation run {} receipt could not be persisted: {error:#}",
@@ -3148,7 +3496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_reaches_old_runs_and_runs_of_deleted_definitions() -> Result<()> {
+    async fn reconciliation_reaches_old_runs_and_delete_waits_for_settled_receipts() -> Result<()> {
         for delete_definition in [false, true] {
             let root = tempfile::tempdir()?;
             let receipts = root.path().join("executions");
@@ -3184,19 +3532,37 @@ mod tests {
                         .all(|candidate| candidate.id != run.id)
                 );
                 if delete_definition {
-                    manager.delete_automation(&automation.id)?;
+                    // The receipt is still queued on disk even though its task
+                    // already settled, so deletion is refused: an in-flight
+                    // occurrence must not be stranded by a deleted definition.
+                    let refused = manager.delete_automation(&automation.id);
+                    assert!(refused.is_err(), "unsettled receipts must block deletion");
                 }
             }
             reconcile_run_statuses_shared(&shared, &tasks).await?;
             let manager = shared.lock().await;
             let found =
                 manager.get_runs_by_ids(&automation.id, &[run.id.clone()].into_iter().collect())?;
-            assert_eq!(found.len(), 1, "unfinished receipt survives deletion");
+            assert_eq!(
+                found.len(),
+                1,
+                "run binding survives until its receipt settles"
+            );
             assert_eq!(found[0].status, AutomationRunStatus::Completed);
             assert_eq!(found[0].task_id.as_deref(), Some(id.as_str()));
             assert_eq!(fixture_executions(&receipts), vec![id]);
             if delete_definition {
+                // The earlier delete was refused, so the definition survived
+                // and reconciliation settled its receipt in place. Deleting
+                // now archives the settled history and removes the live tree.
+                assert!(manager.get_automation(&automation.id).is_ok());
+                manager.delete_automation(&automation.id)?;
                 assert!(manager.get_automation(&automation.id).is_err());
+                let ids = std::collections::BTreeSet::from([run.id.clone()]);
+                assert!(manager.get_runs_by_ids(&automation.id, &ids)?.is_empty());
+                let archived = manager.list_archived_runs(&automation.id)?;
+                assert_eq!(archived.len(), ARCHIVE_RETAINED_TERMINAL_RUNS);
+                assert!(archived.iter().all(|candidate| candidate.id != run.id));
             } else {
                 assert!(
                     manager
@@ -3695,6 +4061,7 @@ mod tests {
             updated_at: now,
             next_run_at: None,
             last_run_at: None,
+            revision: 0,
         }
     }
 
@@ -4121,7 +4488,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_definition_and_settled_runs_but_retains_unfinished_receipts() {
+    fn delete_refuses_active_receipts_then_archives_settled_runs() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let manager =
             AutomationManager::open_for_test(tempdir.path().to_path_buf()).expect("manager");
@@ -4163,7 +4530,8 @@ mod tests {
         let settled = AutomationRunRecord {
             id: Uuid::new_v4().to_string(),
             status: AutomationRunStatus::Completed,
-            ended_at: Some(Utc::now()),
+            created_at: run.created_at - Duration::minutes(1),
+            ended_at: Some(Utc::now() - Duration::minutes(1)),
             ..run.clone()
         };
         manager.save_run(&settled).expect("save settled run");
@@ -4174,16 +4542,224 @@ mod tests {
                 .exists()
         );
 
+        // An unsettled receipt blocks deletion: the definition and both runs
+        // survive untouched, and nothing is archived yet.
+        let refused = manager
+            .delete_automation(&created.id)
+            .expect_err("active run must block deletion");
+        assert!(refused.to_string().contains("Refusing to delete"));
+        assert!(manager.get_automation(&created.id).is_ok());
+        assert_eq!(
+            manager
+                .list_runs(&created.id, None)
+                .expect("retained receipts")
+                .len(),
+            2
+        );
+        assert!(
+            manager
+                .list_archived_runs(&created.id)
+                .expect("archive")
+                .is_empty()
+        );
+
+        // Once the receipt settles, deletion archives the terminal history
+        // and removes the live paths.
+        let mut settled_run = run.clone();
+        settled_run.status = AutomationRunStatus::Completed;
+        settled_run.started_at = Some(Utc::now());
+        settled_run.ended_at = Some(Utc::now());
+        manager.save_run(&settled_run).expect("settle run");
+
+        // A sortable record shadows its legacy path while listing. Make the
+        // older receipt's legacy path a directory so live cleanup fails only
+        // after both records are archived and the newer receipt is removed.
+        let blocked_legacy = manager
+            .legacy_run_path(&created.id, &settled.id)
+            .expect("legacy path");
+        fs::create_dir(&blocked_legacy).expect("block legacy cleanup");
+        let failed = manager
+            .delete_automation(&created.id)
+            .expect_err("live cleanup must fail");
+        assert!(failed.to_string().contains("Failed to delete run"));
+        assert!(
+            manager.get_automation(&created.id).is_ok(),
+            "the definition must survive partial cleanup so deletion can retry"
+        );
+        assert!(
+            !manager
+                .run_path(&settled_run)
+                .expect("newer run path")
+                .exists(),
+            "a newer receipt was already removed before the failure"
+        );
+        assert_eq!(
+            manager
+                .list_archived_runs(&created.id)
+                .expect("partial archive")
+                .len(),
+            2,
+            "both terminal records reached the archive before any live removal"
+        );
+        fs::remove_dir(&blocked_legacy).expect("unblock cleanup");
         manager
             .delete_automation(&created.id)
-            .expect("delete automation");
+            .expect("retry deletion after partial cleanup");
 
         assert!(manager.get_automation(&created.id).is_err());
-        let remaining = manager
-            .list_runs(&created.id, None)
-            .expect("retained receipts");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, run.id);
+        assert!(
+            manager
+                .list_runs(&created.id, None)
+                .expect("live runs")
+                .is_empty()
+        );
+        assert!(
+            !manager
+                .runs_dir_for(&created.id)
+                .expect("runs dir")
+                .exists()
+        );
+        let archived = manager
+            .list_archived_runs(&created.id)
+            .expect("archived runs");
+        assert_eq!(
+            archived.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![settled_run.id.as_str(), settled.id.as_str()],
+            "archive keeps both terminal runs, newest-ended first"
+        );
+        assert_eq!(archived[0].status, AutomationRunStatus::Completed);
+        assert_eq!(archived[1].status, AutomationRunStatus::Completed);
+        let archive_dir = tempdir.path().join("archive").join(&created.id);
+        assert_eq!(
+            fs::read_dir(&archive_dir)
+                .expect("archive dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count(),
+            2,
+            "one archived file per terminal run"
+        );
+    }
+
+    #[test]
+    fn delete_refuses_automation_with_active_run() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            AutomationManager::open_for_test(tempdir.path().to_path_buf()).expect("manager");
+        let automation = automation_record_with_settings(None, None, None, None);
+        manager.save_automation(&automation).expect("save");
+        manager
+            .save_run(&queued_run_for(&automation))
+            .expect("save queued run");
+
+        let err = manager
+            .delete_automation(&automation.id)
+            .expect_err("delete must refuse while a run is active");
+        assert!(err.to_string().contains("Refusing to delete"));
+
+        assert!(manager.get_automation(&automation.id).is_ok());
+        assert!(
+            manager
+                .runs_dir_for(&automation.id)
+                .expect("runs dir")
+                .exists()
+        );
+        assert!(
+            manager
+                .list_archived_runs(&automation.id)
+                .expect("archive")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_caps_archived_terminal_runs_at_retention_limit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            AutomationManager::open_for_test(tempdir.path().to_path_buf()).expect("manager");
+        let automation = automation_record_with_settings(None, None, None, None);
+        manager.save_automation(&automation).expect("save");
+
+        let base = Utc::now();
+        let total = ARCHIVE_RETAINED_TERMINAL_RUNS + 5;
+        let mut saved_ids = Vec::new();
+        for i in 0..total {
+            let mut run = run_created_at(&automation, base - Duration::minutes(i as i64));
+            run.status = AutomationRunStatus::Completed;
+            run.ended_at = Some(base - Duration::minutes(i as i64));
+            manager.save_run(&run).expect("save run");
+            saved_ids.push(run.id);
+        }
+
+        manager.delete_automation(&automation.id).expect("delete");
+
+        let archived = manager
+            .list_archived_runs(&automation.id)
+            .expect("archived runs");
+        assert_eq!(
+            archived.len(),
+            ARCHIVE_RETAINED_TERMINAL_RUNS,
+            "archive keeps only the retention budget"
+        );
+        let retained: std::collections::BTreeSet<&str> =
+            archived.iter().map(|r| r.id.as_str()).collect();
+        // `saved_ids` is newest-first (i counts minutes into the past); the
+        // `total - budget` oldest, at the tail, were dropped.
+        for dropped in &saved_ids[ARCHIVE_RETAINED_TERMINAL_RUNS..] {
+            assert!(!retained.contains(dropped.as_str()), "oldest run survived");
+        }
+        for kept in &saved_ids[..ARCHIVE_RETAINED_TERMINAL_RUNS] {
+            assert!(retained.contains(kept.as_str()), "newer run was dropped");
+        }
+    }
+
+    #[test]
+    fn scheduler_scan_ignores_archived_runs_after_delete() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            AutomationManager::open_for_test(tempdir.path().to_path_buf()).expect("manager");
+        let automation = fixture_due_automation(&manager, "archived", 1);
+        let mut run = run_created_at(&automation, Utc::now());
+        run.status = AutomationRunStatus::Completed;
+        run.ended_at = Some(Utc::now());
+        manager.save_run(&run).expect("save run");
+
+        // The due definition is collected before deletion and must not come
+        // back from the archive afterwards.
+        let due_before = manager
+            .collect_due_runs(Utc::now())
+            .expect("scheduler scan");
+        assert!(
+            due_before
+                .iter()
+                .any(|(record, _)| record.id == automation.id),
+            "the fixture automation is due before deletion"
+        );
+
+        manager.delete_automation(&automation.id).expect("delete");
+        assert!(tempdir.path().join("archive").join(&automation.id).exists());
+
+        let due = manager
+            .collect_due_runs(Utc::now())
+            .expect("scheduler scan");
+        assert!(
+            due.iter().all(|(record, _)| record.id != automation.id),
+            "the deleted automation must not come back due"
+        );
+        assert!(
+            manager
+                .list_runs(&automation.id, None)
+                .expect("live runs")
+                .is_empty(),
+            "archived runs must not re-enter the live runs tree"
+        );
+        assert_eq!(
+            manager
+                .list_archived_runs(&automation.id)
+                .expect("archived runs")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -4250,6 +4826,54 @@ mod tests {
         assert!(!record.task_trust_mode());
         assert!(!record.task_auto_approve());
         assert_eq!(record.delivery_mode(), AutomationDeliveryMode::Task);
+    }
+
+    #[test]
+    fn automation_requests_pin_the_posture_its_bit_stands_for() {
+        let now = Utc::now().to_rfc3339();
+        let legacy: AutomationRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": CURRENT_AUTOMATION_SCHEMA_VERSION,
+            "id": Uuid::new_v4().to_string(),
+            "name": "Nightly",
+            "prompt": "Run the nightly sweep",
+            "rrule": "FREQ=DAILY",
+            "cwds": [],
+            "status": "active",
+            "created_at": now,
+            "updated_at": now
+        }))
+        .expect("legacy automation record");
+
+        // No session exists when a scheduler fires, so the request states the
+        // posture the record's own authority means instead of leaving the
+        // runtime to re-derive it from the bit.
+        assert!(legacy.auto_approve.is_none());
+        assert_eq!(
+            automation_task_request(&legacy)
+                .permission_posture
+                .as_deref(),
+            Some("ask")
+        );
+
+        let elevated: AutomationRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": CURRENT_AUTOMATION_SCHEMA_VERSION,
+            "id": Uuid::new_v4().to_string(),
+            "name": "Nightly, unattended",
+            "prompt": "Run the nightly sweep",
+            "rrule": "FREQ=DAILY",
+            "cwds": [],
+            "auto_approve": true,
+            "status": "active",
+            "created_at": now,
+            "updated_at": now
+        }))
+        .expect("elevated automation record");
+        assert_eq!(
+            automation_task_request(&elevated)
+                .permission_posture
+                .as_deref(),
+            Some("full_access")
+        );
     }
 
     #[tokio::test]

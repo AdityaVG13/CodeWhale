@@ -743,7 +743,7 @@ impl LspManager {
             };
             let relative = match target.strip_prefix(&self.workspace).or_else(|_| target.strip_prefix(&root)) {
                 Ok(relative) if !relative.as_os_str().is_empty()
-                    && relative.components().all(|component| matches!(component, std::path::Component::Normal(part) if part != ".git")) => relative,
+                    && relative.components().all(|component| matches!(component, std::path::Component::Normal(part) if !crate::snapshot::is_git_metadata_name(part))) => relative,
                 _ => { omitted += 1; continue; }
             };
             let Some(path) = semantic_relative_path(relative) else {
@@ -869,7 +869,6 @@ impl LspManager {
 
     /// Best-effort shutdown of every spawned transport. Called when the
     /// session ends.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub async fn shutdown_all(&self) {
         let transports: Vec<TransportSlot> =
             self.transports.lock().await.values().cloned().collect();
@@ -902,7 +901,7 @@ fn semantic_relative_path(path: &Path) -> Option<String> {
     let parts = path
         .components()
         .map(|component| match component {
-            std::path::Component::Normal(part) if part != ".git" => {
+            std::path::Component::Normal(part) if !crate::snapshot::is_git_metadata_name(part) => {
                 part.to_str().filter(|part| !part.contains('\\'))
             }
             _ => None,
@@ -1295,15 +1294,17 @@ pub(crate) mod tests {
         outside["uri"] = serde_json::json!("file:///etc/passwd");
         let mut reverse = good.clone();
         reverse["selectionRange"]["end"]["character"] = serde_json::json!(0);
-        let mut cases = vec![good.clone(), split, huge, unsafe_uri, outside, reverse];
+        let cases = vec![good.clone(), split, huge, unsafe_uri, outside, reverse];
         #[cfg(unix)]
-        {
+        let cases = {
+            let mut cases = cases;
             let link = root.path().join("link.rs");
             std::os::unix::fs::symlink(&file, &link).unwrap();
             let mut linked = good.clone();
             linked["uri"] = serde_json::json!(client::uri_from_path(&link));
             cases.push(linked);
-        }
+            cases
+        };
         let expected_omitted = cases.len() - 1;
         let (locations, truncated, omitted) = manager
             .semantic_locations(&serde_json::json!(cases), &file, "🐋foo\n")

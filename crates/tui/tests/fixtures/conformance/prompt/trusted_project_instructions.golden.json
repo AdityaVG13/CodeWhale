@@ -1,0 +1,36 @@
+{
+  "system_sha256": "cd367daa552060c0b30a60263a509fdd25a0d92c89f24aa9f69c174d52076f3d",
+  "system_bytes": 8757,
+  "system_blocks": 5,
+  "tools_sha256": "1f04ae4b1d2991066f3874f9b892f1b6a3e5317b9f6ab842d97a421cba13224f",
+  "tools_bytes": 15009,
+  "tool_count": 12,
+  "tool_names": [
+    "bash",
+    "create_goal",
+    "edit",
+    "file_search",
+    "get_goal",
+    "load_skill",
+    "read",
+    "todo_write",
+    "update_goal",
+    "write",
+    "execute_tools",
+    "tool_search"
+  ],
+  "prefix_sha256": "eeaf75937da07ebbad4af5d29d326ade43df5c52b770fc64ae8dd8453c4b0c52",
+  "masks": [
+    "<WORKSPACE>",
+    "<HOME>",
+    "<TMP>",
+    "- platform: <PLATFORM>",
+    "- shell: <SHELL>"
+  ],
+  "host_probed_tools_excluded": [
+    "code_execution",
+    "image_ocr",
+    "js_execution",
+    "pandoc_convert"
+  ]
+}

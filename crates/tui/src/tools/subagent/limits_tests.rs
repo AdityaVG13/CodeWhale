@@ -84,26 +84,115 @@ fn child_runtime_budget_context_reports_every_resolved_limit() {
     let mut runtime = stub_runtime();
     runtime.worker_profile.wall_time_secs = Some(1_800);
     runtime.worker_profile.wall_deadline_ms = Some(epoch_millis_now() + 1_700_000);
-    let context = child_runtime_budget_context(&runtime, 50, 49, 100_000);
+    let context = child_runtime_budget_context(&runtime, 50, 49);
     assert!(context.contains("Runtime budget (host-enforced"));
     assert!(context.contains("wall clock: task work stops about"));
     assert!(context.contains("total run budget 30m 00s"));
     assert!(context.contains("49 model turns of task work (limit 50"));
     assert!(context.contains("reserved hand-back turn"));
     assert!(context.contains("Commit or checkpoint work-in-progress early"));
-    assert!(context.contains("single step billing over 100000 input tokens"));
-    assert!(context.contains("There is no cumulative token cap"));
+    assert!(context.contains("There is no token budget and no per-step context cap"));
 }
 
 #[test]
 fn child_runtime_budget_context_names_unbounded_limits_honestly() {
     let runtime = stub_runtime();
-    let context = child_runtime_budget_context(&runtime, 0, 0, 32_000);
+    let context = child_runtime_budget_context(&runtime, 0, 0);
     assert!(context.contains("wall clock: no wall-clock limit."));
     assert!(context.contains("model steps: no per-run step cap."));
-    assert!(context.contains("There is no cumulative token cap"));
-    assert!(context.contains("single step billing over 32000 input tokens"));
+    assert!(context.contains("There is no token budget"));
     assert!(context.contains("reserved hand-back turn"));
+}
+
+#[test]
+fn child_runtime_budget_context_tells_the_child_it_compacts_like_the_parent() {
+    let mut runtime = stub_runtime();
+    let context = child_runtime_budget_context(&runtime, 0, 0);
+    assert!(
+        !context.contains("no automatic compaction"),
+        "children compact like the parent: {context}"
+    );
+    assert!(
+        context.contains("compacts it automatically") && context.contains("the run continues"),
+        "{context}"
+    );
+    assert!(
+        !context.contains("input tokens"),
+        "no per-step input cap: {context}"
+    );
+
+    // The parent's opt-out is the child's opt-out, and the prompt says so.
+    runtime.compaction.enabled = false;
+    let context = child_runtime_budget_context(&runtime, 0, 0);
+    assert!(
+        context.contains("Automatic context compaction is disabled for this session"),
+        "{context}"
+    );
+    assert!(!context.contains("compacts it automatically"), "{context}");
+}
+
+#[test]
+fn child_compaction_config_inherits_the_parent_policy_for_the_child_route() {
+    let mut runtime = stub_runtime();
+    let route = runtime
+        .client
+        .effective_route_envelope(&runtime.model, chrono::Utc::now());
+    let window = crate::route_budget::route_context_window_tokens(
+        route.provider,
+        &route.model,
+        runtime.client.route_limits(),
+    );
+    runtime.compaction = crate::compaction::CompactionConfig {
+        enabled: false,
+        token_threshold: 12_345,
+        effective_context_window: Some(window),
+        summary_instructions: Some("keep file paths".to_string()),
+        retained_user_message_tokens: 777,
+        focus: Some("manual focus never leaks into auto passes".to_string()),
+        ..crate::compaction::CompactionConfig::default()
+    };
+
+    let config = child_compaction_config(
+        &runtime,
+        &route,
+        crate::model_profile::SupportState::Supported,
+    );
+    assert!(!config.enabled, "the parent's opt-out holds for children");
+    assert_eq!(config.token_threshold, 12_345, "same window, same trigger");
+    assert_eq!(config.effective_context_window, Some(window));
+    assert_eq!(config.model, runtime.model);
+    assert_eq!(
+        config.image_input,
+        crate::model_profile::SupportState::Supported
+    );
+    assert_eq!(
+        config.summary_instructions.as_deref(),
+        Some("keep file paths")
+    );
+    assert_eq!(config.retained_user_message_tokens, 777);
+    assert_eq!(config.focus, None);
+    assert_eq!(config.workspace, Some(runtime.context.workspace.clone()));
+
+    // A parent on a different window carries its trigger as the same
+    // fraction of the child's window, through the shared route helper.
+    runtime.compaction.enabled = true;
+    runtime.compaction.effective_context_window = Some(window.saturating_mul(2));
+    runtime.compaction.token_threshold = usize::try_from(window).unwrap();
+    let config = child_compaction_config(
+        &runtime,
+        &route,
+        crate::model_profile::SupportState::Unknown,
+    );
+    assert!(config.enabled);
+    assert_eq!(
+        config.token_threshold,
+        crate::route_budget::compaction_threshold_for_route_at_percent(
+            route.provider,
+            &route.model,
+            runtime.client.route_limits(),
+            50.0,
+        )
+    );
 }
 
 #[test]
@@ -124,43 +213,6 @@ fn child_budget_pacing_notice_stays_silent_with_headroom() {
     assert!(child_budget_pacing_notice(started_at, Some(deadline), 10, 50).is_none());
     // No bound at all means there is nothing to pace against.
     assert!(child_budget_pacing_notice(started_at, None, 9_999, 0).is_none());
-}
-
-#[test]
-fn child_step_input_bound_prefers_half_window_capped_at_the_guardrail() {
-    assert_eq!(child_step_input_bound(None), 100_000);
-    assert_eq!(child_step_input_bound(Some(64_000)), 32_000);
-    assert_eq!(child_step_input_bound(Some(1_000_000)), 100_000);
-    // Degenerate windows fall back to the flat guardrail, never to zero.
-    assert_eq!(child_step_input_bound(Some(0)), 100_000);
-    assert_eq!(child_step_input_bound(Some(1)), 100_000);
-}
-
-#[test]
-fn child_context_trip_fires_only_past_the_bound() {
-    let reason = child_context_trip(100_001, 100_000).expect("over bound trips");
-    assert!(reason.contains("context budget exhausted"), "{reason}");
-    assert!(reason.contains("100001"), "{reason}");
-    assert!(child_context_trip(100_000, 100_000).is_none());
-    assert!(child_context_trip(71_000, 100_000).is_none());
-    assert!(child_context_trip(0, 100_000).is_none());
-}
-
-#[test]
-fn context_budget_death_classifies_distinctly_from_other_budgets() {
-    assert_eq!(
-        subagent_failure_class(
-            &SubAgentStatus::BudgetExhausted,
-            "child context budget exhausted: step billed 150000 input tokens"
-        ),
-        "context_budget"
-    );
-    // The generic budget-exhausted status still classifies when the cause is
-    // something else entirely.
-    assert_eq!(
-        subagent_failure_class(&SubAgentStatus::BudgetExhausted, "some other reason"),
-        "budget_exhausted"
-    );
 }
 
 #[test]
@@ -241,6 +293,12 @@ async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
     let profile = &guard.worker_records[&child.agent_id].spec.runtime_profile;
     assert_eq!(profile.max_steps, 4);
     assert!(profile.wall_time_secs.unwrap() <= 10);
+    // Continuation admission requires the same actor to settle before its saved deadline is checked.
+    let requested = guard.cancel_agent(&child.agent_id).unwrap();
+    drop(guard);
+    let settled = settle_requested_child(&manager, requested).await;
+    assert_eq!(settled.status, SubAgentStatus::Cancelled);
+    let mut guard = manager.write().await;
     guard
         .worker_records
         .get_mut(&child.agent_id)
@@ -266,6 +324,51 @@ async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
             .unwrap_err()
             .to_string()
             .contains("cannot reset its deadline")
+    );
+}
+
+#[tokio::test]
+async fn explicit_wall_time_may_exceed_the_built_in_default() {
+    let tmp = tempdir().unwrap();
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        4,
+    )));
+    let mut runtime = stub_runtime().child_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.manager = Arc::clone(&manager);
+    runtime.worker_profile.wall_time_secs = None;
+    runtime.cancel_token.cancel(); // inspect admission; no provider request may run
+    let spawn = |guard: &mut SubAgentManager, wall_time: Option<Duration>| {
+        let child = guard
+            .spawn_background_with_assignment_options(
+                Arc::clone(&manager),
+                runtime.clone(),
+                FleetRole::Scout,
+                "inspect".to_string(),
+                SubAgentAssignment::new("inspect".to_string(), None),
+                Some(vec![]),
+                SubAgentSpawnOptions {
+                    wall_time,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        guard.worker_records[&child.agent_id]
+            .spec
+            .runtime_profile
+            .wall_time_secs
+    };
+    let mut guard = manager.write().await;
+    assert_eq!(
+        spawn(&mut guard, None),
+        Some(DEFAULT_CHILD_WALL_TIME.as_secs())
+    );
+    assert_eq!(
+        spawn(&mut guard, Some(Duration::from_secs(4 * 60 * 60))),
+        Some(4 * 60 * 60),
+        "an explicit request may raise the built-in 30-minute default"
     );
 }
 
@@ -325,12 +428,19 @@ async fn root_fork_of_depth_two_leaf_cannot_regain_a_generation() {
     runtime.manager = Arc::clone(&manager);
     runtime.cancel_token.cancel();
     let mut guard = manager.write().await;
-    let mut source = make_worker_spec("leaf", tmp.path().to_path_buf());
+    let (canonical, directory) = crate::runtime_api::open_workspace_directory(tmp.path()).unwrap();
+    guard
+        .admit_coordination_workspace(tmp.path().to_path_buf(), canonical, Arc::new(directory))
+        .unwrap();
+    let source_id = guard.insert_test_running_direct_child("leaf", tmp.path());
+    guard.cancel_agent(&source_id).unwrap();
+    let mut source = make_worker_spec(&source_id, tmp.path().to_path_buf());
     source.spawn_depth = 2;
     source.max_spawn_depth = 2;
     source.runtime_profile.spawn_depth = 2;
     source.runtime_profile.max_spawn_depth = 2;
-    guard.register_worker(source);
+    // Preserve the existing actor/origin/session receipt while installing the depth-2 profile.
+    guard.worker_records.get_mut(&source_id).unwrap().spec = source;
     let child = guard
         .spawn_background_with_assignment_options(
             Arc::clone(&manager),
@@ -340,7 +450,7 @@ async fn root_fork_of_depth_two_leaf_cannot_regain_a_generation() {
             SubAgentAssignment::new("fork leaf".to_string(), None),
             Some(vec![]),
             SubAgentSpawnOptions {
-                resume_from_agent_id: Some("leaf".to_string()),
+                resume_from_agent_id: Some(source_id),
                 ..Default::default()
             },
             None,

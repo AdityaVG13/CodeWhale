@@ -2,6 +2,10 @@
 
 > 阅读简体中文版：[zh_hans/PROVIDERS.md](zh_hans/PROVIDERS.md)
 
+Speech recognition, synthesis, translation and video have separate execution
+paths. See [media models](MEDIA_MODELS.md) for current support and reviewed
+upstream candidates; a chat catalogue row alone does not add a media backend.
+
 This registry describes provider behavior that is wired into the current
 Codewhale codebase. It is intentionally conservative: shipped entries are
 limited to provider IDs, config keys, auth paths, base URLs, model resolution,
@@ -26,8 +30,12 @@ host is a `[providers.<name>]` table with a base URL, a model, and a key env
 and a key" path for exactly this. Offerings come from live `GET /v1/models`
 plus the Codewhale catalog rather than a compiled roster (#5350, #6289).
 
-Known-good hosts (documentation, not compiled rows — verify against the
-vendor's own docs before trusting any value here):
+Known-good hosts. These ship as bundled descriptor rows in
+`crates/config/assets/provider_descriptors.json` (compiled in by
+`crates/config/src/descriptors.rs`): each row says how to reach the host — wire,
+base URL, key env, aliases — while model ids stay live from `GET /v1/models`
+and the Codewhale catalog; the example model is only a bootstrap hint. Verify
+against the vendor's own docs before trusting any value here:
 
 | Host | Base URL | Example models | API key env |
 | --- | --- | --- | --- |
@@ -36,27 +44,81 @@ vendor's own docs before trusting any value here):
 | Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | Cerebras | `https://api.cerebras.ai/v1` | `llama-3.3-70b` | `CEREBRAS_API_KEY` |
 | Command Code | `https://api.commandcode.ai/provider/v1` | `deepseek/deepseek-v4-flash` | `COMMAND_CODE_API_KEY` |
-| AICraft | `https://aicraftapi.com/v1` | DeepSeek / Qwen / GLM / MiniMax / Doubao families | `AICRAFT_API_KEY` |
+| Alibaba Model Studio (DashScope) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `qwen3.8-flash` | `DASHSCOPE_API_KEY` |
+| AICraft | `https://aicraftapi.com/v1` | `claude-4.6-sonnet`; DeepSeek / Claude / Gemini / Qwen / GLM / MiniMax / Doubao families | `AICRAFT_API_KEY` |
+| Tsubasa | `https://api.tsubasa.sh/v1` | `tsubasa-pro`, `tsubasa-fast` (32,768-token context) | `TSUBASA_API_KEY` |
+| Cheaper Inference | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini`, `claude-sonnet-5`, `gemini-3.1-pro` | `CHEAPER_INFERENCE_API_KEY` |
+| Yolo-Auto | `https://yolo-auto.com/v1` | `qwen3.8-flash`; `yolo` / `yolo-small` | `YOLO_AUTO_API_KEY` |
 
-AICraft advertises DeepSeek, Qwen, GLM, MiniMax and Doubao and lists no
-Anthropic models — pick a model from their roster, not from this table.
+AICraft's roster spans DeepSeek, Anthropic Claude, Google Gemini, Qwen, GLM,
+MiniMax and Doubao ids on its OpenAI-compatible endpoint. The authority is
+`GET https://aicraftapi.com/v1/models` with your key — pick a model from that
+list, not from this table.
+Tsubasa implements only `GET /v1/models` and Chat Completions. Its two public
+model ids share a 32,768-token context, smaller than the 128,000 tokens Codewhale assumes
+for an unknown model, so set it on the route after saving:
+`codewhale config set providers.tsubasa.context_window 32768`.
+
+Cheaper Inference is an OpenAI-compatible gateway with one key for models from
+several labs. Model ids are bare, such as `gpt-5.4-mini` or `claude-sonnet-5`.
+Pricing varies by model and route; consult the provider’s current catalog.
+The authority is `GET https://api.cheaperinference.com/v1/models` with your key.
+Docs: <https://cheaperinference.com/docs>.
+
 OpenCode Zen and OpenCode Go are first-class provider routes, configured like
-any other provider below; they are not part of this table. `/provider` `P`
-opens the template list; `S` still fills SenseNova; `T` probes `/models` and
-records reachability only (a 2xx is not model-ready).
+any other provider below; they are not part of this table. In `/provider`,
+type to filter the list (letters not bound to a row action); `Ctrl+T` probes the
+selected row's `/models` and records reachability only (a 2xx is not
+model-ready).
 
 Sources to keep in sync:
 
-- `crates/config/src/lib.rs` - shared provider IDs, defaults, env precedence.
-- `crates/tui/src/config.rs` - TUI provider IDs, provider capability metadata,
-  and provider-specific env handling.
-- `crates/agent/src/lib.rs` - static `ModelRegistry` used by
-  `codewhale model list` and `codewhale model resolve`.
+- `crates/config/assets/provider_descriptors.json` - built-in and compatible-host
+  labels, defaults, aliases, key-env lists, config/secret slots, and credential
+  guidance. `crates/config/build.rs` generates immutable typed views and the
+  existing constant projections from this one data owner.
+- `crates/config/src/provider_kind.rs` and `src/lib.rs` - legacy identity serde,
+  config schema, environment precedence and Rust route/auth behavior.
+- `crates/tui/src/config.rs` - captures and verifies exact configured provider
+  identities and keeps provider-specific credential and route policy in Rust.
+- `crates/config/assets/catalog_corrections.json` `reviewed` - intrinsic facts,
+  scoped selector aliases, completion references and pure transport metadata.
+  The existing seed renderer embeds this reviewed supplement in Models.dev.
+- `crates/agent/src/lib.rs` - compatibility projection of those shared selector
+  rows, used by `codewhale model resolve` (and the `[model]` config surface).
+  `codewhale model list` reads the resolved provider lake instead, so a single
+  list shows bundled, live and configured rows together.
 - `config.example.toml` and `docs/CONFIGURATION.md` - user-facing config
   examples and environment variable reference.
 - `scripts/check-provider-registry.py` - drift check for canonical provider
   IDs, live TUI provider IDs, TOML table names, static registry rows, and
   documented defaults.
+
+## Captured Provider Identity
+
+Presentation names, labels, aliases, and historical wire tags come from
+`provider_descriptors.json`. `ProviderKind` remains the Rust-owned intrinsic
+credential, protocol, and region distinction. A configured route captures both
+its kind and exact table key; a custom table named `openai` stays custom and
+does not acquire OpenAI credentials or protocol rules from its name. Case is
+significant for custom keys.
+
+DeepSeek China has three preserved representations: `deepseek_c_n` in released
+TUI serde wrappers, `deepseek-cn` as its captured route ID, and `deepseek_cn` as
+its config leaf. Its intrinsic kind is DeepSeek, while its table and endpoint
+stay distinct.
+
+An old custom route without an additive provider ID can resume only with a
+verified root `base_url` migration into the active `providers.custom` table.
+That private receipt is bound to the parsed table generation. A table-only,
+profile-only, conflicting, or later replaced table cannot establish the
+missing identity; an explicit empty ID is refused. Writes reuse the existing
+locked config mutation and undo comparison, obtain the fresh migration receipt
+under that lock, and verify the captured table before changing a leaf.
+
+In-flight requests retain their captured identity, endpoint, and credential
+generation. Health lookup cannot treat an opaque credential reference as ready
+merely because an earlier request used the same authentication class.
 
 ## Provider Selection
 
@@ -82,8 +144,9 @@ and never changes the saved provider or model. A command-line API key is
 confined to the active provider; other routes are reported as skipped for
 that invocation.
 
-Plain `models` lists the active provider's saved catalog without provider requests or
-authentication checks. Successful refreshes are saved under Codewhale's
+Plain `models` lists the active provider's saved catalog without provider requests.
+For ChatGPT, it validates the selected registration locally before reading
+that account's saved roster. Successful refreshes are saved under Codewhale's
 catalog directory and used by the model/provider pickers. Cache files are
 scoped to provider identity and endpoint; a failed refresh preserves prior
 rows. Text output reports source, last successful fetch time (Unix seconds),
@@ -92,34 +155,59 @@ partial failures return a nonzero exit code after writing those receipts.
 Ordinary `models --json` keeps its model-array format. Bundled/configured
 fallbacks are not proof that an account can use every listed model.
 
-`codewhale models --update --provider openai-codex` asks the installed Codex
-CLI for its signed-in ChatGPT account's model list through the documented
-[app-server stdio API](https://learn.chatgpt.com/docs/app-server). Pagination
-and supported reasoning efforts are preserved. This requires a Codex version
-with `account/read` and `model/list` support. It starts no conversation, imports
-no tokens, and sends no Codewhale provider keys to Codex. Standalone credential
-overrides or custom endpoints that could select a different account are skipped.
+### Sign in with ChatGPT
 
-Codex controls its own upstream cache policy; `model/list` does not expose a
-force-refresh option. Receipts therefore count the result as `loaded`, with an
-`observed_at` lookup time and no claimed upstream `fetched_at`. The observed
-roster is saved for offline listing and pickers, alongside the existing Codex
-cache fallback. A new model, such as GPT-6 Astra, appears only if that account's
-roster supplies its exact ID. Codewhale never guesses availability or substitutes
-a different billing route. Missing/stale rosters, CLI failures, and unsupported
-OAuth catalogs are reported explicitly.
+The `openai-codex` provider ID now uses OpenAI's official open-source
+[Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source).
+Sign in and refresh the selected account's catalog:
 
-Codewhale's observed Codex rosters are bound to the exact filesystem home
-and the metadata version of its `auth.json`; tokens are never read for this
-cache binding. Replacing that login invalidates the observation. A native
-Codex cache fetched before an observed login-file change is also stale.
-Keyring-only accounts without an observable login file can still load a live
-roster, but the receipt reports `codex_observation_not_persisted` and no
-Codewhale observation is retained. The separately attributed Codex-owned
-native cache keeps its existing freshness policy when no login-file version
-can be observed; this is not proof of account identity in an external keyring.
+```sh
+codewhale auth chatgpt
+codewhale models --update --provider openai-codex
+codewhale --provider openai-codex
+```
 
-The canonical provider IDs are the 44 entries of `ProviderKind::ALL`
+Sign-in opens your system browser, uses a loopback callback and PKCE, validates
+the returned identity, and stores the issued registration and renewable tokens
+in Codewhale's protected credential storage. Permission to use your ChatGPT
+plan is separate from identity sign-in. A declined or missing plan grant stops
+inference; choose another provider explicitly if you want another billing path.
+`codewhale auth chatgpt-revoke` signs out of the Codewhale-owned session.
+This experimental implementation retains one active registration. A picker
+for multiple saved ChatGPT accounts is not implemented yet.
+
+Model discovery uses your granted bearer token at
+`GET https://api.openai.com/v1/models`; inference uses the public
+`POST https://api.openai.com/v1/responses` endpoint. The model picker keeps
+OpenAI's display labels and order and lists only entries with `visibility: list`.
+The catalog contains no credentials and is bound to the verified issuer,
+issued client ID, and account subject. Another account or workspace never
+inherits those model choices. Missing, invalid, or older-than-one-day rosters
+are reported explicitly and provide no account entitlement evidence. Run the
+refresh command after signing in. Neither model discovery nor ordinary listing
+starts an inference request. Imported Codex CLI tokens and legacy process-token
+variables cannot authorize this official plan route.
+
+Eligible requests consume your ChatGPT plan or credits. ChatGPT Plus's
+five-hour allowance is shared across apps; each app receives no separate
+allowance. The documented five-hour limit does not apply to Pro. App-specific
+limits can also apply. Review limits and access in
+[ChatGPT usage settings](https://chatgpt.com/settings/usage). Codewhale does
+not silently switch to an API key or another provider when a limit is reached.
+
+This is an OpenAI preview for open-source/local apps. It does not grant access
+to ChatGPT conversation history. Requests stream with `store: false` and
+`stream: true`, while Codewhale retains its own session history and tools.
+OpenAI-hosted image generation, file search, Code Interpreter, native computer
+use, hosted MCP/connectors, and Responses `tool_search` are unavailable on this
+route; Codewhale's own tools use supported function/custom tool calls.
+The ChatGPT preview requests one function call at a time.
+See [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+Paid or remotely hosted applications require the
+[commercial partner interest process](https://openai.com/form/sign-in-with-chatgpt-interest/);
+this local integration is not commercial approval.
+
+The canonical provider IDs are the entries of `ProviderKind::ALL`
 (`crates/config/src/provider_kind.rs`), in that order:
 
 `deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,
@@ -216,8 +304,8 @@ the listed provider env vars.
 | `modelscope` | `[providers.modelscope]` | OpenAI Chat Completions | `MODELSCOPE_API_KEY` |
 | `together` | `[providers.together]` | OpenAI Chat Completions | `TOGETHER_API_KEY` |
 | `qianfan` | `[providers.qianfan]` | OpenAI Chat Completions | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` |
-| `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | Native ChatGPT PKCE (`codewhale auth chatgpt`), `OPENAI_CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN`, or explicit Codex CLI consent |
-| `anthropic` | `[providers.anthropic]` | Anthropic Messages | `ANTHROPIC_API_KEY` |
+| `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | Official Sign in with ChatGPT (`codewhale auth chatgpt`) with a validated Codewhale-owned plan grant |
+| `anthropic` | `[providers.anthropic]` | Anthropic Messages | `ANTHROPIC_API_KEY` or `codewhale auth claude` |
 | `openmodel` | `[providers.openmodel]` | Anthropic Messages | `OPENMODEL_API_KEY` |
 | `zai` | `[providers.zai]` | OpenAI Chat Completions | `ZAI_API_KEY`, `Z_AI_API_KEY` |
 | `stepfun` | `[providers.stepfun]` | OpenAI Chat Completions | `STEPFUN_API_KEY`, `STEP_API_KEY` |
@@ -581,7 +669,7 @@ configuration path instead of guessing a vendor page.
 | `qianfan` | [Baidu Cloud access keys](https://console.bce.baidu.com/iam/#/iam/accesslist) |
 | `anthropic` | [Anthropic API keys](https://console.anthropic.com/settings/keys) |
 | `openmodel` | [OpenModel console](https://console.openmodel.ai/) ([authentication guide](https://docs.openmodel.ai/en/docs/getting-started/authentication)) |
-| `openai-codex` | Sign in with ChatGPT via `codewhale auth chatgpt` (subscription billing, Codewhale-owned tokens). The `openai` API-key route is a different billing owner. Codex CLI import remains an explicit alternative after `codex login` plus `codewhale auth external-consent`. |
+| `openai-codex` | Official Sign in with ChatGPT via `codewhale auth chatgpt` (eligible ChatGPT plan or credits, Codewhale-owned tokens). The `openai` API-key route has separate billing. Legacy imported Codex credentials do not authorize this route. |
 | `sglang`, `vllm` | Local OpenAI-compatible endpoints are keyless by default; configure a key only when the server requires one. |
 | `ollama` | Local Ollama is keyless by default; configure a key only when the local server requires one. |
 | `ollama-cloud` | Create an [Ollama API key](https://ollama.com/settings/keys), save it with `codewhale auth set --provider ollama-cloud`, or set `OLLAMA_CLOUD_API_KEY` / `OLLAMA_API_KEY` in that precedence order. |
@@ -608,6 +696,56 @@ secret. Codewhale links straight to that console and accepts the copied key.
 It never probes or impersonates `kimi_cli`/`kimi_code_cli`; first-class Kimi
 OAuth remains blocked on a vendor-registered Codewhale identity.
 
+### Subscription sign-in accounts (ChatGPT, xAI)
+
+Codewhale keeps one sign-in of its own per subscription provider. It is
+separate from the browser, the ChatGPT or Grok apps, and the Codex or Grok
+CLIs, so those can be signed in to a different account. A successful login
+replaces the previous owned grant; there is no picker for multiple saved
+ChatGPT accounts.
+
+- **See which account is signed in.** `codewhale auth status --provider
+  openai-codex` (or `--provider xai`) and `codewhale auth list` show an account
+  label when the ID token contains an email. ChatGPT plan and workspace
+  details appear only when those claims are present; a workspace label uses
+  the first characters of its account ID. The label is display metadata, not
+  proof of plan entitlement. A valid sign-in may have no email label. Status
+  reads local credential state without contacting the issuer: an expired
+  access token with a stored refresh token remains structurally usable, while
+  missing or invalid storage, or an expired token without a refresh token,
+  is reported unusable. The provider picker shows the label of the sign-in
+  the route would use (for xAI this includes a consented Grok CLI import).
+  Successful login reports the account when known and whether it replaced
+  an earlier sign-in, in the TUI's selected language. No token is printed.
+- **Reauthorize ChatGPT.** Run `/auth chatgpt` inside Codewhale to update the
+  running session, or `codewhale auth chatgpt` from a shell and restart open
+  Codewhale sessions. Ordinary login reuses the selected account/workspace's
+  issued client ID and checks that the returned account is the same. The
+  browser opens with `prompt=login`; `CODEWHALE_CHATGPT_OAUTH_NO_PROMPT=1`
+  omits that parameter if the issuer refuses it.
+- **Replace the ChatGPT account or workspace.** From a shell, run
+  `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`, then refresh its
+  model catalog and restart open Codewhale sessions. If the browser holds the
+  wrong account, sign out there or open the printed URL in a private window.
+  Only a fully validated new grant replaces the active owned sign-in.
+- **Switch xAI accounts.** Run `/auth xai-device` inside Codewhale, or
+  `codewhale auth xai-device` from a shell and restart open sessions. The
+  device page approves with whichever account the browser holds; sign out
+  there or use a private window to approve another account. The login names
+  the account it replaced, or says it is the same account as before.
+- **Usage limits.** ChatGPT plan requests can fail with
+  `subscription_sharing_usage_limit_exceeded` or
+  `subscription_sharing_usage_unavailable`. These errors, and subscription
+  quota errors from other providers, name the account that made the request
+  when its label is known and offer recovery guidance. Codewhale does not
+  retry these terminal errors or silently choose another billing route. An
+  xAI route set to OAuth that fell back to an API key gets no sign-in
+  guidance, since no sign-in was used.
+- **ChatGPT credential authority.** The official ChatGPT plan route uses
+  only its selected, verified Codewhale-owned grant.
+  `OPENAI_CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN`, and consented Codex CLI
+  tokens cannot override or authorize this route.
+
 ### External CLI credential consent
 
 Credential files owned by another CLI are disabled by default. Without an
@@ -616,9 +754,12 @@ do not stat, read, refresh, contact an identity provider for, or rewrite Codex,
 Grok, Kimi, or future external credential files.
 
 Codewhale currently supports exact-path, provider-scoped **read-only** grants
-for the Codex CLI and Grok CLI:
+for the Codex CLI and Grok CLI. Codex grants remain available for legacy
+credential inspection only; they cannot authorize the official ChatGPT plan
+route. Use `codewhale auth chatgpt` for that route.
 
 ```bash
+# Legacy Codex credential inspection; does not authorize ChatGPT plan requests.
 codex login
 codewhale auth external-consent --provider openai-codex --mode read-only
 
@@ -633,9 +774,11 @@ Pass `--path /absolute/path/to/auth.json` when the external CLI uses a custom
 location. Consent persists the provider, external owner, exact absolute path,
 and consent schema version. Later environment-variable changes do not redirect
 that authority to a different file. Read-only grants never refresh, contact an
-identity/discovery service, or rewrite the external file; normal requests to
-the explicitly selected provider may use its token. An expired token fails
-with login guidance. Doctor reports structural consent/config state without
+identity/discovery service, or rewrite the external file. Supported routes such
+as xAI may use the external token after explicit selection. The official ChatGPT
+plan route ignores imported Codex tokens and requires its own verified grant.
+An expired external token fails with login guidance. Doctor reports structural
+consent/config state without
 opening credential files and is always non-mutating.
 
 `managed` is reserved for a future provider-specific preservation adapter.
@@ -678,7 +821,7 @@ overlay and lets DSH resolve its own keys.
 | `arcee` | `[providers.arcee]` | `ARCEE_API_KEY` | `ARCEE_BASE_URL`; default `https://api.arcee.ai/api/v1` | `trinity-large-thinking`, `trinity-large-preview` | Arcee AI direct OpenAI-compatible route, tracked as 256K-context BF16 serving. `ARCEE_MODEL` is accepted. OpenRouter's `arcee-ai/trinity-large-thinking` remains the OpenRouter namespaced model ID; direct Arcee uses the bare `trinity-large-thinking` ID. |
 | `moonshot` | `[providers.moonshot]` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` | `MOONSHOT_BASE_URL`, `KIMI_BASE_URL`; default `https://api.moonshot.ai/v1` | Direct Moonshot: `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k2.6`; Kimi Code membership: `k3`, `kimi-for-coding`, `kimi-for-coding-highspeed` at `https://api.kimi.com/coding/v1` | Moonshot/Kimi route. Exact direct `kimi-k3` routes use the documented Formula web-search tool/fiber loop; direct `kimi-k2.6` retains the built-in `$web_search` contract, and exact Kimi Code membership routes use their structured `/search` service. Adjacent paths, K2.7 direct models, and cross-product model IDs do not inherit native search. `kimi` and `kimi-k2` aliases select `kimi-k2.7-code`; `MOONSHOT_MODEL`, `KIMI_MODEL_NAME`, and `KIMI_MODEL` are accepted. Kimi thinking streams through `reasoning_content`; Codewhale keeps it in Thinking cells and replays it for thinking/tool-call continuity. For direct K3, use exact `base_url = "https://api.moonshot.ai/v1"` and `model = "kimi-k3"`; it is always-thinking and receives top-level `reasoning_effort = "low" | "high" | "max"` (`off` normalizes to `low`), uses only `max_completion_tokens`, and omits `temperature`/`top_p` per the [K3 quickstart](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart). For Kimi Code K3, use a key from the [Kimi Code console](https://www.kimi.com/code/console), exact `base_url = "https://api.kimi.com/coding/v1"`, and bare `model = "k3"`; `off` becomes enabled `low`, while normal dispatched `auto` selects and sends a concrete Codewhale tier. Only an omitted reasoning setting leaves the provider default in control. That membership route defaults safely to 262,144 context tokens; the [Kimi Code model-tier table](https://www.kimi.com/code/docs/en/kimi-code/models.html) grants Allegretto and higher plans up to 1M, which those plans may express as `context_window = 1048576`. `k3[1m]` is Claude Code-only and Codewhale rejects it. `kimi-for-coding` remains the valid K2.7 membership route, and `kimi-for-coding-highspeed` is its own high-speed roster entry (262,144 context); membership ids are rejected on the direct platform endpoint, and `kimi-k3` stays rejected on the membership endpoint. Billing is decided by the endpoint the route resolves to, judged once against the two exact product endpoints: direct Moonshot (`https://api.moonshot.ai/v1` or the default) bills metered with dollar estimates, the exact Kimi Code membership endpoint bills as Kimi Code quota and never shows dollar estimates, and anything else — a gateway host, a neighboring Kimi-hosted path — reports `cost: unknown` rather than borrowing either product. An imported Kimi Code token with no `base_url` in its table still resolves to the membership endpoint, so it bills as Kimi Code quota and never accrues dollars. A completed turn, parent or sub-agent, is billed from the immutable endpoint receipt its own client was built with, never from a later config re-read: `MOONSHOT_BASE_URL`/`KIMI_BASE_URL` are merged into the *active* provider's table only, and an in-turn provider switch can move the ambient config off the route that actually ran. Legacy `auth_mode = "kimi_oauth"` fails to API-key guidance without probing Kimi CLI files. Codewhale does not impersonate `kimi_cli` or `kimi_code_cli`. **China-region keys:** contributor field evidence (@vFONGv, PR #5229, verified on Windows 10) reports that a China-region Moonshot key must be paired with `base_url = "https://api.moonshot.cn/v1"`; left on the default international host (`https://api.moonshot.ai/v1`) it fails authentication. We have no China-region key to verify this ourselves, so it is recorded as a user report rather than a tested route. Note also that editing `base_url` alone does not take effect until `codewhale auth set` is re-run for that provider. |
 | `google` | `[providers.google]` | `GOOGLE_API_KEY`, `GEMINI_API_KEY` | `GOOGLE_BASE_URL`, `GEMINI_BASE_URL`; default `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-3.1-pro-preview` (default); `/model` also lists `gemini-3-pro-preview`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash` | Google Gemini as its own backend on the official OpenAI-compatible Chat Completions route. Thinking models capture `extra_content.google.thought_signature` on tool calls and replay it with the assistant tool-call messages; replaying a tool call whose signature was not captured fails closed with an actionable error instead of letting the tool loop break. `gemini-2.5-flash-lite` ships thinking off and degrades with a warning instead. Reasoning effort maps onto the documented `google.thinking_config.thinking_level` (`low`/`high`). The dialect binds to the exact official base URL: a `google` row pointed at another gateway gets plain OpenAI semantics and no signature requirements. Codewhale never reads Google OAuth files; only an AI Studio API key is used. Not live-tested against the real endpoint in this environment. |
-| `zai` | `[providers.zai]` | `ZAI_API_KEY`, `Z_AI_API_KEY` | `ZAI_BASE_URL`, `Z_AI_BASE_URL`; default `https://api.z.ai/api/coding/paas/v4`; general APIs `https://api.z.ai/api/paas/v4` and `https://open.bigmodel.cn/api/paas/v4` | `GLM-5.3` default; `/model` also lists `GLM-5.3-Flash`, `GLM-5.2`, `GLM-5.1`, and `GLM-5-Turbo` | Z.AI GLM Coding Plan route. All three first-party Chat routes (both api.z.ai products and BigModel's general platform endpoint) share one request dialect, so reasoning controls — the GLM-5.2 thinking toggle, tiered effort, and the forced-thinking GLM-5.3 rewrite that sends `off` as `enabled` + `reasoning_effort: "low"` — apply on BigModel too; neighboring paths such as `/preview` stay fail-closed. The two general API products expose structured provider-native web search (`search-prime` globally, `search_std` in China); Coding Plan and compatible custom endpoints do not inherit it. `GLM-5.3` is the default and a first-class picker row (`model = "GLM-5.3"` or `ZAI_MODEL=GLM-5.3`); `GLM-5.3-Flash` is the 1M multimodal fast sibling (`model = "GLM-5.3-Flash"`). An explicit `GLM-5.2` selection keeps its own id. Limits and reasoning options for 5.3 are inherited from `GLM-5.2` until Z.ai publishes distinct 5.3 metadata; 5.3 carries no price. Flash ships the published $0.15/$0.50 list. A live call can still 429 with entitlement code 1311 on accounts that are not provisioned for 5.3. |
+| `zai` | `[providers.zai]` | `ZAI_API_KEY`, `Z_AI_API_KEY`, `ZHIPU_API_KEY`, `GLM_API_KEY` | `ZAI_BASE_URL`, `Z_AI_BASE_URL`; default `https://api.z.ai/api/coding/paas/v4`; general APIs `https://api.z.ai/api/paas/v4` and `https://open.bigmodel.cn/api/paas/v4` | `GLM-5.3` default; `/model` also lists `GLM-5.3-Flash`, `GLM-5.2`, `GLM-5.1`, and `GLM-5-Turbo` | Z.AI GLM Coding Plan route. All three first-party Chat routes (both api.z.ai products and BigModel's general platform endpoint) share one request dialect, so reasoning controls — the GLM-5.2 thinking toggle, tiered effort, and the forced-thinking GLM-5.3 rewrite that sends `off` as `enabled` + `reasoning_effort: "low"` — apply on BigModel too; neighboring paths such as `/preview` stay fail-closed. The two general API products expose structured provider-native web search (`search-prime` globally, `search_std` in China); Coding Plan and compatible custom endpoints do not inherit it. `GLM-5.3` is the default and a first-class picker row (`model = "GLM-5.3"` or `ZAI_MODEL=GLM-5.3`); `GLM-5.3-Flash` is the 1M multimodal fast sibling (`model = "GLM-5.3-Flash"`). An explicit `GLM-5.2` selection keeps its own id. Limits and reasoning options for 5.3 are inherited from `GLM-5.2` until Z.ai publishes distinct 5.3 metadata; 5.3 carries no price. Flash ships the published $0.15/$0.50 list. A live call can still 429 with entitlement code 1311 on accounts that are not provisioned for 5.3. |
 | `stepfun` | `[providers.stepfun]` | `STEPFUN_API_KEY`, `STEP_API_KEY` | `STEPFUN_BASE_URL`, `STEP_BASE_URL`; default `https://api.stepfun.ai/v1`; Coding Plan endpoint `https://api.stepfun.ai/step_plan/v1` | `step-3.7-flash` | StepFun / StepFlash direct OpenAI-compatible route. `/provider` setup asks which billing route the key belongs to — pay-as-you-go or Step Plan — validates the key against the chosen endpoint, and writes the answer to `[providers.stepfun].base_url` only. A base URL that is neither recognized route is left alone and the question is skipped. You can also set `[providers.stepfun].base_url` or `STEP_BASE_URL` to the Coding Plan URL by hand. Offline accounting labels recognized routes as `stepfun-payg` or `stepfun-plan` without persisting the raw endpoint, and only the standard PAYG route receives token pricing. `STEPFUN_MODEL` and `STEP_MODEL` are accepted. |
 | `minimax` | `[providers.minimax]` | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL`; default `https://api.minimax.io/v1`; China `https://api.minimaxi.com/v1` | `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.1`, `MiniMax-M2.1-highspeed`, `MiniMax-M2` | MiniMax direct OpenAI-compatible route. Codewhale sends `reasoning_split = true` so MiniMax thinking arrives separately from answer text. Both MiniMax dialects sell pay-as-you-go and Token Plan over the same endpoints and the same key, so billing is classified from the credential *product*, never from the endpoint or from a default. `mode = "token-plan"` in `[providers.minimax]`/`[providers.minimax_anthropic]`, or a Token Plan key shaped `sk-cp…`, bills as MiniMax Token Plan quota with no dollar estimates; an explicit pay-as-you-go mode (`pay-as-you-go`/`payg`/`metered`) wins over key shape. The key's product prefix is only visible when the key is in config, bound by `api_key_env`, or exported as `MINIMAX_API_KEY` on an official endpoint — a key saved through `codewhale auth set` (secret store / OS keyring) is deliberately not read to classify billing. With no explicit mode and no visible product marker the route reports `cost: unknown` rather than assuming pay-as-you-go, so a Token Plan account is never charged invented dollars. Custom/gateway endpoints also fail closed with `cost: unknown`. Official M3 input modalities are text, image, and video; M2.7 is text-only. |
 | `minimax-anthropic` | `[providers.minimax_anthropic]` | `MINIMAX_API_KEY` | `MINIMAX_ANTHROPIC_BASE_URL`; default `https://api.minimax.io/anthropic`; China `https://api.minimaxi.com/anthropic` | `MiniMax-M3`, `MiniMax-M2.7` | MiniMax direct Anthropic-compatible Messages route. Keep the `/anthropic` suffix because Codewhale appends `/v1/messages`; the route uses `x-api-key`. M3 supports adaptive or disabled thinking. M2.7 always keeps thinking enabled. |
@@ -691,13 +834,13 @@ overlay and lets DSH resolve its own keys.
 | `deepinfra` | `[providers.deepinfra]` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` | `DEEPINFRA_BASE_URL`; default `https://api.deepinfra.com/v1/openai` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | DeepInfra OpenAI-compatible route. Drop-in replacement for OpenAI SDK. |
 | `together` | `[providers.together]` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL`; default `https://api.together.xyz/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `thinkingmachines/inkling` | Together AI OpenAI-compatible route. `TOGETHER_MODEL` is accepted. Model aliases `deepseek-v4-pro` and `deepseek-v4-flash` normalize to Together's org-prefixed IDs; `inkling` and `together-inkling` normalize to Together's published lowercase Inkling wire ID. Inkling uses the exact `none`/`minimal`/`low`/`medium`/`high`/`max` reasoning vocabulary from Thinking Machines' [official model repository](https://huggingface.co/thinkingmachines/Inkling). Together's [launch post](https://www.together.ai/blog/together-ai-brings-thinking-machines-labs-new-model-inkling-on-day-0) currently says Inkling is live with 1M context, while its [model detail page](https://www.together.ai/models/inkling) says coming soon with 256K context and publishes no price. Until Together's active `/models` endpoint and the Models.dev catalog resolve that conflict, Inkling is not seeded into Codewhale's offline picker and no route-specific context or cost is inferred. |
 | `qianfan` | `[providers.qianfan]` | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` | `QIANFAN_BASE_URL`, `BAIDU_QIANFAN_BASE_URL`; default `https://api.baiduqianfan.ai/v1` | `ernie-4.0-turbo-8k`; provider-scoped custom Qianfan service/model IDs pass through | Baidu Qianfan OpenAI-compatible route. Requests use Bearer auth and Chat Completions payloads. `QIANFAN_MODEL` and `BAIDU_QIANFAN_MODEL` are accepted; aliases `baidu-qianfan`, `baidu_qianfan`, and `baidu` resolve to this provider. Tool/function calling is model-scoped in Qianfan docs, so Codewhale preserves the selected wire model and leaves live capability proof to follow-up route/capability work. |
-| `openai-codex` | `[providers.openai_codex]` | Native ChatGPT PKCE (`codewhale auth chatgpt` / `/provider setup openai-codex`), process token via `OPENAI_CODEX_ACCESS_TOKEN`/`CODEX_ACCESS_TOKEN`, or exact-path read-only consent after `codex login` | `OPENAI_CODEX_BASE_URL`/`CODEX_BASE_URL`; default `https://chatgpt.com/backend-api` | `gpt-5.5` | **Experimental.** Talks to the OpenAI Responses API at `/codex/responses`. Native Sign in with ChatGPT stores refreshable tokens in Codewhale-owned storage and bills the ChatGPT subscription; the `openai` API-key route is a different billing owner. Codex CLI files remain disabled by default; `codewhale auth external-consent --provider openai-codex --mode read-only` is an explicit import alternative. Codewhale never refreshes or rewrites that external file, and expired external tokens fail closed. Revoke owned tokens with `codewhale auth chatgpt-revoke`. `OPENAI_CODEX_MODEL`/`CODEX_MODEL` and `OPENAI_CODEX_ACCOUNT_ID`/`CODEX_ACCOUNT_ID` are accepted. Codewhale budgets this route with the 400K Codex-family effective context window even when the public API model table lists a larger native `gpt-5.5` window. OpenAI has not published a third-party client registration for this public Codex OAuth client; the adapter uses the published issuer, PKCE S256, honest `originator=codewhale`, and does not call unpublished device-auth endpoints. |
+| `openai-codex` | `[providers.openai_codex]` | Official Sign in with ChatGPT (`codewhale auth chatgpt` / `/provider setup openai-codex`) | Official `https://api.openai.com/v1` | Selected account catalog; configured model IDs remain explicit selections | **Experimental.** Public Responses endpoint (`/v1/responses`) with a validated `chatgpt.tokens.use.direct` grant. Dynamic OSS registration issues a client ID for the selected account/workspace; Codewhale protects and renews its own tokens. The account catalog supplies selectable models; public model lists and legacy Codex tokens do not establish plan permission. No silent billing fallback. See [Sign in with ChatGPT](#sign-in-with-chatgpt) for setup, usage limits, and preview boundaries. |
 | `anthropic` | `[providers.anthropic]` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL`; default `https://api.anthropic.com` | `claude-opus-4-8`, `claude-sonnet-4-6` (default), `claude-haiku-4-5` | Native Anthropic Messages API route (`/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`) — not OpenAI-compatible. Prompt caching via `cache_control` breakpoints, adaptive thinking + `output_config.effort`, signed thinking blocks replayed verbatim, cache telemetry normalized per #2961. `ANTHROPIC_MODEL` is accepted. |
 | `openmodel` | `[providers.openmodel]` | `OPENMODEL_API_KEY` | `OPENMODEL_BASE_URL`; default `https://api.openmodel.ai` | `deepseek-v4-flash`; provider-scoped custom model IDs pass through | OpenModel Anthropic-compatible Messages route. Uses `/v1/messages`, Bearer auth, and `anthropic-version: 2023-06-01`; OpenModel selects DeepSeek, DashScope, Xiaomi, Claude, and other routes by model id. `OPENMODEL_MODEL` is accepted. |
 | `sakana` | `[providers.sakana]` | `FUGU_API_KEY`, `SAKANA_API_KEY` | `SAKANA_BASE_URL`; default `https://api.sakana.ai/v1` | `fugu` (default), `fugu-ultra-20260615` | Sakana AI Fugu OpenAI-compatible route. Standard Chat Completions wire protocol; streaming supported. `fugu-ultra-20260615` is the heavy/reasoning variant. Env var aliases: `FUGU_API_KEY` (primary), `SAKANA_API_KEY`; provider aliases: `sakana-ai`, `sakana_ai`, `fugu`. |
 | `longcat` | `[providers.longcat]` | `LONGCAT_API_KEY` | `LONGCAT_BASE_URL`; default `https://api.longcat.chat/openai/v1` | `LongCat-2.0` (default) | Meituan LongCat curated model gateway. OpenAI-compatible Chat Completions wire protocol. Sign up at https://longcat.chat/platform for an API key. Provider aliases: `long-cat`, `meituan-longcat`, `meituan`. |
 | `opencode-go` | `[providers.opencode_go]` | `OPENCODE_GO_API_KEY` | `OPENCODE_GO_BASE_URL`; default `https://opencode.ai/zen/go/v1` | `deepseek-v4-pro` (default), `grok-4.5`, `glm-5.2`, `glm-5.1`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-flash`, `mimo-v2.5`, `mimo-v2.5-pro` | [OpenCode Go](https://opencode.ai/docs/go/) subscription route using OpenAI-compatible Chat Completions. `OPENCODE_GO_MODEL` is accepted. Codewhale uses bare wire IDs; familiar `opencode-go/<model-id>` input aliases normalize to the bare ID. Go models documented only on the Anthropic `/messages` endpoint are deliberately not advertised by this route until Codewhale supports per-model wire selection. Billing surfaces show the Go allowance instead of token-price estimates. |
-| `opencode-zen` | `[providers.opencode_zen]` | `OPENCODE_ZEN_API_KEY`, fallback `OPENCODE_API_KEY` | `OPENCODE_ZEN_BASE_URL`; default `https://opencode.ai/zen/v1` | `gpt-5.5` (default); current documented GPT, Claude, Qwen, DeepSeek, MiniMax, GLM, Kimi, Grok, and free-model IDs | [OpenCode Zen](https://opencode.ai/docs/zen/) model-aware gateway. `OPENCODE_ZEN_MODEL` is accepted, and official `opencode/<model-id>` selectors normalize to bare wire IDs. GPT rows use `/responses`; Claude and Qwen rows use `/messages`; DeepSeek, MiniMax, GLM, Kimi, Grok, and the listed free rows use `/chat/completions`. Responses and Chat Completions authenticate with Bearer `Authorization`, while Anthropic Messages uses `x-api-key`; none of these routes use ChatGPT/Codex OAuth guidance or headers. Gemini currently fails closed because its model-specific Google wire protocol is not implemented. Unknown models also fail closed until their protocol is present in the curated catalog. |
+| `opencode-zen` | `[providers.opencode_zen]` | `OPENCODE_ZEN_API_KEY`, fallback `OPENCODE_API_KEY` | `OPENCODE_ZEN_BASE_URL`; default `https://opencode.ai/zen/v1` | `gpt-5.6` (default); current GPT, Claude, Qwen, DeepSeek, MiniMax, GLM, Kimi, Grok, Muse Spark, and free-model IDs | [OpenCode Zen](https://opencode.ai/docs/zen/) model-aware gateway. `OPENCODE_ZEN_MODEL` is accepted, and official `opencode/<model-id>` selectors normalize to bare wire IDs. Each model's wire comes from the curated snapshot, then from the AI SDK package its [Models.dev](https://models.dev) row names: GPT, Grok, and Muse Spark rows use `/responses`; Claude and most Qwen rows use `/messages`; DeepSeek, MiniMax, GLM, Kimi, `qwen3.8-max`, and the free rows use `/chat/completions`. Responses and Chat Completions authenticate with Bearer `Authorization`, while Anthropic Messages uses `x-api-key`; none of these routes use ChatGPT/Codex OAuth guidance or headers. Gemini fails closed because its model-specific Google wire protocol is not implemented; Models.dev rows marked `deprecated` and models no loaded catalog lists also fail closed. See [OpenCode Zen protocol catalog](#opencode-zen-protocol-catalog). |
 | `meta` | `[providers.meta]` | `META_MODEL_API_KEY`, `MODEL_API_KEY` | `META_MODEL_API_BASE_URL`, `MODEL_API_BASE_URL`; default `https://api.meta.ai/v1` | `muse-spark-1.2` (default) | [Meta Model API](https://developer.meta.com/ai/resources/blog/build-with-muse-spark/) public-preview route using OpenAI-compatible Chat Completions. Muse Spark 1.2 keeps its wire ID, tool support, 1M context, 32K output metadata, and `none` through `xhigh` reasoning effort. `META_MODEL_API_MODEL` and `MODEL_API_MODEL` are accepted. Provider aliases: `meta-ai`, `meta_model_api`, `muse`, `muse-spark`. |
 | `telecomjs` | `[providers.telecomjs]` | `TELECOMJS_API_KEY` | `TELECOMJS_BASE_URL`; default `https://aigw.telecomjs.com/v1` | `deepseek-v4-pro` conservative fallback; authenticated `/models` rows when a key is configured | TelecomJS TokenHub OpenAI-compatible Chat Completions route. Live catalogs are isolated by provider and key fingerprint, stale rows survive transient refresh failures, and unsupported reasoning request fields are omitted. `TELECOMJS_MODEL` is accepted. Provider aliases: `telecom-js`, `telecom_js`, `telecomjs-cn`, `tokenhub`. |
 | `mistral` | `[providers.mistral]` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL`; default `https://api.mistral.ai/v1` | `mistral-code-latest` (default; `codestral-latest` accepted as alias), `mistral-medium-latest` (aliases: `mistral-medium-3-5`), `mistral-small-latest` (aliases: `mistral-small-2603`), `mistral-large-latest` | Mistral AI (la Plateforme) OpenAI-compatible Chat route. On the documented first-party HTTPS `/v1` hosts, Medium and Small send adjustable `reasoning_effort` (`none` or `high` only), parse Mistral's polymorphic thinking/text blocks, and replay stored thinking in that same wire shape. Deprecated native Magistral IDs remain explicit-configuration compatibility routes: they are always-reasoning and never receive the adjustable effort field. Code and Large are non-reasoning. A custom `MISTRAL_BASE_URL` keeps generic Chat semantics unless it is one of the documented first-party hosts. `MISTRAL_MODEL` is accepted. Provider aliases: `mistral-ai`, `mistralai`, `la-plateforme`. |
@@ -706,11 +849,24 @@ overlay and lets DSH resolve its own keys.
 | `csdn` | `[providers.csdn]` | `CSDN_API_KEY` | `CSDN_BASE_URL`; default `https://ai.csdn.net/api/model/v1` | `glm_for_coding` (default; the Coding Plan's dedicated model id); other marketplace model ids pass through | CSDN 星图 (Starmap) OpenAI-compatible hosted platform. Coding Plan keys and general marketplace keys share the one endpoint, so billing follows the credential product, never the URL alone: routing `glm_for_coding` — the shipped default — or setting `mode = "coding_plan"`/`"plan"`/`"subscription"` bills as CSDN Coding Plan quota with no dollar estimates; any other model, or an explicit `pay-as-you-go`/`metered` mode, bills metered; an unrecognized mode or an endpoint off `ai.csdn.net/api/model/v1` reports `cost: unknown`. `CSDN_MODEL` is accepted. Provider aliases: `csdn-ai`, `csdn_ai`, `csdn-coding-plan`, `csdn_coding_plan`, `starmap`. |
 | `concentrate` | `[providers.concentrate]` | `CONCENTRATE_API_KEY` | `CONCENTRATE_BASE_URL`; default `https://api.concentrate.ai/v1` | `deepseek-v4-pro` (default; a plain catalog id lets the gateway pick the upstream provider); `provider/model` ids such as `openai/gpt-5.6-sol` pin one upstream; `concentrate/auto` is the gateway's own router; unauthenticated live `/v1/models` catalog | Concentrate OpenAI Responses-compatible gateway (`POST /v1/responses`, bearer Universal API key). Opt-in and BYOK only: your key, your Concentrate bill, zero Codewhale fee, no managed default. Requests carry only documented fields (the system prompt rides as a `system` input item). Contract: [API introduction](https://concentrate.ai/docs/api-reference/introduction), [request parameters](https://concentrate.ai/docs/api-reference/endpoint/request-parameters), [streaming](https://concentrate.ai/docs/api-reference/endpoint/streaming), [errors](https://concentrate.ai/docs/api-reference/endpoint/errors). See [Concentrate Notes](#concentrate-notes). |
 | `codewhale` | `[providers.codewhale]` | `CODEWHALE_API_KEY` | `CODEWHALE_API_BASE`; default `https://api.codewhale.net/v1` | `deepseek/deepseek-v4-pro` (default), `anthropic/claude-sonnet-5`, `openai/gpt-5.6` are offline bootstrap rows only; the authenticated `GET /v1/models` listing of the account's connected providers is the catalog authority | Codewhale API: account-backed model access over the provider keys the customer connected to their Codewhale account. One `cwc_key_…` account API key with the `models:infer` scope authenticates every model. Model ids are `provider/model` exactly as the account catalog returns them, and each row states its protocol (`chat-completions` → `/v1/chat/completions`, `anthropic-messages` → `/v1/messages`, `responses` → `/v1/responses`); every protocol uses `Authorization: Bearer`, never `x-api-key`. `CODEWHALE_API_BASE` must be HTTPS except on loopback. Connect provider keys with `codewhale account keys set <provider>`. Provider aliases: `codewhale-api`, `cw-api`, `codewhale-cloud`. |
-| `xai` | `[providers.xai]` | `XAI_API_KEY`, Codewhale-owned device OAuth, or explicit read-only Grok CLI consent | `XAI_BASE_URL`; default `https://api.x.ai/v1` | `grok-4.6` (default), `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | xAI/Grok OpenAI-compatible Chat Completions route. Grok 4.6 has a 500K context window, text/image input, function calls, structured output, server-side web search, and `low`/`medium`/`high`/`xhigh` reasoning (default `high`). Its standard rates double when the prompt reaches 200K tokens; the same 2x long-context rule applies to `grok-4.5` (500K context, $2.00 / $0.30 cached / $6.00) and `grok-4.3` (1M context, $1.25 / $0.20 cached / $2.50) per their [model pages](https://docs.x.ai/docs/models/grok-4.5). There is no documented `latest`/`fast` alias and no published numeric output limit. **API-key** (default): Bearer token from console.x.ai via `XAI_API_KEY` / keyring / `api_key`. **OAuth**: `codewhale auth xai-device` uses SSH-friendly device login and Codewhale-owned storage, which may refresh itself. Existing Grok CLI credentials require `codewhale auth external-consent --provider xai --mode read-only`; the granted external file is never refreshed or rewritten. OAuth may return HTTP 403 on some SuperGrok tiers — keep API-key as the reliable fallback. `XAI_MODEL` is accepted. Provider aliases: `x-ai`, `x_ai`, `grok`. |
+| `xai` | `[providers.xai]` | `XAI_API_KEY`, Codewhale-owned device OAuth, or explicit read-only Grok CLI consent | `XAI_BASE_URL`; default `https://api.x.ai/v1` | `grok-4.6` (default), `grok-4.7`, `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | xAI/Grok OpenAI-compatible Chat Completions route. Grok 4.6 has a 500K context window, text/image input, function calls, structured output, server-side web search, and `low`/`medium`/`high`/`xhigh` reasoning (default `high`). [Grok 4.7](https://docs.x.ai/docs/models/grok-4.7) has the same 500K window, text/image input, function calls, structured output, reasoning ladder and $2.00 / $0.50 cached / $6.00 rates; xAI documents no web-search support for it yet, so Codewhale does not claim it. Grok reasoning cannot be disabled ([reasoning guide](https://docs.x.ai/docs/guides/reasoning)). Its standard rates double when the prompt reaches 200K tokens; the same 2x long-context rule applies to `grok-4.5` (500K context, $2.00 / $0.30 cached / $6.00) and `grok-4.3` (1M context, $1.25 / $0.20 cached / $2.50) per their [model pages](https://docs.x.ai/docs/models/grok-4.5). There is no documented `latest`/`fast` alias and no published numeric output limit. **API-key** (default): Bearer token from console.x.ai via `XAI_API_KEY` / keyring / `api_key`. **OAuth**: `codewhale auth xai-device` uses SSH-friendly device login and Codewhale-owned storage, which may refresh itself. Existing Grok CLI credentials require `codewhale auth external-consent --provider xai --mode read-only`; the granted external file is never refreshed or rewritten. OAuth may return HTTP 403 on some SuperGrok tiers — keep API-key as the reliable fallback. `XAI_MODEL` is accepted. Provider aliases: `x-ai`, `x_ai`, `grok`. |
 | `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_TOKEN_PLAN_BASE_URL`; default `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `qwen3.8-max` (default), `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | Alibaba Cloud Model Studio Token Plan OpenAI-compatible Chat Completions route. Token Plan Personal and Team share this endpoint. `qwen3.8-max`, `qwen3.7-plus`, and `qwen3.7-max` can use provider-native web search through the Token Plan Responses Harness; the preview, Coding Plan, and Anthropic routes do not inherit that capability. All listed models are reasoning-capable text/coding models. DeepSeek and GLM entries are provider-scoped and do not collide with first-party routes. `MODELSTUDIO_TOKEN_PLAN_MODEL` is accepted. Provider aliases: `modelstudio-token-plan`, `alibaba-token-plan`, `dashscope-token-plan`. |
 | `modelstudio-token-plan-anthropic` | `[providers.modelstudio_token_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | default `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` | Same model catalog as `modelstudio-token-plan` | Token Plan Anthropic-compatible Messages route (`/apps/anthropic`). Same API key as the OpenAI dialect. Provider aliases: `modelstudio-token-plan-anthropic`, `alibaba-token-plan-anthropic`. |
 | `modelstudio-coding-plan` | `[providers.modelstudio_coding_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_CODING_PLAN_BASE_URL`; default `https://coding-intl.dashscope.aliyuncs.com/v1` | `qwen3.8-max` (default); same catalog as Token Plan | Alibaba Cloud Model Studio Coding Plan OpenAI-compatible Chat Completions route. `MODELSTUDIO_CODING_PLAN_MODEL` is accepted. Provider aliases: `modelstudio-coding-plan`, `alibaba-coding-plan`, `dashscope-coding-plan`. |
 | `modelstudio-coding-plan-anthropic` | `[providers.modelstudio_coding_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | default `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` | Same model catalog as `modelstudio-coding-plan` | Coding Plan Anthropic-compatible Messages route (`/apps/anthropic`). Provider aliases: `modelstudio-coding-plan-anthropic`, `alibaba-coding-plan-anthropic`. |
+
+StepFun's four coding models are available through both its standard API and
+[Step Plan](https://platform.stepfun.ai/docs/en/step-plan/integrations/reasoning-api).
+Choose the billing route in `/provider`, then the model in `/model`; existing
+Step 3.7 selections remain unchanged. [Step 5 Preview](https://platform.stepfun.ai/docs/en/guides/models/step-5-preview)
+has a 1M context window. Step 5 and Step 3.7 expose low/medium/high reasoning;
+Step 3.5 Flash 2603 exposes low/high; base Step 3.5 uses provider-default reasoning.
+[Published API prices](https://platform.stepfun.ai/docs/en/guides/pricing/details)
+apply only to verified PAYG routes. Step Plan displays subscription allowance.
+Speech, music and image-generation models use separate interfaces and are not
+presented as coding models. Provider video capability metadata does not imply
+that every Codewhale client can attach video.
+
 
 ### OpenCode Zen protocol catalog
 
@@ -718,29 +874,54 @@ Zen Responses and Chat Completions requests authenticate with Bearer
 `Authorization`; Zen Anthropic Messages requests use `x-api-key`. None of these
 routes add ChatGPT/Codex OAuth headers.
 
-The bundled Zen transport snapshot follows the [official endpoint
-table](https://opencode.ai/docs/zen/) and is intentionally explicit:
+Each Zen model's wire comes from two sources, and neither is guessed from a
+model-id family (`qwen3.8-flash` is Messages while `qwen3.8-max` is Chat):
 
-- Responses: `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`,
-  `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`,
-  `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.2`, `gpt-5.2-codex`,
-  `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.1-codex-max`,
-  `gpt-5.1-codex-mini`, `gpt-5`, `gpt-5-codex`, `gpt-5-nano`.
-- Anthropic Messages: `claude-fable-5`, `claude-opus-4-8`,
-  `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5`,
+1. **The curated snapshot** compiled into Codewhale, verified against the
+   [official endpoint table](https://opencode.ai/docs/zen/) and the `opencode`
+   provider in [Models.dev](https://models.dev). It is the offline floor, and
+   it wins when a catalog row names a different wire for the same id.
+2. **The Models.dev catalog.** Its `opencode` provider is Zen's published
+   catalog: each model row names the AI SDK package OpenCode itself uses, which
+   Codewhale maps exactly — `@ai-sdk/openai` to Responses, `@ai-sdk/anthropic`
+   to Anthropic Messages, and `@ai-sdk/openai-compatible` (the provider
+   default) to Chat Completions. A Zen model released after this build routes
+   once the catalog lists it, without a Codewhale release. The interactive TUI
+   and `codewhale exec` both load the persisted catalog; refresh it with
+   `codewhale models --update`.
+
+The curated snapshot:
+
+- Responses: `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`,
+  `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`,
+  `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.3-codex`,
+  `gpt-5.3-codex-spark`, `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.1`,
+  `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, `gpt-5`,
+  `gpt-5-codex`, `gpt-5-nano`, `grok-4.7`, `grok-4.6`, `grok-4.5`,
+  `grok-build-0.1`, `muse-spark-1.3`, `muse-spark-1.3-contributor-free`,
+  `muse-spark-1.2`, `muse-spark-1.2-contributor`,
+  `muse-spark-1.2-contributor-free`.
+- Anthropic Messages: `claude-fable-5-1`, `claude-fable-5`,
+  `claude-opus-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`,
+  `claude-opus-4-6`, `claude-opus-4-5`, `claude-sonnet-5-5`,
   `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-sonnet-4-5`,
-  `claude-haiku-4-5`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus`,
-  `qwen3.5-plus`.
-- Chat Completions: `deepseek-v4-pro`, `deepseek-v4-flash`, `minimax-m3`,
-  `minimax-m2.7`, `minimax-m2.5`, `glm-5.2`, `glm-5.1`, `glm-5`,
-  `kimi-k2.5`, `kimi-k2.6`, `kimi-k2.7-code`, `grok-4.5`,
-  `grok-build-0.1`, `big-pickle`, `mimo-v2.5-free`,
-  `north-mini-code-free`, `nemotron-3-ultra-free`,
+  `claude-sonnet-4`, `claude-haiku-4-5`, `qwen3.8-flash`, `qwen3.7-max`,
+  `qwen3.7-plus`, `qwen3.6-plus`, `qwen3.5-plus`.
+- Chat Completions: `deepseek-v4.1-flash`, `deepseek-v4-pro`,
+  `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `minimax-m3`,
+  `minimax-m2.7`, `minimax-m2.5`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2`,
+  `glm-5.1`, `glm-5`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `kimi-k2.5`,
+  `qwen3.8-max`, `big-pickle`, `space-bunny-free`,
+  `longcat-2.5-preview-free`, `mimo-v2.6-flash-free`, `mimo-v2.5-free`,
+  `ling-3.0-flash-fin-free`, `north-mini-code-free`,
+  `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,
   `deepseek-v4-flash-free`.
 
-Gemini entries are excluded because the official table assigns them Google's
-model-specific protocol. A catalog miss never falls back to another Zen wire
-shape, including when a custom Zen base URL is configured.
+These fail closed locally, with the reason in the error, instead of reaching
+Zen: Gemini (`@ai-sdk/google`, Google's model-specific protocol, which Codewhale
+does not speak); a catalog row naming any other package; a catalog row Models.dev
+marks `deprecated`; and a model neither source lists. A miss never falls back to
+another Zen wire shape, including when a custom Zen base URL is configured.
 
 ### Concentrate Notes
 
@@ -868,6 +1049,47 @@ wire models (for example `deepseek/deepseek-v4-pro` or its own
 `orcarouter/auto` router) pass through verbatim, exactly as they do on the
 OpenRouter provider scope.
 
+#### OrcaRouter credentials: API key or OAuth 2.0 + PKCE
+
+OrcaRouter accepts two credential sources, and both write the same durable
+`sk-orca-…` key to the same `orcarouter` secret-store slot with
+`auth_mode = "api_key"`:
+
+- **API key** — `codewhale auth set --provider orcarouter`, `/provider`, or
+  `ORCAROUTER_API_KEY`. Use this when you already have a key.
+- **Connect with OrcaRouter** — `codewhale auth orcarouter` (CLI) or
+  `/auth orcarouter` (in-session). This runs an OAuth 2.0 authorization-code
+  flow with PKCE (S256) on a loopback redirect. The browser is sent to
+  `GET https://www.orcarouter.ai/auth` with `callback_url`, `code_challenge`,
+  `code_challenge_method=S256`, `state`, `app_name`, and `scope`; the code is
+  exchanged at `POST https://www.orcarouter.ai/api/v1/auth/keys` for a
+  durable API key. There is no client secret and no pre-registered redirect
+  URI; state is compared in constant time before the code is used.
+
+Authentication and inference use different origins: the consent and exchange
+live on `https://www.orcarouter.ai`; models and chat live on
+`https://api.orcarouter.ai/v1`. Neither is derived from the other, and
+`/v1/auth/keys` on the API origin is not the exchange route. Self-hosted
+deployments can override each origin explicitly with `ORCA_AUTH_BASE_URL`
+(auth) and `ORCA_API_BASE_URL`/`ORCAROUTER_BASE_URL` (inference); the explicit
+value wins. Remote origins must be HTTPS; plain HTTP is accepted only on
+loopback.
+
+A PKCE-issued key is a durable API key, **not** a refresh token: Codewhale
+stores it, reuses it across restarts, and never sends a refresh grant. Revoke
+the key on the OrcaRouter console (`/auth orcarouter-revoke` clears the local
+copy) and sign in again to get a new one. A 401 from the relay marks that
+credential generation as needing re-authentication rather than silently
+retrying.
+
+The chat model list is discovered live from `GET https://api.orcarouter.ai/v1/models`
+with the configured key. OrcaRouter publishes `supported_endpoint_types` on
+every row, so the chat selector keeps only rows advertising `openai`,
+`anthropic`, `gemini`, or `openai-response`, and drops image-generation,
+video, and rerank rows instead of guessing from a model name. A row that
+states `architecture.input_modalities` with `image` is image-input capable;
+rows that state no architecture are treated as unknown, not as text-only.
+
 ### Recent OpenRouter Large Models
 
 OpenRouter completions and static registry rows include the April 2026 onward
@@ -897,8 +1119,14 @@ price. Flash ships the published $0.15/$0.50 list. A live call can still
 
 ## Static Model Registry
 
-`codewhale model list` and `codewhale model resolve` use the static registry in
-`crates/agent/src/lib.rs`. This is not the same as live `/models` discovery.
+This table describes the static registry, which `codewhale model resolve` (and
+the `[model]` config surface) still use to resolve selector aliases.
+
+`codewhale model resolve` projects the reviewed `selections` in
+`crates/config/assets/catalog_corrections.json` through
+`crates/agent/src/lib.rs`. There is no independent Rust model roster. These
+ordered aliases and flags are compatibility metadata, not account availability
+or executable route permission. This differs from live `/models` discovery.
 Use `/models` or `codewhale models` to fetch model IDs from the active API
 endpoint when the endpoint supports model listing.
 
@@ -919,7 +1147,7 @@ endpoint when the endpoint supports model listing.
 | `arcee` | `trinity-large-thinking`, `trinity-large-preview`; provider-hinted custom model IDs pass through | yes | yes for `trinity-large-thinking`; no for `trinity-large-preview` |
 | `moonshot` | `kimi-k2.7-code`, `kimi-k2.6` | yes | yes |
 | `zai` | `GLM-5.3`, `GLM-5.3-Flash`, `GLM-5.2`, `GLM-5.1`, `GLM-5-Turbo`; provider-hinted custom model IDs pass through | yes | yes |
-| `stepfun` | `step-3.7-flash` | yes | no |
+| `stepfun` | `step-3.7-flash` (default), `step-5-preview`, `step-3.5-flash`, `step-3.5-flash-2603` | yes | yes |
 | `minimax` | `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.1`, `MiniMax-M2.1-highspeed`, `MiniMax-M2` | yes | yes |
 | `minimax-anthropic` | `MiniMax-M3`, `MiniMax-M2.7` | yes | yes |
 | `sglang` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | yes | yes |
@@ -937,7 +1165,7 @@ endpoint when the endpoint supports model listing.
 | `longcat` | `LongCat-2.0` | yes | yes |
 | `opencode-go` | `deepseek-v4-pro`, `grok-4.5`, `glm-5.2`, `glm-5.1`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-flash`, `mimo-v2.5`, `mimo-v2.5-pro` | yes | yes |
 | `meta` | `muse-spark-1.2` | yes | yes |
-| `xai` | `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | yes | yes for `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-build`, and `grok-4.20-0309-reasoning` |
+| `xai` | `grok-4.6`, `grok-4.7`, `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | yes | yes for `grok-4.6`, `grok-4.7`, `grok-4.5`, `grok-4.3`, `grok-build`, and `grok-4.20-0309-reasoning` |
 | `google` | `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash` | yes | yes except `gemini-3.5-flash-lite` |
 | `mistral` | `mistral-code-latest`, `mistral-medium-latest`, `mistral-small-latest`, `mistral-large-latest` | yes | yes for Medium and Small (`reasoning_effort` `none` or `high` on exact first-party routes); deprecated native Magistral remains an always-on explicit compatibility ID; no for Code and Large |
 | `modelstudio-token-plan`, `modelstudio-coding-plan` | `qwen3.8-max`, `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | yes | yes |
@@ -1003,7 +1231,7 @@ while bare `k3` can use an entitled 1M override.
 | Anthropic API `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-fable-5` | 1,000,000 | 128,000 | yes | yes | not documented in code |
 | Google Gemini API `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1,048,576 | 65,536 | model-dependent | no | not documented in code |
 | Meta Model API `muse-spark-1.2` | 1,000,000 | 32,000 | yes | no | not documented in code |
-| OpenAI Codex / ChatGPT route (`openai-codex`) | 400,000 effective | 128,000 | yes | no | route uses Responses payload at `/codex/responses` |
+| ChatGPT plan route (`openai-codex`) | conservatively budgeted; account listing does not state a window | no output cap sent in preview | model dependent | no | public `/v1/responses`; no context limit is inferred from account eligibility |
 | OpenModel default/custom model IDs | 200,000 fallback unless model metadata or config overrides it | 64,000 fallback | model-dependent | no | route uses Messages payload at `/v1/messages` |
 | Wanjie Ark `reasoner` / `r1` model IDs | 128,000 | unknown (no documented maximum) | yes | no | not documented in code |
 | Direct Arcee API `trinity-large-thinking` | 262,144 | 262,144 | yes | no | not documented in code |
@@ -1162,13 +1390,35 @@ python3 scripts/check-provider-registry.py
 The check fails when:
 
 - `docs/PROVIDERS.md` omits a canonical `ProviderKind::as_str()` ID.
-- `crates/tui/src/config.rs` `ApiProvider::as_str()` diverges from
-  `ProviderKind::as_str()` except for the explicit `deepseek-cn` legacy alias.
+- Descriptor presentation IDs or released wire tags are duplicated or drift
+  from intrinsic kinds, or a second provider enum/ordinal bridge is introduced.
 - The shipped-provider table omits or adds a `[providers.*]` TOML table.
 - The static model registry table drifts from providers used by
   `crates/agent/src/lib.rs`.
 - A provider default model or base URL constant in `crates/tui/src/config.rs`
   is no longer mentioned here.
+
+## Provider Gotchas
+
+Three failures that look like something else (measured by a provider operator
+on live traffic):
+
+- **A cold model looks broken.** The first call to a model the provider has not
+  loaded can take 90 to 150 seconds, then drop to a second or less once warm.
+  Raise `[stream].open_timeout_secs` (default 45 seconds, at most 300) before reading a timeout as "model unavailable".
+- **Listed is not callable.** A catalog entry can be visible and still fail
+  every call. The same error text on every attempt (for example a "resources
+  busy" 502) is not transient: a genuinely busy upstream returns successes in
+  between. Probe a model before trusting it, and stop retrying one that fails
+  identically.
+- **A truncated answer can report `stop`.** A reasoning model can spend the
+  whole `max_tokens` allowance on reasoning. When the provider reports
+  `completion_tokens` exactly equal to the `max_tokens` the request asked for
+  and the finish reason is `stop`, Codewhale treats the turn as cut at the
+  ceiling rather than finished (`stop_contradicts_output_ceiling` in
+  `codewhale-models`); retrying the same prompt stops at the same count, so
+  raise the ceiling or shorten the task instead. No inference is made when the
+  provider reports no usage.
 
 ## Planned, Not Shipped Yet
 
@@ -1182,3 +1432,28 @@ provider docs work, but they are not native shipped behavior in this checkout:
 - Hugging Face model passport metadata in the picker, including license, base
   model, context length, chat template, tool-call support, reasoning support,
   and gated/private status.
+
+## Sign in with Claude
+
+Run `codewhale auth claude` (or `/auth claude` in a running session), open the
+printed Claude sign-in URL, and paste the complete `code#state` callback.
+`/provider setup anthropic` also offers API-key and Claude Pro / Max choices.
+Then select `anthropic` or its `claude` alias. API keys continue to use separate
+Anthropic API billing; selecting subscription sign-in never falls back to one.
+
+Codewhale stores the grant in its private credentials directory, commits the
+provider's credential pointer atomically, and refreshes it before requests on a
+worker. Subscription tokens go only to `https://api.anthropic.com`; a custom
+endpoint is rejected. Each request keeps the existing Messages adapter, tool
+protocol, cache prefix, and Codewhale client identity. No Claude Code credential
+file or keychain entry is read or modified.
+
+`codewhale auth claude-revoke` (or `/auth claude-revoke`) removes the owned local
+grant. End remote access separately in your Claude account settings. The
+subscription route then needs another login; select API-key billing explicitly
+to use an API key. Login and inference follow Anthropic's provider-side
+availability; local checks do not
+establish that an account is eligible or that live subscription inference works.
+
+The callback and JSON token exchange follow the interoperable flow used by
+[pi's Anthropic OAuth adapter](https://github.com/fivewillow/badlogic-pi-mono/blob/main/packages/ai/src/utils/oauth/anthropic.ts).

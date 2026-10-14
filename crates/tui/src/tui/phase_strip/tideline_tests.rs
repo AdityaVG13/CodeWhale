@@ -27,7 +27,7 @@ struct Fixture {
 fn working() -> Fixture {
     Fixture {
         permission: ("ask", ChromeInk::PermissionAsk),
-        permission_key: Some("Shift+Tab"),
+        permission_key: Some("Shift+Tab to change"),
         mode: Some(("work", ChromeInk::PolicyAct)),
         mode_key: Some("Tab"),
         turn_clock: Some(("working 1m 15s", ChromeInk::Active)),
@@ -74,7 +74,7 @@ fn footer_matches_goldens_at_blocker_sizes() {
     }
 }
 
-/// Claude Code's grammar: mark, permission chip with its cycle key, mode
+/// Permission chip with its cycle key, mode
 /// with its cycle key, the working clock, live counts, then the one hint
 /// that applies now.
 #[test]
@@ -83,8 +83,24 @@ fn posture_bar_reads_permission_mode_clock_counts_hint() {
     let band = text.lines().last().unwrap_or_default().trim_end();
     assert_eq!(
         band,
-        "▶▶ ask (Shift+Tab) · work (Tab) · working 1m 15s · 2 agents · worked 41m 12s · Esc to interrupt"
+        " ● ask  Shift+Tab to change   work (Tab)   working 1m 15s   2 agents   worked 41m 12s   Esc to interrupt"
     );
+}
+
+/// Experience mark 8: the current permission reads without color. With every
+/// ink stripped the row still marks which chip is the permission in force
+/// (`●`) and says what its key does, instead of printing two look-alike
+/// `word (key)` chips that read as a menu of options.
+#[test]
+fn current_permission_is_identifiable_without_color() {
+    for (w, h) in BLOCKER_SIZES {
+        let text = draw(w, h, &working().widget(&UI_THEME));
+        let band = text.lines().last().unwrap_or_default();
+        assert!(band.starts_with(" ● ask"), "{w}x{h}: {band}");
+        assert_eq!(band.matches('●').count(), 1, "{w}x{h}: {band}");
+        assert!(band.contains("Shift+Tab to change"), "{w}x{h}: {band}");
+        assert!(!band.contains("(Shift+Tab)"), "{w}x{h}: {band}");
+    }
 }
 
 /// The bar carries no cost and no context reading: the metrics line owns
@@ -148,7 +164,7 @@ fn posture_bar_pins_notice_or_remote_control_right() {
     fixture.right = Some(("/rc connected", ChromeInk::Info));
     let text = draw(100, 30, &fixture.widget(&UI_THEME));
     assert!(text.trim_end().ends_with("/rc connected"), "{text}");
-    assert!(text.contains("▶▶ ask (Shift+Tab)"), "{text}");
+    assert!(text.contains(" ● ask  Shift+Tab to change"), "{text}");
 
     fixture.right = Some(("Auto-denied exec_shell", ChromeInk::Attention));
     let text = draw(100, 30, &fixture.widget(&UI_THEME));
@@ -160,11 +176,12 @@ fn posture_bar_pins_notice_or_remote_control_right() {
     // Narrow: the notice truncates against the permission floor, never
     // over it.
     let narrow = draw(30, 12, &fixture.widget(&UI_THEME));
-    assert!(narrow.contains("▶▶ ask"), "{narrow}");
+    assert!(narrow.contains(" ask"), "{narrow}");
 }
 
 /// Shed ladder, most expendable first: the turn clock, the session clock,
-/// the hint, the counts, mode key, mode, permission key. The permission chip
+/// the permission key (a binding reminder, and the widest optional item),
+/// the hint, the counts, mode key, mode. The permission chip
 /// never sheds (#5796); the clock is what a glance wants and the hint and
 /// counts are what a keystroke wants, so on a row too narrow for both the
 /// clock goes (#5914).
@@ -184,15 +201,15 @@ fn posture_bar_sheds_the_clocks_then_the_hint_counts_and_posture_chips() {
     // `work` alone would also match `working`, so measure the mode chip by
     // a needle only the mode paints.
     let mode_key = narrowest_showing("work (Tab)");
-    let mode = narrowest_showing("· work ");
-    let permission_key = narrowest_showing("(Shift+Tab)");
+    let mode = narrowest_showing("   work ");
+    let permission_key = narrowest_showing("Shift+Tab to change");
     assert!(
         turn_clock > session_clock
-            && session_clock > hint
+            && session_clock > permission_key
+            && permission_key > hint
             && hint > counts
             && counts > mode_key
-            && mode_key > mode
-            && mode > permission_key,
+            && mode_key > mode,
         "turn_clock@{turn_clock} session_clock@{session_clock} hint@{hint} counts@{counts} mode_key@{mode_key} mode@{mode} permission_key@{permission_key}"
     );
     for w in 8..=160u16 {
@@ -219,12 +236,13 @@ fn compact_posture_bar_states_posture_and_nothing_live() {
     let mut fixture = working();
     fixture.right = Some(("/rc connected", ChromeInk::Info));
     let wide = draw(160, 3, &fixture.widget(&UI_THEME).compact(true));
-    for kept in ["▶▶ ask (Shift+Tab)", "· work (Tab)", "/rc connected"] {
+    for kept in [" ● ask", "   work (Tab)", "/rc connected"] {
         assert!(wide.contains(kept), "compact keeps {kept}: {wide}");
     }
     for gone in [
         "working 1m 15s",
         "worked 41m 12s",
+        "Shift+Tab to change",
         "2 agents",
         "Esc to interrupt",
     ] {
@@ -285,7 +303,7 @@ fn posture_bar_prints_cycle_keys_only_when_live() {
     fixture.permission_key = None;
     let text = draw(120, 30, &fixture.widget(&UI_THEME));
     assert!(
-        text.contains("▶▶ ask · work · working 1m 15s · 2 agents · worked 41m 12s"),
+        text.contains(" ● ask   work   working 1m 15s   2 agents   worked 41m 12s"),
         "{text}"
     );
     assert!(!text.contains('('), "{text}");
@@ -297,7 +315,7 @@ fn posture_bar_ascii_safe_projects_glyphs() {
     fixture.context_percent = 90;
     let text = draw(100, 30, &fixture.widget(&UI_THEME).ascii_safe(true));
     let band = text.lines().last().unwrap_or_default();
-    assert!(band.starts_with(">> ask"), "mark projects: {band}");
+    assert!(band.starts_with(" . ask"), "inset preserved: {band}");
     assert!(text.contains("^ surface soon"), "{text}");
     for ch in text.chars() {
         if ch != '\n' {
@@ -328,8 +346,8 @@ use crate::tui::footer_hints::{
 };
 
 fn session_app() -> App {
-    let mut app = crate::test_support::test_app_with_options(
-        crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+    let mut app = crate::tui::test_support::test_app_with_options(
+        crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
     );
     app.onboarding = OnboardingState::None;
     app.launch.visible = false;
@@ -349,15 +367,16 @@ fn set_uses(app: &mut App, key: &str, uses: u8) {
 #[test]
 fn cycle_keys_show_at_zero_and_one_use_and_go_bare_at_two() {
     let mut app = session_app();
+    app.approval_mode = codewhale_execpolicy::ApprovalMode::Suggest;
     let facts = tideline_footer_from_app(&mut app, 120);
-    assert_eq!(facts.permission_key, Some("Shift+Tab"));
+    assert_eq!(facts.permission_key.as_deref(), Some("Shift+Tab to change"));
     assert_eq!(facts.mode_key, Some("Tab"));
 
     for key in [PERMISSION_CYCLE, MODE_CYCLE] {
         set_uses(&mut app, key, 1);
     }
     let facts = tideline_footer_from_app(&mut app, 120);
-    assert_eq!(facts.permission_key, Some("Shift+Tab"));
+    assert_eq!(facts.permission_key.as_deref(), Some("Shift+Tab to change"));
     assert_eq!(facts.mode_key, Some("Tab"));
 
     set_uses(&mut app, PERMISSION_CYCLE, 2);
@@ -400,6 +419,24 @@ fn interrupt_hint_shows_at_zero_and_one_use_and_clears_at_two() {
     assert!(tideline_footer_from_app(&mut app, 120).hint.is_none());
 }
 
+/// #6502: while the workbar owns focus, Esc closes the workbar instead of
+/// interrupting, so the posture bar must not promise an interrupt.
+#[test]
+fn interrupt_hint_stands_down_while_the_workbar_owns_esc() {
+    let mut app = session_app();
+    app.is_loading = true;
+    app.work_surface.focused = true;
+    let facts = tideline_footer_from_app(&mut app, 120);
+    assert!(
+        facts
+            .hint
+            .as_ref()
+            .is_none_or(|(text, _)| !text.contains("Esc")),
+        "{:?}",
+        facts.hint.as_ref().map(|(text, _)| text)
+    );
+}
+
 /// The open double-tap window advertises the second Enter until that steer
 /// has fired twice.
 #[test]
@@ -432,6 +469,7 @@ fn completed_subagent(id: &str) -> crate::tools::subagent::SubAgentResult {
         git_branch: None,
         agent_type: crate::tools::subagent::FleetRole::Worker,
         assignment: crate::tools::subagent::SubAgentAssignment {
+            native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
         },
@@ -450,6 +488,8 @@ fn completed_subagent(id: &str) -> crate::tools::subagent::SubAgentResult {
         duration_ms: 0,
         started_at: None,
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 
@@ -470,6 +510,42 @@ fn agent_arrow_hints_show_at_zero_and_one_use_and_clear_at_two() {
 
     set_uses(&mut app, AGENT_ARROWS, 2);
     assert!(tideline_footer_from_app(&mut app, 120).hint.is_none());
+}
+
+/// Esc Esc rewinds the conversation and leaves the files as they are. The
+/// notice gets half the row and loses whole trailing sentences that do not
+/// fit, so the file fact comes first: it is still on screen at 80 columns,
+/// and the pointer to `/undo` joins it once the row is wide enough. The
+/// notice used to read `Rewound to previous user message` and said nothing
+/// about files.
+#[test]
+fn rewind_notice_states_the_file_fact_first_and_names_undo_when_it_fits() {
+    use crate::tui::history::HistoryCell;
+    let mut app = session_app();
+    app.add_message(HistoryCell::User {
+        content: "make whole hours read 2h".to_string(),
+    });
+    app.add_message(HistoryCell::Assistant {
+        content: "Updated duration.mjs".to_string(),
+        streaming: false,
+    });
+
+    crate::tui::ui::apply_backtrack(&mut app, 0);
+
+    assert_eq!(app.input, "make whole hours read 2h");
+    let shown = |app: &mut App, width: u16| {
+        tideline_footer_from_app(app, width)
+            .right
+            .map(|(text, _)| text)
+    };
+    assert_eq!(
+        shown(&mut app, 80).as_deref(),
+        Some("Files not changed. /undo puts them back.")
+    );
+    assert_eq!(
+        shown(&mut app, 124).as_deref(),
+        Some("Files not changed. /undo puts them back. Conversation rewound.")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -589,7 +665,7 @@ fn clock_distinguishes_working_from_waiting_on_something() {
     let subagents = tideline_footer_from_app(&mut app, 160)
         .turn_clock
         .expect("sub-agent clock");
-    assert_eq!(subagents.0, "sub-agents underway 1m 15s");
+    assert_eq!(subagents.0, "agents underway 1m 15s");
     app.agent_progress.clear();
 
     // Waiting on the user parks the clock in the waiting ink.
@@ -602,7 +678,7 @@ fn clock_distinguishes_working_from_waiting_on_something() {
     let waiting = tideline_footer_from_app(&mut app, 160)
         .turn_clock
         .expect("waiting clock");
-    assert_eq!(waiting.0, "waiting on you 1m 15s");
+    assert_eq!(waiting.0, "needs you 1m 15s");
     assert_eq!(waiting.1, ChromeInk::Waiting);
     assert_ne!(waiting.1, working.1, "waiting must not read as working");
 }
@@ -700,12 +776,41 @@ fn narrow_widths_shed_the_clocks_before_the_hint_and_counts() {
 
 #[test]
 fn scheduled_count_opens_automations_directly() {
-    let mut app =
-        crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+    let mut app = crate::tui::test_support::test_app_with_options(
+        crate::tui::test_support::test_tui_options("."),
+    );
     app.automation_panel.active_automations = 2;
     let facts = super::tideline_footer_from_app(&mut app, 140);
     assert_eq!(
         facts.count_actions.last(),
         Some(&crate::tui::tideline::InteractionAction::OpenAutomations)
     );
+}
+
+#[test]
+fn posture_shortcuts_recede_without_changing_count_click_targets() {
+    use ratatui::{buffer::Buffer, style::Modifier};
+    let fixture = working();
+    let mut buf = Buffer::empty(Rect::new(0, 0, 120, 1));
+    let targets = render_tideline_footer(buf.area, &mut buf, &fixture.widget(&UI_THEME));
+    let text: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+    let column = |needle: &str| text[..text.find(needle).unwrap()].chars().count() as u16;
+    let label = column("ask");
+    let key = column("Shift+Tab to change");
+    assert!(buf[(label, 0)].modifier.contains(Modifier::BOLD));
+    assert!(!buf[(key, 0)].modifier.contains(Modifier::BOLD));
+    assert_eq!(
+        buf[(key, 0)].fg,
+        super::tchrome(&UI_THEME, ChromeInk::MetadataHint)
+            .fg
+            .unwrap()
+    );
+    assert_ne!(buf[(label, 0)].fg, buf[(key, 0)].fg);
+    assert_eq!(targets.len(), 1);
+    let (index, target) = targets[0];
+    assert_eq!(index, 0);
+    let painted: String = (target.x..target.right())
+        .map(|x| buf[(x, 0)].symbol())
+        .collect();
+    assert_eq!(painted, "2 agents");
 }

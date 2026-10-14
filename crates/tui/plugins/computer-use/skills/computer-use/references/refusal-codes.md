@@ -1,5 +1,13 @@
 # Refusal codes and the move that fixes them
 
+Named batch lookup returns `element_not_found` or `element_ambiguous` before
+input when its search has zero or multiple matches. `observation_incomplete`
+means a truncated walk cannot prove uniqueness or absence. Narrow the app/window
+or explicitly observe/select a target. Observe and narrow query
+and exact role; do not substitute guessed coordinates. `condition_not_met`
+means a batch wait timed out and subsequent steps did not run. Inspect
+`completed_steps`, `action_sent` and `outcome_unknown`; earlier effects remain.
+
 Every refusal is structured: `ok:false` with an `error.code` you can branch on.
 Never retry a refusal unchanged — re-observe, re-target, or change route.
 
@@ -23,12 +31,14 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 
 | code | meaning | move |
 | --- | --- | --- |
-| `shared_pointer_required` | background mode refuses pointer gestures | use element targets; shared desktop needs the user's explicit authorization |
+| `background_focus_required` | background mode refuses raw pointer gestures (the window route borrows key focus) | use element targets; foreground control needs the user's explicit authorization |
+| `bg_dispatch_unavailable` | the window-routed pointer cannot be resolved on this helper | update Computer Use or use element targets — the user's cursor is never used instead |
+| `real_pointer_refused` | a request tried to drive the user's cursor | there is no such route; use the window-routed pointer tools |
 | `background_scroll_unavailable` | no scrollbar at that point | target an observed scroll area |
 | `menu_item_not_found` | exact title not present (menus expose items only while open) | check the exact title; an ellipsis is part of it |
 | `menu_item_disabled` | item present but the app refuses it right now (often a missing key window) | use the window's own control element instead |
 | `app_not_found` | selector missed — `open_application` names/bundle ids that resolve nowhere and dead pids report it too | `list_apps` (or `all:true`) for exact names/pids |
-| `ambiguous_application` | `kill_app` name matched several running apps | pass `pid` to choose one |
+| `ambiguous_application` | an app name or bundle id matched several running apps (observation, input or `kill_app`) | pass `pid` to choose one |
 | `protected_application` | the target is the Computer Use helper or its host | name the intended app instead; these cannot be terminated through the plugin |
 | `browser_not_running` | browser action before `browser {action:"start"}` (or the browser went away) | start it; a closed CDP connection clears the session state |
 | `browser_not_installed` | no Chromium-family browser found | install one, or set `CODEWHALE_CU_BROWSER_APP` to the app path |
@@ -37,11 +47,26 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 | `not_granted` | the session's capability grant (`CODEWHALE_CU_GRANT`) does not include this tool | work inside the grant; the host narrowed it deliberately |
 | `consent_required` | no user decision exists for this app on the local computer | ask the user, then record it: `consent {action:"allow"\|"deny", app:"…"}` |
 | `app_denied` | the user denied this app — the deny covers every spelling of it | do not work around it; only they can `consent {action:"revoke"}` |
-| `foreground_consent_required` | `activate:true` needs the separate shared-pointer decision | ask, then `consent {action:"allow"\|"deny", scope:"foreground"}` — or keep working background (`activate:false`) |
+| `consent_needs_user` | a consent allow/revoke, a `confirm`, `app_script`, or computer register/spawn was called without the user's own decision | ask the user; the host shows them the exact call — never retry it as a model call or a `run_actions` step |
+| `consent_declined` | the user declined the host's prompt for that call | do not retry; continue without it or ask them |
+| `foreground_consent_required` | `activate:true` needs the separate foreground decision | ask, then `consent {action:"allow"\|"deny", scope:"foreground"}` — or keep working background (`activate:false`) |
+| `confirmation_required` | the click or press would activate a pay/buy/order/send/transfer/delete control | stop and show the user exactly what will happen; only on their approval, `consent {action:"allow", confirm:"<token>"}` and repeat the identical call |
+| `confirmation_unknown` | the confirmation token is unknown, used, or expired | repeat the original call for a fresh token and ask the user again |
+| `script_refused` | `app_script` would reach a shell, Cocoa, dynamic code, a terminal app, or an app it does not name with a literal | use the host's shell for shell work, or name the app literally; never rewrite the script to get past the check |
+| `not_replayable` | a trajectory step contains saved capture pins, redacted text or a consent decision | replay stops there; observe and plan a new action, preserving the actual permission and confirmation gates; never strip or remap pins |
 | `foreground_denied` | the user denied shared-desktop (foreground) control | work background-only; do not retry `activate:true` |
 | `frame_refused` | the app refused both the position and the size write | the window is fullscreen, tiled or otherwise not movable by the app |
 | `trajectory_not_found` | no trajectory file matches the id (or none exist) | `trajectory {action:"status"}` lists recent files |
 | `replay_too_large` | the trajectory exceeds the 200-turn replay cap | split it, or replay a pruned copy |
+| `input_owner_unknown` | Linux cannot tell which app would receive this input: no window manager publishes its stacking order, no managed window has keyboard focus, or the session is Wayland | bring the target app's window to the front (observe it or click it), then retry; on Wayland use an X11 session |
+| `popup_open` | a menu or popup item is open in the app that would receive the keys | send `key escape` (allowed while a menu is open), observe the app, then retry |
+| `window_not_active` | the element is focused, but its window is not the active one, so keys would go to another window | bring the app forward (`open_application activate:true`, which needs foreground consent) or ask the user to focus it |
+| `no_window` | the app has no visible window to capture (minimized or unmapped) | restore it, or ask the user; capture the display instead |
+| `no_window_manager` | window geometry is not published, so app-window screenshots and recordings cannot be cropped | start a window manager, or capture the display |
+| `focus_failed` | AT-SPI refused focus on the element (not focusable, or focus refused) | observe again and choose a focusable control |
+| `select_text_failed` | AT-SPI refused the text range or the caret position | observe the element; the range must lie inside its text |
+| `no_value` | the element exposes neither a text nor a numeric value | read a labelled control or a different element |
+| `recording_failed` | ffmpeg could not start or finish the recording | check the display and the ffmpeg install; the receipt names the partial file |
 | `app_upgrade_required` | the helper predates the feature or is not running | restart/update the Codewhale Computer Use app |
 | `unsupported_on_backend` | tool not implemented on that platform backend | check the platform note in the main skill |
 | `unsupported_on_transport` | `app_script` sent to an ssh/docker/hdc computer — scripting is local-only so a remote channel never becomes a shell | run it on `local`, or use the host's own remote access |
@@ -50,6 +75,7 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 | `spawn_failed` | provisioning failed or the desktop did not become ready | read the message; the failed container is removed automatically — fix the cause and spawn again |
 | `invalid_container` | a docker registry entry lacks a valid container name | register it through `computer spawn`, never by hand |
 | `cleanup_failed` | `docker rm` failed while tearing down a spawned computer | the registry entry is still removed; check `docker ps` for the labeled container and remove it manually |
+| `computer_owned_elsewhere` | `computer remove`, `register` or `spawn` named a desktop another session spawned | leave it; its session removes it at exit (the message names the container if that session is gone) |
 | `script_error` | osascript exited non-zero; stderr is in the message | read the error, check the app's scripting dictionary (`sdef`), fix the script |
 | `script_timeout` | the script — or a consent dialog — was still open at the deadline | narrow the script; a consent prompt is the person's choice, report it |
 | `script_cancelled` | the script's own dialog was cancelled (-128) | the user declined in-app; stop or ask |
@@ -65,9 +91,20 @@ computer; a typing pause does not authorize foreground control.
 
 ## Reading a receipt
 
+- `raster_id` identifies a screenshot, zoom or OCR image on this server and
+  computer. Supply it with raster coordinates. `raster_stale` means another
+  capture replaced it; `no_raster` means the context was retired or no image
+  was observed. Both refuse before input: observe again instead of removing
+  the pin. `bad_target` refuses malformed IDs or IDs on absolute screen points.
+- `target_raster_id` on a successful coordinate receipt names the image used
+  for conversion; `parent_raster_id` on a zoom names the image actually cropped.
+  These are identity receipts, not proof of a current UI or completed task.
+
 - `action_sent` / `verified` mean dispatch (and, where available, read-back) —
   not task success. Verify the effect with a fresh observation.
 - `front_lease` / `front_restored` describe focus accounting for window-record
   deliveries in explicitly authorized foreground mode. `front_restored:false` is a person-visible event: say it out loud.
-- `input_may_have_been_sent` on an error means the press left before the
-  failure: observe the target before doing anything else.
+- `outcome_unknown: true` (with `request_dispatched: true`) on an error means
+  the action was already handed to the helper, remote agent or browser when it
+  timed out, was cancelled or lost its reply: observe the target before doing
+  anything else, and never retry the action blindly.

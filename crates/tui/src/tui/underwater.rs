@@ -46,6 +46,7 @@ pub enum LaunchAction {
     /// The prominent new-session entry: begin a fresh session in the
     /// current workspace.
     NewSession,
+    ReturnToSession,
     /// Resume one recent-work row by session id.
     ResumeSession(String),
     /// The see-all overflow: open the full session picker.
@@ -150,14 +151,14 @@ fn launch_recent_entries(app: &App) -> (Vec<LaunchRecentEntry>, bool) {
                 &session.updated_at,
                 app.ui_locale,
             );
-            let count = crate::tui::session_picker::format_message_count(
-                session.message_count,
-                app.ui_locale,
-            );
             LaunchRecentEntry {
                 id: session.id.clone(),
                 title,
-                detail: format!("{age} · {count}"),
+                detail: if session.interrupted {
+                    format!("interrupted · {age}")
+                } else {
+                    age
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -167,6 +168,19 @@ fn launch_recent_entries(app: &App) -> (Vec<LaunchRecentEntry>, bool) {
     let has_more = app.launch.total_workspace_sessions > recent.len()
         || (recent.is_empty() && app.launch.has_scoped_sessions);
     (recent, has_more)
+}
+
+/// Both painting and input use the same primary action on revisited home.
+fn home_card_rows(app: &App, recent: &[LaunchRecentEntry], has_more: bool) -> Vec<LaunchCardRow> {
+    let mut rows = launch_card_rows(app.ui_locale, recent, has_more);
+    if app.launch.return_to_session {
+        rows[0].id = crate::tui::app::LaunchRowId::ReturnToSession;
+        rows[0].label = format!(
+            "{}  Esc",
+            tr(app.ui_locale, MessageId::HomeBackToConversation)
+        );
+    }
+    rows
 }
 
 /// The card's rows for live `App` state, for keyboard navigation and Enter.
@@ -179,12 +193,10 @@ fn launch_recent_entries(app: &App) -> (Vec<LaunchRecentEntry>, bool) {
 /// list: one ordering for paint, mouse, and keyboard, with no second state.
 #[must_use]
 pub fn launch_rows_for_app(app: &App) -> Vec<LaunchCardRow> {
-    let (recent, has_more) = launch_recent_entries(app);
-    if app.launch.row_hitboxes.is_empty() {
-        // Nothing painted yet (first frame): nothing is selected either.
-        return launch_card_rows(app.ui_locale, &recent, has_more);
-    }
-    let mut superset = launch_card_rows(app.ui_locale, &recent, true);
+    let (recent, _) = launch_recent_entries(app);
+    // An empty pane has no navigable rows, including before its first paint.
+    // A preserved multiline draft can legitimately leave no room for home.
+    let mut superset = home_card_rows(app, &recent, true);
     // MCP rows join the same ordering only when the boot block painted them.
     for id in [
         crate::tui::app::LaunchRowId::McpManager,
@@ -245,6 +257,7 @@ pub fn refresh_launch_row_hitboxes(app: &mut App, area: Rect) {
 pub fn launch_row_click_action(id: &crate::tui::app::LaunchRowId) -> LaunchAction {
     match id {
         crate::tui::app::LaunchRowId::NewSession => LaunchAction::NewSession,
+        crate::tui::app::LaunchRowId::ReturnToSession => LaunchAction::ReturnToSession,
         crate::tui::app::LaunchRowId::Recent(session_id) => {
             LaunchAction::ResumeSession(session_id.clone())
         }
@@ -338,8 +351,8 @@ pub enum LaunchComposerKey {
     ComposerAuthority,
     /// Move the launch card's row selection (Up/Down while the card is up).
     MenuNavigate(i32),
-    /// Run the card's highlighted row (Enter while the card is up, the
-    /// composer is empty, and the user has arrowed onto a row).
+    /// Run the card's highlighted row. Revisited home retains its draft;
+    /// on startup, only an empty composer yields Enter to the card.
     MenuRun,
 }
 
@@ -350,12 +363,27 @@ pub enum LaunchComposerKey {
 /// system. Only F1 help stays launch-owned via
 /// [`LaunchComposerKey::MenuChord`].
 pub fn handle_launch_composer_key(app: &mut App, key: KeyEvent) -> LaunchComposerKey {
+    if app.launch.return_to_session && key.code == KeyCode::Esc {
+        app.launch.dismiss();
+        return LaunchComposerKey::Consumed;
+    }
     let multiline = app.composer_multiline_mode;
     let card_up = app.launch.dissolve_started_ms.is_none();
     match key.code {
         KeyCode::Enter
             if crate::tui::composer_ui::composer_submit_chord(key, multiline).is_some() =>
         {
+            // Explicit home navigation takes precedence over a preserved draft.
+            // Only painted rows may own Enter, just as with mouse activation.
+            if app.launch.return_to_session
+                && card_up
+                && app
+                    .launch
+                    .menu_selected
+                    .is_some_and(|index| index < app.launch.row_hitboxes.len())
+            {
+                return LaunchComposerKey::MenuRun;
+            }
             // #573 parity with the session composer's Enter arm: when a
             // completion popup is matching (e.g. `/mo` → `/model`), Enter
             // applies the highlighted entry instead of sending the literal
@@ -411,7 +439,11 @@ pub fn handle_launch_composer_key(app: &mut App, key: KeyEvent) -> LaunchCompose
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
             {
-                app.launch.dissolve_card(app.ambient_clock_ms);
+                if app.launch.return_to_session {
+                    app.launch.dismiss();
+                } else {
+                    app.launch.dissolve_card(app.ambient_clock_ms);
+                }
             }
             LaunchComposerKey::ComposerAuthority
         }
@@ -609,7 +641,11 @@ impl ShellPhase {
         {
             return Self::Failed;
         }
+        // A child agent's unanswered approval or question is the person's
+        // move, even while other agents keep working: the footer says
+        // "waiting on you", not "agents underway" (#6565).
         if app.pending_user_input_prompt.is_some()
+            || !app.pending_child_requests.is_empty()
             || app
                 .task_panel
                 .iter()
@@ -789,7 +825,7 @@ pub(crate) fn title_activity_verb(app: &App) -> &'static str {
             LiveActivityKind::UsingTool => "using tool…",
             LiveActivityKind::UsingSubagents => "fleet underway…",
             LiveActivityKind::Verifying => "verifying…",
-            LiveActivityKind::Working => "in the current…",
+            LiveActivityKind::Working => "working…",
         },
     }
 }
@@ -856,10 +892,7 @@ pub(crate) fn phase_marker_with_activity(
         ShellPhase::Done => match completion_elapsed_ms(app) {
             Some(elapsed) if elapsed < COMPLETION_RELEASE_MS => {
                 let index = ((elapsed / 140) as usize + 4).min(WORKING_BUBBLE_FRAMES.len() - 1);
-                (
-                    WORKING_BUBBLE_FRAMES[index],
-                    tr(locale, MessageId::PhaseFinishing),
-                )
+                (WORKING_BUBBLE_FRAMES[index], phase.label(locale))
             }
             _ => (crate::tui::glyphs::DONE, phase.label(locale)),
         },
@@ -882,22 +915,8 @@ fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
 /// Tool-approval posture only. Filesystem scope is a separate fact and only
 /// earns header columns when it is worth reading — see
 /// [`filesystem_scope_notice`].
-fn permission_label(app: &App) -> Cow<'static, str> {
-    let locale = app.ui_locale;
-    if app.mode == AppMode::Plan {
-        return tr(locale, MessageId::ChipPermissionReadOnly);
-    }
-    match app.approval_mode {
-        ApprovalMode::Suggest => tr(locale, MessageId::ChipPermissionAsk),
-        ApprovalMode::Auto => tr(locale, MessageId::ChipPermissionAuto),
-        // Keep the effective permission explicit. `bypass` is an
-        // implementation detail and, more importantly, can imply that
-        // repository law no longer applies. Full Access never bypasses
-        // constitution rules. This is **tool-approval posture**, not
-        // filesystem scope — see filesystem_scope_notice.
-        ApprovalMode::Bypass => tr(locale, MessageId::ChipPermissionFullAccess),
-        ApprovalMode::Never => tr(locale, MessageId::ChipPermissionNever),
-    }
+pub(crate) fn permission_label(app: &App) -> Cow<'static, str> {
+    crate::core::authority::permission_label_for(app.ui_locale, app.mode, app.approval_mode)
 }
 
 /// The effective filesystem scope — but only when it says something the
@@ -1126,12 +1145,12 @@ pub struct LaunchEmptyState {
 const LAUNCH_BLOCK_INDENT: usize = 2;
 /// The card's reading measure: a row is a title with its detail set against
 /// it, and without a ceiling the detail right-aligns against the terminal's
-/// far edge. Titles persist at 50 characters, the detail reads ~20.
+/// far edge. The title is primary; the relative age is secondary.
 const LAUNCH_CARD_MEASURE: usize = 72;
 /// Gap between a row's title and its right-aligned detail.
 const LAUNCH_ROW_GAP: usize = 3;
 /// Below this the row spends its whole lane on the title and sheds the detail.
-const LAUNCH_ROW_MIN_TITLE: usize = 24;
+const LAUNCH_ROW_MIN_TITLE: usize = 28;
 /// Labels align with their heading; the action cue has its own gutter.
 /// Blank rows the card spends on rhythm when the pane is tall enough.
 const LAUNCH_SEPARATORS: usize = 3;
@@ -1473,6 +1492,8 @@ struct LaunchFit {
     context: bool,
     help: bool,
     notice: bool,
+    /// The "no model connected · run /provider" line (UX-3).
+    setup: bool,
     heading: bool,
     blanks: usize,
     shown: usize,
@@ -1495,6 +1516,7 @@ impl LaunchFit {
             + (self.context as usize)
             + (self.help as usize)
             + (self.notice as usize)
+            + (self.setup as usize)
             + self.blanks * self.gap
             + 1
             + (self.heading as usize)
@@ -1508,18 +1530,28 @@ impl LaunchFit {
 /// Shed the card down to `height`, in a fixed order: rhythm, the migration
 /// notice, the MCP block's detail, identity/help chrome, then the tail of
 /// the recent list. The overflow row keeps any hidden sessions reachable.
+/// The "no model connected" line goes last of all: on a keyless first run
+/// it is the only thing on the card that explains why nothing will answer.
 ///
 /// The MCP block gives up its rows before the recent list does (recent work
 /// is what the screen is *for*) but keeps its summary line until almost
 /// everything else has gone, because "2 failed" in one row still tells the
 /// truth that the footer chip could not.
-fn launch_fit(height: usize, recent: usize, has_more: bool, notice: bool, mcp: usize) -> LaunchFit {
+fn launch_fit(
+    height: usize,
+    recent: usize,
+    has_more: bool,
+    notice: bool,
+    mcp: usize,
+    setup: bool,
+) -> LaunchFit {
     let mut fit = LaunchFit {
         brand: true,
         context: true,
         help: true,
         notice,
-        heading: true,
+        setup,
+        heading: recent > 0 || has_more,
         blanks: LAUNCH_SEPARATORS,
         shown: recent,
         see_all: has_more,
@@ -1551,6 +1583,7 @@ fn launch_fit(height: usize, recent: usize, has_more: bool, notice: bool, mcp: u
             }
             10 => fit.mcp = 0,
             11 => fit.see_all = false,
+            12 => fit.setup = false,
             _ => break,
         }
         step += 1;
@@ -1598,10 +1631,9 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
     }
 
     let (entries, has_more) = launch_recent_entries(app);
-    // Whether this workspace has recent work at all, before any is shed for
-    // height: the heading must not say "no recent sessions" about a list that
-    // only ran out of rows.
-    let had_recent = !entries.is_empty();
+    // Nothing will answer a message until a model is connected; the card
+    // says so instead of letting the first Enter fail silently (UX-3).
+    let no_model_connected = app.onboarding_needs_api_key;
     // Built before the fit ladder runs: how many rows the block wants is a
     // fact about this workspace's servers, not about the pane.
     let mcp_block = mcp_launch_lines(app, text_width);
@@ -1626,6 +1658,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         has_more,
         app.launch.claude_code_detected,
         mcp_block.lines.len(),
+        no_model_connected,
     );
     if mark.is_some() && !(fit.brand && fit.context) {
         // At the absolute height floor the wordmark yields to the actions too.
@@ -1636,13 +1669,14 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             has_more,
             app.launch.claude_code_detected,
             mcp_block.lines.len(),
+            no_model_connected,
         );
     }
     let header_width =
         text_width.saturating_sub(mark.map_or(0, |size| usize::from(size.cells().0) + 2));
     let spacious = fit.blanks == LAUNCH_SEPARATORS;
     let visible: Vec<LaunchRecentEntry> = entries.into_iter().take(fit.shown).collect();
-    let card_rows = launch_card_rows(locale, &visible, fit.see_all);
+    let card_rows = home_card_rows(app, &visible, fit.see_all);
 
     // The text column, in order. `None` is a blank row.
     let mut text: Vec<Option<Line<'static>>> = Vec::new();
@@ -1688,7 +1722,18 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         text.resize_with(usize::from(mark.cells().1), || None);
         for (row, dots) in mark.rows().iter().enumerate() {
             let mut spans = vec![
-                Span::styled(*dots, Style::default().fg(theme.accent_primary)),
+                Span::styled(
+                    crate::tui::mark::reveal_row(
+                        dots,
+                        app.launch
+                            .mark_reveal_started_at
+                            .map_or(crate::tui::mark::REVEAL_MS, |started| {
+                                started.elapsed().as_millis()
+                            }),
+                        app.motion_policy().allows_decorative() && !app.launch.return_to_session,
+                    ),
+                    Style::default().fg(theme.accent_primary),
+                ),
                 Span::raw("  "),
             ];
             if let Some(line) = text[row].take() {
@@ -1696,6 +1741,18 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             }
             text[row] = Some(Line::from(spans));
         }
+    }
+    if fit.setup {
+        let line = format!(
+            "{}{}{}",
+            tr(locale, MessageId::LaunchNoModelConnected),
+            crate::tui::session_boot::ITEM_SEPARATOR,
+            tr(locale, MessageId::LaunchRunCommand).replace("{command}", "/provider"),
+        );
+        text.push(Some(Line::from(Span::styled(
+            semantic_truncate(&line, text_width),
+            Style::default().fg(theme.warning),
+        ))));
     }
     // The migration notice, while there is still a question to answer. It
     // retires for good once `/import-claude` has been run.
@@ -1713,21 +1770,19 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
 
     for row in &card_rows {
         let style = if row.prominent {
-            Style::default().fg(theme.accent_primary).bold()
+            Style::default().fg(theme.text_body).bold()
         } else {
             Style::default().fg(theme.text_body)
         };
-        // Every action shares the same left edge.
-        let indent = 0;
         if matches!(row.id, crate::tui::app::LaunchRowId::SeeAll) && spacious {
             for _ in 0..fit.gap {
                 text.push(None);
             }
         }
-        let lane = text_width.saturating_sub(indent);
+        let lane = text_width;
         let detail_width = text_display_width(&row.detail);
-        // Age and message count are context, not the row: when the lane
-        // cannot hold a readable title beside them they are dropped whole
+        // Age is context: when the lane cannot hold a readable title
+        // beside it, drop the age whole
         // rather than ellipsing the title to a stub. This is also the
         // fallback for a locale that spends more cells on the same fact.
         let detail = if row.detail.is_empty()
@@ -1745,9 +1800,6 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         let label = semantic_truncate(&row.label, label_budget);
         let label_width = text_display_width(&label);
         let mut spans = Vec::with_capacity(4);
-        if indent > 0 {
-            spans.push(Span::raw(" ".repeat(indent)));
-        }
         spans.push(Span::styled(label, style));
         if !detail.is_empty() {
             let pad = lane
@@ -1767,23 +1819,16 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         }
         rows.push((row.id.clone(), text.len()));
         text.push(Some(Line::from(spans)));
-        if matches!(row.id, crate::tui::app::LaunchRowId::NewSession) && fit.heading {
-            // With no resumable work the heading says so — but only when the
-            // workspace genuinely has none. Sessions the card's filter drops
-            // (empty auto-created shells) still exist in `/resume`, so their
-            // presence earns the honest "Recent" + a see-all row, not a
-            // "no recent sessions" the picker would immediately disprove.
-            let heading = if had_recent || app.launch.has_scoped_sessions {
-                MessageId::LaunchRecentHeading
-            } else {
-                MessageId::LaunchNoRecentSessions
-            };
+        if row.prominent && fit.heading {
+            // An empty workspace needs only the invitation and composer.
+            // Real history, including filtered sessions reachable via See all,
+            // still gets a heading; zero counts are not content.
             if spacious {
                 for _ in 0..fit.gap {
                     text.push(None);
                 }
             }
-            let label = semantic_truncate(&tr(locale, heading), text_width);
+            let label = semantic_truncate(&tr(locale, MessageId::LaunchRecentHeading), text_width);
             let remaining = text_width.saturating_sub(text_display_width(&label) + 2);
             let mut spans = vec![Span::styled(
                 label,
@@ -1930,8 +1975,9 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
 #[cfg(test)]
 mod launch_card_tests {
     use super::{
-        LAUNCH_CARD_MEASURE, LaunchAction, launch_empty_state, launch_fit, launch_row_click_action,
-        launch_rows_for_app, refresh_launch_row_hitboxes, run_launch_card_row, text_display_width,
+        LAUNCH_CARD_MEASURE, LaunchAction, launch_empty_state, launch_fit, launch_recent_entries,
+        launch_row_click_action, launch_rows_for_app, refresh_launch_row_hitboxes,
+        run_launch_card_row, text_display_width,
     };
     use crate::tui::app::{App, LaunchRecentSession, LaunchRowId};
     use ratatui::layout::Rect;
@@ -1939,8 +1985,8 @@ mod launch_card_tests {
     use unicode_segmentation::UnicodeSegmentation;
 
     fn app_with_recent(titles: &[&str], total: usize) -> App {
-        let mut app = crate::test_support::test_app_with_options(
-            crate::test_support::test_tui_options(std::env::temp_dir()),
+        let mut app = crate::tui::test_support::test_app_with_options(
+            crate::tui::test_support::test_tui_options(std::env::temp_dir()),
         );
         app.launch.visible = true;
         app.launch.claude_code_detected = false;
@@ -1953,10 +1999,75 @@ mod launch_card_tests {
                 updated_at: chrono::Utc::now()
                     - chrono::Duration::hours(i64::try_from(index).unwrap_or(0) + 1),
                 message_count: 40 + index,
+                interrupted: false,
             })
             .collect();
         app.launch.total_workspace_sessions = total;
         app
+    }
+
+    #[test]
+    fn launch_primary_action_has_readable_ink_in_every_theme() {
+        for theme in codewhale_palette::SELECTABLE_THEMES {
+            let mut app = app_with_recent(&["Recent proof"], 1);
+            app.ui_theme = theme.ui_theme();
+            app.theme_id = *theme;
+            let card = launch_empty_state(&app, Rect::new(0, 0, 100, 24));
+            let span = card
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains("New session"))
+                .unwrap();
+            assert_eq!(
+                span.style.fg,
+                Some(app.ui_theme.text_body),
+                "{}",
+                theme.name()
+            );
+            if let Some(ratio) =
+                codewhale_palette::contrast_ratio(span.style.fg.unwrap(), app.ui_theme.panel_bg)
+            {
+                assert!(
+                    ratio >= 4.5,
+                    "{} New session contrast {ratio}",
+                    theme.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_settle_keeps_done_label_stable() {
+        let mut app = app_with_recent(&[], 0);
+        app.low_motion = false;
+        app.fancy_animations = true;
+        let activity = super::LiveActivity::from_app(&app);
+        for elapsed in [0, 280, 700] {
+            app.ocean_completion_started_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(elapsed));
+            let (_, label) =
+                super::phase_marker_with_activity(&app, super::ShellPhase::Done, activity);
+            assert_eq!(label, super::ShellPhase::Done.label(app.ui_locale));
+        }
+    }
+
+    #[test]
+    fn launch_reveal_stops_scheduling_after_its_endpoint() {
+        let mut app = app_with_recent(&[], 0);
+        app.onboarding = crate::tui::app::OnboardingState::None;
+        app.theme_id = codewhale_palette::ThemeId::Shoreline;
+        app.low_motion = false;
+        app.fancy_animations = true;
+        app.launch.mark_reveal_started_at = Some(std::time::Instant::now());
+        assert!(super::launch_motion_active(&app, false, true));
+        assert!(!super::launch_motion_active(&app, true, true));
+        app.low_motion = true;
+        assert!(!super::launch_motion_active(&app, false, true));
+        app.low_motion = false;
+        app.launch.mark_reveal_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(361));
+        assert!(!super::launch_motion_active(&app, false, true));
     }
 
     /// The founder's own shape: many servers, a couple genuinely broken, a
@@ -2090,7 +2201,7 @@ mod launch_card_tests {
     #[test]
     fn no_keyboard_row_names_a_session_the_pane_is_not_showing() {
         let mut app = app_with_recent(&["one", "two", "three", "four", "five"], 5);
-        for height in 1u16..=14 {
+        for height in 0u16..=14 {
             refresh_launch_row_hitboxes(&mut app, Rect::new(0, 0, 120, height));
             let painted: Vec<LaunchRowId> = row_ids(&app);
             for row in launch_rows_for_app(&app) {
@@ -2244,21 +2355,58 @@ mod launch_card_tests {
                 for has_more in [false, true] {
                     for notice in [false, true] {
                         for mcp in 0usize..=4 {
-                            let fit = launch_fit(height, recent, has_more, notice, mcp);
-                            assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
-                            assert!(fit.shown <= recent);
-                            assert!(fit.mcp <= mcp);
-                            if fit.shown < recent {
-                                assert!(
-                                    fit.see_all || fit.rows() >= height,
-                                    "shed rows became unreachable: {fit:?}",
-                                );
+                            for setup in [false, true] {
+                                let fit = launch_fit(height, recent, has_more, notice, mcp, setup);
+                                assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
+                                assert!(fit.shown <= recent);
+                                assert!(fit.mcp <= mcp);
+                                if fit.shown < recent {
+                                    assert!(
+                                        fit.see_all || fit.rows() >= height,
+                                        "shed rows became unreachable: {fit:?}",
+                                    );
+                                }
+                                if setup && !fit.setup {
+                                    assert_eq!(
+                                        (fit.shown, fit.mcp, fit.see_all),
+                                        (0, 0, false),
+                                        "the no-model line outlived other rows: {fit:?}",
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_keyless_launch_says_no_model_is_connected_and_how_to_fix_it() {
+        let mut app = app_with_recent(&["Fix the parser"], 1);
+        app.onboarding_needs_api_key = true;
+        let lines = painted(&app, 100, 30).join("\n");
+        assert!(lines.contains("no model connected"), "{lines}");
+        assert!(lines.contains("/provider"), "{lines}");
+        // Even a pane too short for the recent list keeps the recovery line.
+        let short = painted(&app, 100, 3).join("\n");
+        assert!(short.contains("no model connected"), "{short}");
+
+        app.onboarding_needs_api_key = false;
+        let lines = painted(&app, 100, 30).join("\n");
+        assert!(!lines.contains("no model connected"), "{lines}");
+    }
+
+    #[test]
+    fn empty_workspace_omits_recent_section_but_hidden_history_stays_reachable() {
+        let app = app_with_recent(&[], 0);
+        let text = painted(&app, 100, 24).join("\n");
+        assert!(text.contains("New session"));
+        assert!(!text.contains("Recent"));
+        assert!(!text.contains("No recent sessions"));
+        assert!(!launch_fit(24, 0, false, false, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, false).see_all);
     }
 
     // --- the row reads as one object -----------------------------------
@@ -2275,14 +2423,26 @@ mod launch_card_tests {
             text_display_width(row.trim_start()) <= LAUNCH_CARD_MEASURE + 2,
             "row runs to the terminal edge: {row:?}",
         );
-        assert!(row.contains("msgs"), "row lost its detail: {row:?}");
+        let (entries, _) = launch_recent_entries(&app);
+        assert!(
+            row.contains(&entries[0].detail),
+            "row lost its age: {row:?}"
+        );
+        assert!(
+            !row.contains("msgs"),
+            "message counts belong in session details: {row:?}"
+        );
     }
 
     #[test]
     fn a_narrow_pane_spends_its_lane_on_the_title() {
         let app = app_with_recent(&["Ship the launch card"], 1);
         let row = recent_row_title(&app, 40, 24);
-        assert!(!row.contains("msgs"), "detail should have shed: {row:?}");
+        let (entries, _) = launch_recent_entries(&app);
+        assert!(
+            !row.contains(&entries[0].detail),
+            "age should have shed: {row:?}"
+        );
         assert!(row.starts_with("Ship the launch"), "{row:?}");
     }
 
@@ -2513,10 +2673,51 @@ mod launch_card_tests {
     }
 
     #[test]
+    fn mcp_remedy_preserves_a_draft_and_opens_the_manager() {
+        let mut app = with_mcp(app_with_recent(&["one"], 9));
+        app.launch.return_to_session = true;
+        app.input = "unsent draft".into();
+        app.cursor_position = 4;
+        crate::tui::ui::type_launch_mcp_remedy(&mut app);
+        assert_eq!(app.input, "unsent draft");
+        assert_eq!(app.cursor_position, 4);
+        assert_eq!(
+            app.view_stack.top_kind(),
+            Some(crate::tui::views::ModalKind::Extensions),
+        );
+    }
+
+    #[test]
     fn mcp_remedy_action_is_a_noop_when_nothing_is_wrong() {
         let mut app = app_with_recent(&["one"], 9);
         crate::tui::ui::type_launch_mcp_remedy(&mut app);
         assert!(app.input.is_empty());
+    }
+
+    /// The migration notice ends with the reassurance that nothing applies
+    /// unapproved; a truncated notice drops exactly that half. The English
+    /// line must fit the card measure whole at a wide terminal.
+    #[test]
+    fn claude_notice_is_never_truncated_on_a_wide_terminal() {
+        let notice = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::LaunchNoticeClaude,
+        );
+        assert!(
+            text_display_width(&notice) <= LAUNCH_CARD_MEASURE,
+            "notice is {} cells; the card lane is {LAUNCH_CARD_MEASURE}: {notice:?}",
+            text_display_width(&notice),
+        );
+        let mut app = app_with_recent(&["one"], 1);
+        app.launch.claude_code_detected = true;
+        let state = launch_empty_state(&app, Rect::new(0, 0, 160, 40));
+        assert!(
+            state
+                .lines
+                .iter()
+                .any(|line| flatten(line).contains(notice.as_ref())),
+            "the full notice must paint at 160 columns",
+        );
     }
 
     #[test]
@@ -2636,8 +2837,8 @@ mod empty_state_caption_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Launch motion scheduling: only a real dissolve or active water field
-// requests frames. The static workbench index does not animate its identity.
+// Launch motion scheduling: the bounded mark reveal, a real dissolve, or
+// an active water field requests frames through the existing scheduler.
 // ---------------------------------------------------------------------------
 
 /// Whether the launch screen has a visible transition or ambient scene.
@@ -2655,5 +2856,11 @@ pub fn launch_motion_active(app: &App, obscured: bool, ambient_settled: bool) ->
     let dissolve = app.launch.card_dissolve_progress(now, true);
     let dissolving = dissolve > 0.0 && dissolve < 1.0;
     let water_alive = app.theme_id == codewhale_palette::ThemeId::Underwater && !ambient_settled;
-    dissolving || water_alive
+    let revealing = !app.launch.return_to_session
+        && !crate::tui::color_compat::ascii_safe_enabled()
+        && app
+            .launch
+            .mark_reveal_started_at
+            .is_some_and(|started| started.elapsed().as_millis() < crate::tui::mark::REVEAL_MS);
+    revealing || dissolving || water_alive
 }

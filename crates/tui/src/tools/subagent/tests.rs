@@ -1,16 +1,17 @@
 use super::*;
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::fleet::roster::FleetRoster;
 use crate::tools::{AgentToolSurfaceOptions, ToolRegistryBuilder};
 use crate::worker_profile::ShellPolicy;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use std::collections::HashSet;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tempfile::{Builder as TempDirBuilder, tempdir};
 
 mod launch_receipt;
 mod roster_routes;
+mod route_replacement;
 
 fn built_in_whale_name_that_cannot_be_generated_for(agent_id: &str) -> &'static str {
     WHALE_NICKNAMES
@@ -185,6 +186,8 @@ pub(super) fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
         duration_ms: 0,
         started_at: None,
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 
@@ -201,6 +204,7 @@ pub(super) fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWork
         worker_id: worker_id.to_string(),
         run_id: worker_id.to_string(),
         parent_run_id: None,
+        workflow_run_id: None,
         session_name: Some(worker_id.to_string()),
         objective: "inspect the repo".to_string(),
         role: Some("explorer".to_string()),
@@ -254,7 +258,14 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
 
     let mut first_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = first.register_child_approval("resumed-agent-7");
+        let (id, _rx) = first
+            .register_child_approval(
+                "resumed-agent-7",
+                &new_child_execution_id("resumed-agent-7"),
+                "bash",
+                "fixture",
+            )
+            .unwrap();
         assert!(
             SubAgentManager::is_child_approval_id(&id),
             "routing hint must still recognize {id}"
@@ -273,7 +284,14 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
     let mut second = SubAgentManager::new(tmp.path().to_path_buf(), 4);
     let mut second_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = second.register_child_approval("resumed-agent-7");
+        let (id, _rx) = second
+            .register_child_approval(
+                "resumed-agent-7",
+                &new_child_execution_id("resumed-agent-7"),
+                "bash",
+                "fixture",
+            )
+            .unwrap();
         assert!(SubAgentManager::is_child_approval_id(&id));
         second_ids.push(id);
     }
@@ -283,6 +301,65 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
             "id {id} from the second manager collides with the first boot's ids"
         );
     }
+}
+
+#[tokio::test]
+async fn child_execution_identity_cannot_replace_a_waiter_or_answer_a_later_call() {
+    let tmp = tempdir().unwrap();
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let first = new_child_execution_id("child");
+    let second = new_child_execution_id("child");
+    let (registered, receiver) = manager
+        .register_child_approval("child", &first, "bash", "one")
+        .unwrap();
+    assert_eq!(registered, first);
+    assert!(
+        manager
+            .register_child_approval("child", &first, "bash", "replacement")
+            .is_err()
+    );
+    assert!(
+        manager
+            .register_child_approval("other", &first, "bash", "wrong owner")
+            .is_err()
+    );
+    assert!(manager.resolve_child_approval(
+        &first,
+        ChildApprovalOutcome::Denied {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
+    assert!(matches!(
+        receiver.await.unwrap(),
+        ChildApprovalOutcome::Denied {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
+    let (_, mut receiver) = manager
+        .register_child_approval("child", &second, "bash", "two")
+        .unwrap();
+    assert!(!manager.resolve_child_approval(
+        &first,
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(manager.resolve_child_approval(
+        &second,
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
+    assert!(matches!(
+        receiver.await.unwrap(),
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
 }
 
 #[test]
@@ -625,8 +702,87 @@ fn declared_read_only_write_roles_derive_without_mutating_shell() {
             false,
         );
         assert!(!profile.permissions.write, "{request:?}");
-        assert_eq!(profile.shell, ShellPolicy::None, "{request:?}");
+        assert_eq!(profile.shell, ShellPolicy::ReadOnly, "{request:?}");
+
+        runtime.worker_profile.shell = ShellPolicy::None;
+        apply_spawn_write_authority(&mut runtime, &request);
+        assert_eq!(runtime.worker_profile.shell, ShellPolicy::None);
     }
+}
+
+#[tokio::test]
+async fn explicit_read_only_general_can_inspect_git_but_cannot_mutate() {
+    let tmp = tempdir().expect("tempdir");
+    init_claim_repo(tmp.path());
+    let workspace = tmp.path().canonicalize().expect("workspace");
+    let request = parse_spawn_request(&json!({
+        "prompt": "inspect CI evidence",
+        "write_authority": "read_only",
+        "allowed_tools": ["read", "bash"]
+    }))
+    .expect("read-only request");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(workspace.clone());
+    runtime.context.auto_approve = true;
+    apply_spawn_write_authority(&mut runtime, &request);
+    runtime.worker_profile = worker_profile_for_spawn(
+        &runtime,
+        &request.agent_type,
+        &AgentWorkerToolProfile::Inherited,
+        "deepseek-v4-pro",
+        None,
+        false,
+    );
+    let registry = ChildCoreProbe::new(
+        runtime,
+        request.agent_type,
+        Some(vec!["read".into(), "bash".into()]),
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    assert!(registry.unavailable_allowed_tools().is_empty());
+    assert_ne!(
+        registry.grant.files,
+        crate::worker_profile::FileGrant::Write
+    );
+    for command in ["pwd", "git status --short", "git log --oneline -1"] {
+        let output = registry
+            .execute("inspection", "bash", json!({"command": command}))
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+        if command != "git status --short" {
+            assert!(!output.trim().is_empty());
+        }
+    }
+    for command in [
+        "gh run view 123 --repo owner/repo --log-failed",
+        "rg -n TODO src",
+    ] {
+        let input = json!({"command": command});
+        assert!(
+            registry.posture_permits_tool("bash", Some(&input)),
+            "{command}"
+        );
+        assert!(
+            registry.envelope_refusal("bash", &input).is_none(),
+            "{command}"
+        );
+    }
+    for command in [
+        "touch forbidden.txt",
+        "git checkout -b forbidden",
+        "npm test",
+    ] {
+        assert!(
+            registry
+                .execute("inspection", "bash", json!({"command": command}))
+                .await
+                .is_err(),
+            "inspection is not arbitrary execution: {command}"
+        );
+    }
+    assert!(!workspace.join("forbidden.txt").exists());
 }
 
 #[test]
@@ -2035,6 +2191,33 @@ fn message_text(message: &Message) -> &str {
     }
 }
 
+/// Local provider counterpart: preserve the exact fixture payload while
+/// serving Core's real streaming protocol, or ordinary JSON for one-shot
+/// guardian/compaction requests. No production parser or provider is involved.
+pub(super) fn chat_fixture_response(stream: bool, mut response: Value) -> axum::response::Response {
+    if !stream {
+        return Json(response).into_response();
+    }
+    if let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            let message = choice.as_object_mut().unwrap().remove("message").unwrap();
+            let mut delta = message;
+            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for (index, call) in calls.iter_mut().enumerate() {
+                    call["index"] = json!(index);
+                }
+            }
+            choice["delta"] = delta;
+        }
+    }
+    response["object"] = json!("chat.completion.chunk");
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {}\n\ndata: [DONE]\n\n", response),
+    )
+        .into_response()
+}
+
 pub(super) async fn delayed_chat_client(
     first_delay: Duration,
     response_text: &str,
@@ -2042,6 +2225,7 @@ pub(super) async fn delayed_chat_client(
     CodewhaleClient,
     Arc<AtomicUsize>,
     Arc<std::sync::Mutex<Vec<Value>>>,
+    crate::config::Config,
 ) {
     let calls = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2060,27 +2244,30 @@ pub(super) async fn delayed_chat_client(
                     bodies
                         .lock()
                         .expect("request body recorder mutex poisoned")
-                        .push(body);
+                        .push(body.clone());
                     if attempt == 1 {
                         tokio::time::sleep(first_delay).await;
                     }
-                    Json(json!({
-                        "id": format!("chatcmpl-test-{attempt}"),
-                        "model": "deepseek-v4-flash",
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_text
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 1,
-                            "completion_tokens": 1,
-                            "total_tokens": 2
-                        }
-                    }))
+                    chat_fixture_response(
+                        body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                        json!({
+                            "id": format!("chatcmpl-test-{attempt}"),
+                            "model": "deepseek-v4-flash",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": response_text
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "total_tokens": 2
+                            }
+                        }),
+                    )
                 }
             }
         }),
@@ -2095,12 +2282,14 @@ pub(super) async fn delayed_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake chat client");
-    (client, calls, bodies)
+    (client, calls, bodies, config)
 }
 
 #[tokio::test]
@@ -2130,10 +2319,10 @@ async fn detached_interactive_usage_after_mailbox_seal_reaches_session_accountin
             "subagent:agent_deepseek:step:1:response:late",
             crate::cost_status::EffectiveRouteEnvelope::capture(
                 None,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-direct",
                 "deepseek-v4-flash",
-                Some(ApiProvider::Deepseek.default_base_url()),
+                Some(ProviderKind::Deepseek.provider().default_base_url()),
                 chrono::Utc::now(),
             ),
             Usage {
@@ -2147,10 +2336,10 @@ async fn detached_interactive_usage_after_mailbox_seal_reaches_session_accountin
             "subagent:agent_anthropic:step:1:response:late",
             crate::cost_status::EffectiveRouteEnvelope::capture(
                 None,
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "anthropic-direct",
                 "claude-sonnet-4-5",
-                Some(ApiProvider::Anthropic.default_base_url()),
+                Some(ProviderKind::Anthropic.provider().default_base_url()),
                 chrono::Utc::now(),
             ),
             Usage {
@@ -2164,7 +2353,7 @@ async fn detached_interactive_usage_after_mailbox_seal_reaches_session_accountin
             "subagent:agent_custom:step:1:response:late",
             crate::cost_status::EffectiveRouteEnvelope::capture(
                 None,
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 "lab-compatible-route",
                 "lab-model-v1",
                 Some("https://models.example.test/v1"),
@@ -2295,10 +2484,10 @@ async fn child_guardian_usage_source_is_sanitized_and_replay_idempotent() {
 
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-direct",
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         chrono::Utc::now(),
     );
     let usage = Usage {
@@ -2364,10 +2553,10 @@ async fn ownerless_no_mailbox_provider_usage_reaches_accounting_once() {
     let source_id = "subagent:agent_direct:step:1:response:direct";
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-direct",
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         chrono::Utc::now(),
     );
     let usage = Usage {
@@ -2464,10 +2653,10 @@ async fn ownerless_child_usage_crossing_new_settles_to_its_dispatch_origin_once(
 
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
-        "deepseek-direct",
+        ProviderKind::Deepseek,
+        ProviderKind::Deepseek.as_str(),
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         chrono::Utc::now(),
     );
     let usage = Usage {
@@ -2588,10 +2777,10 @@ async fn provider_success_without_usage_records_one_route_aware_gap_and_no_zero_
     let source_id = child_guardian_usage_source_id("agent_missing_usage", "tool-fixed");
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-direct",
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         chrono::Utc::now(),
     );
     for _ in 0..2 {
@@ -2635,42 +2824,53 @@ async fn provider_success_without_usage_records_one_route_aware_gap_and_no_zero_
     assert_eq!(worker.usage_source_fingerprints, [fingerprint].into());
 }
 
+/// A server-side delay no test outlives: the request is accepted and counted
+/// but never answered, so a step timeout can never lose a race to the reply.
+const NEVER_ANSWERS: Duration = Duration::from_secs(3600);
+
+/// Upper bound for waits on real loopback I/O. Hitting it means the child hung;
+/// the assertions themselves never depend on how fast the runner is.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
 /// Like [`delayed_chat_client`] but delays *every* attempt, so the per-step
 /// API timeout fires on the first call and on every retry — the shape needed
 /// to drive the timeout-retry budget to exhaustion.
 async fn always_delayed_chat_client(
     delay: Duration,
     response_text: &str,
-) -> (CodewhaleClient, Arc<AtomicUsize>) {
+) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let response_text = response_text.to_string();
     let app = Router::new().route(
         "/{*path}",
         post({
             let calls = Arc::clone(&calls);
-            move |Json(_body): Json<Value>| {
+            move |Json(body): Json<Value>| {
                 let calls = Arc::clone(&calls);
                 let response_text = response_text.clone();
                 async move {
                     let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     tokio::time::sleep(delay).await;
-                    Json(json!({
-                        "id": format!("chatcmpl-test-{attempt}"),
-                        "model": "deepseek-v4-flash",
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_text
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 1,
-                            "completion_tokens": 1,
-                            "total_tokens": 2
-                        }
-                    }))
+                    chat_fixture_response(
+                        body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                        json!({
+                            "id": format!("chatcmpl-test-{attempt}"),
+                            "model": "deepseek-v4-flash",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": response_text
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "total_tokens": 2
+                            }
+                        }),
+                    )
                 }
             }
         }),
@@ -2685,41 +2885,62 @@ async fn always_delayed_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake always-slow chat client");
-    (client, calls)
+    (client, calls, config)
 }
 
 #[tokio::test]
 async fn tool_free_subagent_omits_chat_tools_and_tool_choice() {
     let tmp = tempdir().expect("tempdir");
-    let (client, calls, bodies) = delayed_chat_client(Duration::ZERO, "done").await;
+    let (client, calls, bodies, fixture_config) = delayed_chat_client(Duration::ZERO, "done").await;
     let manager = Arc::new(RwLock::new(SubAgentManager::new(
         tmp.path().to_path_buf(),
         2,
     )));
     let mut runtime = stub_runtime();
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = manager;
     runtime.context = ToolContext::new(tmp.path());
-    let (_input_tx, input_rx) = mpsc::unbounded_channel();
-
-    let result = run_subagent(
-        &runtime,
-        "agent_no_tools_request".to_string(),
-        FleetRole::Worker,
-        "Return a final answer without tools.".to_string(),
-        make_assignment(),
-        Some(Vec::new()),
-        false,
-        Instant::now(),
-        1,
-        None,
-        input_rx,
-    )
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let started = runtime
+            .manager
+            .write()
+            .await
+            .spawn_background_with_assignment_options(
+                Arc::clone(&runtime.manager),
+                runtime.clone(),
+                FleetRole::Worker,
+                "Return a final answer without tools.".to_string(),
+                make_assignment(),
+                Some(Vec::new()),
+                SubAgentSpawnOptions {
+                    name: Some("no_tools_request".to_string()),
+                    max_steps: Some(1),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("actual tool-free child admission");
+        loop {
+            let result = runtime
+                .manager
+                .read()
+                .await
+                .get_result(&started.agent_id)
+                .expect("admitted child remains registered");
+            if result.status != SubAgentStatus::Running {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
     .expect("tool-free sub-agent should complete");
 
@@ -2736,14 +2957,14 @@ async fn tool_free_subagent_omits_chat_tools_and_tool_choice() {
 
 async fn transient_header_timeout_then_success_chat_client(
     response_text: &str,
-) -> (CodewhaleClient, Arc<AtomicUsize>) {
+) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let response_text = response_text.to_string();
     let app = Router::new().route(
         "/{*path}",
         post({
             let calls = Arc::clone(&calls);
-            move |Json(_body): Json<Value>| {
+            move |Json(body): Json<Value>| {
                 let calls = Arc::clone(&calls);
                 let response_text = response_text.clone();
                 async move {
@@ -2759,7 +2980,7 @@ async fn transient_header_timeout_then_success_chat_client(
                         )
                             .into_response();
                     }
-                    Json(json!({
+                    chat_fixture_response(body.get("stream").and_then(Value::as_bool).unwrap_or(false), json!({
                         "id": format!("chatcmpl-test-{attempt}"),
                         "model": "deepseek-v4-flash",
                         "choices": [{
@@ -2791,15 +3012,18 @@ async fn transient_header_timeout_then_success_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake transient chat client");
-    (client, calls)
+    (client, calls, config)
 }
 
-async fn always_rate_limited_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>) {
+async fn always_rate_limited_chat_client()
+-> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route(
         "/{*path}",
@@ -2833,22 +3057,28 @@ async fn always_rate_limited_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake rate-limited chat client");
-    (client, calls)
+    (client, calls, config)
 }
 
-async fn always_invalid_request_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>) {
+async fn always_invalid_request_chat_client()
+-> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route(
         "/{*path}",
@@ -2883,19 +3113,24 @@ async fn always_invalid_request_chat_client() -> (CodewhaleClient, Arc<AtomicUsi
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake invalid-request chat client");
-    (client, calls)
+    (client, calls, config)
 }
 
 fn estimate_tool_description_tokens_conservative(text: &str) -> usize {
@@ -3716,6 +3951,51 @@ fn direct_consultant_aliases_apply_role_reasoning_default_after_inheritance() {
     );
 }
 
+/// A `Faster`/`Auto` child on a pair the router has no cheap sibling for used
+/// to run on the parent model at the parent's price with nothing said. The
+/// fallback stays — the router must not invent a model — but it now carries a
+/// note, so the operator can see why the child was not cheaper.
+#[test]
+fn a_fast_lane_the_router_cannot_serve_carries_a_note() {
+    let mut unknown = stub_runtime_for_provider("moonshot");
+    unknown.model = "kimi-k3".to_string();
+    let route = worker_profile_subagent_assignment_route(
+        &unknown,
+        &ModelRoute::Faster,
+        SubAgentThinking::Auto,
+        &FleetRole::Worker,
+    );
+    assert_eq!(route.model, "kimi-k3", "the child still runs on the parent");
+    let note = route
+        .route_note
+        .expect("an unserved fast lane must be visible, not silent");
+    assert!(
+        note.contains("kimi-k3") && note.contains("parent price"),
+        "{note}"
+    );
+
+    // A pair the route table does know keeps its sibling and stays quiet.
+    let mut served = stub_runtime_for_provider("moonshot");
+    served.model = "kimi-k2.7-code".to_string();
+    let route = worker_profile_subagent_assignment_route(
+        &served,
+        &ModelRoute::Faster,
+        SubAgentThinking::Auto,
+        &FleetRole::Worker,
+    );
+    assert_eq!(route.model, "kimi-k2.6");
+    assert_eq!(route.route_note, None);
+
+    // Inherit never asked for a fast lane, so there is nothing to report.
+    let route = worker_profile_subagent_assignment_route(
+        &unknown,
+        &ModelRoute::Inherit,
+        SubAgentThinking::Auto,
+        &FleetRole::Worker,
+    );
+    assert_eq!(route.route_note, None);
+}
+
 /// The role name has to survive the wire, or receipts and resumed sessions
 /// silently reclassify a consultant as the default worker.
 #[test]
@@ -4134,8 +4414,25 @@ fn test_parse_spawn_request_rejects_invalid_child_thinking() {
     });
     let err = parse_spawn_request(&input).expect_err("invalid thinking should fail");
     assert!(
-        err.to_string()
-            .contains("thinking must be one of: inherit, auto, off, low, medium, high, max")
+        err.to_string().contains(
+            "thinking must be one of: inherit, auto, off, low, medium, high, xhigh, max, ultra"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn thinking_schema_values_all_parse() {
+    // The rejection message and the schema enum both read this list. A value
+    // listed there and refused by the parser would send the model in a loop.
+    for value in SUBAGENT_THINKING_SCHEMA_VALUES {
+        SubAgentThinking::parse(value)
+            .unwrap_or_else(|err| panic!("advertised thinking value {value:?} is refused: {err}"));
+    }
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 1)));
+    assert_eq!(
+        AgentTool::new(manager, stub_runtime()).input_schema()["properties"]["thinking"]["enum"],
+        json!(SUBAGENT_THINKING_SCHEMA_VALUES)
     );
 }
 
@@ -4460,7 +4757,7 @@ async fn manual_role_pin_accepts_only_its_exact_qualified_provider_selector() {
             .expect("the task may restate the same exact route");
         assert_eq!(route, ModelRoute::Fixed("deepseek-v4-flash".into()));
         assert_eq!(source, SpawnRouteSource::RolePin);
-        assert_eq!(runtime.client.api_provider(), ApiProvider::Deepseek);
+        assert_eq!(runtime.client.api_provider(), ProviderKind::Deepseek);
     }
     let request = parse_spawn_request(&json!({
         "prompt":"review", "type":"reviewer", "model":"moonshot/deepseek-v4-flash"
@@ -4470,7 +4767,7 @@ async fn manual_role_pin_accepts_only_its_exact_qualified_provider_selector() {
         .await
         .expect_err("a provider prefix cannot retarget the saved pin");
     assert!(error.to_string().contains("conflicts"), "{error}");
-    assert_eq!(runtime.client.api_provider(), ApiProvider::Deepseek);
+    assert_eq!(runtime.client.api_provider(), ProviderKind::Deepseek);
 }
 
 #[tokio::test]
@@ -4556,6 +4853,7 @@ async fn xai_pin_without_credentials_fails_closed_without_fallback() {
 
 fn credentialless_xai_member() -> crate::fleet::profile::AgentProfile {
     crate::fleet::profile::AgentProfile {
+        native_preset: None,
         id: "xai-pin".to_string(),
         display_name: None,
         description: None,
@@ -4583,7 +4881,6 @@ fn credentialless_xai_runtime() -> SubAgentRuntime {
         .expect("stub config")
         .as_ref()
         .clone();
-    config.api_key = None;
     config.providers = None;
     runtime.api_config = Some(std::sync::Arc::new(config));
     runtime
@@ -4717,18 +5014,24 @@ async fn structured_custom_pin_refuses_named_provider_migration_but_accepts_lite
         ..Default::default()
     };
     assert_eq!(
-        named.resolve_provider_identity("custom").unwrap().key,
+        named
+            .resolve_provider_identity("custom")
+            .unwrap()
+            .key
+            .as_str(),
         "TeamA",
         "historical session migration remains available and is the exact rejected pin shape"
     );
     let literal = crate::config::Config {
         provider: Some("custom".into()),
-        base_url: Some("http://127.0.0.1:2/v1".into()),
-        api_key: Some("fixture-literal-key".into()),
         default_text_model: Some("model-x".into()),
         subagents: pin(),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("fixture-literal-key".into()),
+        Some("http://127.0.0.1:2/v1".into()),
+    );
     for (config, should_bind) in [(named, false), (literal, true)] {
         let mut runtime = stub_runtime();
         runtime.client = CodewhaleClient::new(&config).unwrap();
@@ -4748,7 +5051,10 @@ async fn structured_custom_pin_refuses_named_provider_migration_but_accepts_lite
                     .api_config
                     .as_ref()
                     .unwrap()
-                    .provider_identity_for(ApiProvider::Custom),
+                    .active_provider_identity()
+                    .unwrap()
+                    .key
+                    .as_str(),
                 "custom"
             );
         } else {
@@ -5375,8 +5681,8 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
         }],
     };
     let fork_context = SubAgentForkContext {
-        messages: vec![parent_message.clone()],
         live_header: crate::prompt_zones::new_live_header_cell(),
+        messages: vec![parent_message.clone()],
         structured_state_block: Some("## Fork State\n- Mode: `AGENT`".to_string()),
         work_source: None,
     };
@@ -5701,6 +6007,7 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
         "detached",
         "exact_files",
         "expected_artifact",
+        "fork_context",
         "limit",
         "max_output_tokens",
         "max_steps",
@@ -5728,7 +6035,6 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
     );
     for unadvertised in [
         "max_depth",
-        "fork_context",
         "workspace_policy",
         "worktree_base",
         "worktree_branch",
@@ -5798,6 +6104,83 @@ fn agent_start_schema_documents_hidden_spawn_requirements() {
             "cwd description should teach {needle:?}: {cwd}"
         );
     }
+}
+
+#[test]
+fn spawn_limits_accept_whole_number_floats_and_still_refuse_fractions() {
+    // Providers that serialize every number as a float send `900.0`.
+    let request = parse_spawn_request(&json!({
+        "prompt": "p",
+        "max_steps": 300.0,
+        "wall_time_secs": 900.0,
+        "max_output_tokens": 4096.0,
+    }))
+    .expect("whole-number floats are integers");
+    assert_eq!(request.max_steps, Some(300));
+    assert_eq!(request.wall_time, Some(Duration::from_secs(900)));
+    assert_eq!(request.max_output_tokens, Some(4096));
+
+    for bad in [json!(2.5), json!(0.0), json!(-1.0), json!("900")] {
+        let error = parse_spawn_request(&json!({"prompt": "p", "wall_time_secs": bad}))
+            .expect_err("fractional, zero, negative and string limits stay refused")
+            .to_string();
+        assert!(
+            error.contains("wall_time_secs must be between 1 and"),
+            "{error}"
+        );
+    }
+}
+
+// The wait surfaces block the turn, so the model-facing text must disclose
+// the bounded block (default 30s, max 120s) and the timed_out receipt shape;
+// an undisclosed finite block reads as a hang when nothing settles.
+#[test]
+fn wait_schema_text_discloses_timeout_bound_and_timed_out_receipt() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
+    let agent_schema = AgentTool::new(manager.clone(), stub_runtime()).input_schema();
+    let until = schema_property_description(&agent_schema, "until");
+    // The advertised numbers are tied to the runtime constants so a drift in
+    // either direction (constant change, copy change) turns the other red.
+    assert!(
+        until.contains(&format!(
+            "default {}s, max {}s",
+            SUBAGENT_WAIT_DEFAULT_TIMEOUT_SECS, SUBAGENT_WAIT_MAX_TIMEOUT_SECS
+        )) && until.contains("timed_out"),
+        "agent(action=wait) until description must disclose the runtime \
+         timeout bound and the timed_out receipt:\n{until}"
+    );
+
+    let wait_tool = AgentsWaitTool::new(manager);
+    let wait_description = wait_tool.description();
+    assert!(
+        wait_description.contains(&format!(
+            "timeout_secs (default {}, max {})",
+            coord::COORD_WAIT_DEFAULT_TIMEOUT_SECS,
+            coord::COORD_WAIT_MAX_TIMEOUT_SECS
+        )) && wait_description.contains("timed_out=true"),
+        "agents/wait description must disclose the runtime timeout bound and \
+         the timed_out receipt:\n{wait_description}"
+    );
+}
+
+// The two wait faces advertise from two independent constant sets, so each
+// face's own pin can stay green while the surfaces drift numerically apart;
+// this cross-assertion closes that gap.
+#[test]
+fn wait_bound_constants_agree_across_both_wait_faces() {
+    assert_eq!(
+        SUBAGENT_WAIT_DEFAULT_TIMEOUT_SECS,
+        coord::COORD_WAIT_DEFAULT_TIMEOUT_SECS,
+        "the agent broadcast face and the agents/wait face must advertise the \
+         same default timeout"
+    );
+    assert_eq!(
+        SUBAGENT_WAIT_MAX_TIMEOUT_SECS,
+        coord::COORD_WAIT_MAX_TIMEOUT_SECS,
+        "the agent broadcast face and the agents/wait face must advertise the \
+         same maximum timeout"
+    );
 }
 
 #[test]
@@ -6539,6 +6922,111 @@ async fn agent_tool_cancel_stops_running_child() {
     );
 }
 
+/// #6184 H2: a full host event channel used to drop `AgentComplete`, leaving
+/// a ghost Running row. Fill the channel, finish a child, and the terminal
+/// event must still arrive once the host drains.
+#[tokio::test]
+async fn full_event_channel_still_delivers_agent_complete() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_full_channel".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "finish while the host is backed up".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (event_tx, mut event_rx) = mpsc::channel(1);
+    event_tx
+        .try_send(Event::status("host is busy"))
+        .expect("fill the only slot");
+    let mut runtime = runtime_with_depth(1, None);
+    runtime.event_tx = Some(event_tx);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+
+    let result = manager.cancel_agent(&agent_id).expect("stop");
+    assert_eq!(result.status, SubAgentStatus::Cancelled);
+    assert_ne!(
+        manager.get_result(&agent_id).expect("roster row").status,
+        SubAgentStatus::Running,
+        "the roster leaves Running"
+    );
+
+    let filler = event_rx.recv().await.expect("filler event");
+    assert!(matches!(filler, Event::Status { .. }));
+    let delivered = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        .await
+        .expect("terminal event is not dropped")
+        .expect("channel open");
+    assert!(matches!(
+        &delivered,
+        Event::AgentComplete { id, outcome: Some(SubAgentStatus::Cancelled), .. } if id == &agent_id
+    ));
+}
+
+/// #6560 D02-06: a nested parent's completion inbox is bounded and has no
+/// terminal-results synthesis behind it, so a completion that meets a full
+/// inbox must wait for capacity rather than be dropped.
+#[tokio::test]
+async fn full_nested_completion_inbox_still_delivers_child_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_full_inbox".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "finish while the parent inbox is full".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(1);
+    completion_tx
+        .try_send(SubAgentCompletion {
+            owner_session_id: String::new(),
+            agent_id: "earlier_sibling".to_string(),
+            payload: "already queued".to_string(),
+        })
+        .expect("fill the only slot");
+    let runtime = runtime_with_depth(2, Some(completion_tx));
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+
+    let result = manager.cancel_agent(&agent_id).expect("stop");
+    assert_eq!(result.status, SubAgentStatus::Cancelled);
+
+    let filler = completion_rx.recv().await.expect("filler completion");
+    assert_eq!(filler.agent_id, "earlier_sibling");
+    let delivered = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+        .await
+        .expect("child completion is not dropped")
+        .expect("inbox open");
+    assert_eq!(delivered.agent_id, agent_id);
+}
+
 #[tokio::test]
 async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
     use tokio_util::sync::CancellationToken;
@@ -7026,7 +7514,7 @@ async fn issue_5633_catalog_and_dispatch_are_one_grant() {
         runtime.context = ToolContext::new(tmp.path().to_path_buf());
         runtime.allow_shell = true;
         runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Worker);
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -7045,7 +7533,7 @@ async fn issue_5633_catalog_and_dispatch_are_one_grant() {
         // can never call what it cannot see. `Bash`/`exec_shell` are hidden
         // execution-compatibility aliases, so they never appear in any
         // catalog — under a non-Full grant they are still refused by name.
-        for name in ["terminal/run", "terminal/send", "task_shell_start"] {
+        for name in ["terminal/run", "terminal/send"] {
             assert_eq!(
                 catalog.contains(name),
                 full_shell,
@@ -7357,7 +7845,7 @@ fn test_subagent_tool_registry_reports_unavailable_tools() {
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.allow_shell = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         Some(vec![
@@ -7381,7 +7869,7 @@ fn test_subagent_tools_respect_nested_agent_depth_budget() {
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.spawn_depth = 1;
     runtime.max_spawn_depth = 2;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime.clone(),
         FleetRole::Scout,
         None,
@@ -7397,7 +7885,7 @@ fn test_subagent_tools_respect_nested_agent_depth_budget() {
     assert!(registry.is_tool_allowed("agent"));
 
     runtime.spawn_depth = 2;
-    let capped = SubAgentToolRegistry::new(
+    let capped = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         None,
@@ -7527,7 +8015,6 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         "diagnostics",
         "edit",
         "file_search",
-        "fim_edit",
         "finance",
         "get_goal",
         "github",
@@ -7554,7 +8041,6 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         "session_get",
         "session_search",
         "speech",
-        "task_shell_start",
         "task_shell_wait",
         "tasks",
         "terminal/cancel",
@@ -7600,7 +8086,7 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         }
         let explicit = matches!(role, FleetRole::Custom)
             .then(|| vec!["read_file".to_string(), "load_skill".to_string()]);
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             explicit,
@@ -7652,7 +8138,7 @@ fn an_explicit_parent_tool_scope_is_enforced_by_the_child_registry() {
         "grep_files".to_string(),
     ]);
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         // The child asks for nothing in particular; the parent's subset is
@@ -7733,82 +8219,12 @@ fn enabled_agent_surface_options() -> AgentToolSurfaceOptions {
 ///
 /// Request-boundary tests use this fixture so Moonshot compatibility coverage
 /// cannot drift into a hand-maintained approximation of the child surface.
-#[test]
-fn deferred_agent_and_workflow_are_discoverable_by_name() {
-    // Diet regression: deferral must never strand the tools. The real
-    // registry (not fixtures) carries them deferred, and both match
-    // algorithms surface them for the obvious queries.
-    use crate::core::engine::tool_catalog::{
-        TOOL_SEARCH_NAME, apply_native_tool_deferral, execute_tool_search_with_cache,
-    };
-    use crate::core::session::ToolActivationCache;
-    use crate::tools::registry::ToolRegistryBuilder;
-    use crate::tools::{ToolContext, todo};
-    use std::collections::HashSet;
-
-    let tmp = tempdir().expect("tempdir");
-    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
-    let registry = ToolRegistryBuilder::new()
-        .with_agent_runtime_surface(
-            None,
-            "test-model".to_string(),
-            enabled_agent_surface_options(),
-            todo::new_shared_todo_list(),
-            crate::tools::plan::new_shared_plan_state(),
-        )
-        .with_subagent_tools(manager, stub_runtime())
-        .build(ToolContext::new(tmp.path().to_path_buf()));
-    let mut catalog = registry.to_api_tools();
-    let always_load = HashSet::new();
-    apply_native_tool_deferral(&mut catalog, &always_load);
-    for name in ["agent", "workflow"] {
-        assert_eq!(
-            catalog
-                .iter()
-                .find(|tool| tool.name == name)
-                .and_then(|tool| tool.defer_loading),
-            Some(true),
-            "{name} is registered and deferred"
-        );
-    }
-
-    for (query, match_kind, wanted) in [
-        ("agent", "regex", "agent"),
-        ("workflow", "regex", "workflow"),
-        ("spawn subagent worker", "bm25", "agent"),
-        ("spawn subagent worker", "bm25", "workflow"),
-    ] {
-        let mut active = HashSet::new();
-        let mut cache = ToolActivationCache::default();
-        let found = execute_tool_search_with_cache(
-            TOOL_SEARCH_NAME,
-            &json!({"query": query, "match": match_kind}),
-            &catalog,
-            &mut active,
-            &mut cache,
-        )
-        .expect("tool_search runs")
-        .metadata
-        .expect("metadata")["tool_references"]
-            .as_array()
-            .expect("refs")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        assert!(
-            found.contains(&wanted.to_string()),
-            "{match_kind} {query:?} must surface {wanted}; got {found:?}"
-        );
-    }
-}
-
 pub(crate) fn kimi_general_child_request_tools_fixture() -> Vec<Tool> {
     let tmp = tempdir().expect("tempdir");
     let mut runtime =
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         None,
@@ -7824,15 +8240,15 @@ pub(crate) fn kimi_general_child_request_tools_fixture() -> Vec<Tool> {
     assert!(names.contains("get_goal"));
     assert!(!names.contains("create_goal"));
     assert!(!names.contains("update_goal"));
-    let mut surface = SubAgentToolSurface::new(catalog, &[]);
+    let mut surface = ChildSurfaceProbe::new(catalog, &[]);
     model_request_tools(&mut surface)
 }
 
-fn small_surface_registry(role: FleetRole) -> SubAgentToolRegistry {
+fn small_surface_registry(role: FleetRole) -> ChildCoreProbe {
     let mut runtime =
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
-    SubAgentToolRegistry::new(
+    ChildCoreProbe::new(
         runtime,
         role,
         None,
@@ -7859,7 +8275,7 @@ fn small_surface_legacy_rules_cover_lowercase_primitives_with_deny_wins() {
 
     let mut runtime = stub_runtime();
     runtime.worker_profile.denied_tools = vec!["File".to_string(), "Bash".to_string()];
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         Some(vec!["File".to_string(), "Bash".to_string()]),
@@ -7877,7 +8293,7 @@ fn small_surface_legacy_rules_cover_lowercase_primitives_with_deny_wins() {
             .into_iter()
             .map(str::to_string)
             .collect();
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         None,
@@ -7892,15 +8308,15 @@ fn small_surface_legacy_rules_cover_lowercase_primitives_with_deny_wins() {
     }
 }
 
-fn model_request_tools(surface: &mut SubAgentToolSurface) -> Vec<Tool> {
-    surface.request_tools(surface.catalog.clone(), false)
+fn model_request_tools(surface: &mut ChildSurfaceProbe) -> Vec<Tool> {
+    surface.request_tools(surface.catalog().to_vec(), false)
 }
 
 fn forked_child_request_fixture(
-    registry: &SubAgentToolRegistry,
+    registry: &ChildCoreProbe,
     role: &FleetRole,
     fork_context: &SubAgentForkContext,
-) -> (Vec<Message>, SubAgentToolSurface) {
+) -> (Vec<Message>, ChildSurfaceProbe) {
     let assignment = SubAgentAssignment::new("continue from parent".to_string(), None);
     let messages = build_initial_subagent_messages(
         "continue from parent",
@@ -7909,46 +8325,53 @@ fn forked_child_request_fixture(
         Some(fork_context),
     );
     let catalog = registry.deferred_catalog_for_model(role);
-    (messages, SubAgentToolSurface::new(catalog, &[]))
+    (messages, ChildSurfaceProbe::new(catalog, &[]))
 }
 
 async fn execute_surface_tool(
-    registry: &SubAgentToolRegistry,
-    surface: &mut SubAgentToolSurface,
+    registry: &ChildCoreProbe,
+    surface: &mut ChildSurfaceProbe,
     name: &str,
     input: Value,
 ) -> Result<String> {
-    let request_active = surface.active_names.clone();
     registry
-        .execute_from_surface("agent_test", "", surface, &request_active, name, input)
+        .execute_from_surface(
+            "agent_test",
+            &new_child_execution_id("agent_test"),
+            surface,
+            name,
+            input,
+        )
         .await
         .map(|result| result.result.content)
 }
 
 #[test]
-fn small_surface_starts_with_core_tools_and_discoverable_goal_control() {
+fn small_surface_starts_with_core_tools_and_read_only_goal_control() {
     let registry = small_surface_registry(FleetRole::Builder);
     let catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
-    let mut surface = SubAgentToolSurface::new(catalog, &[]);
+    let mut surface = ChildSurfaceProbe::new(catalog, &[]);
 
-    // Token diet: agent+workflow+get_goal ride discovery, not the head.
     assert_eq!(
         model_tool_names(model_request_tools(&mut surface)),
-        ["bash", "edit", "read", "todo_write", "tool_search", "write",]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "agent",
+            "bash",
+            "edit",
+            "file_search",
+            "get_goal",
+            "load_skill",
+            "read",
+            "todo_write",
+            "tool_search",
+            "workflow",
+            "write",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     );
-    // The goal control still exists — deferred, not deleted.
-    assert_eq!(
-        surface
-            .catalog
-            .iter()
-            .find(|tool| tool.name == "get_goal")
-            .and_then(|tool| tool.defer_loading),
-        Some(true)
-    );
-    let strict = surface.request_tools(surface.catalog.clone(), true);
+    let strict = surface.request_tools(surface.catalog().to_vec(), true);
     assert_eq!(
         strict
             .iter()
@@ -7972,34 +8395,133 @@ async fn small_surface_read_only_child_discovers_web_deferred() {
         .expect("Web action enum");
     assert_eq!(actions, &[json!("search"), json!("fetch")]);
 
-    let mut surface = SubAgentToolSurface::new(catalog, &[]);
+    let mut surface = ChildSurfaceProbe::new(catalog, &[]);
     assert!(!model_tool_names(model_request_tools(&mut surface)).contains("Web"));
-    let request_active = surface.active_names.clone();
+    let denied = registry
+        .execute_from_surface(
+            "agent_scout",
+            "",
+            &mut surface,
+            "Web",
+            json!({"not_a_web_field": "codewhale"}),
+        )
+        .await
+        .expect_err("a missing evidence action is denied before schema hydration");
+    assert!(
+        matches!(denied.downcast_ref::<ToolError>(), Some(ToolError::PermissionDenied { message })
+            if message.contains("limited to search/fetch")),
+        "{denied}"
+    );
+    assert!(!surface.active_names().contains("Web"));
+    assert!(!model_tool_names(model_request_tools(&mut surface)).contains("Web"));
+
+    let same_batch = registry
+        .execute_from_surface(
+            "agent_scout",
+            "",
+            &mut surface,
+            "Web",
+            // Allowed evidence action, malformed schema: hydrate without network work.
+            json!({"action": "search", "not_a_web_field": "codewhale"}),
+        )
+        .await
+        .expect("a malformed first use hydrates instead of executing");
+    assert!(same_batch.result.content.contains("deferred"));
+    assert!(
+        same_batch
+            .result
+            .content
+            .contains("The tool was not executed.")
+    );
+    assert!(model_tool_names(model_request_tools(&mut surface)).contains("Web"));
+
+    // Search independently admits the exact schema on a fresh cold surface.
+    let mut surface =
+        ChildSurfaceProbe::new(registry.deferred_catalog_for_model(&FleetRole::Scout), &[]);
+    assert!(!model_tool_names(model_request_tools(&mut surface)).contains("Web"));
     let result = registry
         .execute_from_surface(
             "agent_scout",
             "",
             &mut surface,
-            &request_active,
             TOOL_SEARCH_NAME,
             json!({"query": "web", "match": "regex"}),
         )
         .await
         .expect("child-local search");
     assert!(result.result.content.contains("\"tool_name\":\"Web\""));
-    let same_batch = registry
-        .execute_from_surface(
-            "agent_scout",
-            "",
-            &mut surface,
-            &request_active,
-            "Web",
-            json!({"action": "search", "query": "codewhale"}),
-        )
-        .await
-        .expect("same-batch first use hydrates instead of executing");
-    assert!(same_batch.result.content.contains("deferred"));
+    assert!(surface.active_names().contains("Web"));
     assert!(model_tool_names(model_request_tools(&mut surface)).contains("Web"));
+}
+
+/// First-call tool policy: a read-only investigator's well-formed first call
+/// to a deferred inspection tool runs immediately instead of costing a
+/// discovery turn, while mutation stays refused at dispatch.
+#[tokio::test]
+async fn small_surface_read_only_child_runs_well_formed_deferred_first_call() {
+    let registry = small_surface_registry(FleetRole::Scout);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|tool| tool.name == "list_dir")
+            .and_then(|tool| tool.defer_loading),
+        Some(true),
+        "list_dir is a deferred evidence tool for Scouts"
+    );
+    let mut surface = ChildSurfaceProbe::new(catalog, &[]);
+    assert!(!model_tool_names(model_request_tools(&mut surface)).contains("list_dir"));
+    let listing = execute_surface_tool(&registry, &mut surface, "list_dir", json!({}))
+        .await
+        .expect("well-formed first call executes");
+    assert!(
+        !listing.contains("was deferred"),
+        "the call ran instead of returning its schema: {listing}"
+    );
+    assert!(model_tool_names(model_request_tools(&mut surface)).contains("list_dir"));
+
+    let hint = execute_surface_tool(
+        &registry,
+        &mut ChildSurfaceProbe::new(registry.deferred_catalog_for_model(&FleetRole::Scout), &[]),
+        "list_dir",
+        json!({"directory": "."}),
+    )
+    .await
+    .expect("malformed first call returns the schema");
+    assert!(
+        hint.contains("was deferred") && hint.contains("path"),
+        "{hint}"
+    );
+
+    for mutation in [
+        ("write", json!({"path": "scout.txt", "content": "x"})),
+        (
+            "edit",
+            json!({"path": "scout.txt", "old_string": "x", "new_string": "y"}),
+        ),
+    ] {
+        assert!(
+            execute_surface_tool(&registry, &mut surface, mutation.0, mutation.1)
+                .await
+                .is_err(),
+            "a Scout must not {}",
+            mutation.0
+        );
+    }
+}
+
+/// Tools an assignment names explicitly start on the child's first request.
+#[test]
+fn small_surface_warms_explicitly_allowed_deferred_tools() {
+    let registry = small_surface_registry(FleetRole::Scout);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
+    let mut surface =
+        ChildSurfaceProbe::new(catalog, &["list_dir".to_string(), "read".to_string()]);
+    let names = model_tool_names(model_request_tools(&mut surface));
+    assert!(
+        names.contains("list_dir") && names.contains("read"),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]
@@ -8011,6 +8533,7 @@ async fn small_surface_fork_context_survives_fresh_child_discovery() {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "search-1".to_string(),
                     name: TOOL_SEARCH_NAME.to_string(),
                     input: json!({"query": "web"}),
@@ -8021,6 +8544,7 @@ async fn small_surface_fork_context_survives_fresh_child_discovery() {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "search-1".to_string(),
                     content: json!({
                         "type": "tool_search_tool_search_result",
@@ -8083,7 +8607,7 @@ async fn small_surface_denied_warm_tool_is_not_resurrected() {
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     runtime.worker_profile.denied_tools.push("Web".to_string());
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         None,
@@ -8091,7 +8615,7 @@ async fn small_surface_denied_warm_tool_is_not_resurrected() {
         crate::tools::plan::new_shared_plan_state(),
     );
     let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
-    let mut surface = SubAgentToolSurface::new(catalog, &["Web".to_string()]);
+    let mut surface = ChildSurfaceProbe::new(catalog, &["Web".to_string()]);
     assert!(!model_tool_names(model_request_tools(&mut surface)).contains("Web"));
     let searched = execute_surface_tool(
         &registry,
@@ -8102,47 +8626,7 @@ async fn small_surface_denied_warm_tool_is_not_resurrected() {
     .await
     .expect("search remains available");
     assert!(!searched.contains("\"tool_name\":\"Web\""));
-    assert!(surface.hydrate("Web").is_err());
-}
-
-fn synthetic_eager_tool(name: &str) -> Tool {
-    Tool {
-        tool_type: Some("function".to_string()),
-        name: name.to_string(),
-        description: "eager".to_string(),
-        input_schema: json!({"type": "object", "properties": {}}),
-        allowed_callers: None,
-        defer_loading: Some(false),
-        input_examples: None,
-        strict: None,
-        cache_control: None,
-    }
-}
-
-#[test]
-fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
-    // Same catalog plus same warm names must serialize identically,
-    // and warming must change the wire block.
-    let catalog = vec![
-        synthetic_eager_tool("read"),
-        synthetic_deferred_tool("agent", 8),
-        synthetic_eager_tool(TOOL_SEARCH_NAME),
-    ];
-    let warm = ["agent".to_string()];
-    let mut first = SubAgentToolSurface::new(catalog.clone(), &warm);
-    let mut second = SubAgentToolSurface::new(catalog.clone(), &warm);
-    let first_wire = model_request_tools(&mut first);
-    let second_wire = model_request_tools(&mut second);
-    let first_json = crate::prompt_zones::wire_tool_catalog_json(&first_wire).expect("serializes");
-    let second_json =
-        crate::prompt_zones::wire_tool_catalog_json(&second_wire).expect("serializes");
-    assert_eq!(first_json, second_json, "same catalog plus same names");
-    assert!(first_wire.iter().any(|tool| tool.name == "agent"));
-    let mut cold = SubAgentToolSurface::new(catalog, &[]);
-    let cold_wire = model_request_tools(&mut cold);
-    let cold_json = crate::prompt_zones::wire_tool_catalog_json(&cold_wire).expect("serializes");
-    assert_ne!(cold_json, first_json, "warming must change the wire block");
-    assert!(!cold_wire.iter().any(|tool| tool.name == "agent"));
+    assert!(surface.hydrate("Web", &json!({})).is_err());
 }
 
 fn synthetic_deferred_tool(name: &str, description_bytes: usize) -> Tool {
@@ -8174,23 +8658,22 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
     let warm = (0..9)
         .map(|index| format!("deferred_{index}"))
         .collect::<Vec<_>>();
-    let mut first = SubAgentToolSurface::new(catalog.clone(), &warm);
-    let mut second = SubAgentToolSurface::new(catalog, &[]);
+    let mut first = ChildSurfaceProbe::new(catalog.clone(), &warm);
+    let mut second = ChildSurfaceProbe::new(catalog, &[]);
     let first_names = model_tool_names(model_request_tools(&mut first));
-    // Priority order: the warm tail (lowest priority) is evicted first.
-    assert!(!first_names.contains("deferred_8"));
     assert!(first_names.contains("deferred_0"));
+    assert!(!first_names.contains("deferred_8"));
     assert!(!model_tool_names(model_request_tools(&mut second)).contains("deferred_0"));
 
-    first.catalog.retain(|tool| tool.name != "deferred_0");
+    first.catalog_mut().retain(|tool| tool.name != "deferred_0");
     assert!(!model_tool_names(model_request_tools(&mut first)).contains("deferred_0"));
     first
-        .catalog
-        .push(synthetic_deferred_tool("oversized", 25 * 1024));
-    assert!(first.hydrate("oversized").is_err());
+        .catalog_mut()
+        .push(synthetic_deferred_tool("oversized", 17 * 1024));
+    assert!(first.hydrate("oversized", &json!({})).is_err());
 
     let mut byte_catalog = (0..3)
-        .map(|index| synthetic_deferred_tool(&format!("bytes_{index}"), 9 * 1024))
+        .map(|index| synthetic_deferred_tool(&format!("bytes_{index}"), 6 * 1024))
         .collect::<Vec<_>>();
     ensure_advanced_tooling(
         &mut byte_catalog,
@@ -8202,10 +8685,10 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
     let byte_warm = (0..3)
         .map(|index| format!("bytes_{index}"))
         .collect::<Vec<_>>();
-    let mut byte_surface = SubAgentToolSurface::new(byte_catalog, &byte_warm);
+    let mut byte_surface = ChildSurfaceProbe::new(byte_catalog, &byte_warm);
     let byte_names = model_tool_names(model_request_tools(&mut byte_surface));
-    assert!(!byte_names.contains("bytes_2"));
     assert!(byte_names.contains("bytes_0") && byte_names.contains("bytes_1"));
+    assert!(!byte_names.contains("bytes_2"));
 }
 
 #[tokio::test]
@@ -8226,12 +8709,14 @@ async fn small_surface_successful_cached_use_touches_lru() {
     let mut warm = vec!["get_goal".to_string()];
     warm.extend(others.by_ref().take(7));
     let ninth = others.next().expect("ninth deferred child tool");
-    let mut surface = SubAgentToolSurface::new(catalog, &warm);
+    let mut surface = ChildSurfaceProbe::new(catalog, &warm);
     model_request_tools(&mut surface);
     execute_surface_tool(&registry, &mut surface, "get_goal", json!({}))
         .await
         .expect("cached read tool executes");
-    surface.hydrate(&ninth).expect("ninth activation");
+    surface
+        .hydrate(&ninth, &json!({}))
+        .expect("ninth activation");
     assert!(model_tool_names(model_request_tools(&mut surface)).contains("get_goal"));
 }
 
@@ -8241,25 +8726,34 @@ fn small_surface_depth_cap_removes_only_agent() {
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
     runtime.spawn_depth = runtime.max_spawn_depth;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         None,
         crate::tools::todo::new_shared_todo_list(),
         crate::tools::plan::new_shared_plan_state(),
     );
-    let mut surface = SubAgentToolSurface::new(
+    let mut surface = ChildSurfaceProbe::new(
         registry.deferred_catalog_for_model(&FleetRole::Builder),
         &[],
     );
-    // Token diet: the depth cap still removes only agent; get_goal and
-    // workflow are absent from the head by deferral, not by depth.
     assert_eq!(
         model_tool_names(model_request_tools(&mut surface)),
-        ["bash", "edit", "read", "todo_write", "tool_search", "write",]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "bash",
+            "edit",
+            "file_search",
+            "get_goal",
+            "load_skill",
+            "read",
+            "todo_write",
+            "tool_search",
+            "workflow",
+            "write"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     );
 }
 
@@ -8290,7 +8784,7 @@ fn subagent_general_catalog_keeps_parent_surface_except_root_goal_mutators() {
         )
         .build(runtime.context.clone());
     let child_registry =
-        SubAgentToolRegistry::new(runtime, FleetRole::Worker, None, todo_list, plan_state);
+        ChildCoreProbe::new(runtime, FleetRole::Worker, None, todo_list, plan_state);
 
     let parent_names = tool_names(parent_registry.to_api_tools());
     let child_names = tool_names(child_registry.tools_for_model(&FleetRole::Worker));
@@ -8332,7 +8826,7 @@ fn subagent_feature_gates_match_parent_agent_surface() {
         )
         .build(runtime.context.clone());
     let child_registry =
-        SubAgentToolRegistry::new(runtime, FleetRole::Builder, None, todo_list, plan_state);
+        ChildCoreProbe::new(runtime, FleetRole::Builder, None, todo_list, plan_state);
 
     let parent_names = tool_names(parent_registry.to_api_tools());
     let child_names = tool_names(child_registry.tools_for_model(&FleetRole::Builder));
@@ -8381,10 +8875,10 @@ fn seed_read_only_role_deny_list(runtime: &mut SubAgentRuntime) {
 }
 
 /// #5426 acceptance point 1, gate-level: a live scout must be able to run
-/// the three canonical read-only inspection commands DIRECTLY through
-/// canonical `bash` — `git -C ... log`, `find ... | head`, `npm view` — with
+/// the canonical read-only inspection commands DIRECTLY through
+/// canonical `bash` — `git -C ... log`, `find ... | head` — with
 /// no child spawn. The first live dogfood against a #5428 binary denied all
-/// three at `posture_permits_tool`: the Required branch demanded
+/// these at `posture_permits_tool`: the Required branch demanded
 /// `ShellPolicy::Full`, and #5428's relaxed agent classifier was unreachable
 /// from the gate (it only guards `BashTool::execute`, which the gate
 /// precedes). This test pins the gate↔classifier agreement the catalog
@@ -8398,7 +8892,7 @@ fn scout_posture_gate_admits_agent_readonly_bash_commands() {
     runtime.context.auto_approve = true;
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     seed_read_only_role_deny_list(&mut runtime);
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         None,
@@ -8410,7 +8904,6 @@ fn scout_posture_gate_admits_agent_readonly_bash_commands() {
     let admitted = [
         "git -C /Volumes/VIXinSSD/CW/worktrees/demo log --oneline -3",
         "find /Volumes/VIXinSSD/CW/worktrees/demo/crates -name offering.rs -maxdepth 4 | head -3",
-        "npm view @deepseek-ai/dsh version",
     ];
     for command in admitted {
         let input = serde_json::json!({ "command": command });
@@ -8418,6 +8911,20 @@ fn scout_posture_gate_admits_agent_readonly_bash_commands() {
             registry.posture_permits_tool("bash", Some(&input)),
             "scout posture gate must admit agent-read-only bash directly: {command}"
         );
+    }
+    // npm's project/user configuration can redirect its destination, so a
+    // network-enabled Scout still cannot grant it automatic shell authority.
+    for command in [
+        "npm view @deepseek-ai/dsh version",
+        "npm view x --json",
+        "npm view owner/repo",
+    ] {
+        let input = serde_json::json!({"command": command});
+        assert!(
+            !registry.posture_permits_tool("bash", Some(&input)),
+            "{command}"
+        );
+        assert!(!registry.envelope_permits("bash", &input), "{command}");
     }
 
     // Mutation still refused at the gate, legacy `Bash` stays raw-shell-denied
@@ -8478,7 +8985,7 @@ async fn read_only_inspection_roles_execute_pwd_and_absolute_git_log() {
         runtime.context = ToolContext::new(workspace.clone());
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         seed_read_only_role_deny_list(&mut runtime);
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -8556,7 +9063,7 @@ async fn children_cannot_reach_machine_control_tools() {
         let mut runtime =
             stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -8596,7 +9103,7 @@ fn git_fetch_is_visible_only_where_the_grant_holds_it() {
         if matches!(role, FleetRole::Verifier) {
             seed_read_only_role_deny_list(&mut runtime);
         }
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -8642,7 +9149,7 @@ fn git_fetch_is_visible_only_where_the_grant_holds_it() {
         runtime.context = ToolContext::new(tmp.path().to_path_buf());
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         seed_read_only_role_deny_list(&mut runtime);
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -8678,7 +9185,7 @@ fn git_fetch_is_visible_only_where_the_grant_holds_it() {
         runtime.context = ToolContext::new(tmp.path().to_path_buf());
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         seed_read_only_role_deny_list(&mut runtime);
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -8715,7 +9222,7 @@ async fn read_only_inspection_roles_cannot_write_through_text_filters() {
         runtime.context = ToolContext::new(tmp.path().to_path_buf());
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         seed_read_only_role_deny_list(&mut runtime);
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -8762,7 +9269,7 @@ fn explore_catalog_inherits_web_but_hides_write_shell_and_fim_tools() {
     // (write:false => raw shell + mutating surface denied); model it so the
     // catalog assertion matches what a real scout lane sees.
     seed_read_only_role_deny_list(&mut runtime);
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         None,
@@ -8819,7 +9326,7 @@ async fn read_only_roles_expose_and_dispatch_lowercase_bash_only() {
         // The clamp a real spawn installs, `Bash` included.
         seed_read_only_role_deny_list(&mut runtime);
         let todo_list = crate::tools::todo::new_shared_todo_list();
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -9027,7 +9534,7 @@ async fn planner_exposes_and_dispatches_read_only_bash_probes() {
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Planner);
     seed_read_only_role_deny_list(&mut runtime);
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Planner,
         None,
@@ -9081,7 +9588,7 @@ async fn scout_shell_respects_parent_shell_and_network_ceilings() {
     shell_off.context = ToolContext::new(tmp.path().to_path_buf());
     shell_off.allow_shell = false;
     shell_off.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
-    let shell_off = SubAgentToolRegistry::new(
+    let shell_off = ChildCoreProbe::new(
         shell_off,
         FleetRole::Scout,
         None,
@@ -9105,7 +9612,7 @@ async fn scout_shell_respects_parent_shell_and_network_ceilings() {
     network_off.context = ToolContext::new(tmp.path().to_path_buf());
     network_off.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     network_off.worker_profile.permissions.network = false;
-    let network_off = SubAgentToolRegistry::new(
+    let network_off = ChildCoreProbe::new(
         network_off,
         FleetRole::Scout,
         None,
@@ -9128,7 +9635,7 @@ async fn scout_shell_respects_parent_shell_and_network_ceilings() {
             stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
         runtime.context = ToolContext::new(tmp.path().to_path_buf());
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -9152,12 +9659,12 @@ async fn scout_shell_respects_parent_shell_and_network_ceilings() {
 }
 
 #[test]
-fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
+fn implementer_catalog_hides_fim_on_unsupported_route() {
     let tmp = tempdir().expect("tempdir");
     let mut runtime =
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         None,
@@ -9167,12 +9674,16 @@ fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
 
     let tools = registry.tools_for_model(&FleetRole::Builder);
     let names = tool_names(tools.clone());
-    for name in ["read", "write", "edit", "fim_edit"] {
+    for name in ["read", "write", "edit"] {
         assert!(
             names.contains(name),
             "Implementer should inherit write-capable tool {name}"
         );
     }
+    assert!(
+        !names.contains("fim_edit"),
+        "Implementer must not advertise FIM on its unsupported route"
+    );
     // The lowercase write/edit primitives carry their own path-bound schemas;
     // the legacy action-enum File family stays registered for transcripts.
     for name in ["write", "edit"] {
@@ -9237,7 +9748,7 @@ fn every_fleet_role_catalog_advertises_one_executable_load_skill() {
             // spawn does (write:false => raw shell + mutating surface denied).
             seed_read_only_role_deny_list(&mut role_runtime);
         }
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             role_runtime,
             role.clone(),
             None,
@@ -9311,7 +9822,7 @@ fn custom_child_allowlist_omitting_load_skill_fails_closed() {
     let todo_list = crate::tools::todo::new_shared_todo_list();
     let plan_state = crate::tools::plan::new_shared_plan_state();
 
-    let without = SubAgentToolRegistry::new(
+    let without = ChildCoreProbe::new(
         runtime.clone(),
         FleetRole::Custom,
         Some(vec!["read_file".to_string()]),
@@ -9328,7 +9839,7 @@ fn custom_child_allowlist_omitting_load_skill_fails_closed() {
         "load_skill must not be auto-injected into a custom allow-list: {names:?}"
     );
 
-    let with = SubAgentToolRegistry::new(
+    let with = ChildCoreProbe::new(
         runtime,
         FleetRole::Custom,
         Some(vec!["read_file".to_string(), "load_skill".to_string()]),
@@ -9354,7 +9865,7 @@ async fn plan_parent_profile_narrows_even_implementer_child_to_read_only() {
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Planner);
     runtime.agent_tool_surface_options.shell_policy = ShellPolicy::None;
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         None,
@@ -9417,16 +9928,22 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    // Every attempt outlasts the 50ms step timeout, so the timeout-retry
-    // budget (SUBAGENT_API_TIMEOUT_MAX_RETRIES) is driven to exhaustion
-    // before the step interrupts. The backoff base is shrunk to 1ms so the
-    // test does not wait out the production backoff sequence.
-    let (client, calls) =
-        always_delayed_chat_client(Duration::from_millis(150), "resumed answer").await;
+    // Every attempt outlasts the step timeout, so the timeout-retry budget
+    // (SUBAGENT_API_TIMEOUT_MAX_RETRIES) is driven to exhaustion before the
+    // step interrupts. The backoff base is shrunk to 1ms so the test does not
+    // wait out the production backoff sequence.
+    //
+    // Determinism (fleet-6): the server never answers within the test, so the
+    // step timeout always wins; a 150ms reply used to race a 50ms timeout on a
+    // loaded runner. The 250ms step timeout is the window each attempt has to
+    // reach the loopback server and be counted.
+    let (client, calls, fixture_config) =
+        always_delayed_chat_client(NEVER_ANSWERS, "resumed answer").await;
     let mut runtime = stub_runtime()
-        .with_step_api_timeout(Duration::from_millis(50))
+        .with_step_api_timeout(Duration::from_millis(250))
         .with_api_timeout_retry_base_backoff(Duration::from_millis(1));
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
     let (mailbox, mut mailbox_rx) =
@@ -9445,13 +9962,14 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
     };
     let task_handle = tokio::spawn(run_subagent_task(task));
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if calls.load(Ordering::SeqCst) >= 1 {
                 break;
@@ -9462,7 +9980,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
     .await
     .expect("first timed-out API attempt should reach the test server");
 
-    let interrupted_envelope = tokio::time::timeout(Duration::from_secs(5), async {
+    let interrupted_envelope = tokio::time::timeout(HANG_GUARD, async {
         loop {
             for env in mailbox_rx.drain() {
                 if let MailboxMessage::Interrupted {
@@ -9485,7 +10003,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         interrupted_envelope.1
     );
 
-    tokio::time::timeout(Duration::from_secs(5), task_handle)
+    tokio::time::timeout(HANG_GUARD, task_handle)
         .await
         .expect("sub-agent task must not park waiting for checkpoint input")
         .expect("sub-agent task should finish");
@@ -9592,15 +10110,18 @@ async fn subagent_retries_api_timeout_before_succeeding() {
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    // Only the first attempt outlasts the 50ms step timeout; the retry
-    // answers immediately, so a single timed-out attempt must be retried
-    // exactly once and then complete.
-    let (client, calls, _bodies) =
-        delayed_chat_client(Duration::from_millis(150), "recovered answer").await;
+    // Only the first attempt outlasts the step timeout; the retry answers
+    // immediately, so a single timed-out attempt must be retried exactly once
+    // and then complete. The first reply never arrives within the test, so it
+    // cannot race the timeout (fleet-6); 500ms is the window the immediate
+    // retry has to answer on a loaded runner.
+    let (client, calls, _bodies, fixture_config) =
+        delayed_chat_client(NEVER_ANSWERS, "recovered answer").await;
     let mut runtime = stub_runtime()
-        .with_step_api_timeout(Duration::from_millis(50))
+        .with_step_api_timeout(Duration::from_millis(500))
         .with_api_timeout_retry_base_backoff(Duration::from_millis(1));
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
 
@@ -9616,18 +10137,16 @@ async fn subagent_retries_api_timeout_before_succeeding() {
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
     };
 
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::spawn(run_subagent_task(task)),
-    )
-    .await
-    .expect("sub-agent task should finish")
-    .expect("sub-agent join should succeed");
+    tokio::time::timeout(HANG_GUARD, tokio::spawn(run_subagent_task(task)))
+        .await
+        .expect("sub-agent task should finish")
+        .expect("sub-agent join should succeed");
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -9717,6 +10236,60 @@ fn transient_provider_classifier_matches_structured_rate_limit() {
     assert!(is_transient_subagent_provider_error(&err));
 }
 
+#[test]
+fn transient_provider_classifier_respects_durable_typed_errors() {
+    // The provider body and outer context both contain the old transient
+    // heuristics. Neither may override a durable HTTP-boundary classification.
+    let misleading = "429 rate limited: stream request temporarily unavailable";
+    let mut errors = vec![
+        LlmError::from_http_response(401, misleading),
+        LlmError::AuthorizationError(misleading.to_string()),
+        LlmError::ModelError(misleading.to_string()),
+        LlmError::ContentPolicyError(misleading.to_string()),
+        LlmError::ContextLengthError(misleading.to_string()),
+    ];
+    for status in [400, 402, 429] {
+        let quota = LlmError::from_http_response(
+            status,
+            r#"{"error":{"type":"insufficient_quota","message":"429: insufficient quota for stream request"}}"#,
+        );
+        assert!(matches!(quota, LlmError::QuotaExhausted(_)));
+        errors.push(quota);
+    }
+    for error in errors {
+        assert!(!error.is_retryable(), "fixture must be a durable refusal");
+        let error = anyhow::Error::new(error).context("stream request failed: 503");
+        assert!(
+            !is_transient_subagent_provider_error(&error),
+            "typed refusal must not become transient: {error:#}"
+        );
+        assert!(retryable_subagent_provider_failure(&error, 1).is_none());
+    }
+}
+
+#[test]
+fn transient_provider_classifier_uses_typed_retryability_without_keywords() {
+    for error in [
+        LlmError::ServerError {
+            status: 500,
+            message: "upstream failed".to_string(),
+        },
+        LlmError::NetworkError("socket closed".to_string()),
+        LlmError::Timeout(Duration::from_secs(1)),
+    ] {
+        let error = anyhow::Error::new(error);
+        assert!(is_transient_subagent_provider_error(&error));
+        assert!(retryable_subagent_provider_failure(&error, 1).is_some());
+    }
+    let error = anyhow::Error::new(LlmError::RateLimited {
+        message: "slow down".to_string(),
+        retry_after: Some(Duration::from_secs(7)),
+    });
+    let retry = retryable_subagent_provider_failure(&error, 1).expect("transient rate limit");
+    assert_eq!(retry.delay, Duration::from_secs(7));
+    assert_eq!(retry.checkpoint_reason, "api_rate_limited");
+}
+
 #[tokio::test]
 async fn subagent_retries_transient_provider_header_timeout_before_succeeding() {
     let tmp = tempdir().expect("tempdir");
@@ -9744,10 +10317,11 @@ async fn subagent_retries_transient_provider_header_timeout_before_succeeding() 
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    let (client, calls) =
+    let (client, calls, fixture_config) =
         transient_header_timeout_then_success_chat_client("recovered answer").await;
     let mut runtime = stub_runtime().with_step_api_timeout(Duration::from_secs(5));
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
 
@@ -9763,6 +10337,7 @@ async fn subagent_retries_transient_provider_header_timeout_before_succeeding() 
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -9818,9 +10393,10 @@ async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    let (client, calls) = always_rate_limited_chat_client().await;
+    let (client, calls, fixture_config) = always_rate_limited_chat_client().await;
     let mut runtime = stub_runtime().with_step_api_timeout(Duration::from_secs(5));
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
 
@@ -9836,6 +10412,7 @@ async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -9880,7 +10457,11 @@ async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
 async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
     // #2656: the duplicate-name error must identify the conflicting agent so a
     // model can recover deterministically (reuse the id, or pick a new name).
-    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 5)));
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 5);
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
     let boot_id = manager.read().await.session_boot_id().to_string();
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut existing = SubAgent::new(
@@ -9892,7 +10473,7 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
         Some("Blue".to_string()),
         Some(vec!["read_file".to_string()]),
         input_tx,
-        PathBuf::from("."),
+        tmp.path().to_path_buf(),
         boot_id,
     );
     existing.session_name = "researcher".to_string();
@@ -9908,7 +10489,7 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
         guard
             .spawn_background_with_assignment_options(
                 manager.clone(),
-                stub_runtime(),
+                runtime,
                 FleetRole::Scout,
                 "new work".to_string(),
                 make_assignment(),
@@ -11033,6 +11614,142 @@ fn persist_state_rejects_state_path_outside_state_root() {
     assert!(format!("{err:#}").contains("must stay within state root"));
 }
 
+/// A user who keeps application state on another volume makes the workspace's
+/// `.codewhale` a junction, so `.codewhale/state/...` resolves inside that
+/// target. That target is where the state lives; refusing it failed every
+/// child at step 0.
+#[cfg(windows)]
+#[test]
+fn state_path_accepts_a_state_root_relocated_behind_a_junction() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let relocated = tmp.path().join("relocated-state");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&relocated).expect("mkdir relocated");
+    let link = workspace.join(".codewhale");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&relocated)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_path = checked_subagent_state_path(
+        &workspace,
+        &std::path::Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
+    .expect("a relocated state root must pass containment");
+
+    let resolved_target = relocated.canonicalize().expect("canonical target");
+    assert!(
+        state_path.starts_with(&resolved_target),
+        "state must land in the junction target {}: {}",
+        resolved_target.display(),
+        state_path.display()
+    );
+
+    // The re-root covers that one user-owned link, not the boundary: a path
+    // that resolves outside both roots is still refused.
+    let escaped = std::path::Path::new("..")
+        .join("escaped")
+        .join(SUBAGENT_STATE_FILE);
+    assert!(
+        checked_subagent_state_path(&workspace, &escaped).is_err(),
+        "an escape past both roots must still fail"
+    );
+
+    // `mklink /J` accepts a target that does not exist yet, and creating the
+    // junction before the first run is a normal setup order. Both sides then
+    // resolve to the link's own spelling, so containment holds until the
+    // target exists.
+    let dangling_workspace = tmp.path().join("dangling");
+    let dangling_target = tmp.path().join("not-created-yet");
+    std::fs::create_dir_all(&dangling_workspace).expect("mkdir dangling workspace");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(dangling_workspace.join(".codewhale"))
+        .arg(&dangling_target)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create dangling junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dangling_target.exists(),
+        "the probe needs a target that does not exist yet"
+    );
+    checked_subagent_state_path(
+        &dangling_workspace,
+        &std::path::Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
+    .expect("a junction whose target is not created yet must pass containment");
+}
+
+/// The guards that run after `checked_subagent_state_path` must reach the same
+/// root decision it did. Before they did, the containment check passed and the
+/// write still failed with the same message on the child's first step.
+#[cfg(windows)]
+#[test]
+fn state_writes_follow_a_relocated_state_root() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let relocated = tmp.path().join("relocated-state");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&relocated).expect("mkdir relocated");
+    let link = workspace.join(".codewhale");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&relocated)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The manager state file: write_json_atomic and read_subagent_state_file.
+    let mut manager = SubAgentManager::new(workspace.clone(), 1);
+    manager
+        .persist_state_synchronously()
+        .expect("persist under a relocated state root");
+    manager
+        .load_state()
+        .expect("load under a relocated state root");
+
+    // The child's transcript: the pre-create and append guards.
+    let state_root = normalize_subagent_workspace(&workspace);
+    let writer = SubAgentTranscriptArtifactWriter::create(&state_root, "agent_relocated")
+        .expect("transcript create under a relocated state root");
+    append_private_subagent_transcript(
+        &state_root,
+        &writer.path,
+        b"{\"kind\":\"message\"}\n",
+        true,
+    )
+    .expect("transcript append under a relocated state root");
+
+    let resolved_target = relocated.canonicalize().expect("canonical target");
+    assert!(
+        writer.path.starts_with(&resolved_target),
+        "the transcript must land in the junction target {}: {}",
+        resolved_target.display(),
+        writer.path.display()
+    );
+}
+
 #[test]
 fn explicit_state_roots_isolate_managers_for_the_same_execution_workspace() {
     let tmp = tempdir().expect("tempdir");
@@ -11123,6 +11840,34 @@ fn persist_state_rejects_symlinked_state_directory() {
     assert!(
         format!("{err:#}").contains("must stay within state root")
             || format!("{err:#}").contains("must not traverse symlinks")
+    );
+}
+
+/// A linked `.codewhale` must be refused before anything is created: the
+/// coordination lock used to `create_dir_all` through the link first.
+#[cfg(unix)]
+#[test]
+fn coordination_lock_refuses_linked_codewhale_without_writing_through_it() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::os::unix::fs::symlink(&outside, workspace.join(".codewhale")).expect("link .codewhale");
+
+    let Err(err) = CoordinationProcessLock::acquire(&workspace) else {
+        panic!("a linked .codewhale must be refused");
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("must not traverse symlinks")
+            || message.contains("must stay within state root"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside).expect("read outside").count(),
+        0,
+        "nothing may be created through the link"
     );
 }
 
@@ -11315,31 +12060,210 @@ fn parse_spawn_request_cwd_empty_string_yields_none() {
 
 #[test]
 fn create_isolated_worktree_creates_branch_checkout_outside_parent_repo() {
-    let repo = init_subagent_git_repo();
-    let worktree_home = tempdir().expect("worktree home");
+    let (_harness, repo) = git_repo_in_harness();
     let request = SubAgentWorktreeRequest {
         branch: Some("codex/agent-isolated-test".to_string()),
-        path: Some(worktree_home.path().join("isolated")),
+        path: Some(PathBuf::from("isolated")),
         base_ref: None,
     };
 
-    let path = create_isolated_worktree(
-        repo.path(),
-        &request,
-        Some("isolated-test"),
-        &FleetRole::Builder,
-    )
-    .expect("worktree should be created");
+    let path =
+        create_isolated_worktree(&repo, &request, Some("isolated-test"), &FleetRole::Builder)
+            .expect("worktree should be created");
 
     assert!(path.exists(), "worktree path should exist");
     assert!(
-        !path.starts_with(repo.path()),
+        !path.starts_with(&repo),
         "generated worktree must be outside the parent checkout"
     );
     assert_eq!(
         current_git_branch(&path).as_deref(),
         Some("codex/agent-isolated-test")
     );
+}
+
+#[test]
+fn unchanged_isolated_worktree_is_removed_and_changed_one_is_kept() {
+    let (harness, repo) = git_repo_in_harness();
+    let make = |name: &str| {
+        create_isolated_worktree(
+            &repo,
+            &SubAgentWorktreeRequest {
+                branch: Some(format!("codex/agent-{name}")),
+                path: Some(PathBuf::from(name)),
+                base_ref: None,
+            },
+            Some(name),
+            &FleetRole::Builder,
+        )
+        .expect("worktree should be created")
+    };
+    let branch_exists = |name: &str| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/codex/agent-{name}"))
+            .current_dir(&repo)
+            .output()
+            .expect("git rev-parse")
+            .status
+            .success()
+    };
+
+    let clean = make("clean");
+    let empty = std::collections::BTreeSet::new();
+    assert!(worktree::remove_unchanged_worktree(&clean, Some(&empty)));
+    assert!(!clean.exists(), "unchanged worktree is removed");
+    assert!(!branch_exists("clean"), "its merged branch is deleted too");
+
+    let changed = make("changed");
+    let touched = std::collections::BTreeSet::from(["src/lib.rs".to_string()]);
+    assert!(!worktree::remove_unchanged_worktree(
+        &changed,
+        Some(&touched)
+    ));
+    assert!(changed.exists(), "a worktree with changes is kept");
+
+    let unknown = make("unknown");
+    assert!(!worktree::remove_unchanged_worktree(&unknown, None));
+    assert!(unknown.exists(), "no evidence means no removal");
+    assert!(branch_exists("unknown"));
+
+    // An ignored file is invisible to the delivery inventory but was still
+    // written by the worker, so the worktree is kept.
+    let ignored = make("ignored");
+    std::fs::write(repo.join(".git/info/exclude"), "scratch/\n").expect("exclude");
+    std::fs::create_dir_all(ignored.join("scratch")).expect("scratch dir");
+    std::fs::write(ignored.join("scratch/report.md"), "findings").expect("ignored file");
+    assert!(!worktree::remove_unchanged_worktree(&ignored, Some(&empty)));
+    assert!(ignored.join("scratch/report.md").exists());
+
+    // Never deletes a directory git does not list as a linked worktree.
+    let plain = harness.path().join("plain");
+    std::fs::create_dir_all(&plain).expect("plain dir");
+    assert!(!worktree::remove_unchanged_worktree(&plain, Some(&empty)));
+    assert!(plain.exists());
+}
+
+/// A git repository at `<harness>/repo`, so its sub-agent worktree root
+/// (`<harness>/.codewhale-worktrees/repo`) is removed with the harness.
+fn git_repo_in_harness() -> (tempfile::TempDir, PathBuf) {
+    let harness = tempdir().expect("harness");
+    let repo = harness.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    init_git_repo_at(&repo);
+    let repo = repo.canonicalize().expect("canonical repo");
+    (harness, repo)
+}
+
+#[test]
+fn create_isolated_worktree_keeps_absolute_paths_under_worktree_root() {
+    let (harness, repo) = git_repo_in_harness();
+    let outside = tempdir().expect("outside dir");
+    let escape = outside.path().join("escaped");
+    let branch_exists = |name: &str| {
+        Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{name}"))
+            .current_dir(&repo)
+            .status()
+            .expect("git rev-parse")
+            .success()
+    };
+
+    let err = create_isolated_worktree(
+        &repo,
+        &SubAgentWorktreeRequest {
+            branch: Some("codex/agent-escape".to_string()),
+            path: Some(escape.clone()),
+            base_ref: None,
+        },
+        None,
+        &FleetRole::Builder,
+    )
+    .expect_err("absolute path outside the worktree root must be refused");
+    assert!(
+        err.to_string().contains("must stay under"),
+        "unexpected error: {err}"
+    );
+    assert!(!escape.exists(), "nothing is created at the refused path");
+    assert!(!branch_exists("codex/agent-escape"));
+
+    // A `..` walk out of the root is refused the same way.
+    let root = harness
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".codewhale-worktrees")
+        .join("repo");
+    let dotdot = root.join("..").join("..").join("walked");
+    create_isolated_worktree(
+        &repo,
+        &SubAgentWorktreeRequest {
+            branch: Some("codex/agent-dotdot".to_string()),
+            path: Some(dotdot),
+            base_ref: None,
+        },
+        None,
+        &FleetRole::Builder,
+    )
+    .expect_err("a path that walks out of the root must be refused");
+    assert!(!harness.path().join("walked").exists());
+
+    // A symlink under the root that points elsewhere is refused.
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(&root).expect("worktree root");
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).expect("symlink");
+        create_isolated_worktree(
+            &repo,
+            &SubAgentWorktreeRequest {
+                branch: Some("codex/agent-link".to_string()),
+                path: Some(root.join("link").join("child")),
+                base_ref: None,
+            },
+            None,
+            &FleetRole::Builder,
+        )
+        .expect_err("a symlinked parent must not redirect the checkout");
+        assert!(!outside.path().join("child").exists());
+        assert!(!branch_exists("codex/agent-link"));
+    }
+
+    // An absolute path inside the root is still accepted.
+    let inside = root.join("inside");
+    let path = create_isolated_worktree(
+        &repo,
+        &SubAgentWorktreeRequest {
+            branch: Some("codex/agent-inside".to_string()),
+            path: Some(inside),
+            base_ref: None,
+        },
+        None,
+        &FleetRole::Builder,
+    )
+    .expect("absolute path under the worktree root");
+    assert!(path.exists());
+}
+
+#[test]
+fn create_isolated_worktree_rejects_option_shaped_base_ref() {
+    let (harness, repo) = git_repo_in_harness();
+    let err = create_isolated_worktree(
+        &repo,
+        &SubAgentWorktreeRequest {
+            branch: Some("codex/agent-optbase".to_string()),
+            path: Some(PathBuf::from("optbase")),
+            base_ref: Some("--no-checkout".to_string()),
+        },
+        None,
+        &FleetRole::Scout,
+    )
+    .expect_err("option-shaped base ref must be refused");
+    assert!(
+        err.to_string().contains("cannot start with '-'"),
+        "unexpected error: {err}"
+    );
+    assert!(!harness.path().join(".codewhale-worktrees").exists());
 }
 
 #[test]
@@ -11396,10 +12320,9 @@ fn create_isolated_worktree_discovers_nested_repo_from_harness_parent() {
     let nested = harness.path().join("CodeWhale");
     std::fs::create_dir_all(&nested).expect("nested checkout dir");
     init_git_repo_at(&nested);
-    let worktree_home = tempdir().expect("worktree home");
     let request = SubAgentWorktreeRequest {
         branch: Some("codex/agent-harness-nested".to_string()),
-        path: Some(worktree_home.path().join("isolated")),
+        path: Some(PathBuf::from("isolated")),
         base_ref: None,
     };
 
@@ -11510,6 +12433,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     let tmp = tempdir().expect("tempdir");
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
     let native_skill = workspace.join(".agents/skills/native-review");
     let plugin_root = workspace.join(".codewhale/plugins/demo");
     std::fs::create_dir_all(&native_skill).expect("native Skill dir");
@@ -11841,7 +12765,7 @@ fn annotated_failure_message_composes_class_tag_and_model_hint() {
     ))
     .context("Responses API request failed");
 
-    let provider = crate::config::ApiProvider::OpenaiCodex;
+    let provider = crate::config::ProviderKind::OpenaiCodex;
     let route = ModelRoute::Fixed("gpt-5.5-codex".to_string());
     let annotated = annotate_child_model_error(
         &subagent_failure_message(&err),
@@ -11868,7 +12792,10 @@ fn annotated_failure_message_composes_class_tag_and_model_hint() {
         "{annotated}"
     );
     // #4049: the failure now names the provider and the route source.
-    assert!(annotated.contains(provider.display_name()), "{annotated}");
+    assert!(
+        annotated.contains(provider.provider().display_name()),
+        "{annotated}"
+    );
     assert!(annotated.contains("route:"), "{annotated}");
     assert!(annotated.contains("explicit model id"), "{annotated}");
 }
@@ -11918,20 +12845,24 @@ fn subagent_failure_message_preserves_error_chain() {
 fn annotate_child_model_error_adds_actionable_hint() {
     // #2653: a bare provider 403 becomes actionable by naming the model and the
     // recovery path, while unrelated errors pass through unchanged.
-    let provider = crate::config::ApiProvider::Moonshot;
+    let provider = crate::config::ProviderKind::Moonshot;
     let inherit = ModelRoute::Inherit;
     let auth = annotate_child_model_error("403 Forbidden", "kimi-k2", provider, &inherit);
     assert!(auth.contains("kimi-k2"), "names the model: {auth}");
     assert!(
-        auth.contains("child model override"),
+        auth.contains("child-agent model config"),
         "names the recovery path: {auth}"
+    );
+    assert!(
+        !auth.contains("explicit child model override"),
+        "an inherited route never blames an override nobody gave: {auth}"
     );
     assert!(
         auth.contains("403 Forbidden"),
         "preserves the original: {auth}"
     );
     // #4049: provider + route source are named in the hint.
-    assert!(auth.contains(provider.display_name()), "{auth}");
+    assert!(auth.contains(provider.provider().display_name()), "{auth}");
     assert!(auth.contains("inherited from the parent"), "{auth}");
 
     // Unrelated errors still pass through completely unchanged (no provider
@@ -11951,13 +12882,50 @@ fn annotate_child_model_error_adds_actionable_hint() {
     let openai_style = annotate_child_model_error(
         "The model `gpt-5.5-nano` does not exist or you do not have access to it.",
         "gpt-5.5-nano",
-        crate::config::ApiProvider::OpenaiCodex,
+        crate::config::ProviderKind::OpenaiCodex,
         &ModelRoute::Fixed("gpt-5.5-nano".to_string()),
     );
     assert!(
         openai_style.contains("child-agent model config"),
         "OpenAI-style rejection gets the hint: {openai_style}"
     );
+
+    // A spent-balance quota refusal names the route too: the operator must
+    // know which account is exhausted. A short-lived rate limit passes
+    // through: retry, not a route change, is the recovery.
+    let quota = annotate_child_model_error(
+        "[quota_exhausted] Provider plan quota exhausted: You have run out of credits.",
+        "kimi-k2",
+        provider,
+        &inherit,
+    );
+    assert!(
+        quota.contains("child-agent model config"),
+        "exhausted balance gets the hint: {quota}"
+    );
+    assert!(quota.contains("kimi-k2"), "names the model: {quota}");
+    let limited =
+        annotate_child_model_error("Rate limited: slow down", "kimi-k2", provider, &inherit);
+    assert_eq!(limited, "Rate limited: slow down");
+}
+
+#[test]
+fn child_runtime_capability_errors_are_not_misreported_as_model_access_errors() {
+    for error in [
+        "Sub-agent requested unavailable tools: bash",
+        "Requested source file does not exist",
+        "The worktree path is unavailable",
+    ] {
+        assert_eq!(
+            annotate_child_model_error(
+                error,
+                "deepseek-flash",
+                crate::config::ProviderKind::Deepseek,
+                &ModelRoute::Inherit,
+            ),
+            error,
+        );
+    }
 }
 
 #[test]
@@ -11969,7 +12937,7 @@ fn child_launch_error_names_provider_model_and_route_source() {
     let err = anyhow::Error::new(crate::llm_client::LlmError::ModelError(
         "Model \"deepseek-v4-pro\" not found".to_string(),
     ));
-    let provider = crate::config::ApiProvider::Deepseek;
+    let provider = crate::config::ProviderKind::Deepseek;
     let route = ModelRoute::Fixed("deepseek-v4-pro".to_string());
     let annotated = annotate_child_model_error(
         &subagent_failure_message(&err),
@@ -11978,7 +12946,7 @@ fn child_launch_error_names_provider_model_and_route_source() {
         &route,
     );
     assert!(
-        annotated.contains(provider.display_name()),
+        annotated.contains(provider.provider().display_name()),
         "provider: {annotated}"
     );
     assert!(annotated.contains("deepseek-v4-pro"), "model: {annotated}");
@@ -12066,11 +13034,14 @@ async fn rate_limit_pause_blocks_subagent_spawn() {
     let _clear = ClearRateLimitOnDrop;
     crate::retry_status::clear();
     crate::retry_status::clear_rate_limit();
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    crate::retry_status::note_rate_limit(
+        &runtime.client.rate_limit_scope(),
+        Duration::from_secs(30),
+    );
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
 
     let err = spawn_subagent_from_input(
@@ -12098,6 +13069,7 @@ fn child_runtime_increments_depth_and_preserves_auto_approve() {
     let mut parent = stub_runtime();
     parent.spawn_depth = 1;
     parent.context.auto_approve = false; // parent in suggest mode
+    parent.context.approval_mode = codewhale_execpolicy::ApprovalMode::Auto;
     let child = parent.child_runtime();
     assert_eq!(child.spawn_depth, 2, "child depth = parent + 1");
     assert_eq!(child.step_api_timeout, DEFAULT_STEP_API_TIMEOUT);
@@ -12105,13 +13077,25 @@ fn child_runtime_increments_depth_and_preserves_auto_approve() {
         !child.context.auto_approve,
         "child must inherit parent approval state"
     );
+    // Auto-Review is a posture, not a set bit: a child that pinned only the bit
+    // would run a task it creates one step stricter than the parent.
+    assert_eq!(
+        child.context.approval_mode,
+        codewhale_execpolicy::ApprovalMode::Auto,
+        "child inherits the parent's posture"
+    );
     assert!(!parent.context.auto_approve);
 
     parent.context.auto_approve = true;
+    parent.context.approval_mode = codewhale_execpolicy::ApprovalMode::Bypass;
     let auto_child = parent.child_runtime();
     assert!(
         auto_child.context.auto_approve,
         "auto-approved parents should still create auto-approved children"
+    );
+    assert_eq!(
+        auto_child.context.approval_mode,
+        codewhale_execpolicy::ApprovalMode::Bypass
     );
 }
 
@@ -12314,10 +13298,54 @@ async fn parent_todo_state_still_reaches_children_as_immutable_fork_context() {
         work_source: None,
     });
 
+    let parent_header = Arc::clone(&parent.fork_context.as_ref().unwrap().live_header);
+    *parent_header.lock().unwrap() = Some(crate::prompt_zones::LiveHeaderSnapshot {
+        system: Some(codewhale_models::SystemPrompt::Text(
+            "captured parent header".to_string(),
+        )),
+        tools_json: String::new(),
+        active_names: Vec::new(),
+        model: parent.model.clone(),
+        provider: crate::config::ProviderKind::Deepseek,
+        provider_identity: "fixture-parent".to_string(),
+        endpoint_fingerprint: Some("fixture-endpoint".to_string()),
+        route_receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
+            crate::config::ProviderKind::Deepseek,
+            "fixture-parent",
+            &parent.model,
+            "https://api.example.test/v1",
+            "fake-cache-key",
+        )),
+        history: Vec::new(),
+        last_hit_tokens: Some(1),
+    });
     let direct = parent.child_runtime();
     let nested = direct.child_runtime();
+    parent_header.lock().unwrap().as_mut().unwrap().system = Some(
+        codewhale_models::SystemPrompt::Text("later parent header".to_string()),
+    );
 
     for (label, child) in [("direct child", &direct), ("nested child", &nested)] {
+        let child_header = &child.fork_context.as_ref().unwrap().live_header;
+        assert!(!Arc::ptr_eq(&parent_header, child_header));
+        let header = child_header.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            header.route_receipt.as_ref(),
+            Some(&crate::route_receipt::TurnRouteReceipt::new(
+                crate::config::ProviderKind::Deepseek,
+                "fixture-parent",
+                &parent.model,
+                "https://api.example.test/v1",
+                "fake-cache-key",
+            ))
+        );
+        assert_eq!(
+            header.system,
+            Some(codewhale_models::SystemPrompt::Text(
+                "captured parent header".to_string()
+            )),
+            "{label} must retain the header captured at spawn"
+        );
         let block = child
             .fork_context
             .as_ref()
@@ -12451,7 +13479,7 @@ fn child_and_background_runtimes_preserve_step_api_timeout() {
 async fn subagent_registry_blocks_approval_tools_without_parent_auto_approve() {
     let mut runtime = stub_runtime();
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         Some(vec!["Bash".to_string()]),
@@ -12469,7 +13497,8 @@ async fn subagent_registry_blocks_approval_tools_without_parent_auto_approve() {
         .expect_err("approval-gated child tool should be blocked");
 
     assert!(
-        err.to_string().contains("requires approval"),
+        matches!(err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
         "unexpected error: {err}"
     );
 }
@@ -12490,7 +13519,7 @@ async fn prompt_only_general_cannot_mutate_under_parent_auto_approve() {
         None,
         false,
     );
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         request.agent_type,
         None,
@@ -12525,10 +13554,19 @@ async fn prompt_only_general_cannot_mutate_under_parent_auto_approve() {
 
 const MCP_ACTION_TOOL: &str = "mcp_github_create_pull_request";
 
-fn subagent_registry_with_mcp_action(auto_approve: bool) -> SubAgentToolRegistry {
+fn subagent_registry_with_mcp_action(auto_approve: bool) -> (ChildCoreProbe, tempfile::TempDir) {
+    let home = tempdir().expect("private MCP probe receipt home");
     let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(home.path());
+    runtime = runtime.with_approval_receipt_store(Ok(
+        crate::approval_log::ApprovalReceiptStore::new(home.path().join("sessions")),
+    ));
     runtime.context.auto_approve = auto_approve;
-    let mut registry = SubAgentToolRegistry::new(
+    // Core dispatches MCP through the captured pool; the registry facade supplies its schema.
+    runtime = runtime.with_mcp_pool(Some(Arc::new(tokio::sync::Mutex::new(
+        crate::mcp::McpPool::new(crate::mcp::McpConfig::default()),
+    ))));
+    let mut registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         Some(vec![MCP_ACTION_TOOL.to_string()]),
@@ -12540,7 +13578,7 @@ fn subagent_registry_with_mcp_action(auto_approve: bool) -> SubAgentToolRegistry
         .register(crate::tools::registry::mcp_tool_adapter_for_test(
             MCP_ACTION_TOOL,
         ));
-    registry
+    (registry, home)
 }
 
 #[tokio::test]
@@ -12584,7 +13622,7 @@ async fn child_write_tool_fails_closed_outside_registered_scope() {
     runtime.context = ToolContext::new(tmp.path());
     runtime.context.auto_approve = true;
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
-    let registry = SubAgentToolRegistry::new_with_owner(
+    let registry = ChildCoreProbe::new_with_owner(
         runtime,
         FleetRole::Builder,
         "agent_scoped".into(),
@@ -12775,7 +13813,7 @@ async fn lone_shared_writer_keeps_unbounded_shell() {
     runtime.context = ToolContext::new(tmp.path());
     runtime.context.auto_approve = true;
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
-    let registry = SubAgentToolRegistry::new_with_owner(
+    let registry = ChildCoreProbe::new_with_owner(
         runtime,
         FleetRole::Builder,
         "agent_solo".into(),
@@ -12831,13 +13869,13 @@ fn contended_builder_registry(
     manager: &SharedSubAgentManager,
     workspace: &Path,
     owner: &str,
-) -> SubAgentToolRegistry {
+) -> ChildCoreProbe {
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(manager);
     runtime.context = ToolContext::new(workspace);
     runtime.context.auto_approve = true;
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
-    SubAgentToolRegistry::new_with_owner(
+    ChildCoreProbe::new_with_owner(
         runtime,
         FleetRole::Builder,
         owner.to_string(),
@@ -13079,6 +14117,7 @@ fn waiting_for_user_headless_worker_is_not_a_live_coordination_owner() {
 /// Register a shared-checkout write claim for `owner` the way production does,
 /// so the presence stamp (#5906) is recorded rather than defaulted away.
 fn claim_shared_root(manager: &mut SubAgentManager, owner: &str, root: &str) -> Result<(), String> {
+    let workspace = manager.workspace.clone();
     manager
         .register_claim_with_presence(
             WriteScopeClaim {
@@ -13088,6 +14127,7 @@ fn claim_shared_root(manager: &mut SubAgentManager, owner: &str, root: &str) -> 
                 contracts: Vec::new(),
             },
             false,
+            &workspace,
         )
         .map(|_| ())
 }
@@ -13286,7 +14326,7 @@ fn a_claim_whose_paths_vanished_stops_blocking_but_a_future_tree_still_does() {
 
 #[tokio::test]
 async fn subagent_blocks_mcp_action_without_parent_auto_approve() {
-    let registry = subagent_registry_with_mcp_action(false);
+    let (registry, _home) = subagent_registry_with_mcp_action(false);
 
     let err = registry
         .execute("agent_test", MCP_ACTION_TOOL, json!({}))
@@ -13294,16 +14334,31 @@ async fn subagent_blocks_mcp_action_without_parent_auto_approve() {
         .expect_err("non-read MCP actions must require parent auto approval");
 
     assert!(
-        err.to_string().contains(
-            "requires approval and cannot run inside this sub-agent without a session decision"
-        ),
+        matches!(err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
         "unexpected MCP approval error: {err}"
     );
+    let store = registry
+        .gate_runtime
+        .approval_receipt_store
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap();
+    let replay = store
+        .replay(&registry.gate_runtime.context.state_namespace)
+        .unwrap();
+    assert_eq!(replay.completed.len(), 1);
+    assert_eq!(
+        replay.completed[0].outcome,
+        crate::approval_log::ApprovalOutcome::Unavailable
+    );
+    assert!(replay.unmatched_asks.is_empty());
 }
 
 #[tokio::test]
 async fn auto_approved_subagent_passes_mcp_action_approval_gate() {
-    let registry = subagent_registry_with_mcp_action(true);
+    let (registry, _home) = subagent_registry_with_mcp_action(true);
 
     let err = registry
         .execute("agent_test", MCP_ACTION_TOOL, json!({}))
@@ -13332,7 +14387,7 @@ async fn implementer_delegation_allows_suggest_write_without_parent_auto_approve
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(workspace.clone());
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         None,
@@ -13368,7 +14423,7 @@ async fn workflow_accept_edits_allows_general_file_write_without_parent_auto_app
     runtime.context = ToolContext::new(workspace.clone());
     runtime.context.auto_approve = false;
     runtime.accept_edits = true;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         None,
@@ -13402,7 +14457,8 @@ async fn workflow_accept_edits_allows_general_file_write_without_parent_auto_app
         .await
         .expect_err("shell must still require parent auto-approve");
     assert!(
-        err.to_string().contains("requires approval"),
+        matches!(err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
         "unexpected: {err}"
     );
 }
@@ -13414,7 +14470,7 @@ async fn general_delegation_still_blocks_suggest_write_without_parent_auto_appro
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(workspace.clone());
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         None,
@@ -13430,10 +14486,10 @@ async fn general_delegation_still_blocks_suggest_write_without_parent_auto_appro
         )
         .await
         .expect_err("general agent should not silently gain write permission");
-    let msg = err.to_string();
     assert!(
-        msg.contains("not delegated to general sub-agents"),
-        "general writes should be rejected with a role-aware message: {msg}"
+        matches!(err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
+        "general writes must retain the canonical no-host approval refusal: {err}"
     );
 
     assert!(
@@ -13451,7 +14507,7 @@ async fn explore_role_still_blocks_suggest_writes_without_parent_auto_approve() 
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         None,
@@ -13491,7 +14547,7 @@ async fn explore_role_blocks_writes_even_under_parent_auto_approve() {
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.context.auto_approve = true;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         None,
@@ -13537,7 +14593,7 @@ async fn delegated_write_role_still_blocks_required_tools() {
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         Some(vec!["Bash".to_string()]),
@@ -13554,9 +14610,9 @@ async fn delegated_write_role_still_blocks_required_tools() {
         .await
         .expect_err("Required-level shell must still need parent auto-approve");
     assert!(
-        err.to_string()
-            .contains("cannot run inside this sub-agent without a session decision"),
-        "expected Required-level approval message, got: {err}"
+        matches!(err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
+        "Required-level shell must retain the canonical no-host approval refusal: {err}"
     );
 }
 
@@ -13619,6 +14675,12 @@ fn write_capable_or_unproven_starts_keep_the_approval_gate() {
         json!({"action": "start", "type": "scout", "role": "builder", "prompt": "x"}),
         json!({"action": "start", "role": "release_lead", "prompt": "x"}), // roster token
         json!({"action": "start", "type": "bogus", "prompt": "x"}),
+        // Any worktree request provisions a checkout, so a read-only role
+        // does not skip the approval card.
+        json!({"action": "start", "type": "reviewer", "worktree_path": "/tmp/x", "prompt": "x"}),
+        json!({"action": "start", "type": "scout", "worktree": true, "prompt": "x"}),
+        json!({"action": "start", "type": "scout", "base_ref": "HEAD", "prompt": "x"}),
+        json!({"action": "start", "type": "scout", "isolation": "worktree", "prompt": "x"}),
     ] {
         assert_eq!(
             tool.approval_requirement_for(&input),
@@ -13653,7 +14715,7 @@ async fn worker_child_inherits_workspace_write_carve_out_without_parent_auto_app
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(workspace.clone());
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         None,
@@ -13686,7 +14748,8 @@ async fn worker_child_inherits_workspace_write_carve_out_without_parent_auto_app
             .await
             .expect_err("excluded targets must stay gated");
         assert!(
-            err.to_string().contains("is not delegated to"),
+            matches!(err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+                if message == "child caller has no host that can answer this approval"),
             "{input}: unexpected error {err}"
         );
     }
@@ -13700,7 +14763,7 @@ async fn worker_child_write_carve_out_requires_a_git_work_tree() {
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         None,
@@ -13717,7 +14780,8 @@ async fn worker_child_write_carve_out_requires_a_git_work_tree() {
         .await
         .expect_err("non-git workspace keeps the delegation gate");
     assert!(
-        err.to_string().contains("is not delegated to"),
+        matches!(err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
         "unexpected error: {err}"
     );
 }
@@ -13731,7 +14795,9 @@ async fn builder_child_runs_bounded_verification_but_not_shell_without_parent_au
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.context.auto_approve = false;
-    let registry = SubAgentToolRegistry::new(
+    let receipt_store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
+    runtime = runtime.with_approval_receipt_store(Ok(receipt_store.clone()));
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         None,
@@ -13752,6 +14818,10 @@ async fn builder_child_runs_bounded_verification_but_not_shell_without_parent_au
         ),
     }
 
+    assert!(
+        receipt_store.load("workspace").unwrap().is_empty(),
+        "bounded verification never asks approval"
+    );
     let shell_err = registry
         .execute(
             "agent_test",
@@ -13761,9 +14831,8 @@ async fn builder_child_runs_bounded_verification_but_not_shell_without_parent_au
         .await
         .expect_err("arbitrary shell stays gated for children of non-auto parents");
     assert!(
-        shell_err
-            .to_string()
-            .contains("cannot run inside this sub-agent without a session decision"),
+        matches!(shell_err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
         "unexpected error: {shell_err}"
     );
 
@@ -13776,9 +14845,19 @@ async fn builder_child_runs_bounded_verification_but_not_shell_without_parent_au
         .await
         .expect_err("unbounded verification argv stays gated");
     assert!(
-        argv_err.to_string().contains("requires approval"),
+        matches!(argv_err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
         "unexpected error: {argv_err}"
     );
+    let replay = receipt_store.replay("workspace").unwrap();
+    assert_eq!(replay.completed.len(), 2);
+    assert!(
+        replay
+            .completed
+            .iter()
+            .all(|receipt| receipt.outcome == crate::approval_log::ApprovalOutcome::Unavailable)
+    );
+    assert!(replay.unmatched_asks.is_empty());
 }
 
 #[tokio::test]
@@ -13789,7 +14868,7 @@ async fn auto_approved_parent_runs_required_tools_in_subagent() {
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.context.auto_approve = true;
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         None,
@@ -13833,7 +14912,7 @@ fn incomplete_response_failure_keeps_the_provider_stop_cause() {
         usage: Usage::default(),
     };
 
-    let failure = incomplete_subagent_response_failure(&response);
+    let failure = incomplete_subagent_response_failure(response.stop_reason.as_deref());
     assert!(failure.contains("response was incomplete"), "{failure}");
     assert!(failure.contains("`content_filter`"), "{failure}");
     assert!(!failure.contains("budget exhausted"), "{failure}");
@@ -14105,7 +15184,7 @@ async fn turn_end_parking_preserves_a_step_zero_resumable_checkpoint() {
     let parking = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (_input_tx, input_rx) = mpsc::unbounded_channel();
 
-    let result = run_subagent(
+    let result = engine::run_child_agent(
         &runtime,
         agent_id.to_string(),
         FleetRole::Worker,
@@ -14465,9 +15544,9 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
     // rebinding (#5042) needs it to rebuild the client for model-aware
     // routes such as deepseek-v4-flash.
     let stub_config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
     let accounting_origin = SubAgentAccountingOrigin::capture(&context);
     SubAgentRuntime {
         client: stub_client(),
@@ -14478,6 +15557,8 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         reasoning_effort: None,
         reasoning_effort_auto: false,
         role_models: std::collections::HashMap::new(),
+        route_replacements: Vec::new(),
+        route_origin: None,
         context,
         allow_shell: true,
         accept_edits: false,
@@ -14497,12 +15578,16 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         parent_completion_tx: None,
         fork_context: None,
         parent_mode: AppMode::Agent,
-        approval_mode: ApprovalMode::Suggest,
         auto_review_policy: std::sync::Arc::new(
-            crate::tui::auto_review::AutoReviewPolicy::default(),
+            crate::core::authority::auto_review::AutoReviewPolicy::default(),
         ),
         parent_can_prompt: false,
-        approval_receipt_store: None,
+        approval_receipt_store: Some(Ok(crate::approval_log::ApprovalReceiptStore::new(
+            std::env::temp_dir().join(format!(
+                "codewhale-child-approval-tests-{}",
+                uuid::Uuid::new_v4()
+            )),
+        ))),
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
         api_timeout_retry_base_backoff: SUBAGENT_API_TIMEOUT_INITIAL_BACKOFF,
@@ -14513,6 +15598,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         // Test stubs run without a manager-stamped governor; the LLM call
         // path treats `None` as "report nothing".
         governor: None,
+        compaction: crate::compaction::CompactionConfig::default(),
     }
 }
 
@@ -14554,7 +15640,7 @@ async fn root_operate_dispatch_delegates_builtin_verification_but_not_shell() {
     runtime.context.auto_approve = false;
     runtime.parent_mode = AppMode::Operate;
     apply_session_spawn_defaults(&mut runtime);
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime.clone(),
         FleetRole::Worker,
         None,
@@ -14578,7 +15664,11 @@ async fn root_operate_dispatch_delegates_builtin_verification_but_not_shell() {
         )
         .await
         .expect_err("raw Cargo argv must stay approval-gated");
-    assert!(targeted_err.to_string().contains("requires approval"));
+    assert!(
+        matches!(targeted_err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
+        "unexpected approval refusal: {targeted_err}"
+    );
 
     let shell_err = registry
         .execute(
@@ -14588,7 +15678,11 @@ async fn root_operate_dispatch_delegates_builtin_verification_but_not_shell() {
         )
         .await
         .expect_err("Operate verification delegation must not grant raw shell");
-    assert!(shell_err.to_string().contains("requires approval"));
+    assert!(
+        matches!(shell_err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
+        "unexpected approval refusal: {shell_err}"
+    );
 
     let custom_err = registry
         .execute(
@@ -14601,7 +15695,11 @@ async fn root_operate_dispatch_delegates_builtin_verification_but_not_shell() {
         )
         .await
         .expect_err("Operate verification delegation must not grant custom commands");
-    assert!(custom_err.to_string().contains("requires approval"));
+    assert!(
+        matches!(custom_err.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message == "child caller has no host that can answer this approval"),
+        "unexpected approval refusal: {custom_err}"
+    );
 
     let direct_child = runtime.child_runtime();
     assert!(direct_child.accept_verification);
@@ -14718,11 +15816,13 @@ fn worker_lifecycle_records_direct_operate_approval_without_delegating_authority
 /// only validates that an API key field exists, not that the key works.
 fn stub_runtime_for_provider(provider: &str) -> SubAgentRuntime {
     let mut runtime = stub_runtime();
-    runtime.client = stub_client_for_provider(provider);
+    let (client, config) = stub_client_for_provider(provider);
+    runtime.client = client;
+    runtime.api_config = Some(Arc::new(config));
     runtime
 }
 
-fn stub_client_for_provider(provider: &str) -> CodewhaleClient {
+fn stub_client_for_provider(provider: &str) -> (CodewhaleClient, crate::config::Config) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut providers = crate::config::ProvidersConfig::default();
     match provider {
@@ -14764,21 +15864,28 @@ fn stub_client_for_provider(provider: &str) -> CodewhaleClient {
         }
         other => panic!("extend stub_client_for_provider for provider {other}"),
     }
-    let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
+    let mut config = crate::config::Config {
         provider: Some(provider.to_string()),
         providers: Some(providers),
         ..crate::config::Config::default()
-    };
-    CodewhaleClient::new(&config).expect("stub client should construct")
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
+    if provider == "openai-codex" {
+        crate::oauth::install_test_chatgpt_registration(&mut config)
+            .expect("owned official ChatGPT fixture grant");
+    }
+    (
+        CodewhaleClient::new(&config).expect("stub client should construct"),
+        config,
+    )
 }
 
 fn stub_client() -> CodewhaleClient {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
     CodewhaleClient::new(&config).expect("stub client should construct")
 }
 
@@ -14821,7 +15928,7 @@ fn spawn_child_runtime_inherits_session_client_and_config() {
     let runtime = cross_provider_runtime();
     assert_eq!(
         runtime.client.api_provider(),
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         "precondition: session is on DeepSeek"
     );
 
@@ -14830,7 +15937,7 @@ fn spawn_child_runtime_inherits_session_client_and_config() {
     for child in [runtime.child_runtime(), runtime.background_runtime()] {
         assert_eq!(
             child.client.api_provider(),
-            crate::config::ApiProvider::Deepseek
+            crate::config::ProviderKind::Deepseek
         );
         assert!(
             child
@@ -15574,6 +16681,82 @@ fn terminal_results_excluding_returns_only_current_root_undelivered_agents() {
     assert!(manager.terminal_results_excluding(&delivered).is_empty());
 }
 
+/// The 09-23 session shape: a workflow spawned from the root turn launched
+/// five children whose `parent_run_id` was empty, so the terminal synthesis
+/// re-injected every child report after the workflow receipt had already
+/// carried them. The workflow driver owns those results; a direct child's
+/// result still reaches the parent turn.
+#[test]
+fn workflow_children_are_never_synthesized_into_the_parent_turn() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+    let current_boot = manager.current_session_boot_id.clone();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    for id in ["agent_direct_done", "agent_workflow_done"] {
+        let mut agent = SubAgent::new(
+            id.to_string(),
+            FleetRole::Worker,
+            id.to_string(),
+            make_assignment(),
+            "deepseek-v4-flash".to_string(),
+            None,
+            None,
+            input_tx.clone(),
+            tmp.path().to_path_buf(),
+            current_boot.clone(),
+        );
+        agent.status = SubAgentStatus::Completed;
+        agent.result = Some(format!("{id} report"));
+        manager.agents.insert(agent.id.clone(), agent);
+    }
+    manager.register_worker(make_worker_spec(
+        "agent_direct_done",
+        tmp.path().to_path_buf(),
+    ));
+    let mut workflow_spec = make_worker_spec("agent_workflow_done", tmp.path().to_path_buf());
+    assert!(
+        workflow_spec.parent_run_id.is_none(),
+        "spawned from the root"
+    );
+    workflow_spec.workflow_run_id = Some("workflow_d08d912f".to_string());
+    manager.register_worker(workflow_spec);
+
+    let none_delivered = HashSet::new();
+    let results = manager.terminal_results_excluding(&none_delivered);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["agent_direct_done"],
+        "only the direct child is the parent turn's to receive"
+    );
+    assert!(manager.may_transform_next_parent_request_inner(None, &none_delivered));
+    let direct_delivered = HashSet::from(["agent_direct_done".to_string()]);
+    assert!(
+        !manager.may_transform_next_parent_request_inner(None, &direct_delivered),
+        "a settled workflow child must not hold the parent request open"
+    );
+}
+
+#[test]
+fn worker_spec_workflow_run_id_is_optional_on_disk() {
+    let mut spec = make_worker_spec("agent_wf", PathBuf::from("/tmp/ws"));
+    let legacy = serde_json::to_value(&spec).expect("serialize");
+    assert!(
+        legacy.get("workflow_run_id").is_none(),
+        "a direct child writes the same record shape as before"
+    );
+    let parsed: AgentWorkerSpec = serde_json::from_value(legacy).expect("legacy record loads");
+    assert_eq!(parsed.workflow_run_id, None);
+
+    spec.workflow_run_id = Some("workflow_1234abcd".to_string());
+    let value = serde_json::to_value(&spec).expect("serialize");
+    assert_eq!(value["workflow_run_id"], "workflow_1234abcd");
+    let parsed: AgentWorkerSpec = serde_json::from_value(value).expect("round trip");
+    assert_eq!(parsed.workflow_run_id.as_deref(), Some("workflow_1234abcd"));
+}
+
 #[tokio::test]
 async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
     let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 2)));
@@ -15595,6 +16778,13 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
 
     let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
+    // Answer the child's single model call from a loopback stub instead of the
+    // stub client's real provider URL: the old network round-trip (DNS, TLS,
+    // a 401) is what made the post-release wait flaky (fleet-6).
+    let (client, _calls, _bodies, fixture_config) =
+        delayed_chat_client(Duration::ZERO, "done").await;
+    runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
     manager.write().await.agents.insert(agent_id.clone(), agent);
@@ -15611,6 +16801,7 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -15629,14 +16820,16 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
     );
     drop(manager_lock);
 
-    let completion = tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+    // Hang guard only: the completion is ordered after the claim, not timed.
+    let completion = tokio::time::timeout(Duration::from_secs(30), completion_rx.recv())
         .await
         .expect("completion should follow the successful terminal claim");
     let completion = completion.expect("completion channel should remain open");
     assert_eq!(completion.agent_id, agent_id);
 
-    task_handle
+    tokio::time::timeout(Duration::from_secs(30), task_handle)
         .await
+        .expect("run_subagent_task should not hang after lock release")
         .expect("run_subagent_task should complete after lock release");
 
     let snapshot = manager
@@ -15697,6 +16890,7 @@ async fn cancellation_wins_task_race_but_still_fans_in_exactly_once() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -15774,42 +16968,46 @@ async fn cancellation_wins_task_race_but_still_fans_in_exactly_once() {
 
 /// Call 1 answers with a tool call (so the child banks a real step);
 /// every later call fails with a non-retryable 400.
-async fn tool_call_then_invalid_request_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>) {
+async fn tool_call_then_invalid_request_chat_client()
+-> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route(
         "/{*path}",
         post({
             let calls = Arc::clone(&calls);
-            move |Json(_body): Json<Value>| {
+            move |Json(body): Json<Value>| {
                 let calls = Arc::clone(&calls);
                 async move {
                     let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     if attempt == 1 {
-                        Json(json!({
-                            "id": "chatcmpl-fatal-midrun-1",
-                            "model": "deepseek-v4-flash",
-                            "choices": [{
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": null,
-                                    "tool_calls": [{
-                                        "id": "call_step_one",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "read_file",
-                                            "arguments": "{\"path\":\"README.md\"}"
-                                        }
-                                    }]
-                                },
-                                "finish_reason": "tool_calls"
-                            }],
-                            "usage": {
-                                "prompt_tokens": 10,
-                                "completion_tokens": 5,
-                                "total_tokens": 15
-                            }
-                        }))
+                        chat_fixture_response(
+                            body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                            json!({
+                                "id": "chatcmpl-fatal-midrun-1",
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": "call_step_one",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": "{\"path\":\"README.md\"}"
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 10,
+                                    "completion_tokens": 5,
+                                    "total_tokens": 15
+                                }
+                            }),
+                        )
                         .into_response()
                     } else {
                         (
@@ -15836,19 +17034,24 @@ async fn tool_call_then_invalid_request_chat_client() -> (CodewhaleClient, Arc<A
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fatal-midrun chat client");
-    (client, calls)
+    (client, calls, config)
 }
 
 #[tokio::test]
@@ -15882,9 +17085,10 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    let (client, calls) = tool_call_then_invalid_request_chat_client().await;
+    let (client, calls, fixture_config) = tool_call_then_invalid_request_chat_client().await;
     let mut runtime = stub_runtime();
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
 
@@ -15900,6 +17104,7 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
         started_at: Instant::now(),
         max_steps: 4,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -15924,7 +17129,10 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
         SubAgentStatus::Interrupted(reason) => reason.clone(),
         _ => unreachable!(),
     };
-    assert!(reason.contains("fatal provider error"), "{reason}");
+    assert_eq!(
+        reason,
+        "Invalid request (400): model is not supported on this endpoint"
+    );
     let checkpoint = parked
         .checkpoint
         .as_ref()
@@ -15981,10 +17189,11 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
         manager.agents.insert(resumed_id.clone(), resumed_agent);
         manager.register_worker(make_worker_spec(&resumed_id, tmp.path().to_path_buf()));
     }
-    let (healthy_client, _healthy_calls) =
+    let (healthy_client, _healthy_calls, fixture_config) =
         token_heavy_chat_client(10, 5, "resumed and finished").await;
     let mut resume_runtime = stub_runtime();
     resume_runtime.client = healthy_client;
+    resume_runtime.api_config = Some(Arc::new(fixture_config));
     resume_runtime.manager = Arc::clone(&manager);
     resume_runtime.context = ToolContext::new(tmp.path());
 
@@ -16000,6 +17209,7 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
         started_at: Instant::now(),
         max_steps: 2,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: resume_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16021,61 +17231,68 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
 /// Six responses re-issuing the same role-denied call, then a text report —
 /// the exact stall #6015 guards: three denied rounds trigger the strategy
 /// switch, three held rounds the report-only response.
-async fn denied_call_then_report_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>) {
+async fn denied_call_then_report_chat_client()
+-> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route(
         "/{*path}",
         post({
             let calls = Arc::clone(&calls);
-            move |Json(_body): Json<Value>| {
+            move |Json(body): Json<Value>| {
                 let calls = Arc::clone(&calls);
                 async move {
                     let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     if attempt <= 6 {
-                        Json(json!({
-                            "id": format!("chatcmpl-denied-{attempt}"),
-                            "model": "deepseek-v4-flash",
-                            "choices": [{
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": null,
-                                    "tool_calls": [{
-                                        "id": format!("call_denied_{attempt}"),
-                                        "type": "function",
-                                        "function": {
-                                            "name": "bash",
-                                            "arguments": "{\"command\":\"cargo build\"}"
-                                        }
-                                    }]
-                                },
-                                "finish_reason": "tool_calls"
-                            }],
-                            "usage": {
-                                "prompt_tokens": 10,
-                                "completion_tokens": 5,
-                                "total_tokens": 15
-                            }
-                        }))
+                        chat_fixture_response(
+                            body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                            json!({
+                                "id": format!("chatcmpl-denied-{attempt}"),
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_denied_{attempt}"),
+                                            "type": "function",
+                                            "function": {
+                                                "name": "bash",
+                                                "arguments": "{\"command\":\"cargo build\"}"
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 10,
+                                    "completion_tokens": 5,
+                                    "total_tokens": 15
+                                }
+                            }),
+                        )
                         .into_response()
                     } else {
-                        Json(json!({
-                            "id": format!("chatcmpl-report-{attempt}"),
-                            "model": "deepseek-v4-flash",
-                            "choices": [{
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "Partial report: every bash call was denied."
-                                },
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {
-                                "prompt_tokens": 10,
-                                "completion_tokens": 5,
-                                "total_tokens": 15
-                            }
-                        }))
+                        chat_fixture_response(
+                            body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                            json!({
+                                "id": format!("chatcmpl-report-{attempt}"),
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Partial report: every bash call was denied."
+                                    },
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 10,
+                                    "completion_tokens": 5,
+                                    "total_tokens": 15
+                                }
+                            }),
+                        )
                         .into_response()
                     }
                 }
@@ -16092,19 +17309,24 @@ async fn denied_call_then_report_chat_client() -> (CodewhaleClient, Arc<AtomicUs
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("denial-stall chat client");
-    (client, calls)
+    (client, calls, config)
 }
 
 /// #6015: a read-only worker that keeps re-issuing the same denied action
@@ -16138,12 +17360,13 @@ async fn repeated_typed_denials_stop_worker_as_failed_not_budget() {
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    let (client, calls) = denied_call_then_report_chat_client().await;
+    let (client, calls, fixture_config) = denied_call_then_report_chat_client().await;
     let mut runtime =
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     seed_read_only_role_deny_list(&mut runtime);
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
 
@@ -16159,6 +17382,7 @@ async fn repeated_typed_denials_stop_worker_as_failed_not_budget() {
         started_at: Instant::now(),
         max_steps: 20,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16190,6 +17414,16 @@ async fn repeated_typed_denials_stop_worker_as_failed_not_budget() {
         Some("Partial report: every bash call was denied."),
         "the report-only response's text is the recorded result"
     );
+    // The refusals reached the model as errors, not as successful results.
+    let transcript = checkpoint_messages_to_text(
+        &result
+            .checkpoint
+            .as_ref()
+            .expect("the stalled worker keeps its transcript")
+            .messages,
+    );
+    assert!(transcript.contains("(error)"), "{transcript}");
+    assert!(!transcript.contains("(ok)"), "{transcript}");
 }
 
 #[tokio::test]
@@ -16219,9 +17453,10 @@ async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
     let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let (event_tx, mut event_rx) = mpsc::channel(8);
-    let (client, calls) = always_invalid_request_chat_client().await;
+    let (client, calls, fixture_config) = always_invalid_request_chat_client().await;
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
     runtime.mailbox = Some(mailbox);
@@ -16245,6 +17480,7 @@ async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16354,8 +17590,8 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
     let (root_tx, mut root_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let direct_child_runtime = runtime_with_depth(1, Some(root_tx));
     let fork_context = SubAgentForkContext {
-        messages: Vec::new(),
         live_header: crate::prompt_zones::new_live_header_cell(),
+        messages: Vec::new(),
         structured_state_block: None,
         work_source: None,
     };
@@ -16625,6 +17861,14 @@ async fn faster_route_on_provider_without_known_sibling_stays_on_parent_model() 
             !route.model.contains("deepseek"),
             "no DeepSeek id may be fabricated: {route:?}"
         );
+        // Staying on the parent is right; staying there quietly is not, so the
+        // same unknown family that must not fabricate an id must also say why
+        // the faster lane resolved to the parent.
+        let note = route
+            .route_note
+            .as_deref()
+            .expect("an unserved fast lane must be visible, not silent");
+        assert!(note.contains("qwen3:32b"), "{note}");
     }
 }
 
@@ -16723,7 +17967,7 @@ fn normalize_requested_subagent_model_rejects_cross_namespace_for_sakana() {
     let err = normalize_requested_subagent_model(
         "deepseek-v4-flash",
         "model",
-        crate::config::ApiProvider::Sakana,
+        crate::config::ProviderKind::Sakana,
     )
     .expect_err("Sakana must reject DeepSeek-only model ids at spawn");
     assert!(
@@ -16739,22 +17983,15 @@ fn gpt55_faster_route_stays_on_gpt55_with_low_reasoning() {
     // fabricate a DeepSeek/GLM id — and resolve Low reasoning rather than Off,
     // because the Codex adapter has no true "off" on the wire.
     //
-    // The Codex client validates OAuth credentials at construction time, so we
-    // stub the access-token env var for the duration of this test (save/restore
-    // to avoid leaking into parallel tests).
-    let prev_token = std::env::var_os("OPENAI_CODEX_ACCESS_TOKEN");
-    // Safety: this test does not run concurrently with other tests that read
-    // OPENAI_CODEX_ACCESS_TOKEN, and we restore the original value below.
-    unsafe {
-        std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-    }
+    // Use Codewhale's protected official grant fixture in an isolated home.
+    // Preparing this route makes no provider request.
+    let home = tempdir().expect("owned official grant fixture home");
+    let owned_home = home
+        .path()
+        .canonicalize()
+        .expect("canonical owned fixture home");
+    let _home = crate::test_support::SealedHome::at(&owned_home);
     let mut codex = stub_runtime_for_provider("openai-codex");
-    unsafe {
-        match prev_token {
-            Some(prev) => std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", prev),
-            None => std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN"),
-        }
-    }
     codex.model = "gpt-5.5".to_string();
     let route = fallback_subagent_assignment_route(
         &codex,
@@ -16871,7 +18108,7 @@ fn operator_model_for_subagent_enumerates_from_catalog_facade() {
     runtime.model = "definitely-not-a-real-model".to_string();
 
     let provider = runtime.client.api_provider();
-    assert_eq!(provider, crate::config::ApiProvider::Deepseek);
+    assert_eq!(provider, crate::config::ProviderKind::Deepseek);
     // Sanity: the strict provider really does reject the invalid id, so
     // operator_model_for_subagent must take the enumeration branch.
     assert!(crate::config::validate_route(provider, &runtime.model).is_err());
@@ -16909,7 +18146,7 @@ fn normalize_requested_subagent_model_is_provider_aware() {
         normalize_requested_subagent_model(
             "kimi-k2.5",
             "model",
-            crate::config::ApiProvider::Moonshot
+            crate::config::ProviderKind::Moonshot
         )
         .expect("Moonshot accepts its own ids"),
         "kimi-k2.5"
@@ -16918,7 +18155,7 @@ fn normalize_requested_subagent_model_is_provider_aware() {
         normalize_requested_subagent_model(
             "qwen3:32b",
             "model",
-            crate::config::ApiProvider::Ollama
+            crate::config::ProviderKind::Ollama
         )
         .expect("Ollama tags pass through"),
         "qwen3:32b"
@@ -16927,7 +18164,7 @@ fn normalize_requested_subagent_model_is_provider_aware() {
         normalize_requested_subagent_model(
             "kimi-k2.5",
             "model",
-            crate::config::ApiProvider::Deepseek
+            crate::config::ProviderKind::Deepseek
         )
         .is_err(),
         "official DeepSeek API rejects foreign ids"
@@ -17010,10 +18247,12 @@ async fn launch_gate_queues_extra_direct_children() {
         4,
     )));
 
-    let (client, _calls, _bodies) = delayed_chat_client(Duration::from_millis(150), "done").await;
+    let (client, _calls, _bodies, fixture_config) =
+        delayed_chat_client(Duration::from_millis(150), "done").await;
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let mut runtime = stub_runtime();
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
     runtime.mailbox = Some(mailbox);
@@ -17048,6 +18287,7 @@ async fn launch_gate_queues_extra_direct_children() {
             started_at: Instant::now(),
             max_steps: 1,
             wall_time: DEFAULT_CHILD_WALL_TIME,
+            wall_ceiling_ms: None,
             input_rx,
             launch_gate: gate,
             _foreground_child_registration: None,
@@ -17202,6 +18442,7 @@ async fn queued_turn_owned_child_parks_without_a_false_start_transition() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: Duration::from_secs(5),
+        wall_ceiling_ms: None,
         input_rx,
         launch_gate: Some(Arc::clone(&gate)),
         _foreground_child_registration: Some(registration),
@@ -17302,7 +18543,7 @@ async fn queued_turn_owned_child_parks_without_a_false_start_transition() {
 }
 
 #[tokio::test]
-async fn launch_gate_wait_counts_against_child_wall_timeout() {
+async fn launch_gate_wait_that_never_ends_fails_as_never_started() {
     use tokio_util::sync::CancellationToken;
 
     const WALL_TIME: Duration = Duration::from_millis(150);
@@ -17350,6 +18591,7 @@ async fn launch_gate_wait_counts_against_child_wall_timeout() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx,
         launch_gate: Some(Arc::clone(&gate)),
         _foreground_child_registration: None,
@@ -17396,22 +18638,27 @@ async fn launch_gate_wait_counts_against_child_wall_timeout() {
     let snapshot = manager
         .get_result(&agent_id)
         .expect("timed-out child remains inspectable");
-    assert_eq!(snapshot.status, SubAgentStatus::BudgetExhausted);
-    let error = &snapshot
-        .checkpoint
-        .as_ref()
-        .expect("wall-budget checkpoint")
-        .reason;
-    assert!(
-        error.contains("child wall-time budget exhausted"),
-        "{error}"
-    );
+    // #6015: a child that never got a launch slot did no work; it is not a
+    // run that exhausted its budget.
+    let error = match &snapshot.status {
+        SubAgentStatus::Failed(error) => error.clone(),
+        other => panic!("expected Failed(never started), got {other:?}"),
+    };
+    assert!(error.contains("never started"), "{error}");
+    assert!(!error.contains("wall-time budget exhausted"), "{error}");
+    assert_eq!(snapshot.steps_taken, 0);
 
     let worker = manager
         .get_worker_record(&agent_id)
         .expect("timed-out durable worker remains inspectable");
     assert_eq!(worker.status, AgentWorkerStatus::Failed);
-    assert_eq!(worker.error.as_deref(), Some(error.as_str()));
+    assert!(
+        worker
+            .error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("never started")),
+        "{worker:?}"
+    );
     assert!(
         worker
             .events
@@ -17438,7 +18685,7 @@ async fn token_heavy_chat_client(
     prompt_tokens: u64,
     completion_tokens: u64,
     response_text: &str,
-) -> (CodewhaleClient, Arc<AtomicUsize>) {
+) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let response_text = response_text.to_string();
     let app = Router::new().route(
@@ -17446,28 +18693,31 @@ async fn token_heavy_chat_client(
         post({
             let calls = Arc::clone(&calls);
             let response_text = response_text.clone();
-            move |Json(_body): Json<Value>| {
+            move |Json(body): Json<Value>| {
                 let calls = Arc::clone(&calls);
                 let response_text = response_text.clone();
                 async move {
                     let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
-                    Json(json!({
-                        "id": format!("chatcmpl-budget-{attempt}"),
-                        "model": "deepseek-v4-flash",
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_text
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": prompt_tokens,
-                            "completion_tokens": completion_tokens,
-                            "total_tokens": prompt_tokens + completion_tokens
-                        }
-                    }))
+                    chat_fixture_response(
+                        body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                        json!({
+                            "id": format!("chatcmpl-budget-{attempt}"),
+                            "model": "deepseek-v4-flash",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": response_text
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens
+                            }
+                        }),
+                    )
                 }
             }
         }),
@@ -17482,12 +18732,14 @@ async fn token_heavy_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake chat client");
-    (client, calls)
+    (client, calls, config)
 }
 
 /// First response carries partial text plus a tool call and the requested
@@ -17495,14 +18747,14 @@ async fn token_heavy_chat_client(
 /// allowed to retry, completes normally.
 async fn incomplete_then_complete_chat_client(
     first_stop_reason: &str,
-) -> (CodewhaleClient, Arc<AtomicUsize>) {
+) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
     let calls = Arc::new(AtomicUsize::new(0));
     let first_stop_reason = first_stop_reason.to_string();
     let app = Router::new().route(
         "/{*path}",
         post({
             let calls = Arc::clone(&calls);
-            move |Json(_body): Json<Value>| {
+            move |Json(body): Json<Value>| {
                 let calls = Arc::clone(&calls);
                 let first_stop_reason = first_stop_reason.clone();
                 async move {
@@ -17534,7 +18786,7 @@ async fn incomplete_then_complete_chat_client(
                             "finish_reason": "stop"
                         })
                     };
-                    Json(json!({
+                    chat_fixture_response(body.get("stream").and_then(Value::as_bool).unwrap_or(false), json!({
                         "id": format!("chatcmpl-incomplete-{attempt}"),
                         "model": "deepseek-v4-flash",
                         "choices": [choice],
@@ -17558,12 +18810,14 @@ async fn incomplete_then_complete_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake incomplete-response client");
-    (client, calls)
+    (client, calls, config)
 }
 
 pub(super) async fn run_incomplete_response_worker(
@@ -17602,10 +18856,11 @@ pub(super) async fn run_incomplete_response_worker(
         manager.register_worker(make_worker_spec(&agent_id, workspace.to_path_buf()));
     }
 
-    let (client, calls) = incomplete_then_complete_chat_client(stop_reason).await;
+    let (client, calls, fixture_config) = incomplete_then_complete_chat_client(stop_reason).await;
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let mut runtime = stub_runtime();
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(workspace.to_path_buf());
     runtime.mailbox = Some(mailbox);
@@ -17624,6 +18879,7 @@ pub(super) async fn run_incomplete_response_worker(
         started_at: Instant::now(),
         max_steps,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -17773,6 +19029,32 @@ async fn spawn_budget_capped_worker(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_budget_capped_worker_with_pause(
+        workspace,
+        prompt_tokens,
+        completion_tokens,
+        max_steps,
+        wall_time,
+        None,
+    )
+    .await
+}
+
+/// As [`spawn_budget_capped_worker`], optionally opening a rate-limit pause
+/// on the worker's own route before it starts.
+async fn spawn_budget_capped_worker_with_pause(
+    workspace: &Path,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    max_steps: u32,
+    wall_time: Duration,
+    pause: Option<Duration>,
+) -> (
+    Arc<RwLock<SubAgentManager>>,
+    String,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let manager = Arc::new(RwLock::new(SubAgentManager::new(
         workspace.to_path_buf(),
         2,
@@ -17797,10 +19079,11 @@ async fn spawn_budget_capped_worker(
         manager.register_worker(make_worker_spec(&agent_id, workspace.to_path_buf()));
     }
 
-    let (client, calls) =
+    let (client, calls, fixture_config) =
         token_heavy_chat_client(prompt_tokens, completion_tokens, "partial answer").await;
     let mut runtime = stub_runtime();
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(workspace.to_path_buf());
 
@@ -17816,10 +19099,14 @@ async fn spawn_budget_capped_worker(
         started_at: Instant::now(),
         max_steps,
         wall_time,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
     };
+    if let Some(pause) = pause {
+        crate::retry_status::note_rate_limit(&runtime.client.rate_limit_scope(), pause);
+    }
     let task_handle = tokio::spawn(run_subagent_task(task));
     (manager, agent_id, calls, task_handle)
 }
@@ -17846,42 +19133,239 @@ async fn worker_stops_with_typed_wall_time_reason() {
         .as_ref()
         .expect("wall-budget checkpoint")
         .reason;
-    assert!(reason.contains("wall-time budget exhausted"), "{reason}");
-    assert!(reason.contains("wall-time limit"), "{reason}");
-    assert!(reason.contains("operator"), "{reason}");
+    assert_eq!(reason, "child wall-time work budget exhausted");
+    assert_eq!(
+        subagent_failure_class(&result.status, reason),
+        "wall_time_budget"
+    );
+}
+
+/// Scripted provider for the child-compaction test. Task steps call
+/// `read_file` while billing `step_prompt_tokens` each; the compaction
+/// summary request (recognized by its instruction) returns a handoff; the
+/// first task step after it finishes the run and records whether the request
+/// carried the compaction checkpoint instead of the replaced history.
+async fn compacting_child_chat_client(
+    step_prompt_tokens: u64,
+) -> (
+    CodewhaleClient,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+    crate::config::Config,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let summaries = Arc::new(AtomicUsize::new(0));
+    let saw_checkpoint = Arc::new(AtomicBool::new(false));
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            let summaries = Arc::clone(&summaries);
+            let saw_checkpoint = Arc::clone(&saw_checkpoint);
+            move |Json(body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                let summaries = Arc::clone(&summaries);
+                let saw_checkpoint = Arc::clone(&saw_checkpoint);
+                async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let wire = body["messages"].to_string();
+                    let usage = |prompt: u64, completion: u64| {
+                        json!({
+                            "prompt_tokens": prompt,
+                            "completion_tokens": completion,
+                            "total_tokens": prompt + completion
+                        })
+                    };
+                    let message = if wire.contains(crate::compaction::COMPACT_PROMPT_OPENING) {
+                        summaries.fetch_add(1, Ordering::SeqCst);
+                        return chat_fixture_response(body.get("stream").and_then(Value::as_bool).unwrap_or(false), json!({
+                            "id": format!("chatcmpl-compact-{attempt}"),
+                            "model": "deepseek-v4-flash",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Objective: inspect README.md. Progress: the file was read three times. Next action: report that the inspection is done."
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": usage(1_000, 200)
+                        }));
+                    } else if summaries.load(Ordering::SeqCst) > 0 {
+                        saw_checkpoint.store(
+                            wire.contains(crate::compaction::COMPACTION_SUMMARY_MARKER),
+                            Ordering::SeqCst,
+                        );
+                        json!({ "role": "assistant", "content": "done after compaction" })
+                    } else {
+                        json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": format!("call_read_{attempt}"),
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"README.md\"}"
+                                }
+                            }]
+                        })
+                    };
+                    let finish = if message.get("tool_calls").is_some() {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    };
+                    let prompt = if summaries.load(Ordering::SeqCst) > 0 {
+                        3_000
+                    } else {
+                        step_prompt_tokens
+                    };
+                    chat_fixture_response(body.get("stream").and_then(Value::as_bool).unwrap_or(false), json!({
+                        "id": format!("chatcmpl-step-{attempt}"),
+                        "model": "deepseek-v4-flash",
+                        "choices": [{ "index": 0, "message": message, "finish_reason": finish }],
+                        "usage": usage(prompt, 40)
+                    }))
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake chat server");
+    let addr = listener.local_addr().expect("fake chat server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config = crate::config::Config {
+        ..crate::config::Config::default()
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
+    let client = CodewhaleClient::new(&config).expect("fake chat client");
+    (client, calls, summaries, saw_checkpoint, config)
 }
 
 #[tokio::test]
-async fn worker_lands_with_typed_context_reason_past_the_step_input_bound() {
-    // #6194 item 7: one step billing past the per-step bound lands the run
-    // through budget death (report + preservation) instead of burning
-    // quadratically to wall/token death.
+async fn worker_compacts_past_its_context_window_and_keeps_working() {
+    // A child whose billed input runs far past the old 100k per-step bound
+    // (and past its route's compaction trigger) compacts at the request
+    // boundary like the parent and completes, instead of landing with
+    // BudgetExhausted.
     let tmp = tempdir().expect("tempdir");
-    let (manager, agent_id, calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 150_000, 40, 120, Duration::from_secs(300)).await;
+    std::fs::write(tmp.path().join("README.md"), "hello from the readme\n").expect("readme");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_compacting_worker".to_string();
+    let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "Inspect the readme".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Compact".to_string()),
+        Some(vec!["read_file".to_string()]),
+        task_input_tx,
+        tmp.path().to_path_buf(),
+        "boot_compact".to_string(),
+    );
+    {
+        let mut manager = manager.write().await;
+        manager.agents.insert(agent_id.clone(), agent);
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    }
 
-    tokio::time::timeout(Duration::from_secs(10), task_handle)
+    let (client, calls, summaries, saw_checkpoint, fixture_config) =
+        compacting_child_chat_client(900_000).await;
+    let mut runtime = stub_runtime();
+    runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    assert!(runtime.compaction.enabled, "the inherited default compacts");
+
+    let task = SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime: runtime.clone(),
+        agent_id: agent_id.clone(),
+        agent_type: FleetRole::Worker,
+        prompt: "Inspect the readme".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(vec!["read_file".to_string()]),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 20,
+        wall_time: Duration::from_secs(300),
+        wall_ceiling_ms: None,
+        input_rx: task_input_rx,
+        launch_gate: None,
+        _foreground_child_registration: None,
+    };
+    tokio::time::timeout(Duration::from_secs(20), run_subagent_task(task))
         .await
-        .expect("context-capped worker must terminate")
-        .expect("task should finish");
+        .expect("compacting worker must terminate");
 
     let result = manager
         .read()
         .await
         .get_result(&agent_id)
         .expect("agent registered");
-    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
-    let reason = &result
-        .checkpoint
-        .as_ref()
-        .expect("context-budget checkpoint")
-        .reason;
-    assert!(reason.contains("context budget exhausted"), "{reason}");
-    assert!(reason.contains("150000"), "{reason}");
-    // Task work stopped at the first billed step; only hand-back turns follow.
+    assert_eq!(
+        result.status,
+        SubAgentStatus::Completed,
+        "compaction replaces the old context-budget death: {:?}",
+        result
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| &checkpoint.reason)
+    );
+    assert_eq!(result.result.as_deref(), Some("done after compaction"));
+    assert_eq!(summaries.load(Ordering::SeqCst), 1, "one summarizer pass");
     assert!(
-        calls.load(Ordering::SeqCst) <= 3,
-        "landed early instead of running 120 steps"
+        saw_checkpoint.load(Ordering::SeqCst),
+        "the post-compaction request carries the checkpoint"
+    );
+    // Three 900k-billed tool steps, the summary, and the finishing step.
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    // The summarizer's tokens count toward the worker like any other step.
+    let usage = manager
+        .read()
+        .await
+        .worker_records
+        .get(&agent_id)
+        .expect("worker record")
+        .usage
+        .clone();
+    assert_eq!(
+        usage.total_tokens,
+        Some(3 * 900_040 + 1_200 + 3_040),
+        "{usage:?}"
+    );
+
+    // The complete transcript keeps the replaced history, then the checkpoint.
+    let state_root = manager.read().await.state_root.clone();
+    let transcript =
+        load_subagent_transcript_artifact(&state_root, &agent_id).expect("transcript loads");
+    let checkpoint_at = transcript
+        .iter()
+        .position(crate::compaction::is_wire_compaction_checkpoint_message)
+        .expect("checkpoint recorded");
+    assert!(checkpoint_at >= 7, "replaced history kept before it");
+    assert!(
+        transcript[checkpoint_at + 1..]
+            .iter()
+            .any(|message| message.role == Role::Assistant),
+        "the run continued after the checkpoint"
     );
 }
 
@@ -17907,11 +19391,17 @@ async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
     // in-flight requests promptly.
     let _guard = crate::retry_status::test_guard();
     let _clear = ClearRateLimitOnDrop;
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
-    let (manager, agent_id, _calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, 4, DEFAULT_CHILD_WALL_TIME).await;
+    let (manager, agent_id, _calls, task_handle) = spawn_budget_capped_worker_with_pause(
+        tmp.path(),
+        60,
+        40,
+        4,
+        DEFAULT_CHILD_WALL_TIME,
+        Some(Duration::from_secs(30)),
+    )
+    .await;
 
     // Simulate the concurrent test finishing: the window closes shortly
     // after the worker's first request has already observed it.
@@ -18636,6 +20126,188 @@ async fn agent_wait_wakes_when_child_settles() {
     assert_eq!(settled[0]["agent_id"], json!(agent_id));
     assert_eq!(settled[0]["status"], json!("completed"));
     assert_eq!(payload["timed_out"], json!(false));
+    assert!(
+        payload.get("needs_person").is_none(),
+        "nothing pending, so the payload shape is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn agent_wait_returns_early_with_needs_approval() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_agent_wait_needs_person");
+    // The child is blocked on the Ask prompt for a shell call.
+    let (_approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "Tool bash requires approval\nand more",
+        )
+        .unwrap();
+    let manager = Arc::new(RwLock::new(inner));
+
+    let context = ToolContext::new(".");
+    let started = Instant::now();
+    let result = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 30}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("wait should succeed");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "wait must return early"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("wait payload should be json");
+    let needs = payload["needs_person"].as_array().expect("needs_person");
+    assert_eq!(needs.len(), 1);
+    assert_eq!(needs[0]["agent_id"], json!(agent_id));
+    assert_eq!(needs[0]["kind"], json!("needs_approval"));
+    assert_eq!(needs[0]["tool"], json!("bash"));
+    assert_eq!(
+        needs[0]["summary"],
+        json!("Tool bash requires approval and more"),
+        "the summary is one line"
+    );
+    assert_eq!(payload["timed_out"], json!(false));
+    assert!(
+        payload["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("Tell the user")),
+        "{payload}"
+    );
+}
+
+#[tokio::test]
+async fn agent_wait_does_not_rewake_on_reported_request() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_agent_wait_no_rewake");
+    let (_approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "held",
+        )
+        .unwrap();
+    let manager = Arc::new(RwLock::new(inner));
+    let context = ToolContext::new(".");
+
+    let first = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 30}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("first wait");
+    let first: serde_json::Value = serde_json::from_str(&first.content).unwrap();
+    assert_eq!(first["needs_person"].as_array().map(Vec::len), Some(1));
+
+    let second = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 1}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("second wait");
+    let second: serde_json::Value = serde_json::from_str(&second.content).unwrap();
+    assert_eq!(second["timed_out"], json!(true), "{second}");
+    assert!(second.get("needs_person").is_none());
+
+    // `until=all` shares the cursor.
+    let joined = coord::dispatch_wait(
+        &json!({"until": "all", "timeout_secs": 1}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("join");
+    let joined: serde_json::Value = serde_json::from_str(&joined.content).unwrap();
+    assert!(joined.get("needs_person").is_none(), "{joined}");
+
+    // A new request wakes the join.
+    let (_next_id, _next_rx) = manager
+        .write()
+        .await
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "write_file",
+            "held again",
+        )
+        .unwrap();
+    let joined = coord::dispatch_wait(
+        &json!({"until": "all", "timeout_secs": 30}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("join");
+    let joined: serde_json::Value = serde_json::from_str(&joined.content).unwrap();
+    assert_eq!(
+        joined["needs_person"][0]["tool"],
+        json!("write_file"),
+        "{joined}"
+    );
+}
+
+#[tokio::test]
+async fn status_waiting_is_derived_from_pending_store() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_status_pending_store");
+    inner.register_worker_for_session(
+        make_worker_spec(&agent_id, PathBuf::from(".")),
+        "workspace",
+        None,
+    );
+    let (approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "held",
+        )
+        .unwrap();
+    // The WaitingForUser progress write was skipped under contention; the
+    // store still makes the record waiting, with the request and the action.
+    let record = inner.get_worker_record(&agent_id).expect("worker record");
+    assert_eq!(record.status, AgentWorkerStatus::WaitingForUser);
+    let pending = record.pending_request.expect("pending request");
+    assert_eq!(pending.tool, "bash");
+    assert_eq!(pending.kind, "needs_approval");
+    assert_eq!(record.recommended_action.action, "tell_user");
+    assert!(record.recommended_action.tool.is_none());
+    assert!(
+        record
+            .recommended_action
+            .reason
+            .contains("you cannot approve it"),
+        "{}",
+        record.recommended_action.reason
+    );
+
+    // A stale WaitingForUser from the progress path flips off as soon as the
+    // decision lands, with no further progress event.
+    inner.record_worker_event(
+        &agent_id,
+        AgentWorkerStatus::WaitingForUser,
+        Some("waiting".to_string()),
+        None,
+        Some("bash".to_string()),
+    );
+    assert!(inner.resolve_child_approval(
+        &approval_id,
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
+    let record = inner.get_worker_record(&agent_id).expect("worker record");
+    assert_ne!(record.status, AgentWorkerStatus::WaitingForUser);
+    assert!(record.pending_request.is_none());
+    assert_ne!(record.recommended_action.action, "tell_user");
 }
 
 #[tokio::test]
@@ -18728,7 +20400,7 @@ fn agent_action_parses_wait_aliases() {
 // PR #4096 by @JayBeest).
 //
 // These tests verify that the parent session's `--disallowed-tools` flows into
-// spawned sub-agents through `SubAgentRuntime` → `SubAgentToolRegistry`. The
+// spawned sub-agents through `SubAgentRuntime` → `ChildCoreProbe`. The
 // deny-list is stamped onto `worker_profile.denied_tools` by the engine and
 // cloned through `child_runtime()`/`background_runtime()`, so a registry built
 // from a child runtime enforces it in `is_tool_allowed()`, `tools_for_model()`,
@@ -18748,14 +20420,14 @@ fn stub_runtime_with_disallowed(disallowed: Vec<String>) -> SubAgentRuntime {
     rt
 }
 
-/// Build a `SubAgentToolRegistry` wired with `disallowed_tools`. Passes the
-/// runtime through `SubAgentToolRegistry::new()` so the constructor picks up
+/// Build a `ChildCoreProbe` wired with `disallowed_tools`. Passes the
+/// runtime through `ChildCoreProbe::new()` so the constructor picks up
 /// `worker_profile.denied_tools`. `allowed_tools` is forwarded directly.
 fn new_registry_with_disallowed(
     runtime: SubAgentRuntime,
     allowed_tools: Option<Vec<String>>,
-) -> SubAgentToolRegistry {
-    SubAgentToolRegistry::new(
+) -> ChildCoreProbe {
+    ChildCoreProbe::new(
         runtime,
         FleetRole::Worker,
         allowed_tools,
@@ -18935,18 +20607,48 @@ async fn test_disallowed_tools_execute_rejects_denied_tool() {
     runtime.allow_shell = true; // remove posture as a confound
     let registry = new_registry_with_disallowed(runtime, None);
 
-    let result = registry
-        .execute("agent_test", "exec_shell", json!({"command": "echo hi"}))
-        .await;
+    // The inherited legacy deny applies to both available shell spellings.
+    for name in ["bash", "Bash"] {
+        let result = registry
+            .execute(
+                "agent_test",
+                name,
+                json!({"action": "run", "command": "touch denied-sentinel"}),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "execute must reject a tool denied by disallowed_tools"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ToolError>(),
+                Some(ToolError::PermissionDenied { .. })
+            ),
+            "{name}: {error}"
+        );
+        let err = error.to_string();
+        assert!(
+            err.contains("not allowed") || err.contains("denied"),
+            "error should mention denial: {err}"
+        );
+        assert!(!tmp.path().join("denied-sentinel").exists());
+    }
+    let retired = registry
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "touch denied-sentinel"}),
+        )
+        .await
+        .expect_err("the retired alias must not acquire an executable handler");
     assert!(
-        result.is_err(),
-        "execute must reject a tool denied by disallowed_tools"
+        matches!(retired.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+            if message.contains("`exec_shell` was replaced by `bash`")),
+        "{retired}"
     );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("not allowed") || err.contains("denied"),
-        "error should mention denial: {err}"
-    );
+    assert!(!tmp.path().join("denied-sentinel").exists());
 }
 
 // === deny-list propagation through runtime cloning ===
@@ -19315,7 +21017,7 @@ fn an_exact_member_with_tools_false_gets_no_model_tools_at_all() {
     let mut runtime =
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         authority.allowed_tools.clone(),
@@ -19359,7 +21061,7 @@ async fn an_exact_member_without_a_network_tool_really_loses_the_network_surface
     // `disallowed_tools` does: through the child's worker profile.
     runtime.worker_profile.denied_tools = authority.disallowed_tools.clone();
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         authority.allowed_tools.clone(),
@@ -19476,10 +21178,10 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
         let mut runtime =
             stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
         runtime.context = ToolContext::new(tmp.path());
-        runtime.approval_mode = ApprovalMode::Never;
+        runtime.context.approval_mode = ApprovalMode::Never;
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         runtime.worker_profile.permissions.network = true;
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -19503,12 +21205,10 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
                 "outbound data requires consent"
             );
             assert!(
-                matches!(
-                    registry
-                        .gate_held_call("agent_scout", "test-web", name, &input)
-                        .await,
-                    ChildGateVerdict::Deny(_)
-                ),
+                registry
+                    .execute_full("agent_scout", "test-web", name, input.clone())
+                    .await
+                    .is_err(),
                 "Never must not send the request"
             );
         }
@@ -19544,7 +21244,7 @@ async fn a_read_only_inspection_member_gets_only_bounded_web_search() {
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     runtime.worker_profile.denied_tools = authority.disallowed_tools.clone();
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         authority.allowed_tools.clone(),
@@ -19609,7 +21309,7 @@ async fn a_read_only_inspection_member_gets_only_bounded_web_search() {
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     full_runtime.context = ToolContext::new(tmp.path().to_path_buf());
     full_runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
-    let full_registry = SubAgentToolRegistry::new(
+    let full_registry = ChildCoreProbe::new(
         full_runtime,
         FleetRole::Builder,
         full_authority.allowed_tools.clone(),
@@ -19657,7 +21357,7 @@ fn the_unified_rlm_action_cannot_bypass_a_denied_alias() {
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
     runtime.worker_profile.denied_tools = authority.disallowed_tools.clone();
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         authority.allowed_tools.clone(),
@@ -19720,6 +21420,19 @@ fn a_network_denied_child_cannot_address_a_remote_location_through_any_tool() {
             "Bash",
             json!({"action": "run", "command": "gh issue view 5287"}),
         ),
+        // #6015: a network read inside a pipeline or chain, and npm reads.
+        ("bash", json!({"command": "gh pr view 1 | head"})),
+        ("bash", json!({"command": "ls && gh issue list"})),
+        ("bash", json!({"command": "npm view x | head"})),
+        ("bash", json!({"command": "npm view owner/repo"})),
+        (
+            "bash",
+            json!({"command": "npm view @scope/pkg --registry=https://registry.example/"}),
+        ),
+        // A leading `cd` is moved into `cwd` before the command runs, so the
+        // read behind it is judged too.
+        ("bash", json!({"command": "cd . && gh pr view 1"})),
+        ("bash", json!({"command": "cd sub && npm view x"})),
     ] {
         assert!(
             reject_network_reaching_input(name, &input).is_err(),
@@ -19897,7 +21610,7 @@ async fn a_parent_read_only_session_narrows_a_full_exact_member_in_the_child_reg
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     runtime.worker_profile.denied_tools = authority.disallowed_tools.clone();
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         authority.allowed_tools.clone(),
@@ -19987,7 +21700,7 @@ fn the_session_ceiling_reflects_the_live_parent_posture() {
 // capability it will be refused for using.
 
 /// The child registry a Runtime verifier under a full parent actually runs with.
-fn read_only_with_shell_registry() -> (tempfile::TempDir, SubAgentToolRegistry) {
+fn read_only_with_shell_registry() -> (tempfile::TempDir, ChildCoreProbe) {
     let tmp = tempdir().expect("tempdir");
     let authority = crate::fleet::role::ChildAuthority::from_runtime_role(
         "verifier",
@@ -20011,7 +21724,7 @@ fn read_only_with_shell_registry() -> (tempfile::TempDir, SubAgentToolRegistry) 
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Verifier);
     runtime.worker_profile.denied_tools = authority.disallowed_tools.clone();
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Verifier,
         authority.allowed_tools.clone(),
@@ -20035,7 +21748,7 @@ fn shell_denial_from_parent_is_not_a_read_only_role_exception() {
             if let Some(rule) = explicit_rule {
                 runtime.context.disallowed_tools = vec![rule.into()];
             }
-            let registry = SubAgentToolRegistry::new(
+            let registry = ChildCoreProbe::new(
                 runtime,
                 role.clone(),
                 None,
@@ -20302,7 +22015,7 @@ fn a_write_capable_member_keeps_every_execution_gate() {
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
     runtime.worker_profile.denied_tools = authority.disallowed_tools.clone();
 
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Builder,
         authority.allowed_tools.clone(),
@@ -20556,14 +22269,47 @@ fn the_launched_authority_is_the_one_the_spawn_boundary_accepts() {
 /// Ceilings are in serialized bytes (deterministic, unlike token estimates);
 /// the stale token figure in workflows/stopship.workflow.js:1-5 is
 /// superseded by these tests.
-/// Measured 80,856B on 2026-08-02 (commit body has the receipt); +10%.
-const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
+/// Measured 80,856B on 2026-08-02; the ceiling includes the display-only bash description.
+const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_112;
 /// Measured 85,913B on 2026-09-15 with the always-on session recall tools
 /// (#5715). Keep the next increase visible instead of adding another broad
 /// margin. Re-measured at 87,529B on 2026-09-17, with the bounded Git
 /// fetch / merge_tree verify tools (b89349286f) and this slice's grant
 /// text both in the shared catalog.
-const PARENT_SURFACE_BYTE_CEILING: usize = 88_398;
+// Re-measured when `load_skill` joined the eager catalog: +244B for its
+// name, description and schema, against the `## Skills` index the prefix
+// already carries and a `change:tool_surface` re-pin per skill use avoided.
+// Re-measured 2026-09-22 at 88,715B on Linux (88,702B on macOS), +73B: the
+// base prompt's progress-narration rule (E4, 5cf9db3d6) and the workflow
+// Fleet origin list (26cfaf8de), net of the read/bash wording trims
+// (105ad9d3e).
+// The agent schema's `fork_context` property (2026-09-25) fit under this
+// ceiling by trimming the `resume_from` and `wall_time_secs` descriptions.
+// Re-measured 2026-10-01 at 88,824B on macOS, +162B over 88,662B, both from
+// audit fixes: +106B because composition branches keep their `required`
+// lists (D04-11, 46835a2fc; `apply_patch`'s `oneOf` had degraded to three
+// unsatisfiable `{}` branches), and +56B for the finance timeout description
+// now saying the budget is shared with the chart fallback (D03-m3,
+// 7c36620d4). Re-measured 2026-10-05 at 89,602B on macOS (9dbc2efe1).
+// Re-measured 2026-10-05 at 90,121B on macOS, +519B: the model-facing tool
+// description rewrites (goal, file read/write/edit, web search/fetch,
+// workflow, request_user_input). The static prompt bytes are unchanged.
+// Linux measured 13B above macOS last time, so the ceiling carries that
+// margin until a hosted Linux run re-measures it.
+// The wait-bound disclosure (#6850) adds exactly 222 UTF-8 bytes to the
+// agent schema on top of the rewrites; the runtime measurement below still
+// detects unrelated growth.
+// Re-measured 2026-10-08 at 90,667B on macOS with `pandoc` and `tesseract`
+// installed. The catalog includes `pandoc_convert` (1,347B) and `image_ocr`
+// (723B) only when those programs are on the host
+// (`dependencies::host_tool_available`), so a machine without them, including
+// the hosted CI runners, measures about 2,070B lower and cannot trip this
+// ceiling. The figure before this batch was already 90,552B on the same
+// machine, 209B over the previous ceiling, which only CI had been checking.
+// The 0.10.2 batch adds 227B: +145B for the `agent` tool sentence that
+// restores the legacy Operate contract, less 30B from the background-shell
+// schema edits, plus 112B for the display-only bash description. The ceiling keeps the 13B Linux margin.
+const PARENT_SURFACE_BYTE_CEILING: usize = 90_792;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {
@@ -20584,8 +22330,7 @@ async fn read_only_child_envelope_stays_within_measured_ceiling() {
         &system_prompt,
         None,
     );
-    let registry =
-        SubAgentToolRegistry::new(runtime, FleetRole::Scout, None, todo_list, plan_state);
+    let registry = ChildCoreProbe::new(runtime, FleetRole::Scout, None, todo_list, plan_state);
     let tools = registry.tools_for_model(&FleetRole::Scout);
 
     let envelope_bytes = system_prompt.len()
@@ -20762,6 +22507,42 @@ fn parse_spawn_request_resume_from_with_fork_context_false_is_parseable() {
         parse_spawn_request(&input).expect("parse should succeed; conflict detected at spawn");
     assert_eq!(parsed.resume_from.as_deref(), Some("agent_abc123"));
     assert_eq!(parsed.fork_context, Some(false));
+}
+
+#[tokio::test]
+async fn runtime_surface_hardening_resume_from_requires_descendant_control() {
+    let tmp = tempdir().unwrap();
+    let source_workspace = tempdir().unwrap();
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let (caller, source) = {
+        let mut guard = manager.write().await;
+        let caller = guard.insert_test_running_agent("caller", tmp.path());
+        let source = guard.insert_test_running_agent("source", source_workspace.path());
+        guard.agents.get_mut(&source).unwrap().status = SubAgentStatus::Completed;
+        for id in [&caller, &source] {
+            assign_test_session_owner(&mut guard, id, &runtime.context.state_namespace);
+        }
+        (caller, source)
+    };
+    runtime.parent_agent_id = Some(caller);
+    let input = json!({"prompt": "Continue the completed work", "resume_from": source});
+    let err =
+        spawn_subagent_from_input(input.clone(), manager.clone(), runtime.clone(), false, None)
+            .await
+            .expect_err("a sibling is not a continuation source");
+    assert!(
+        err.to_string().contains("only its own descendants"),
+        "{err}"
+    );
+
+    runtime.parent_agent_id = None;
+    let err = spawn_subagent_from_input(input, manager.clone(), runtime, false, None)
+        .await
+        .expect_err("root still observes the workspace boundary");
+    assert!(err.to_string().contains("different workspace"), "{err}");
+    assert_eq!(manager.read().await.agents.len(), 2);
 }
 
 #[test]
@@ -21383,13 +23164,32 @@ fn coordination_lock_loss_to_own_process_reads_as_handover_and_self_heals() {
 
 // -- resume-from-checkpoint tests (checkpoint-based continuation) --
 
+/// Seed a settled direct child without inventing a nested parent agent. The
+/// generic fixture also serves nested-lineage tests and keeps its own contract.
+fn interrupted_direct_child_fixture(
+    manager: &mut SubAgentManager,
+    name: &str,
+    workspace: &Path,
+    messages: Vec<Message>,
+) -> (String, String) {
+    let seeded = manager.insert_test_interrupted_continuable_agent(name, workspace, messages);
+    let record = manager
+        .worker_records
+        .get_mut(&seeded.0)
+        .expect("worker record");
+    record.parent_run_id = None;
+    record.spec.parent_run_id = None;
+    seeded
+}
+
 #[tokio::test]
 async fn resume_from_checkpoint_spawns_seeded_agent_with_checkpoint_context() {
     let tmp = tempdir().unwrap();
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
     let (agent_id, _handle) = {
         let mut guard = manager.write().await;
-        guard.insert_test_interrupted_continuable_agent(
+        interrupted_direct_child_fixture(
+            &mut guard,
             "paused_child",
             tmp.path(),
             vec![Message {
@@ -21466,7 +23266,7 @@ async fn parked_followup_reuses_successor_and_preserves_route_authority_and_line
     };
     let agent_id = {
         let mut guard = manager.write().await;
-        let id = guard.insert_test_running_agent("parked-inventory", tmp.path());
+        let id = guard.insert_test_running_direct_child("parked-inventory", tmp.path());
         let agent = guard.agents.get_mut(&id).unwrap();
         agent.agent_type = FleetRole::Scout;
         agent.model = saved_route.model_id.clone();
@@ -21487,9 +23287,11 @@ async fn parked_followup_reuses_successor_and_preserves_route_authority_and_line
     // Reuse the existing loopback client so a scheduled child cannot contact
     // a provider. The public tool must preserve the child's read-only profile
     // even though the caller permits writes and has a different workspace.
-    let (client, _calls, _bodies) = delayed_chat_client(Duration::from_secs(30), "done").await;
+    let (client, _calls, _bodies, fixture_config) =
+        delayed_chat_client(Duration::from_secs(30), "done").await;
     let mut runtime = stub_runtime();
     runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
     assert_ne!(runtime.context.workspace, tmp.path());
     let tool = AgentTool::new(Arc::clone(&manager), runtime);
@@ -21566,21 +23368,24 @@ async fn parked_followup_executes_on_the_saved_cross_provider_route() {
                     bodies
                         .lock()
                         .expect("request body recorder mutex poisoned")
-                        .push(body);
-                    Json(json!({
-                        "id": "chatcmpl-cross-provider-resume",
-                        "model": "glm-5",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "done"},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 1,
-                            "completion_tokens": 1,
-                            "total_tokens": 2
-                        }
-                    }))
+                        .push(body.clone());
+                    chat_fixture_response(
+                        body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                        json!({
+                            "id": "chatcmpl-cross-provider-resume",
+                            "model": "glm-5",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "done"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "total_tokens": 2
+                            }
+                        }),
+                    )
                 }
             }
         }),
@@ -21621,7 +23426,7 @@ async fn parked_followup_executes_on_the_saved_cross_provider_route() {
     runtime.manager = Arc::clone(&manager);
     assert_eq!(
         runtime.client.api_provider(),
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "precondition: the session is on a different provider than the pin"
     );
 
@@ -21642,7 +23447,7 @@ async fn parked_followup_executes_on_the_saved_cross_provider_route() {
     };
     let agent_id = {
         let mut guard = manager.write().await;
-        let id = guard.insert_test_running_agent("parked-cross-provider", tmp.path());
+        let id = guard.insert_test_running_direct_child("parked-cross-provider", tmp.path());
         let agent = guard.agents.get_mut(&id).unwrap();
         agent.agent_type = FleetRole::Scout;
         agent.model = saved_route.model_id.clone();
@@ -21729,7 +23534,8 @@ async fn resume_from_checkpoint_is_idempotent_across_repeated_followups() {
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
     let (agent_id, _handle) = {
         let mut guard = manager.write().await;
-        guard.insert_test_interrupted_continuable_agent(
+        interrupted_direct_child_fixture(
+            &mut guard,
             "paused_child",
             tmp.path(),
             vec![Message {
@@ -21782,10 +23588,12 @@ async fn resume_keeps_recorded_reasoning_in_manifest_and_request_after_parent_ch
     ] {
         let tmp = tempdir().unwrap();
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls, bodies) = delayed_chat_client(Duration::ZERO, "done").await;
+        let (client, calls, bodies, fixture_config) =
+            delayed_chat_client(Duration::ZERO, "done").await;
         let agent_id = {
             let mut guard = manager.write().await;
-            let (id, _) = guard.insert_test_interrupted_continuable_agent(
+            let (id, _) = interrupted_direct_child_fixture(
+                &mut guard,
                 "paused-tier",
                 tmp.path(),
                 vec![Message {
@@ -21824,6 +23632,7 @@ async fn resume_keeps_recorded_reasoning_in_manifest_and_request_after_parent_ch
         };
         let mut runtime = stub_runtime();
         runtime.client = client;
+        runtime.api_config = Some(Arc::new(fixture_config));
         runtime.manager = Arc::clone(&manager);
         runtime.reasoning_effort = Some("high".into());
         runtime.reasoning_effort_auto = true;
@@ -21864,7 +23673,10 @@ async fn resume_keeps_recorded_reasoning_in_manifest_and_request_after_parent_ch
                 "resuming must not rewrite the interrupted record"
             );
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Readiness only: the poll ends on the first request. A loaded
+        // shared-process `cargo test` run, where env readers can queue behind the
+        // process-wide test env barrier, overran 5s here (#6698).
+        tokio::time::timeout(Duration::from_secs(30), async {
             while calls.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -22020,6 +23832,253 @@ fn user_follow_up_to_completed_child_requires_a_runtime_to_resume() {
     assert!(err.to_string().contains("no runtime"), "{err}");
 }
 
+/// A finished worker's unchanged isolated worktree is removed, but its
+/// checkpoint stays continuable. Continuing it used to start a child inside
+/// the missing directory, where every tool failed.
+#[tokio::test]
+async fn continuing_a_child_whose_worktree_was_removed_fails_with_the_reason() {
+    let tmp = tempdir().expect("tempdir");
+    let worktree = tmp.path().join("removed-worktree");
+    std::fs::create_dir_all(&worktree).expect("worktree dir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let (id, _) = guard.insert_test_interrupted_continuable_agent(
+            "read_mostly",
+            &worktree,
+            vec![text_message("user", "prior work")],
+        );
+        guard.agents.get_mut(&id).expect("agent").status = SubAgentStatus::Completed;
+        id
+    };
+    std::fs::remove_dir(&worktree).expect("worktree removed on completion");
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+
+    let result = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(Arc::clone(&manager), Some(runtime), &agent_id, "more")
+    };
+    let err = result.expect_err("a child whose workspace is gone cannot be continued");
+    assert!(err.to_string().contains("no longer exists"), "{err}");
+    assert_eq!(
+        manager.read().await.agents.len(),
+        1,
+        "no continuation child was started"
+    );
+}
+
+/// A finished worker's unchanged worktree is removed on the blocking pool, and
+/// an interrupt can win while that runs. A continuation started then passed
+/// the existence check and could lose its directory to the removal. It now
+/// waits until the claimed removal has settled.
+#[tokio::test]
+async fn continuation_is_refused_while_its_worktree_removal_is_claimed() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("worktree");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let (agent_id, claim) = {
+        let mut guard = manager.write().await;
+        let (id, _) = interrupted_direct_child_fixture(
+            &mut guard,
+            "claimed",
+            &workspace,
+            vec![text_message("user", "prior work")],
+        );
+        let claim = guard
+            .claim_worktree_cleanup(&id, &workspace)
+            .expect("the removal is claimed");
+        assert!(
+            guard.claim_worktree_cleanup(&id, &workspace).is_none(),
+            "one removal per path at a time"
+        );
+        (id, claim)
+    };
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+
+    let refused = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(
+            Arc::clone(&manager),
+            Some(runtime.clone()),
+            &agent_id,
+            "more",
+        )
+    };
+    let err = refused.expect_err("no successor starts while the removal is claimed");
+    assert!(err.to_string().contains("checked for removal"), "{err}");
+    assert_eq!(manager.read().await.agents.len(), 1);
+
+    drop(claim);
+    let resumed = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(Arc::clone(&manager), Some(runtime), &agent_id, "more")
+    };
+    resumed.expect("continues once the removal settled and kept the workspace");
+    assert!(workspace.is_dir());
+    assert_eq!(manager.read().await.agents.len(), 2);
+}
+
+/// The removal decides when it runs, not when its inputs were read before
+/// the terminal commit: a worker an interrupt made continuable in between
+/// keeps its worktree, and a completed one's is removed.
+#[tokio::test]
+async fn finished_worktree_removal_keeps_a_worker_that_became_continuable() {
+    let (_harness, repo) = git_repo_in_harness();
+    let make = |name: &str| {
+        create_isolated_worktree(
+            &repo,
+            &SubAgentWorktreeRequest {
+                branch: Some(format!("codex/agent-{name}")),
+                path: Some(PathBuf::from(name)),
+                base_ref: None,
+            },
+            Some(name),
+            &FleetRole::Builder,
+        )
+        .expect("worktree should be created")
+    };
+    let kept = make("interrupted");
+    let removed = make("completed");
+    let manager = new_shared_subagent_manager(repo.clone(), 4);
+    let (interrupted_id, completed_id, claims) = {
+        let mut guard = manager.write().await;
+        let (interrupted_id, _) = guard.insert_test_interrupted_continuable_agent(
+            "interrupted",
+            &kept,
+            vec![text_message("user", "prior work")],
+        );
+        let completed_id = guard.insert_test_running_agent("completed", &removed);
+        guard.agents.get_mut(&completed_id).expect("agent").status = SubAgentStatus::Completed;
+        let claims = (
+            guard
+                .claim_worktree_cleanup(&interrupted_id, &kept)
+                .expect("claim"),
+            guard
+                .claim_worktree_cleanup(&completed_id, &removed)
+                .expect("claim"),
+        );
+        (interrupted_id, completed_id, claims)
+    };
+    let shared = Arc::clone(&manager);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let empty = std::collections::BTreeSet::new();
+        (
+            remove_finished_worktree(&shared, &interrupted_id, claims.0, Some(&empty)),
+            remove_finished_worktree(&shared, &completed_id, claims.1, Some(&empty)),
+        )
+    })
+    .await
+    .expect("blocking removal");
+    assert_eq!(outcome, (false, true));
+    assert!(kept.is_dir(), "the continuable worker keeps its worktree");
+    assert!(!removed.exists(), "the completed worker's is removed");
+    let guard = manager.read().await;
+    assert!(
+        !guard.worktree_cleanup_pending(&kept) && !guard.worktree_cleanup_pending(&removed),
+        "both claims are released"
+    );
+}
+
+/// A spawn refused after its isolated worktree was created used to leave the
+/// checkout and its branch behind, one more per failed attempt.
+#[tokio::test]
+async fn failed_spawn_removes_the_worktree_it_created() {
+    let repo = init_subagent_git_repo();
+    refuse_worktree_spawn_and_expect_cleanup(&repo, "codex/agent-rollback-probe").await;
+}
+
+/// Post-checkout hooks (and line-ending or LFS filters) can leave files in a
+/// fresh checkout. The rollback used to require a pristine `git status`, so
+/// in such repos every refused spawn still left its worktree behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_spawn_removes_its_worktree_despite_post_checkout_hook_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_subagent_git_repo();
+    let hook = repo.path().join(".git").join("hooks").join("post-checkout");
+    std::fs::create_dir_all(hook.parent().unwrap()).expect("hooks dir");
+    std::fs::write(&hook, "#!/bin/sh\necho generated > hook-output.txt\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    refuse_worktree_spawn_and_expect_cleanup(&repo, "codex/agent-hook-probe").await;
+}
+
+async fn refuse_worktree_spawn_and_expect_cleanup(repo: &tempfile::TempDir, branch: &str) {
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(repo.path().to_path_buf());
+    let manager = new_shared_subagent_manager(repo.path().to_path_buf(), 4);
+    let source = {
+        let mut guard = manager.write().await;
+        let source = guard.insert_test_running_agent("busy-source", repo.path());
+        assign_test_session_owner(&mut guard, &source, &runtime.context.state_namespace);
+        source
+    };
+    let worktree_path = format!("{}-path", branch.replace('/', "-"));
+    let err = spawn_subagent_from_input(
+        json!({
+            "prompt": "continue the review",
+            "type": "scout",
+            "worktree": true,
+            "worktree_branch": branch,
+            "worktree_path": worktree_path,
+            "resume_from": source,
+        }),
+        Arc::clone(&manager),
+        runtime,
+        false,
+        None,
+    )
+    .await
+    .expect_err("a running resume source refuses the spawn");
+    assert!(err.to_string().contains("still running"), "{err}");
+
+    // The removal runs on the blocking pool, off the async worker.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let stdout_if_ok = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    loop {
+        let only_main_left =
+            stdout_if_ok(&["worktree", "list", "--porcelain"]).is_some_and(|worktrees| {
+                worktrees
+                    .lines()
+                    .filter(|line| line.starts_with("worktree "))
+                    .count()
+                    == 1
+            });
+        let branch_gone = stdout_if_ok(&["branch", "--list", branch])
+            .as_deref()
+            .is_some_and(str::is_empty);
+        if (only_main_left && branch_gone) || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let worktrees = git_stdout(repo.path(), &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        worktrees
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1,
+        "only the main checkout remains: {worktrees}"
+    );
+    assert!(
+        git_stdout(repo.path(), &["branch", "--list", branch]).is_empty(),
+        "the spawn's branch is removed too"
+    );
+}
+
 // === child permission gate: the session posture applied to a worker's calls ===
 
 mod child_permission_gate {
@@ -22034,30 +24093,52 @@ mod child_permission_gate {
         approval_mode: ApprovalMode,
         auto_approve: bool,
         parent_can_prompt: bool,
-        client: Option<CodewhaleClient>,
+        client: Option<(CodewhaleClient, crate::config::Config)>,
     ) -> (
-        SubAgentToolRegistry,
+        ChildCoreProbe,
+        tokio::sync::mpsc::Receiver<Event>,
+        SharedSubAgentManager,
+    ) {
+        worker_registry_with_live_posture(
+            approval_mode,
+            auto_approve,
+            parent_can_prompt,
+            client,
+            None,
+        )
+    }
+
+    fn worker_registry_with_live_posture(
+        approval_mode: ApprovalMode,
+        auto_approve: bool,
+        parent_can_prompt: bool,
+        client: Option<(CodewhaleClient, crate::config::Config)>,
+        live_posture: Option<crate::core::engine::LivePosture>,
+    ) -> (
+        ChildCoreProbe,
         tokio::sync::mpsc::Receiver<Event>,
         SharedSubAgentManager,
     ) {
         let tmp = tempdir().expect("tempdir");
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut runtime = stub_runtime();
-        if let Some(client) = client {
+        if let Some((client, config)) = client {
             runtime.client = client;
+            runtime.api_config = Some(Arc::new(config));
         }
         let workspace = tmp.path().to_path_buf();
         let session_id = format!("child_gate_{}", uuid::Uuid::new_v4().simple());
         runtime.context = ToolContext::new(workspace.clone()).with_state_namespace(session_id);
         runtime.context.auto_approve = auto_approve;
+        runtime.context.approval_mode = approval_mode;
+        runtime.context.live_posture = live_posture;
         runtime.allow_shell = true;
         runtime.event_tx = Some(tx);
         runtime = runtime.with_approval_receipt_store(Ok(
             crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions")),
         ));
         runtime = runtime.with_permission_posture(
-            approval_mode,
-            std::sync::Arc::new(crate::tui::auto_review::AutoReviewPolicy::default()),
+            std::sync::Arc::new(crate::core::authority::auto_review::AutoReviewPolicy::default()),
             parent_can_prompt,
         );
         let manager = Arc::clone(&runtime.manager);
@@ -22074,7 +24155,7 @@ mod child_permission_gate {
         // Keep the tempdir alive for the registry's lifetime by leaking it
         // into the workspace path (tests are short-lived).
         std::mem::forget(tmp);
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             FleetRole::Worker,
             None,
@@ -22105,7 +24186,7 @@ mod child_permission_gate {
         out
     }
 
-    fn receipt_context(registry: &SubAgentToolRegistry) -> (ApprovalReceiptStore, String) {
+    fn receipt_context(registry: &ChildCoreProbe) -> (ApprovalReceiptStore, String) {
         let store = registry
             .gate_runtime
             .approval_receipt_store
@@ -22117,8 +24198,14 @@ mod child_permission_gate {
         (store, registry.gate_runtime.context.state_namespace.clone())
     }
 
+    /// Readiness ceiling for a child's approval prompt or wait-end event to
+    /// reach hosts. It ends on the first matching event, so it only bounds how
+    /// long a stuck case takes to fail; a loaded shared-process `cargo test`
+    /// run overran the earlier 2s and 5s ceilings (#6698).
+    const CHILD_APPROVAL_EVENT_READINESS: std::time::Duration = std::time::Duration::from_secs(30);
+
     async fn next_child_approval_id(rx: &mut tokio::sync::mpsc::Receiver<Event>) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, async {
             while let Some(event) = rx.recv().await {
                 if let Event::ApprovalRequired { id, .. } = event {
                     return id;
@@ -22148,7 +24235,10 @@ mod child_permission_gate {
     async fn guardian_mock_with_stop(
         content: &str,
         finish_reason: &str,
-    ) -> (wiremock::MockServer, CodewhaleClient) {
+    ) -> (
+        wiremock::MockServer,
+        (CodewhaleClient, crate::config::Config),
+    ) {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -22168,19 +24258,28 @@ mod child_permission_gate {
             .mount(&server)
             .await;
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some(server.uri()),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
         let client = CodewhaleClient::new(&config).expect("mock-backed client");
-        (server, client)
+        (server, (client, config))
     }
 
-    async fn guardian_mock(content: &str) -> (wiremock::MockServer, CodewhaleClient) {
+    async fn guardian_mock(
+        content: &str,
+    ) -> (
+        wiremock::MockServer,
+        (CodewhaleClient, crate::config::Config),
+    ) {
         guardian_mock_with_stop(content, "stop").await
     }
 
-    async fn guardian_mock_without_usage(content: &str) -> (wiremock::MockServer, CodewhaleClient) {
+    async fn guardian_mock_without_usage(
+        content: &str,
+    ) -> (
+        wiremock::MockServer,
+        (CodewhaleClient, crate::config::Config),
+    ) {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -22199,22 +24298,26 @@ mod child_permission_gate {
             .mount(&server)
             .await;
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some(server.uri()),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
         let client = CodewhaleClient::new(&config).expect("mock-backed client");
-        (server, client)
+        (server, (client, config))
     }
 
-    fn unreachable_client() -> CodewhaleClient {
+    fn unreachable_client() -> (CodewhaleClient, crate::config::Config) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some("http://127.0.0.1:1".to_string()),
             ..crate::config::Config::default()
-        };
-        CodewhaleClient::new(&config).expect("unreachable client")
+        }
+        .with_legacy_root(
+            Some("test-key".to_string()),
+            Some("http://127.0.0.1:1".to_string()),
+        );
+        (
+            CodewhaleClient::new(&config).expect("unreachable client"),
+            config,
+        )
     }
 
     fn typed_deny_rules(rules: Vec<ToolAskRule>) -> Ruleset {
@@ -22247,7 +24350,7 @@ mod child_permission_gate {
                 ExecPolicyEngine::with_rulesets(vec![typed_deny_rules(vec![
                     ToolAskRule::exec_shell("touch"),
                 ])]);
-            for name in ["bash", "Bash", "exec_shell"] {
+            for name in ["bash", "Bash"] {
                 let err = registry
                     .execute(
                         "agent_gate",
@@ -22256,6 +24359,13 @@ mod child_permission_gate {
                     )
                     .await
                     .expect_err("typed deny must stop child execution before ordinary approval");
+                assert!(
+                    matches!(
+                        err.downcast_ref::<ToolError>(),
+                        Some(ToolError::PermissionDenied { .. })
+                    ),
+                    "{mode:?} {name}: {err}"
+                );
                 assert!(
                     err.to_string().contains("explicitly denies"),
                     "{mode:?} {name}: {err}"
@@ -22269,6 +24379,27 @@ mod child_permission_gate {
                         .exists()
                 );
             }
+            let retired = registry
+                .execute(
+                    "agent_gate",
+                    "exec_shell",
+                    json!({"command": "touch policy-sentinel"}),
+                )
+                .await
+                .expect_err("a retired shell alias remains unavailable in every posture");
+            assert!(
+                matches!(retired.downcast_ref::<ToolError>(), Some(ToolError::NotAvailable { message })
+                    if message.contains("`exec_shell` was replaced by `bash`")),
+                "{mode:?}: {retired}"
+            );
+            assert!(
+                !registry
+                    .gate_runtime
+                    .context
+                    .workspace
+                    .join("policy-sentinel")
+                    .exists()
+            );
             assert!(
                 rx.try_recv().is_err(),
                 "a typed deny must not ask a human or guardian"
@@ -22312,7 +24443,7 @@ mod child_permission_gate {
                         .map(|tool| ToolAskRule::file_path(tool, "protected.txt"))
                         .collect(),
                 )]);
-            let registry = SubAgentToolRegistry::new(
+            let registry = ChildCoreProbe::new(
                 runtime,
                 FleetRole::Worker,
                 None,
@@ -22388,7 +24519,7 @@ mod child_permission_gate {
             child_runtime,
         ]
         .map(|runtime| {
-            SubAgentToolRegistry::new(
+            ChildCoreProbe::new(
                 runtime,
                 FleetRole::Worker,
                 None,
@@ -22435,12 +24566,20 @@ mod child_permission_gate {
             )
             .await
             .expect_err("arbitrary shell needs a session decision under Ask");
+        let typed = err
+            .downcast_ref::<ToolError>()
+            .expect("canonical typed refusal");
+        assert!(matches!(typed, ToolError::NotAvailable { .. }), "{typed}");
         assert!(
-            err.to_string().contains("without a session decision"),
-            "{err}"
+            typed
+                .to_string()
+                .contains("child caller has no host that can answer this approval"),
+            "{typed}"
         );
-        assert!(err.to_string().contains("cannot raise a prompt"), "{err}");
-        // A refusal the child model sees is not a silent decision; no receipt.
+        // This is the actual canonical unavailable-host outcome, never an
+        // automatic grant or a model guardian decision.
+        let (store, session_id) = receipt_context(&registry);
+        assert_completed_receipt(&store, &session_id, ApprovalOutcome::Unavailable);
         assert!(drain_gate_receipts(&mut rx).is_empty());
     }
 
@@ -22450,7 +24589,7 @@ mod child_permission_gate {
         registry.gate_runtime.approval_receipt_store = None;
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(30),
             registry.execute("agent_gate", "bash", json!({"command": "echo gated"})),
         )
         .await
@@ -22469,16 +24608,38 @@ mod child_permission_gate {
 
     #[tokio::test]
     async fn ask_with_a_prompting_host_raises_the_prompt_and_honours_the_answer() {
-        for (answer, expect_ok) in [
-            (ChildApprovalOutcome::Approved, true),
-            (ChildApprovalOutcome::Denied, false),
-        ] {
+        use crate::approval_log::ApprovalDecider;
+        for (by, expect_ok) in [
+            ApprovalDecider::User,
+            ApprovalDecider::SessionRule,
+            ApprovalDecider::Posture,
+            ApprovalDecider::Host,
+        ]
+        .into_iter()
+        .flat_map(|by| [(by, true), (by, false)])
+        {
+            let answer = if expect_ok {
+                ChildApprovalOutcome::Approved { by }
+            } else {
+                ChildApprovalOutcome::Denied { by }
+            };
             let (registry, mut rx, manager) =
                 worker_registry(ApprovalMode::Suggest, false, true, None);
             let (receipt_store, session_id) = receipt_context(&registry);
             let receipt_store_for_answer = receipt_store.clone();
             let session_id_for_answer = session_id.clone();
             let manager_for_answer = Arc::clone(&manager);
+            let execution_id = new_child_execution_id("agent_gate");
+            let expected_id = execution_id.clone();
+            let input = json!({"command": "echo gated"});
+            let prepared = registry
+                .registry
+                .get("bash")
+                .expect("registered bash")
+                .prepare(input.clone(), registry.registry.context())
+                .expect("side-effect-free preparation");
+            let expected_description = prepared.description;
+            let expected_input = prepared.input;
             let answerer = tokio::spawn(async move {
                 // Wait for the prompt, then answer it exactly like the engine
                 // does when the person decides in the parent's UI.
@@ -22489,11 +24650,16 @@ mod child_permission_gate {
                             id,
                             tool_name,
                             description,
+                            input,
                             ..
                         } = event
                     {
                         assert_eq!(tool_name, "bash");
-                        assert!(description.contains("wants to run 'bash'"), "{description}");
+                        assert!(
+                            description.starts_with(&expected_description),
+                            "{description}"
+                        );
+                        assert_eq!(input, expected_input);
                         assert!(SubAgentManager::is_child_approval_id(&id));
                         approval_id = Some(id);
                         break;
@@ -22501,6 +24667,7 @@ mod child_permission_gate {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 let approval_id = approval_id.expect("child prompt must reach the host");
+                assert_eq!(approval_id, expected_id);
                 let replay_before_decision = receipt_store_for_answer
                     .replay(&session_id_for_answer)
                     .expect("the durable ask replays before the prompt is answered");
@@ -22520,16 +24687,40 @@ mod child_permission_gate {
                 );
                 replay_before_decision
             });
-            let result = registry
-                .execute("agent_gate", "bash", json!({"command": "echo gated"}))
-                .await;
-            let replay_before_decision = answerer.await.expect("answerer task");
+            let execution = async {
+                registry
+                    .execute_full("agent_gate", &execution_id, "bash", input)
+                    .await
+                    .map(|output| output.result.content)
+            };
+            let responder = async { answerer.await.expect("answerer task") };
+            // Poll the responder concurrently, so its assertion panic cannot strand a human wait.
+            let (result, replay_before_decision) = tokio::time::timeout(
+                CHILD_APPROVAL_EVENT_READINESS,
+                async { tokio::join!(execution, responder) },
+            ).await.expect("approval fixture settles both execution and responder within its readiness deadline");
             assert_eq!(replay_before_decision.unmatched_asks.len(), 1);
             assert!(replay_before_decision.completed.is_empty());
             match (expect_ok, result) {
                 (true, Ok(output)) => assert!(output.contains("gated"), "{output}"),
                 (false, Err(err)) => {
-                    assert!(err.to_string().contains("denied by the user"), "{err}");
+                    assert!(
+                        matches!(
+                            err.downcast_ref::<ToolError>(),
+                            Some(ToolError::PermissionDenied { .. })
+                        ),
+                        "{err}"
+                    );
+                    if by == ApprovalDecider::User {
+                        // Match the typed message: Display prefixes
+                        // "Failed to authorize tool execution: ".
+                        assert!(
+                            matches!(err.downcast_ref::<ToolError>(),
+                                Some(ToolError::PermissionDenied { message })
+                                    if message.starts_with("Tool 'bash' denied by user — ")),
+                            "{err}"
+                        );
+                    }
                 }
                 (true, Err(err)) => panic!("approved call must run: {err}"),
                 (false, Ok(output)) => panic!("denied call must not run: {output}"),
@@ -22545,12 +24736,81 @@ mod child_permission_gate {
                 ApprovalOutcome::Denied
             };
             assert_eq!(replay.completed[0].outcome, expected_outcome);
+            assert_eq!(replay.completed[0].decided_by, Some(by));
             assert!(matches!(
                 &replay.completed[0].ask,
                 ApprovalReceipt::Asked { tool_name, .. } if tool_name == "bash"
             ));
             assert_eq!(manager.read().await.pending_child_approvals(), 0);
         }
+    }
+
+    #[test]
+    fn child_approval_keys_use_agent_scoped_normal_scheme() {
+        let (exact_a, grouping_a) = child_approval_keys(
+            "agent_one",
+            "bash",
+            &json!({"command": "cargo test -p demo"}),
+        );
+        let (exact_b, grouping_b) = child_approval_keys(
+            "agent_one",
+            "bash",
+            &json!({"command": "cargo test -p demo --lib"}),
+        );
+        assert_eq!(grouping_a, grouping_b, "one command family, one grant");
+        assert_ne!(exact_a, exact_b, "denials stay exact");
+        for key in [&exact_a, &grouping_a, &exact_b, &grouping_b] {
+            assert!(key.starts_with("agent:agent_one:shell:"), "{key}");
+            assert!(!key.contains(":approval:"), "{key}");
+        }
+    }
+
+    #[test]
+    fn child_grant_does_not_match_parent_or_sibling() {
+        let input = json!({"command": "cargo test -p demo"});
+        let (_, child) = child_approval_keys("agent_one", "bash", &input);
+        let (_, sibling) = child_approval_keys("agent_two", "bash", &input);
+        let parent = crate::tools::approval_cache::build_approval_grouping_key("bash", &input).0;
+        assert_ne!(child, sibling);
+        assert_ne!(child, parent);
+        assert!(
+            child.ends_with(&parent),
+            "child key reuses the normal scheme"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_prompt_carries_agent_scoped_keys() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let input = json!({"command": "echo gated"});
+        let expected = child_approval_keys("agent_gate", "bash", &input);
+        let manager_for_answer = Arc::clone(&manager);
+        let answerer = tokio::spawn(async move {
+            tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, async {
+                while let Some(event) = rx.recv().await {
+                    if let Event::ApprovalRequired {
+                        id,
+                        approval_key,
+                        approval_grouping_key,
+                        ..
+                    } = event
+                    {
+                        manager_for_answer.write().await.resolve_child_approval(
+                            &id,
+                            ChildApprovalOutcome::Denied {
+                                by: crate::approval_log::ApprovalDecider::User,
+                            },
+                        );
+                        return (approval_key, approval_grouping_key);
+                    }
+                }
+                panic!("channel closed before the child prompt");
+            })
+            .await
+            .expect("child prompt arrives")
+        });
+        let _ = registry.execute("agent_gate", "bash", input).await;
+        assert_eq!(answerer.await.expect("answerer"), expected);
     }
 
     #[tokio::test]
@@ -22568,9 +24828,281 @@ mod child_permission_gate {
             .await
             .expect_err("a closed decision channel must fail closed");
         closer.await.expect("closer task");
-        assert!(err.to_string().contains("could no longer reach"), "{err}");
+        assert!(
+            matches!(err.downcast_ref::<ToolError>(), Some(ToolError::ExecutionFailed { message, .. })
+                if message.starts_with("The approval request for this call was no longer current ")
+                    && message.contains("The user did not deny it.")),
+            "{err}"
+        );
         assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Unavailable);
         assert_eq!(manager.read().await.pending_child_approvals(), 0);
+    }
+
+    /// Wait for Core's withdrawal after its durable cancelled decision.
+    async fn next_wait_end(
+        rx: &mut tokio::sync::mpsc::Receiver<Event>,
+        approval_id: &str,
+    ) -> Event {
+        tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, async {
+            while let Some(event) = rx.recv().await {
+                if let Event::ApprovalWithdrawn { id } = &event
+                    && id == approval_id
+                {
+                    return event;
+                }
+            }
+            panic!("event channel closed before the wait ended");
+        })
+        .await
+        .expect("the end of the wait reaches hosts")
+    }
+
+    /// A running agent in the gate's own manager, so cancel and status paths
+    /// see the same pending store the gate writes.
+    async fn running_gate_agent(
+        registry: &ChildCoreProbe,
+        manager: &SharedSubAgentManager,
+        name: &str,
+    ) -> String {
+        let mut manager = manager.write().await;
+        let agent_id = insert_running_agent(&mut manager, name);
+        manager.register_worker_for_session(
+            make_worker_spec(&agent_id, registry.gate_runtime.context.workspace.clone()),
+            "guardian-test-session",
+            None,
+        );
+        agent_id
+    }
+
+    #[tokio::test]
+    async fn cancel_while_pending_withdraws_request_with_cancelled_receipt() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let (receipt_store, session_id) = receipt_context(&registry);
+        let agent_id = running_gate_agent(&registry, &manager, "cancel_pending").await;
+        manager
+            .write()
+            .await
+            .agents
+            .get_mut(&agent_id)
+            .expect("agent")
+            .stop_token = Some(registry.gate_runtime.cancel_token.clone());
+        let registry = Arc::new(registry);
+        let task = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let manager = Arc::clone(&manager);
+            let agent_id = agent_id.clone();
+            async move {
+                let result = registry
+                    .execute(&agent_id, "bash", json!({"command": "echo gated"}))
+                    .await;
+                assert!(result.is_err(), "cancelled permission never executes");
+                let mut manager = manager.write().await;
+                let mut terminal = manager.get_result(&agent_id).expect("owned agent");
+                terminal.status = SubAgentStatus::Cancelled;
+                terminal.needs_input = None;
+                assert!(manager.finish_terminal_result(&agent_id, terminal, false, true));
+            }
+        });
+        let approval_id = next_child_approval_id(&mut rx).await;
+        {
+            let mut manager = manager.write().await;
+            let record = manager.get_worker_record(&agent_id).expect("record");
+            assert_eq!(record.status, AgentWorkerStatus::WaitingForUser);
+            // The task retains the exact Core future until its decision settles.
+            if let Some(old) = manager
+                .agents
+                .get_mut(&agent_id)
+                .and_then(|agent| agent.task_handle.replace(task))
+            {
+                old.abort();
+            }
+            let requested = manager.cancel_agent(&agent_id).expect("cancel");
+            assert_eq!(requested.status, SubAgentStatus::Running);
+            assert!(
+                manager
+                    .agents
+                    .get(&agent_id)
+                    .expect("agent")
+                    .task_handle
+                    .is_some()
+            );
+            assert!(!manager.resolve_child_approval(
+                &approval_id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
+        }
+        let requested = manager.read().await.get_result(&agent_id).expect("agent");
+        let settled = settle_requested_child(&manager, requested).await;
+        assert_eq!(settled.status, SubAgentStatus::Cancelled);
+        {
+            let manager = manager.read().await;
+            assert_eq!(manager.pending_child_approvals(), 0);
+            let record = manager.get_worker_record(&agent_id).expect("record");
+            assert_ne!(
+                record.status,
+                AgentWorkerStatus::WaitingForUser,
+                "a cancelled agent never reports waiting on a person"
+            );
+            assert!(record.pending_request.is_none());
+            assert_ne!(record.recommended_action.action, "tell_user");
+        }
+        let withdrawal = next_wait_end(&mut rx, &approval_id).await;
+        assert!(
+            matches!(withdrawal, Event::ApprovalWithdrawn { .. }),
+            "{withdrawal:?}"
+        );
+        assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Cancelled);
+        // A late answer finds nobody waiting and applies to nothing.
+        assert!(!manager.write().await.resolve_child_approval(
+            &approval_id,
+            ChildApprovalOutcome::Approved {
+                by: crate::approval_log::ApprovalDecider::User
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn wall_deadline_ends_pending_wait_with_receipt() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let (receipt_store, session_id) = receipt_context(&registry);
+        let mut gated =
+            Box::pin(registry.execute("agent_gate", "bash", json!({"command": "echo gated"})));
+        // Drive the call until its prompt is out, then start the deadline:
+        // a deadline armed before the prompt could expire first on a loaded
+        // shared-process run and never exercise the pending wait (#6698).
+        let approval_id = tokio::select! {
+            id = next_child_approval_id(&mut rx) => id,
+            _ = &mut gated => panic!("the gated call finished without prompting"),
+        };
+        let work_deadline = Instant::now() + Duration::from_millis(300);
+        let ran = run_tool_with_person_aware_timeout(
+            Duration::from_secs(60),
+            Some(work_deadline),
+            &registry.person_wait,
+            &mut gated,
+        )
+        .await;
+        assert!(
+            ran.is_none(),
+            "the wall-clock deadline still ends the agent"
+        );
+        // Cancel first and continue the same future: dropping it cannot append
+        // Core's durable decision. The real actor driver uses this same order.
+        registry.gate_runtime.cancel_token.cancel();
+        let settled = tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, &mut gated)
+            .await
+            .expect("canonical cancelled decision settles");
+        assert!(settled.is_err(), "deadline cannot execute the pending tool");
+        let withdrawal = next_wait_end(&mut rx, &approval_id).await;
+        assert!(
+            matches!(withdrawal, Event::ApprovalWithdrawn { .. }),
+            "{withdrawal:?}"
+        );
+        assert_eq!(manager.read().await.pending_child_approvals(), 0);
+        assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_longer_than_tool_timeout_is_answered_and_runs() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let (receipt_store, session_id) = receipt_context(&registry);
+        // Wide margins: after approval the call spawns a real shell, which
+        // can take well over 200ms on a loaded Windows runner.
+        let tool_timeout = Duration::from_secs(2);
+        let manager_for_answer = Arc::clone(&manager);
+        let answerer = tokio::spawn(async move {
+            let id = next_child_approval_id(&mut rx).await;
+            // The person takes several tool timeouts to decide.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(manager_for_answer.write().await.resolve_child_approval(
+                &id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
+        });
+        let output = run_tool_with_person_aware_timeout(
+            tool_timeout,
+            None,
+            &registry.person_wait,
+            registry.execute("agent_gate", "bash", json!({"command": "echo gated-ran"})),
+        )
+        .await
+        .expect("the approval wait never spends the tool timeout")
+        .expect("the approved call runs");
+        answerer.await.expect("answerer");
+        assert!(output.contains("gated-ran"), "{output}");
+        assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::ApprovedOnce);
+
+        // Without a person wait the same bound still fires.
+        let clock = PersonWaitClock::default();
+        let slow = run_tool_with_person_aware_timeout(
+            tool_timeout,
+            None,
+            &clock,
+            tokio::time::sleep(Duration::from_secs(3)),
+        )
+        .await;
+        assert!(slow.is_none(), "ordinary tool work keeps its timeout");
+    }
+
+    #[tokio::test]
+    async fn session_close_withdraws_old_children_requests() {
+        let (registry, _rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let agent_id = running_gate_agent(&registry, &manager, "old_session_child").await;
+        let mut manager = manager.write().await;
+        let (_id, receiver) = manager
+            .register_child_approval(
+                &agent_id,
+                &new_child_execution_id(&agent_id),
+                "bash",
+                "held",
+            )
+            .unwrap();
+        assert!(manager.finalize_session_close_for_session("workspace") > 0);
+        assert_eq!(
+            manager.pending_child_approvals(),
+            0,
+            "a conversation boundary ends its children's waits"
+        );
+        assert!(
+            receiver.await.is_err(),
+            "a live waiter sees its channel close"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_event_channel_still_delivers_child_approval_retirement() {
+        let (registry, _rx, _manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let mut runtime = registry.gate_runtime;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Event::status("host is busy")).unwrap();
+        runtime.event_tx = Some(tx);
+        let delivery = announce_child_approval_wait_ended(
+            &runtime,
+            "agent_busy",
+            "agent:agent_busy:approval:boot:1",
+            "bash",
+            AgentWorkerStatus::Cancelled,
+            "agent stopped".to_string(),
+        );
+        tokio::pin!(delivery);
+        assert!(
+            futures_util::poll!(&mut delivery).is_pending(),
+            "retirement waits for channel capacity instead of dropping the event"
+        );
+        assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
+        tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, delivery)
+            .await
+            .expect("retirement is delivered once the host drains");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::AgentProgress { activity, .. })
+                if activity.approval_id.as_deref() == Some("agent:agent_busy:approval:boot:1")
+                    && activity.worker_status == AgentWorkerStatus::Cancelled
+        ));
     }
 
     #[tokio::test]
@@ -22588,7 +25120,11 @@ mod child_permission_gate {
             .await
             .expect_err("runtime cancellation must fail the held call closed");
         canceller.await.expect("canceller task");
-        assert!(err.to_string().contains("was cancelled"), "{err}");
+        assert!(
+            matches!(err.downcast_ref::<ToolError>(), Some(ToolError::Cancelled { message })
+                if message.starts_with("Request cancelled while awaiting approval")),
+            "{err}"
+        );
         assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Cancelled);
         assert_eq!(manager.read().await.pending_child_approvals(), 0);
     }
@@ -22603,7 +25139,12 @@ mod child_permission_gate {
             .execute("agent_gate", "bash", json!({"command": "echo gated"}))
             .await
             .expect_err("an unavailable prompt host must fail closed");
-        assert!(err.to_string().contains("could not be asked"), "{err}");
+        assert!(
+            matches!(err.downcast_ref::<ToolError>(), Some(ToolError::ExecutionFailed { message, .. })
+                if message.starts_with("The approval request for this call was no longer current ")
+                    && message.contains("The user did not deny it.")),
+            "{err}"
+        );
         assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Unavailable);
         assert_eq!(manager.read().await.pending_child_approvals(), 0);
     }
@@ -22626,12 +25167,12 @@ mod child_permission_gate {
             let approval_id = next_child_approval_id(&mut rx).await;
             std::fs::remove_file(&log_path).expect("remove log after durable ask");
             std::fs::create_dir(&log_path).expect("replace log with unwritable directory");
-            assert!(
-                manager_for_answer
-                    .write()
-                    .await
-                    .resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved)
-            );
+            assert!(manager_for_answer.write().await.resolve_child_approval(
+                &approval_id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
         });
 
         let err = registry
@@ -22883,12 +25424,14 @@ mod child_permission_gate {
             })
             .mount(&server)
             .await;
-        let client = CodewhaleClient::new(&crate::config::Config {
-            api_key: Some("test-guardian-fresh-key".to_string()),
-            base_url: Some(server.uri()),
-            ..Default::default()
-        })
-        .expect("mock-backed client");
+        let config = crate::config::Config::default().with_legacy_root(
+            Some("test-guardian-fresh-key".to_string()),
+            Some(server.uri()),
+        );
+        let client = (
+            CodewhaleClient::new(&config).expect("mock-backed client"),
+            config,
+        );
         let (registry, mut rx, manager) =
             worker_registry(ApprovalMode::Auto, false, true, Some(client));
         let marker = registry
@@ -22969,8 +25512,331 @@ mod child_permission_gate {
         assert!(receipts[0].2.is_none());
     }
 
+    /// A running agent's next call observes the person's current posture in
+    /// both directions. Auto Review allows this harmless pipeline, while an
+    /// exact typed Ask still requires a real human answer. Full Access runs
+    /// the same call without consulting the reviewer or opening a prompt.
     #[tokio::test]
-    async fn full_access_runs_ordinary_shell_but_still_hard_blocks_the_safety_floor() {
+    async fn a_posture_switch_reaches_an_already_running_agent() {
+        let (server, (client, mut config)) = guardian_mock(
+            r#"{"risk_level":"low","decision":"allow","reason":"harmless workspace pipeline"}"#,
+        )
+        .await;
+        let mut ask = ToolAskRule::exec_shell(GUARDIAN_PIPELINE);
+        ask.command_exact = true;
+        config.exec_policy_engine = ExecPolicyEngine::with_rulesets(vec![
+            Ruleset::user(vec![], vec![]).with_ask_rules(vec![ask]),
+        ]);
+        let live =
+            crate::core::engine::LivePosture::for_tests(&std::env::temp_dir(), ApprovalMode::Auto);
+        let (registry, mut rx, manager) = worker_registry_with_live_posture(
+            ApprovalMode::Auto,
+            false,
+            true,
+            Some((client, config)),
+            Some(live.clone()),
+        );
+        let input = json!({"command": GUARDIAN_PIPELINE});
+        let (receipt_store, session_id) = receipt_context(&registry);
+        for denied_count in 1..=2 {
+            let execution = registry.execute("agent_gate", "bash", input.clone());
+            let answer = async {
+                let id = next_child_approval_id(&mut rx).await;
+                assert!(SubAgentManager::is_child_approval_id(&id), "{id}");
+                let replay = receipt_store
+                    .replay(&session_id)
+                    .expect("the actual Core ask is durable before the answer");
+                assert_eq!(replay.unmatched_asks.len(), 1);
+                assert_eq!(replay.completed.len(), denied_count - 1);
+                assert!(matches!(
+                    &replay.unmatched_asks[0],
+                    ApprovalReceipt::Asked { approval_id, tool_call_id, tool_name, .. }
+                        if approval_id == &id && tool_call_id == &id && tool_name == "bash"
+                ));
+                let mut manager = manager.write().await;
+                assert_eq!(manager.pending_child_approvals(), 1);
+                assert!(manager.resolve_child_approval(
+                    &id,
+                    ChildApprovalOutcome::Denied {
+                        by: crate::approval_log::ApprovalDecider::User
+                    }
+                ));
+                assert!(
+                    !manager.resolve_child_approval(
+                        &id,
+                        ChildApprovalOutcome::Approved {
+                            by: crate::approval_log::ApprovalDecider::User
+                        }
+                    ),
+                    "a late allow cannot replace the same denied request"
+                );
+                id
+            };
+            // Readiness belongs to this test's responder, never to the
+            // production human wait or to a manufactured approval decision.
+            let (result, id) = tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, async {
+                tokio::join!(execution, answer)
+            })
+            .await
+            .expect("the fixture's real answer settles the actual Core approval");
+            let err = result.expect_err("Auto cannot run a call the person denied");
+            assert!(
+                matches!(err.downcast_ref::<ToolError>(), Some(ToolError::PermissionDenied { message })
+                    if message.starts_with("Tool 'bash' denied by user — ")),
+                "{err}"
+            );
+            let replay = receipt_store
+                .replay(&session_id)
+                .expect("both real decisions remain durable");
+            assert!(replay.unmatched_asks.is_empty());
+            assert_eq!(replay.completed.len(), denied_count);
+            assert_eq!(replay.completed[denied_count - 1].ask.approval_id(), id);
+            assert!(
+                replay
+                    .completed
+                    .iter()
+                    .all(|receipt| receipt.outcome == ApprovalOutcome::Denied)
+            );
+            assert_eq!(manager.read().await.pending_child_approvals(), 0);
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("mock requests")
+                    .len(),
+                denied_count,
+                "each Auto stage reviews once before its exact human Ask"
+            );
+
+            if denied_count == 1 {
+                live.switch_for_tests(ApprovalMode::Bypass);
+                let output = tokio::time::timeout(
+                    CHILD_APPROVAL_EVENT_READINESS,
+                    registry.execute("agent_gate", "bash", input.clone()),
+                )
+                .await
+                .expect("Full Access settles without an unanswered approval prompt")
+                .expect("the same running agent runs once Full Access is granted");
+                assert!(output.contains("built"), "{output}");
+                assert!(
+                    drain_gate_receipts(&mut rx).is_empty(),
+                    "Full Access consults no guardian"
+                );
+                assert_eq!(
+                    server
+                        .received_requests()
+                        .await
+                        .expect("mock requests")
+                        .len(),
+                    1,
+                    "Full Access makes no additional reviewer request"
+                );
+                live.switch_for_tests(ApprovalMode::Auto);
+            }
+        }
+    }
+
+    /// Linux report against 0.10.0: an agent given Full Access still had its
+    /// calls denied by the "safety gate". Every child call was judged as
+    /// detached background work, so an ordinary absolute-path cleanup — which
+    /// the same session runs without a word in its own turn — failed closed in
+    /// the agent. Full Access judges the agent's call exactly like the
+    /// parent's: only a genuinely detached start keeps the floor.
+    #[tokio::test]
+    async fn full_access_child_runs_what_the_parent_turn_runs() {
+        let (mut registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
+        // A foreground agent: the parent turn owns and waits on it.
+        registry.gate_runtime.foreground_children = Some(Arc::new(ForegroundChildRegistry::new()));
+        let workspace = registry.gate_runtime.context.workspace.clone();
+        let build = workspace.join("build");
+        std::fs::create_dir_all(build.join("out")).unwrap();
+        #[cfg(windows)]
+        let command = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force",
+            build.to_string_lossy().replace('\'', "''")
+        );
+        #[cfg(not(windows))]
+        let command = format!(
+            "rm -rf {}",
+            shlex::try_quote(&build.to_string_lossy()).unwrap()
+        );
+        // Parent classification is covered in core::authority::auto_review; this runtime
+        // test proves the child actually executes and preserves the gate receipt.
+        registry
+            .execute("agent_gate", "bash", json!({"command": command}))
+            .await
+            .expect("a Full Access agent runs what its Full Access session runs");
+        assert!(!build.exists(), "the cleanup actually ran");
+        assert!(drain_gate_receipts(&mut rx).is_empty());
+    }
+
+    /// Review finding on d1655c424: judging agent calls as foreground let a
+    /// detached agent run catastrophic work. Nobody watches a detached agent,
+    /// so the floor holds for it in the reviewing postures. Full Access
+    /// judges the call exactly as the parent turn does and does not apply
+    /// the floor.
+    #[tokio::test]
+    async fn a_detached_agents_catastrophic_shell_is_held_in_the_reviewing_postures() {
+        for mode in [
+            ApprovalMode::Auto,
+            ApprovalMode::Suggest,
+            ApprovalMode::Never,
+        ] {
+            let (registry, mut rx, manager) =
+                worker_registry(mode, false, false, Some(unreachable_client()));
+            assert!(registry.gate_runtime.foreground_children.is_none());
+            let (receipt_store, session_id) = receipt_context(&registry);
+            for (index, command) in [
+                "dd if=/dev/zero of=/dev/null count=0",
+                "rm -rf /home/me",
+                "bash -c 'rm -rf /etc'",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let err = registry
+                    .execute("agent_gate", "bash", json!({ "command": command }))
+                    .await
+                    .expect_err("a detached agent's catastrophic write is held");
+                let typed = err
+                    .downcast_ref::<ToolError>()
+                    .expect("canonical typed refusal");
+                if mode == ApprovalMode::Suggest {
+                    // Ask retains the floor as a real human decision. This
+                    // detached host cannot answer it, so Core records Unavailable.
+                    assert!(
+                        matches!(typed, ToolError::NotAvailable { .. }),
+                        "{mode:?} {command}: {err}"
+                    );
+                    assert!(
+                        typed
+                            .to_string()
+                            .contains("child caller has no host that can answer this approval"),
+                        "{mode:?} {command}: {err}"
+                    );
+                    let replay = receipt_store
+                        .replay(&session_id)
+                        .expect("the missing host has an actual durable terminal receipt");
+                    assert!(replay.unmatched_asks.is_empty());
+                    assert_eq!(replay.completed.len(), index + 1);
+                    assert!(
+                        replay
+                            .completed
+                            .iter()
+                            .all(|receipt| { receipt.outcome == ApprovalOutcome::Unavailable })
+                    );
+                } else {
+                    assert!(
+                        matches!(typed, ToolError::PermissionDenied { message }
+                            if message.contains("destructive background/headless")),
+                        "{mode:?} {command}: {err}"
+                    );
+                }
+                assert_eq!(manager.read().await.pending_child_approvals(), 0);
+            }
+            let receipts = drain_gate_receipts(&mut rx);
+            assert_eq!(
+                receipts.len(),
+                if mode == ApprovalMode::Suggest { 0 } else { 3 },
+                "{mode:?}: every autonomous hold has its exact deterministic receipt"
+            );
+            assert!(
+                receipts.iter().all(|receipt| {
+                    receipt.0 == ToolGate::AutoReviewDeterministic
+                        && receipt.1 == ToolGateVerdict::Denied
+                        && receipt.3.contains("destructive background/headless")
+                }),
+                "{mode:?}: the floor never reaches a guardian: {receipts:?}"
+            );
+        }
+
+        // Full Access: the detached call runs — only the harmless fixture is
+        // dispatched, so a regression can never touch a real system path.
+        {
+            let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, false, None);
+            assert!(registry.gate_runtime.foreground_children.is_none());
+            registry
+                .execute(
+                    "agent_gate",
+                    "bash",
+                    json!({ "command": "dd if=/dev/zero of=/dev/null count=0" }),
+                )
+                .await
+                .expect("Full Access runs a detached destructive call");
+            assert!(drain_gate_receipts(&mut rx).is_empty());
+        }
+    }
+
+    /// Review finding on d1655c424: the posture was read once, before the
+    /// gate. A person who tightened Permissions while an agent's prompt was
+    /// open still had that call run under the old posture once approved.
+    #[tokio::test]
+    async fn a_posture_narrowed_during_a_prompt_regates_the_call() {
+        let live = crate::core::engine::LivePosture::for_tests(
+            &std::env::temp_dir(),
+            ApprovalMode::Suggest,
+        );
+        let (registry, mut rx, manager) = worker_registry_with_live_posture(
+            ApprovalMode::Suggest,
+            false,
+            true,
+            None,
+            Some(live.clone()),
+        );
+        let marker = registry
+            .gate_runtime
+            .context
+            .workspace
+            .join("permission-narrowed.txt");
+        assert!(!marker.exists());
+        let (receipt_store, session_id) = receipt_context(&registry);
+        let call = registry.execute(
+            "agent_gate",
+            "bash",
+            json!({"command": "echo held | cat > permission-narrowed.txt"}),
+        );
+        let answer = async {
+            let id = loop {
+                match rx.recv().await.expect("event stream") {
+                    Event::ApprovalRequired { id, .. } => break id,
+                    _ => continue,
+                }
+            };
+            // The person tightens Permissions, then answers the open card.
+            live.switch_for_tests(ApprovalMode::Never);
+            assert!(manager.write().await.resolve_child_approval(
+                &id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
+            id
+        };
+        let (result, id) = tokio::join!(call, answer);
+        let err = result.expect_err("the call is gated again under the narrower posture");
+        assert!(
+            matches!(err.downcast_ref::<ToolError>(), Some(ToolError::PermissionDenied { message })
+                if message == "Permissions changed before this tool call executed; retry it with the current permissions."),
+            "{err}"
+        );
+        assert!(
+            !marker.exists(),
+            "the narrowed call never executed its write"
+        );
+        assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::ApprovedOnce);
+        assert!(
+            !manager.write().await.resolve_child_approval(
+                &id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ),
+            "a late allow cannot revive the already refused call"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_access_runs_ordinary_and_destructive_shell_without_a_prompt() {
         let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
         let output = registry
             .execute("agent_gate", "bash", json!({"command": "echo full-access"}))
@@ -22978,20 +25844,28 @@ mod child_permission_gate {
             .expect("Full Access runs ordinary shell without a prompt");
         assert!(output.contains("full-access"), "{output}");
         assert!(drain_gate_receipts(&mut rx).is_empty());
-        // Destructive detached work holds in every posture (children are
-        // background workers), so Full Access still fails closed here.
-        let err = registry
-            .execute("agent_gate", "bash", json!({"command": "rm -rf /usr"}))
-            .await
-            .expect_err("destructive background shell stays blocked in Full Access");
-        assert!(
-            err.to_string().to_lowercase().contains("destructive")
-                || err.to_string().to_lowercase().contains("safety"),
-            "{err}"
+        // A forced recursive delete is a destructive action kind, and this
+        // harness agent is detached (no foreground turn owns it). Full Access
+        // still runs it: the floor guards the reviewing postures, not Bypass.
+        let workspace = registry.gate_runtime.context.workspace.clone();
+        let doomed = workspace.join("full-access-doomed");
+        std::fs::create_dir_all(&doomed).unwrap();
+        #[cfg(windows)]
+        let command = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force",
+            doomed.to_string_lossy().replace('\'', "''")
         );
-        let receipts = drain_gate_receipts(&mut rx);
-        assert_eq!(receipts.len(), 1, "{receipts:?}");
-        assert_eq!(receipts[0].1, ToolGateVerdict::Denied);
+        #[cfg(not(windows))]
+        let command = format!(
+            "rm -rf {}",
+            shlex::try_quote(&doomed.to_string_lossy()).unwrap()
+        );
+        registry
+            .execute("agent_gate", "bash", json!({ "command": command }))
+            .await
+            .expect("Full Access runs a detached destructive call");
+        assert!(!doomed.exists(), "the cleanup actually ran");
+        assert!(drain_gate_receipts(&mut rx).is_empty());
     }
 }
 
@@ -23062,11 +25936,7 @@ fn tool_search_cannot_return_a_retired_agents_tool() {
     let tmp = tempdir().expect("tempdir");
     let registry = subagent_registry_for_catalog(tmp.path());
     let mut catalog = registry.to_api_tools();
-    // Token diet: agent is searchable by default; this test's subject is
-    // retired-tool exclusion, so its precondition re-eagers agent through
-    // the same always-load path discovery uses.
-    let always_load = HashSet::from(["agent".to_string()]);
-    apply_native_tool_deferral(&mut catalog, &always_load);
+    apply_native_tool_deferral(&mut catalog, &HashSet::new());
     assert!(
         catalog
             .iter()
@@ -23182,7 +26052,7 @@ async fn agent_claim_expands_the_callers_write_scope() {
     runtime.context = ToolContext::new(tmp.path());
     runtime.context.auto_approve = true;
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
-    let registry = SubAgentToolRegistry::new_with_owner(
+    let registry = ChildCoreProbe::new_with_owner(
         runtime,
         FleetRole::Builder,
         "agent_scoped".into(),
@@ -23282,7 +26152,7 @@ async fn agent_claim_is_withheld_from_a_role_with_no_write_authority() {
             stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
         runtime.context = ToolContext::new(tmp.path().to_path_buf());
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
-        let registry = SubAgentToolRegistry::new(
+        let registry = ChildCoreProbe::new(
             runtime,
             role.clone(),
             None,
@@ -23327,7 +26197,7 @@ async fn agent_claim_is_withheld_from_a_role_with_no_write_authority() {
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     runtime.context.auto_approve = true;
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
-    let registry = SubAgentToolRegistry::new(
+    let registry = ChildCoreProbe::new(
         runtime,
         FleetRole::Scout,
         None,
@@ -23344,6 +26214,207 @@ async fn agent_claim_is_withheld_from_a_role_with_no_write_authority() {
         .expect_err("a read-only role cannot widen a write scope")
         .to_string();
     assert!(refusal.contains("no write authority to widen"), "{refusal}");
+}
+
+// Regression (stopship scout repair): the workflow's read-only scout
+// activates `grep_files` with one `tool_search` call before searching. That
+// two-step path only works while the scout surface keeps a first-turn-active
+// `tool_search` and a deferred, searchable `grep_files`; the hidden `File`
+// alias the brief cited before is filtered from every model-visible catalog
+// (`to_api_tools`), which is what silently broke the release-acceptance
+// explore gate. The registry is built with the scope the fixture scout really
+// runs under (`leaf_allowed_tools` lowers a read-only leaf to `["File"]`), so
+// the guard also pins the alias-family intersection that keeps `grep_files`
+// discoverable under that legacy rule. If a surface reshape fails this test,
+// re-work the fixture brief in the same change instead of leaving it
+// instructing calls the child cannot make.
+#[tokio::test]
+async fn scout_surface_keeps_tool_search_grep_files_activation_path() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+    let registry = ChildCoreProbe::new(
+        runtime,
+        FleetRole::Scout,
+        Some(vec!["File".to_string()]),
+        todo_list,
+        plan_state,
+    );
+
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
+    let search = catalog
+        .iter()
+        .find(|tool| tool.name == "tool_search")
+        .expect("scout must keep an active tool_search");
+    let grep = catalog
+        .iter()
+        .find(|tool| tool.name == "grep_files")
+        .expect("scout must keep a deferred, searchable grep_files");
+    assert_eq!(
+        search.defer_loading,
+        Some(false),
+        "tool_search must be first-turn active on the scout"
+    );
+    assert_eq!(
+        grep.defer_loading,
+        Some(true),
+        "grep_files must be deferred so the taught tool_search activation is required"
+    );
+    assert!(
+        !catalog.iter().any(|tool| tool.name == "File"),
+        "the hidden File alias must stay out of scout catalogs"
+    );
+}
+
+// Regression (stopship scout repair, phantom-tool class): fleet workflow
+// briefs are model-facing text too. The scout brief must name tools the child
+// catalog can actually see (`tool_search`, `grep_files`) and never cite the
+// hidden `File` alias or its retired `search_content` action — that wording
+// failed the release-acceptance explore gate exactly the way the
+// bundled-skills `File` citations stalled real reasoning loops.
+#[test]
+fn workflow_briefs_name_catalog_visible_tools() {
+    const STOPSHIP: &str = include_str!("../../../../../workflows/stopship.workflow.js");
+    // Guard the fixture definition, not the maintainer header comment.
+    let body = STOPSHIP
+        .split_once("export default")
+        .expect("workflow module must export its definition")
+        .1;
+    assert!(
+        body.contains("`tool_search`") && body.contains("`grep_files`"),
+        "the scout brief must teach the two-step activation path:\n{body}"
+    );
+    // Every catalog-invisible execution name (hidden replay aliases and the
+    // retired `search_content` action) is denied as a whole word, so an
+    // unbackticked or renamed citation cannot slip past the guard. `list_dir`
+    // and the lowercase primitives stay legal: they are model-visible.
+    const HIDDEN_EXEC_NAMES: [&str; 8] = [
+        "File",
+        "Bash",
+        "TodoWrite",
+        "work_update",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search_content",
+    ];
+    let cited: Vec<&str> = body
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| HIDDEN_EXEC_NAMES.iter().any(|hidden| hidden == word))
+        .collect();
+    assert!(
+        cited.is_empty(),
+        "workflow briefs must not command calls a catalog can never return: {cited:?}"
+    );
+}
+
+// Behavioral counterpart to the two composition guards above: on the scout's
+// live surface, one `tool_search` call must make the deferred `grep_files`
+// dispatchable through the same gate the child step loop uses. Saved `File`
+// calls retain a hidden compatibility handler for safe reads, but neither
+// model visibility nor that handler grants the scout mutation authority.
+#[tokio::test]
+async fn scout_activation_makes_grep_files_dispatchable() {
+    let tmp = tempdir().expect("tempdir");
+    let evidence = tmp.path().join("evidence.txt");
+    std::fs::write(&evidence, "stopship evidence\n").expect("fixture evidence");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+    // The default workflow leaf captures no explicit list; the Scout grant stays read-only.
+    let registry = ChildCoreProbe::new(runtime, FleetRole::Scout, None, todo_list, plan_state);
+    // Mirror the spawn loop: filtered catalog, then a cold surface.
+    let mut surface =
+        ChildSurfaceProbe::new(registry.deferred_catalog_for_model(&FleetRole::Scout), &[]);
+
+    assert!(!surface.catalog().iter().any(|tool| tool.name == "File"));
+    assert!(!model_tool_names(model_request_tools(&mut surface)).contains("File"));
+    let file_read = registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            "File",
+            serde_json::json!({"action": "search_content", "path": ".", "pattern": "stopship"}),
+        )
+        .await
+        .expect("saved File evidence calls retain their hidden registered handler");
+    assert!(file_read.result.success, "{file_read:?}");
+    assert!(
+        file_read.result.content.contains("stopship"),
+        "{file_read:?}"
+    );
+    assert!(!model_tool_names(model_request_tools(&mut surface)).contains("File"));
+    let denied = registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            "File",
+            serde_json::json!({"action": "write", "path": "evidence.txt", "content": "replaced"}),
+        )
+        .await
+        .expect_err("hidden compatibility cannot grant scout write authority");
+    assert!(
+        matches!(
+            denied.downcast_ref::<ToolError>(),
+            Some(ToolError::PermissionDenied { .. })
+        ),
+        "{denied}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&evidence).unwrap(),
+        "stopship evidence\n"
+    );
+    assert!(!surface.active_names().contains("File"));
+
+    registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            "tool_search",
+            serde_json::json!({"query": "grep_files"}),
+        )
+        .await
+        .expect("tool_search activation must succeed on the scout surface");
+    assert!(
+        surface.active_names().contains("grep_files"),
+        "activation must admit grep_files into the same surface the dispatch gate reads"
+    );
+
+    registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            "grep_files",
+            serde_json::json!({
+                "path": ".",
+                "pattern": "stopship",
+                "max_results": 5,
+                "context_lines": 1
+            }),
+        )
+        .await
+        .expect("grep_files must dispatch through the real tool after the taught activation");
+}
+
+#[test]
+fn agent_tool_description_states_the_operate_child_approval_rule() {
+    // `apply_session_spawn_defaults` delegates edits and the bounded Run
+    // checks to a root Operate child; other shell follows the session.
+    let text = super::AGENT_TOOL_DESCRIPTION.as_str();
+    assert!(!text.contains("arbitrary shell remains gated"), "{text}");
+    assert!(
+        text.contains("any other shell command follows the session's approval settings"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -23412,7 +26483,8 @@ async fn test_disallowed_tools_resume_keeps_saved_and_current_ancestor_denials()
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
     let agent_id = {
         let mut guard = manager.write().await;
-        let (id, _) = guard.insert_test_interrupted_continuable_agent(
+        let (id, _) = interrupted_direct_child_fixture(
+            &mut guard,
             "saved_worker",
             tmp.path(),
             vec![Message {
@@ -23517,4 +26589,1002 @@ fn missing_precomputed_evidence_falls_back_to_inline_capture() {
         .get_worker_record("agent_inline")
         .expect("worker record");
     assert!(record.delivery_evidence.changed_paths(tmp.path()).is_some());
+}
+
+/// F5: a queued row is republished only when the governor state changes, so
+/// its budget half must name the end time, not a countdown that freezes.
+#[test]
+fn queued_budget_note_names_the_end_time_and_keeps_the_cause_stable() {
+    use chrono::TimeZone as _;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 9, 22, 14, 2, 0)
+        .single()
+        .expect("local time");
+    let note = queued_budget_note(Duration::from_secs(30 * 60), now);
+    assert_eq!(
+        note,
+        "(stops waiting at 14:32; its work budget starts at launch)"
+    );
+    let later = queued_budget_note(
+        Duration::from_secs(10 * 60),
+        now + chrono::Duration::minutes(20),
+    );
+    assert_eq!(note, later, "same deadline, same text: no stale countdown");
+    let reason = format!("{SUBAGENT_QUEUED_LAUNCH_REASON} {note}");
+    assert_eq!(queued_reason_cause(&reason), SUBAGENT_QUEUED_LAUNCH_REASON);
+}
+
+/// #6015: read-only children run read-only shell commands, refusals come back
+/// as actionable error results, and the child ends with an honest status.
+mod readonly_shell_6015 {
+    use super::*;
+
+    /// One `bash` call per command, then a text report.
+    async fn scripted_bash_calls_client(
+        commands: Vec<&'static str>,
+        report: &'static str,
+    ) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
+        scripted_bash_calls_with_pairing(commands, report, None).await
+    }
+
+    async fn scripted_bash_calls_with_pairing(
+        commands: Vec<&'static str>,
+        report: &'static str,
+        invalid_ids: Option<[&'static str; 2]>,
+    ) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/{*path}",
+            post({
+                let calls = Arc::clone(&calls);
+                move |Json(request): Json<Value>| {
+                    let calls = Arc::clone(&calls);
+                    let commands = commands.clone();
+                    async move {
+                        let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                        let serialized = request.to_string();
+                        assert!(!serialized.contains("execution_id"));
+                        assert!(!serialized.contains(":approval:"));
+                        for message in request["messages"].as_array().unwrap() {
+                            if message["role"] == "tool" {
+                                assert_eq!(message["tool_call_id"], "call_ro_reused");
+                            }
+                        }
+                        let usage = json!({
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15
+                        });
+                        let mut body = match commands.get(attempt) {
+                            Some(command) => json!({
+                                "id": format!("chatcmpl-ro-{attempt}"),
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": "call_ro_reused",
+                                            "execution_id": "provider-forged-local",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "bash",
+                                                "arguments": json!({"command": command}).to_string()
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }],
+                                "usage": usage
+                            }),
+                            None => json!({
+                                "id": format!("chatcmpl-ro-report-{attempt}"),
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": report},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": usage
+                            }),
+                        };
+                        if let Some(ids) = invalid_ids {
+                            body["choices"][0]["message"]["content"] =
+                                json!("Text retained from the refused tool response.");
+                            let prototype = body["choices"][0]["message"]["tool_calls"][0].clone();
+                            body["choices"][0]["message"]["tool_calls"] = json!(ids.map(|id| {
+                                let mut call = prototype.clone();
+                                call["id"] = json!(id);
+                                call
+                            }));
+                        }
+                        chat_fixture_response(
+                            request
+                                .get("stream")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            body,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let config = crate::config::Config {
+            retry: Some(crate::config::RetryConfig {
+                enabled: Some(false),
+                max_retries: Some(0),
+                initial_delay: Some(0.0),
+                max_delay: Some(0.0),
+                exponential_base: Some(1.0),
+                jitter: None,
+                jitter_factor: None,
+                respect_retry_after: None,
+            }),
+            ..crate::config::Config::default()
+        }
+        .with_legacy_root(
+            Some("test-key".to_string()),
+            Some(format!("http://{addr}/v1")),
+        );
+        (
+            CodewhaleClient::new(&config).expect("scripted chat client"),
+            calls,
+            config,
+        )
+    }
+
+    fn scout_runtime(
+        workspace: &Path,
+        client: CodewhaleClient,
+        config: crate::config::Config,
+    ) -> SubAgentRuntime {
+        let mut runtime =
+            stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+        runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
+        seed_read_only_role_deny_list(&mut runtime);
+        runtime.client = client;
+        runtime.api_config = Some(Arc::new(config));
+        runtime.context = ToolContext::new(workspace);
+        runtime
+    }
+
+    async fn run_scout(
+        workspace: &Path,
+        client: CodewhaleClient,
+        config: crate::config::Config,
+        id: &str,
+    ) -> SubAgentResult {
+        let manager = Arc::new(RwLock::new(SubAgentManager::new(
+            workspace.to_path_buf(),
+            2,
+        )));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let agent = SubAgent::new(
+            id.to_string(),
+            FleetRole::Scout,
+            "Inspect the workspace".to_string(),
+            make_assignment(),
+            "deepseek-v4-flash".to_string(),
+            Some("Probe".to_string()),
+            None,
+            input_tx,
+            workspace.to_path_buf(),
+            "boot_readonly".to_string(),
+        );
+        {
+            let mut manager = manager.write().await;
+            manager.agents.insert(id.to_string(), agent);
+            manager.register_worker(make_worker_spec(id, workspace.to_path_buf()));
+        }
+        let mut runtime = scout_runtime(workspace, client, config);
+        runtime.manager = Arc::clone(&manager);
+        run_subagent_task(SubAgentTask {
+            manager_handle: Arc::clone(&manager),
+            runtime,
+            agent_id: id.to_string(),
+            agent_type: FleetRole::Scout,
+            prompt: "Inspect the workspace".to_string(),
+            assignment: make_assignment(),
+            allowed_tools: None,
+            fork_context: false,
+            started_at: Instant::now(),
+            max_steps: 20,
+            wall_time: DEFAULT_CHILD_WALL_TIME,
+            wall_ceiling_ms: None,
+            input_rx,
+            launch_gate: None,
+            _foreground_child_registration: None,
+        })
+        .await;
+        manager
+            .read()
+            .await
+            .get_result(id)
+            .expect("agent registered")
+    }
+
+    /// Every tool result the child sent back, in order: (is_error, content).
+    fn tool_results(result: &SubAgentResult) -> Vec<(Option<bool>, String)> {
+        result
+            .checkpoint
+            .as_ref()
+            .expect("the child keeps a checkpoint of its transcript")
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => Some((*is_error, content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ambiguous_child_batch_keeps_text_and_usage_without_executing_calls() {
+        for ids in [["same", "same"], ["valid", ""]] {
+            let tmp = tempdir().unwrap();
+            let (client, calls, config) =
+                scripted_bash_calls_with_pairing(vec!["pwd"], "no further round", Some(ids)).await;
+            let result = run_scout(tmp.path(), client, config, "agent_bad_identity").await;
+            assert!(
+                matches!(&result.status, SubAgentStatus::Failed(error) if error.contains("pairing id")),
+                "{:?}",
+                result.status
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "invalid batch is terminal before dispatch"
+            );
+            assert!(
+                result.usage.as_ref().and_then(|usage| usage.total_tokens) == Some(15),
+                "billed usage must survive refusal"
+            );
+            let checkpoint = result
+                .checkpoint
+                .as_ref()
+                .expect("refused response checkpoint");
+            assert!(checkpoint.messages.iter().flat_map(|m| &m.content).any(
+                |block| matches!(block, ContentBlock::Text { text, .. } if text == "Text retained from the refused tool response.")
+            ));
+            assert!(
+                checkpoint
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .all(|block| !matches!(
+                        block,
+                        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                    ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_provider_ids_keep_child_execution_history_distinct() {
+        let tmp = tempdir().unwrap();
+        let (client, calls, config) =
+            scripted_bash_calls_client(vec!["pwd", "pwd"], "read twice").await;
+        let result = run_scout(tmp.path(), client, config, "agent_identity").await;
+        assert_eq!(
+            result.status,
+            SubAgentStatus::Completed,
+            "{:?}",
+            result.result
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let checkpoint = result.checkpoint.as_ref().expect("real child checkpoint");
+        let mut ids = Vec::new();
+        let mut results = Vec::new();
+        for block in checkpoint.messages.iter().flat_map(|m| &m.content) {
+            match block {
+                ContentBlock::ToolUse {
+                    id, execution_id, ..
+                } => {
+                    assert_eq!(id, "call_ro_reused");
+                    let local = execution_id.clone().expect("host identity");
+                    assert!(SubAgentManager::is_child_approval_id(&local));
+                    assert_ne!(local, "provider-forged-local");
+                    ids.push(local);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    execution_id,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "call_ro_reused");
+                    results.push(execution_id.clone().expect("result identity"));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids, results);
+        assert_ne!(
+            child_guardian_usage_source_id("agent_identity", &ids[0]),
+            child_guardian_usage_source_id("agent_identity", &ids[1])
+        );
+        let restored: SubAgentCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(checkpoint).unwrap()).unwrap();
+        assert_eq!(restored.messages, checkpoint.messages);
+    }
+
+    // Only the unix-gated tests build a git fixture; ungated, Windows
+    // `-D warnings` rejects this helper as dead code.
+    #[cfg(unix)]
+    fn git(workspace: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_scout_runs_read_only_commands_and_completes() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("sub")).expect("sub");
+        std::fs::write(tmp.path().join("sub/listed.txt"), "x\n").expect("listed");
+        std::fs::write(tmp.path().join("notes.txt"), "the needle line\n").expect("notes");
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "seed commit subject"]);
+
+        let (client, calls, config) = scripted_bash_calls_client(
+            vec!["cd sub && ls", "git grep -n needle", "git log --oneline -1"],
+            "Found the needle in notes.txt.",
+        )
+        .await;
+        let result = run_scout(tmp.path(), client, config, "agent_ro_reads").await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(
+            matches!(result.status, SubAgentStatus::Completed),
+            "{:?}",
+            result.status
+        );
+        assert!(result.steps_taken >= 4, "steps {}", result.steps_taken);
+        assert_eq!(
+            result.result.as_deref(),
+            Some("Found the needle in notes.txt.")
+        );
+        let results = tool_results(&result);
+        assert_eq!(results.len(), 3, "{results:?}");
+        for (is_error, content) in &results {
+            assert_eq!(*is_error, None, "a read must not be refused: {content}");
+        }
+        assert!(results[0].1.contains("listed.txt"), "{}", results[0].1);
+        assert!(results[1].1.contains("needle"), "{}", results[1].1);
+        assert!(
+            results[2].1.contains("seed commit subject"),
+            "{}",
+            results[2].1
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_scout_write_attempt_is_an_actionable_error_result() {
+        let tmp = tempdir().expect("tempdir");
+        let (client, calls, config) =
+            scripted_bash_calls_client(vec!["touch evil.txt"], "Reported the blocked probe.").await;
+        let result = run_scout(tmp.path(), client, config, "agent_ro_write").await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the worker takes another step"
+        );
+        assert!(!tmp.path().join("evil.txt").exists());
+        assert!(
+            matches!(result.status, SubAgentStatus::Completed),
+            "{:?}",
+            result.status
+        );
+        assert_eq!(
+            result.result.as_deref(),
+            Some("Reported the blocked probe.")
+        );
+        let results = tool_results(&result);
+        assert_eq!(results.len(), 1, "{results:?}");
+        let (is_error, content) = &results[0];
+        assert_eq!(*is_error, Some(true), "{content}");
+        assert!(content.contains("[shell.readonly.command]"), "{content}");
+        assert!(content.contains("program: `touch`"), "{content}");
+        assert!(content.contains("File tool"), "{content}");
+        for absent in ["Git", "Run tests", "/mode"] {
+            assert!(!content.contains(absent), "{absent} in {content}");
+        }
+        assert!(
+            checkpoint_messages_to_text(&result.checkpoint.as_ref().unwrap().messages)
+                .contains("(error)")
+        );
+    }
+
+    /// Every read-only gate gives the same admit/refuse answer and, for a
+    /// refusal, the same rule text: the Scout posture gate, the shared
+    /// predicate, the durable authority, and the executor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_gates_agree_and_share_refusal_text() {
+        use crate::tools::spec::{
+            ToolAuthorityEnvelope, ToolMutationAuthority, ToolShellAuthority,
+            ToolVerificationAuthority,
+        };
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("sub")).expect("sub");
+        std::fs::write(tmp.path().join("sub/a.txt"), "needle\n").expect("fixture");
+
+        let child = ChildCoreProbe::new(
+            scout_runtime(
+                tmp.path(),
+                stub_runtime().client,
+                stub_runtime().api_config.as_deref().unwrap().clone(),
+            ),
+            FleetRole::Scout,
+            None,
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let durable = ToolContext::new(tmp.path())
+            .with_tool_authority(ToolAuthorityEnvelope {
+                schema_version: 1,
+                owner: "scout-durable".to_string(),
+                authority: ToolMutationAuthority::ReadOnly,
+                network_access: Some(true),
+                shell: ToolShellAuthority::ReadOnly,
+                verification: ToolVerificationAuthority::None,
+                writable_roots: Vec::new(),
+                writable_files: Vec::new(),
+                coordination_contracts: Vec::new(),
+            })
+            .expect("durable authority")
+            .with_shell_policy(ShellPolicy::ReadOnly);
+        let executor = ToolContext::new(tmp.path())
+            .with_shell_policy(ShellPolicy::ReadOnly)
+            .with_owner_agent("agent_gate", "gate");
+        let bash = crate::tools::shell::BashTool::new("Bash");
+
+        for (command, admitted) in [
+            ("ls", true),
+            ("cat sub/a.txt", true),
+            ("cd sub && ls", true),
+            ("ls | head -1", true),
+            ("cat sub/a.txt && echo ---", true),
+            ("find . -name '*.txt'", true),
+            ("sed -n 1p sub/a.txt", true),
+            ("wc -l sub/a.txt 2>/dev/null", true),
+            ("git log --oneline -3; git status --short", true),
+            ("touch x", false),
+            ("ls && rm x", false),
+            ("cat sub/a.txt > b", false),
+            ("echo $(id)", false),
+            ("python3 -c 'print(1)'", false),
+            ("git commit -m x", false),
+            ("sort -o out sub/a.txt", false),
+            ("cd sub; ls", false),
+            ("(ls)", false),
+            ("ls &", false),
+            ("gh issue close 1", false),
+        ] {
+            let lower = json!({"command": command});
+            let upper = json!({"action": "run", "command": command});
+            assert_eq!(
+                crate::tools::shell::agent_readonly_bash_input(&lower),
+                admitted,
+                "{command}"
+            );
+            let authority =
+                crate::tools::registry::enforce_tool_authority("Bash", &upper, &bash, &durable);
+            let posture = child.execute("gate_call", "bash", lower.clone()).await;
+            let executed = bash.execute(upper.clone(), &executor).await;
+            if admitted {
+                authority.unwrap_or_else(|error| panic!("{command}: {error}"));
+                for outcome in [
+                    posture.err().map(|error| error.to_string()),
+                    executed.err().map(|error| error.to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    assert!(
+                        !outcome.contains("[shell.readonly.command]"),
+                        "{command} was refused by a gate: {outcome}"
+                    );
+                }
+                continue;
+            }
+            let normalized = crate::tools::shell::normalize_readonly_cd(&lower);
+            let rule = codewhale_execpolicy::command_safety::agent_readonly_verdict(
+                normalized["command"].as_str().unwrap(),
+            )
+            .expect_err("refused")
+            .to_string();
+            for (gate, message) in [
+                ("authority", authority.expect_err("refused").to_string()),
+                ("posture", posture.expect_err("refused").to_string()),
+                ("execute", executed.expect_err("refused").to_string()),
+            ] {
+                assert!(
+                    message.contains(&rule),
+                    "{gate} refusal for {command} lacks the shared rule {rule:?}: {message}"
+                );
+            }
+        }
+        assert!(!tmp.path().join("x").exists());
+        assert!(!tmp.path().join("b").exists());
+        assert!(!tmp.path().join("out").exists());
+    }
+}
+
+/// #6015: a child that waits for a launch slot gets its full work budget
+/// from the moment it launches. Under the old shared deadline, the queue wait
+/// below would leave too little time for the one slow model response.
+#[tokio::test]
+async fn late_launch_permit_still_gets_the_full_work_budget() {
+    use tokio_util::sync::CancellationToken;
+
+    const WALL_TIME: Duration = Duration::from_millis(2_000);
+    const QUEUE_HOLD: Duration = Duration::from_millis(1_500);
+    const MODEL_DELAY: Duration = Duration::from_millis(900);
+
+    let app = Router::new().route(
+        "/{*path}",
+        post(move |Json(body): Json<Value>| async move {
+            tokio::time::sleep(MODEL_DELAY).await;
+            chat_fixture_response(
+                body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                json!({
+                    "id": "chatcmpl-late",
+                    "model": "deepseek-v4-flash",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "done after launch"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                }),
+            )
+            .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let fixture_config = crate::config::Config {
+        retry: Some(crate::config::RetryConfig {
+            enabled: Some(false),
+            max_retries: Some(0),
+            initial_delay: Some(0.0),
+            max_delay: Some(0.0),
+            exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
+        }),
+        ..crate::config::Config::default()
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
+    let client = CodewhaleClient::new(&fixture_config).expect("delayed chat client");
+
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let agent_id = "agent_late_permit".to_string();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "Answer".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        Some(vec![]),
+        input_tx,
+        tmp.path().to_path_buf(),
+        "boot_test".to_string(),
+    );
+    agent.status = SubAgentStatus::Running;
+    let mut runtime = stub_runtime();
+    runtime.client = client;
+    runtime.api_config = Some(Arc::new(fixture_config));
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+    runtime = runtime.with_cancel_token(CancellationToken::new());
+    {
+        let mut manager = manager.write().await;
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+        manager.agents.insert(agent_id.clone(), agent);
+    }
+
+    let gate = Arc::new(governor::DynamicGate::new(1));
+    let held = Arc::clone(&gate).try_acquire().expect("hold the only slot");
+    let spawned_at_ms = epoch_millis_now();
+    let task_handle = tokio::spawn(run_subagent_task(SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime,
+        agent_id: agent_id.clone(),
+        agent_type: FleetRole::Worker,
+        prompt: "Answer".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(vec![]),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 1,
+        wall_time: WALL_TIME,
+        wall_ceiling_ms: None,
+        input_rx,
+        launch_gate: Some(Arc::clone(&gate)),
+        _foreground_child_registration: None,
+    }));
+    tokio::time::sleep(QUEUE_HOLD).await;
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(10), task_handle)
+        .await
+        .expect("child finishes")
+        .expect("child task exits cleanly");
+
+    let snapshot = manager
+        .read()
+        .await
+        .get_result(&agent_id)
+        .expect("child remains inspectable");
+    assert!(
+        matches!(snapshot.status, SubAgentStatus::Completed),
+        "a late launch must still get its full budget: {:?}",
+        snapshot.status
+    );
+    assert_eq!(snapshot.result.as_deref(), Some("done after launch"));
+
+    // Continuation reads the saved deadline (`source_deadline`). It must be
+    // the one restarted at launch, not the spawn-time one, or continuing this
+    // child would be refused as out of budget.
+    let saved_deadline_ms = manager
+        .read()
+        .await
+        .worker_records
+        .get(&agent_id)
+        .and_then(|record| record.spec.runtime_profile.wall_deadline_ms)
+        .expect("launch saves the restarted deadline");
+    let wall_ms = u64::try_from(WALL_TIME.as_millis()).expect("wall ms");
+    let hold_ms = u64::try_from(QUEUE_HOLD.as_millis()).expect("hold ms");
+    assert!(
+        saved_deadline_ms >= spawned_at_ms + hold_ms + wall_ms,
+        "saved deadline {saved_deadline_ms} must start from launch, not spawn ({spawned_at_ms})"
+    );
+}
+
+#[tokio::test]
+async fn computer_use_consent_is_denied_in_child_gate_every_mode() {
+    let tmp = tempdir().expect("tempdir");
+    for (auto_approve, approval_mode) in [
+        (true, codewhale_execpolicy::ApprovalMode::Bypass),
+        (false, codewhale_execpolicy::ApprovalMode::Auto),
+        (false, codewhale_execpolicy::ApprovalMode::Suggest),
+        (false, codewhale_execpolicy::ApprovalMode::Never),
+    ] {
+        let mut runtime = stub_runtime();
+        runtime.context = ToolContext::new(tmp.path());
+        runtime.context.auto_approve = auto_approve;
+        runtime.context.execution.approval_mode = approval_mode;
+        runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Worker);
+        let registry = ChildCoreProbe::new(
+            runtime,
+            FleetRole::Worker,
+            None,
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        for (name, input) in [
+            (
+                "mcp_codewhale-cu_consent",
+                json!({"action": "allow", "app": "Safari", "remember": true}),
+            ),
+            ("mcp_codewhale-cu_consent_allow", json!({"app": "Terminal"})),
+            (
+                "mcp_codewhale-cu_app_script",
+                json!({"script": "tell application \"Finder\" to activate"}),
+            ),
+            (
+                "mcp_codewhale-cu_computer_register",
+                json!({"computer": "box", "transport": "ssh", "host": "box.example"}),
+            ),
+            (
+                "mcp_codewhale-cu_run_actions",
+                json!({"steps": [{"tool": "codewhale-cu_consent_allow", "arguments": {"app": "Safari"}}]}),
+            ),
+        ] {
+            let verdict = registry
+                .execute_full("agent_child", "call_1", name, input)
+                .await;
+            assert!(
+                matches!(verdict, Err(ref error) if error.downcast_ref::<ToolError>().is_some_and(|error| matches!(error, ToolError::PermissionDenied { .. }))),
+                "{approval_mode:?} {name}: {verdict:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_completion_counts_exclude_parent_siblings_and_foreign_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let _home = crate::test_support::SealedHome::at(dir.path());
+    let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 8);
+    let parent = manager.insert_test_running_agent("scope-parent", dir.path());
+    let sibling = manager.insert_test_running_agent("scope-sibling", dir.path());
+    let direct = manager.insert_test_running_agent("scope-direct", dir.path());
+    let foreign = manager.insert_test_running_agent("scope-foreign", dir.path());
+    manager
+        .worker_records
+        .get_mut(&direct)
+        .unwrap()
+        .parent_run_id = Some(parent.clone());
+    manager
+        .worker_records
+        .get_mut(&foreign)
+        .unwrap()
+        .parent_run_id = Some(parent.clone());
+    manager.assign_test_session_owner(&foreign, "different-session");
+    assert_eq!(manager.live_count_for_parent("workspace", &parent), 1);
+    assert_eq!(manager.running_count_for_parent("workspace", &parent), 1);
+    assert_eq!(manager.live_count_for_session("workspace"), 3);
+    manager.worker_records.remove(&direct);
+    assert_eq!(manager.live_count_for_parent("workspace", &parent), 0);
+    for id in [parent, sibling, direct, foreign] {
+        if let Some(handle) = manager
+            .agents
+            .get_mut(&id)
+            .and_then(|agent| agent.task_handle.take())
+        {
+            handle.abort();
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn settled_projection_waiter_releases_origin_lease_and_mailbox_before_metadata_lock() {
+    let _cost_scope = crate::cost_status::test_scope();
+    let tmp = tempdir().unwrap();
+    let _home = crate::test_support::SealedHome::at(tmp.path());
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(tmp.path().into(), 2)));
+    let worker = manager
+        .write()
+        .await
+        .insert_test_running_agent("projection", tmp.path());
+    manager
+        .write()
+        .await
+        .assign_test_session_owner(&worker, "projection-session");
+    let owner = "interactive:projection-session:origin-turn";
+    let sink_lifetime = Arc::new(());
+    let sink_weak = Arc::downgrade(&sink_lifetime);
+    crate::cost_status::register_runtime_usage_sink(
+        owner,
+        Arc::new(move |_| {
+            let _held = &sink_lifetime;
+            true
+        }),
+    );
+    let (mailbox, mut receiver) = Mailbox::new(CancellationToken::new());
+    let mut runtime = stub_runtime();
+    runtime.manager = manager.clone();
+    runtime.mailbox = Some(mailbox);
+    runtime.runtime_usage_lease = crate::cost_status::acquire_runtime_usage_lease(owner);
+    let projection = engine::ChildAccountingProjection::capture(&runtime, &worker);
+    drop(runtime);
+    crate::cost_status::finish_runtime_usage_owner(owner);
+    let route = crate::cost_status::EffectiveRouteEnvelope::capture(
+        None,
+        ProviderKind::Deepseek,
+        "deepseek",
+        "deepseek-v4-flash",
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
+        chrono::Utc::now(),
+    );
+    let usage = Usage {
+        input_tokens: 13,
+        output_tokens: 7,
+        ..Usage::default()
+    };
+    let held_metadata = manager.write().await;
+    projection.recover_settled(
+        &tokio::runtime::Handle::current(),
+        "settled-response".into(),
+        route,
+        usage,
+        Some(7),
+        crate::cost_status::RuntimeUsageMissingReason::SuccessWithoutUsage,
+    );
+    tokio::task::yield_now().await;
+    drop(projection);
+    assert!(
+        sink_weak.upgrade().is_none(),
+        "the metadata waiter must not extend the billing lease"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .is_none(),
+        "the metadata waiter must not retain the originating mailbox"
+    );
+    assert!(
+        crate::cost_status::take_runtime_usage(owner)
+            .records
+            .is_empty(),
+        "recovery never bills"
+    );
+    drop(held_metadata);
+    let manager = tokio::time::timeout(Duration::from_secs(1), manager.read())
+        .await
+        .unwrap();
+    let record = manager
+        .get_result_by_ref_for_session("projection-session", &worker)
+        .unwrap();
+    let usage = record.usage.as_ref().unwrap();
+    assert_eq!(usage.total_tokens, Some(20));
+    assert_eq!(usage.cost_microusd, Some(7));
+}
+
+#[test]
+fn small_surface_starts_with_core_tools_and_discoverable_goal_control() {
+    let registry = small_surface_registry(FleetRole::Builder);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
+    let mut surface = ChildSurfaceProbe::new(catalog, &[]);
+
+    assert_eq!(
+        model_tool_names(model_request_tools(&mut surface)),
+        [
+            "agent",
+            "bash",
+            "edit",
+            "file_search",
+            "get_goal",
+            "load_skill",
+            "read",
+            "todo_write",
+            "tool_search",
+            "workflow",
+            "write"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    assert_eq!(
+        surface
+            .catalog()
+            .iter()
+            .find(|tool| tool.name == "get_goal")
+            .and_then(|tool| tool.defer_loading),
+        Some(false)
+    );
+    let strict = surface.request_tools(surface.catalog().to_vec(), true);
+    assert_eq!(
+        strict
+            .iter()
+            .find(|tool| tool.name == "read")
+            .and_then(|tool| tool.strict),
+        Some(true)
+    );
+}
+
+#[test]
+fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
+    let catalog = vec![
+        Tool {
+            defer_loading: Some(false),
+            ..synthetic_deferred_tool("read", 8)
+        },
+        synthetic_deferred_tool("agent", 8),
+        Tool {
+            defer_loading: Some(false),
+            ..synthetic_deferred_tool(TOOL_SEARCH_NAME, 8)
+        },
+    ];
+    let warm = ["agent".to_string()];
+    let mut first = ChildSurfaceProbe::new(catalog.clone(), &warm);
+    let mut second = ChildSurfaceProbe::new(catalog.clone(), &warm);
+    let first_wire = model_request_tools(&mut first);
+    let second_wire = model_request_tools(&mut second);
+    let first_json = crate::prompt_zones::wire_tool_catalog_json(&first_wire).expect("serializes");
+    let second_json =
+        crate::prompt_zones::wire_tool_catalog_json(&second_wire).expect("serializes");
+    assert_eq!(first_json, second_json, "same catalog plus same names");
+    assert!(first_wire.iter().any(|tool| tool.name == "agent"));
+    let mut cold = ChildSurfaceProbe::new(catalog, &[]);
+    let cold_wire = model_request_tools(&mut cold);
+    let cold_json = crate::prompt_zones::wire_tool_catalog_json(&cold_wire).expect("serializes");
+    assert_ne!(cold_json, first_json, "warming must change the wire block");
+    assert!(!cold_wire.iter().any(|tool| tool.name == "agent"));
+}
+
+#[test]
+fn eager_agent_and_workflow_stay_offered_without_search_rejection() {
+    use crate::core::engine::tool_catalog::{TOOL_SEARCH_NAME, execute_tool_search_with_cache};
+    use crate::core::session::ToolActivationCache;
+    use std::collections::HashSet;
+
+    let registry = small_surface_registry(FleetRole::Builder);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
+    let mut surface = ChildSurfaceProbe::new(catalog.clone(), &[]);
+    let eager_names = model_tool_names(model_request_tools(&mut surface));
+    for name in ["agent", "workflow"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.defer_loading),
+            Some(false),
+            "{name} is registered and eager"
+        );
+        assert!(eager_names.contains(name), "{name} must already be offered");
+    }
+
+    for (query, match_kind, wanted) in [
+        ("agent", "regex", "agent"),
+        ("workflow", "regex", "workflow"),
+        ("spawn subagent worker", "bm25", "agent"),
+        ("spawn subagent worker", "bm25", "workflow"),
+    ] {
+        let mut active = eager_names.iter().cloned().collect::<HashSet<_>>();
+        let mut cache = ToolActivationCache::default();
+        let metadata = execute_tool_search_with_cache(
+            TOOL_SEARCH_NAME,
+            &json!({"query": query, "match": match_kind}),
+            &catalog,
+            &mut active,
+            &mut cache,
+        )
+        .expect("tool_search runs")
+        .metadata
+        .expect("metadata");
+        let found = metadata["tool_references"].as_array().expect("refs");
+        let unavailable = metadata["unavailable_tool_references"]
+            .as_array()
+            .expect("unavailable refs");
+        assert!(
+            active.contains(wanted),
+            "{match_kind} {query:?} must keep {wanted} offered"
+        );
+        for name in ["agent", "workflow"] {
+            assert!(active.contains(name), "{name} must stay active");
+            assert!(
+                !found.iter().any(|value| value.as_str() == Some(name)),
+                "{match_kind} {query:?} must not re-offer eager {name}: {found:?}"
+            );
+            assert!(
+                !unavailable
+                    .iter()
+                    .any(|value| value["tool_name"].as_str() == Some(name)),
+                "{match_kind} {query:?} must not reject eager {name}: {unavailable:?}"
+            );
+            assert!(!cache.names().any(|cached| cached == name));
+        }
+    }
 }

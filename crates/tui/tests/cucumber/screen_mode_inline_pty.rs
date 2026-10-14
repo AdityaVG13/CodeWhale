@@ -42,7 +42,7 @@ fn offline_queue_late_unbracketed_submit_keeps_composer_and_commands_responsive(
             let trust_dir = workspace.workspace().join(".deepseek");
             std::fs::create_dir_all(&trust_dir).expect("workspace trust dir");
             std::fs::write(trust_dir.join("trusted"), "").expect("workspace trust marker");
-            let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+            let mut tui = Harness::builder(Harness::codewhale_binary())
                 .cwd(workspace.workspace())
                 .clear_env()
                 .seal_home(workspace.home())
@@ -59,20 +59,8 @@ fn offline_queue_late_unbracketed_submit_keeps_composer_and_commands_responsive(
                 .spawn()
                 .expect("start offline TUI");
 
-            wait_or_panic(
-                &mut tui,
-                "Choose your model provider",
-                STARTUP_WAIT,
-                "provider",
-            );
-            tui.send(keys::key::ctrl('o')).expect("Explore Offline");
-            wait_or_panic(&mut tui, "You're ready.", SETTLE_WAIT, "offline ready");
-            tui.send(keys::key::enter()).expect("leave onboarding");
             wait_or_panic(&mut tui, "New session", STARTUP_WAIT, "launch card");
-            tui.wait_for_idle(Duration::from_millis(100), SETTLE_WAIT)
-                .expect("composer ready");
-            tui.send(keys::key::ctrl('u'))
-                .expect("clear suggested prompt");
+            super::launch_card_pty::explore_offline_from_composer(&mut tui);
 
             tui.send(keys::key::text("late queue draft"))
                 .expect("raw prompt bytes");
@@ -137,7 +125,7 @@ fn inline_start_never_takes_the_alternate_screen_and_screen_commands_switch_it()
         std::fs::write(&path, config).expect("seed inline screen mode");
     }
 
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -241,15 +229,11 @@ fn wait_for_bottom_rows_painted(tui: &mut Harness, label: &str) {
     }
 }
 
-/// Walk the real onboarding into deterministic offline-explore mode: no
-/// provider, no credentials, no network.
+/// Land on the composer-first launch card with no
+/// provider, no credentials and no network.
 fn enter_live_shell(tui: &mut Harness) {
-    wait_or_panic(tui, "Choose your model provider", STARTUP_WAIT, "provider");
-    tui.send(keys::key::ctrl('o'))
-        .expect("choose Explore Offline");
-    wait_or_panic(tui, "You're ready.", SETTLE_WAIT, "offline explore ready");
-    tui.send(keys::key::enter()).expect("leave onboarding");
     wait_or_panic(tui, "New session", STARTUP_WAIT, "launch card");
+    super::launch_card_pty::explore_offline_from_composer(tui);
     // Typing goes straight to the composer; Enter sends the first message
     // and the session begins (the card dissolved on the first keystroke).
     // type_line, not send+enter: a zero-gap PTY write is paste-classified

@@ -587,6 +587,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
                 objective: "objective".into(),
                 role: None,
             },
@@ -605,6 +606,8 @@ mod tests {
             duration_ms: 0,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         };
         assert_eq!(WhaleState::for_subagent(&agent), WhaleState::Working);
         agent.status = SubAgentStatus::Completed;

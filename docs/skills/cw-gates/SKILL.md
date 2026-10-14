@@ -45,7 +45,7 @@ invocation, and applies the isolated build-dir topology
 
 ```bash
 scripts/dev-test.sh --list
-scripts/dev-test.sh crates/tui/src/elapsed.rs      # path → area + filter
+scripts/dev-test.sh crates/command-contract/src/elapsed.rs      # path → area + filter
 scripts/dev-test.sh tui tools::                    # area + filter
 scripts/dev-test.sh config
 ```
@@ -70,7 +70,7 @@ python3 scripts/check-persistence-backlog-budget.py
 python3 scripts/check-provider-registry.py         # provider registry drift
 python3 scripts/check-command-crate-boundaries.py  # command-contract boundary
 python3 scripts/check-command-migration-manifest.py
-python3 scripts/check-tui-locale-parity.py         # touched crates/tui/locales/
+python3 scripts/check-tui-locale-parity.py         # touched crates/localization/locales/
 sh scripts/check-tui-product-vocabulary.sh
 python3 scripts/check-readme-translations.py       # touched README*.md
 ./scripts/release/check-versions.sh                # touched a version anywhere
@@ -92,9 +92,9 @@ cargo test --workspace --all-features --locked --doc
 git diff --exit-code -- Cargo.lock                 # lockfile drift guard
 ```
 
-`--all-targets` matters: without it, clippy never lints test code, and the
-v0.9.10 release gate opened with four clippy failures on a green `main`, three
-of them in test targets.
+`--all-targets` matters: without it, clippy never lints test code. (CI runs
+the all-targets form since the v0.9.10 gate incident; run the same form
+locally so there is no weaker subset.)
 
 ### Rung 5 — website, when `web/` changed
 
@@ -104,14 +104,13 @@ cd web && npm ci && npm test && npm run check
 
 ## Claiming a test passed
 
-- Quote the real `test result: N passed; M failed` line, and confirm `N > 0`
-  **for the tests that cover your change**. `cargo test <filter>` exits 0 having
-  run zero tests when the filter matches nothing; an exit code alone has already
-  been mistaken for a pass here.
-- Prefer proving a regression test fails without the fix. A test that passes
-  either way pins the implementation, not the defect.
-- Audit any harness before trusting its score. `ok = ok and X or True` parses as
-  `(ok and X) or True` and once reported twelve unevaluated rows as passing.
+`AGENTS.md` ("Claiming a test passed") owns the rules: quote the real count
+line with `N > 0` for the tests that cover the change, prefer a regression
+test that fails without the fix, and audit hand-rolled scorers. Two additions
+for gate runs:
+
+- Check the count **per filter group**. A green run where one required filter
+  matched zero tests is a miss, not a pass.
 - A focused rerun of a failing test distinguishes flake from regression in
   seconds. Do that before calling anything a flake, and root-cause anything that
   fails outside a known-flaky name — check for unisolated config-path reads or

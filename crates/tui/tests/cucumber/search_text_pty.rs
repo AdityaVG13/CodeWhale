@@ -11,7 +11,7 @@ use super::qa_harness::{
 #[test]
 fn search_text_stays_in_modal_and_out_of_composer() {
     let workspace = make_sealed_workspace().expect("sealed workspace");
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -29,7 +29,7 @@ fn search_text_stays_in_modal_and_out_of_composer() {
         .spawn()
         .expect("start TUI");
     let timeout = Duration::from_secs(10);
-    tui.wait_for_text("Type a message", timeout).unwrap();
+    tui.wait_for_composer(timeout).unwrap();
     // Enter the live shell with a local command, without making a model call.
     tui.paste("/help").unwrap();
     tui.wait_for_text("❯ /help", timeout).unwrap();
@@ -44,11 +44,11 @@ fn search_text_stays_in_modal_and_out_of_composer() {
     for (open, title, prefix, query, escapes) in [
         (keys::key::f1(), "Help —", "Filter: ", "queue", 1),
         (keys::key::f1(), "Help —", "Filter: ", "Queue", 1),
-        (keys::key::f2(), "Config", "Search: ", "quiet", 2),
-        (keys::key::f2(), "Config", "Search: ", "effort", 2),
-        (keys::key::f2(), "Config", "Search: ", "json", 2),
-        (keys::key::f2(), "Config", "Search: ", "key", 2),
-        (keys::key::f2(), "Config", "Search: ", " 队列é", 2),
+        (keys::key::f2(), "Settings", "Search: ", "quiet", 2),
+        (keys::key::f2(), "Settings", "Search: ", "effort", 2),
+        (keys::key::f2(), "Settings", "Search: ", "json", 2),
+        (keys::key::f2(), "Settings", "Search: ", "key", 2),
+        (keys::key::f2(), "Settings", "Search: ", " 队列é", 2),
         (keys::key::ctrl('k'), "Command —", "Filter: ", "json", 1),
         (keys::key::ctrl('k'), "Command —", "Filter: ", "key", 1),
     ] {
@@ -76,7 +76,7 @@ fn search_text_stays_in_modal_and_out_of_composer() {
             .split_once('❯')
             .unwrap()
             .1
-            .split("[↑]")
+            .split("[↵]")
             .next()
             .unwrap()
             .trim_end();

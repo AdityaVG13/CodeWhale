@@ -15,7 +15,7 @@ const CONTAINER_USE_SOURCE: &str = "https://github.com/dagger/container-use";
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "mcp",
-    aliases: &[],
+    aliases: &["mcps"],
     usage: "/mcp [init|import|import approve <name>|import decline <name>|recommendations|add recommended <id>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>|retry <name>|doctor|validate|restart|reload]",
     description_key: "cmd_mcp_description",
 };
@@ -45,7 +45,12 @@ fn mcp_contextual(contexts: CommandContexts<'_>, args: Option<&str>) -> CommandR
 
 fn mcp(presentation: &mut dyn CommandPresentationContext, args: Option<&str>) -> CommandResult {
     let raw = args.unwrap_or("").trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("status") || raw.eq_ignore_ascii_case("list") {
+    if raw.is_empty() {
+        return CommandResult::action(AppAction::OpenExtensions {
+            tab: crate::tui::views::extensions::ExtensionsTab::Mcp,
+        });
+    }
+    if raw.eq_ignore_ascii_case("status") || raw.eq_ignore_ascii_case("list") {
         return CommandResult::action(AppAction::Mcp(McpUiAction::Show));
     }
 
@@ -244,10 +249,7 @@ fn mcp_unknown_id(presentation: &mut dyn CommandPresentationContext) -> String {
 fn recommended_mcp_text(presentation: &mut dyn CommandPresentationContext) -> String {
     let heading = presentation
         .translate("mcp_recommendations_heading", &[])
-        .unwrap_or_else(|_| {
-            "Suggested Codewhale plugins (MCP components; nothing installs automatically)"
-                .to_string()
-        });
+        .unwrap_or_else(|_| "Suggested MCP servers (nothing installs automatically)".to_string());
     let safety = presentation
         .translate(
             "mcp_recommendations_safety",
@@ -382,8 +384,7 @@ mod tests {
                     "Unknown MCP suggestion. Run {recommendations_command} to see the list.".to_string()
                 }
                 "mcp_recommendations_heading" => {
-                    "Suggested Codewhale plugins (MCP components; nothing installs automatically)"
-                        .to_string()
+                    "Suggested MCP servers (nothing installs automatically)".to_string()
                 }
                 "mcp_recommendations_safety" => {
                     "Looking adds nothing. Adding writes config only — review it before {restart_command} connects anything."
@@ -595,7 +596,7 @@ mod tests {
     fn recommendations_state_execution_and_install_boundaries() {
         let text = recommended_mcp_text(&mut FakePresentation);
         assert!(text.contains("nothing installs automatically"));
-        assert!(text.contains("Suggested Codewhale plugins"));
+        assert!(text.contains("Suggested MCP servers"));
         assert!(text.contains("never downloads or"));
         assert!(text.contains("installs this binary"));
         assert!(text.contains("experimental"));
@@ -621,6 +622,6 @@ mod tests {
             Some("Error: Command capability unavailable: presentation")
         );
         assert_eq!(McpCmd::info().description_key, "cmd_mcp_description");
-        assert_eq!(McpCmd::info().aliases, &[] as &[&str]);
+        assert_eq!(McpCmd::info().aliases, &["mcps"]);
     }
 }

@@ -109,6 +109,8 @@ fn default_capability_state() -> String {
 /// byte-identical: `{"kind":"send_message", ...fields}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_constitution: Option<serde_json::Value>,
     #[serde(
         default,
         rename = "maxOutputTokens",
@@ -382,6 +384,14 @@ pub enum Op {
         mode: String,
     },
 
+    /// Rewind an unchanged conversation. `expected` is the complete observed
+    /// session snapshot; a receiver must compare it before changing history.
+    /// The success/refusal receipt travels out-of-band.
+    RewindConversation {
+        expected: Value,
+        messages: Vec<Value>,
+    },
+
     /// Run context compaction on one exact provider route.
     CompactContext {
         id: String,
@@ -459,6 +469,7 @@ pub const OP_KINDS: &[&str] = &[
     "set_search_provider",
     "set_fleet_roster",
     "sync_session",
+    "rewind_conversation",
     "compact_context",
     "cancel_compaction",
     "get_session_snapshot",
@@ -503,6 +514,7 @@ impl Op {
             Self::SetSearchProvider { .. } => "set_search_provider",
             Self::SetFleetRoster { .. } => "set_fleet_roster",
             Self::SyncSession { .. } => "sync_session",
+            Self::RewindConversation { .. } => "rewind_conversation",
             Self::CompactContext { .. } => "compact_context",
             Self::CancelCompaction { .. } => "cancel_compaction",
             Self::GetSessionSnapshot => "get_session_snapshot",
@@ -528,6 +540,7 @@ pub fn headless_send_message_op(thread_id: ThreadId, content: impl Into<String>)
         thread_id: thread_id.clone(),
         session_id: SessionId::new(),
         op: Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: content.into(),
             images: Vec::new(),
@@ -679,6 +692,10 @@ mod tests {
                 model: "m".into(),
                 workspace: PathBuf::from("/ws"),
                 mode: "agent".into(),
+            },
+            Op::RewindConversation {
+                expected: json!({"session_id": "s", "messages": []}),
+                messages: vec![],
             },
             Op::CompactContext {
                 id: "cmp-1".into(),

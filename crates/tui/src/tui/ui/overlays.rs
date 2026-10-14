@@ -75,8 +75,7 @@ pub(crate) fn toggle_help_view(app: &mut App) {
     if app.view_stack.top_kind() == Some(ModalKind::Help) {
         app.view_stack.pop();
     } else {
-        let help = HelpView::new_for_shortcuts(app.ui_locale, &app.workspace, &app.cached_skills)
-            .with_groups_expanded(app.help_expand_groups);
+        let help = HelpView::new_for_app(app, true).with_groups_expanded(app.help_expand_groups);
         app.view_stack.push(help);
     }
     app.needs_redraw = true;
@@ -225,7 +224,8 @@ pub(crate) async fn cycle_permission_posture(
 
 /// Open the one canonical provider setup surface for onboarding. Fresh
 /// onboarding opens on the full provider catalog, hosted providers included
-/// (#5563), with `L` as the explicit opt-in local-only view. Missing-key
+/// (#5563). Local runtimes are listed, and `L` filters to them, only once one
+/// answered the startup probe or is already configured. Missing-key
 /// recovery instead focuses the already-configured route so an exact Kimi
 /// Code K3 configuration can expose its plan route before a secret is entered.
 /// Either way the picker opens on the navigable list (#4763): onboarding never
@@ -246,11 +246,12 @@ pub(crate) async fn open_onboarding_provider_picker(
     app.view_stack.push(
         crate::tui::provider_picker::ProviderPickerView::new_for_onboarding(
             app.api_provider,
-            recover_configured_route.then_some(app.onboarding_provider),
+            recover_configured_route.then(|| app.onboarding_provider.as_str().into()),
             config,
             runtime_status,
         )
         .with_locale(app.ui_locale)
+        .with_local_runtime_detected(app.local_runtime_detected)
         .with_provider_health(&app.provider_health),
     );
     app.needs_redraw = true;
@@ -295,13 +296,8 @@ pub(crate) async fn open_provider_picker(
     engine_handle: &EngineHandle,
 ) {
     if app.onboarding == OnboardingState::Provider {
-        open_onboarding_provider_picker(
-            app,
-            config,
-            engine_handle,
-            app.onboarding_missing_key_recovery,
-        )
-        .await;
+        let recover_configured_route = app.onboarding_recovers_configured_route();
+        open_onboarding_provider_picker(app, config, engine_handle, recover_configured_route).await;
     } else {
         open_launch_provider_picker(app, config, engine_handle).await;
     }
@@ -318,6 +314,22 @@ pub(crate) fn open_text_pager(app: &mut App, title: String, content: String) {
         &content,
         width.saturating_sub(2),
     ));
+}
+
+/// Open a unified diff in a pager, rendered like an edit in the transcript.
+pub(crate) fn open_diff_pager(app: &mut App, title: String, diff: &str) {
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    // A patch is file content. Keep the terminal-injection boundary
+    // `PagerView::from_text` applies to every other pager body.
+    let mut sanitized = String::with_capacity(diff.len());
+    crate::tui::osc8::strip_ansi_into(diff, &mut sanitized);
+    let lines = crate::tui::diff_render::render_diff(&sanitized, width.saturating_sub(2));
+    app.view_stack
+        .push(PagerView::new(title, lines).with_copy_text(sanitized));
 }
 
 pub(crate) fn open_context_inspector(app: &mut App) {
@@ -400,13 +412,17 @@ pub(crate) fn toggle_live_transcript_overlay(app: &mut App) {
 pub(crate) fn open_model_picker_for_provider(
     app: &mut App,
     config: &Config,
-    provider: crate::config::ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) {
+    if let Err(reason) = config.verify_provider_identity(identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
     if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
         app.view_stack
             .push(crate::tui::model_picker::ModelPickerView::new(app, config));
     }
-    for ch in provider.display_name().chars() {
+    for ch in identity.key.as_str().chars() {
         // Char input updates the query and never emits a ViewEvent, so the
         // returned (empty) event list is safe to drop.
         let _ = app.view_stack.handle_key(crossterm::event::KeyEvent::new(
@@ -441,6 +457,12 @@ pub(crate) fn disable_hotbar(app: &mut App, config: &mut Config) {
 }
 
 pub(crate) fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
+    refresh_config_view_after_commit(app, focus_key, false);
+}
+
+/// Rebuild an open settings view from disk truth after a commit. When the host
+/// rejected the value, the editor reopens with what the user typed.
+pub(crate) fn refresh_config_view_after_commit(app: &mut App, focus_key: &str, rejected: bool) {
     if app.view_stack.top_kind() != Some(ModalKind::Config) {
         return;
     }
@@ -448,7 +470,13 @@ pub(crate) fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
         return;
     };
     let rebuilt = match boxed.as_any_mut().downcast_ref::<ConfigView>() {
-        Some(previous) => ConfigView::rebuild_preserving(app, previous, focus_key),
+        Some(previous) => {
+            let mut view = ConfigView::rebuild_preserving(app, previous, focus_key);
+            if rejected {
+                view.restore_rejected_commit(previous);
+            }
+            view
+        }
         // Not a `ConfigView`: rebuild from scratch rather than restoring an
         // unknown modal, matching how the stack got here.
         None => {
@@ -492,11 +520,12 @@ pub(crate) fn push_approval_request_view(
     description: &str,
     tool_input: &serde_json::Value,
     approval_key: &str,
+    approval_grouping_key: &str,
     intent_summary: Option<&str>,
     default_selection: crate::config::ApprovalDefaultSelection,
     timeout: Option<std::time::Duration>,
 ) {
-    let request = ApprovalRequest::new_with_intent(
+    let mut request = ApprovalRequest::new_with_intent(
         id,
         tool_name,
         description,
@@ -505,6 +534,33 @@ pub(crate) fn push_approval_request_view(
         intent_summary,
         &app.workspace,
     );
+    // The engine owns the grant scope: a child's grouping key is prefixed
+    // with its agent so "allow for this conversation" never covers the
+    // parent or a sibling (C3). Keep the card's own key only when the
+    // event carries none.
+    if !approval_grouping_key.is_empty() {
+        request.approval_grouping_key = approval_grouping_key.to_string();
+    }
+    // A child's gate never consults saved repo allow rules, so a child card
+    // must not offer "Always allow in this repo" — it would do nothing. The
+    // card names its agent (approvals C1).
+    if crate::tools::subagent::SubAgentManager::is_child_approval_id(id) {
+        request.persistent_allow_rules.clear();
+        if let Some(agent_id) = crate::tui::pending_requests::child_agent_id(id) {
+            request.owner = Some(crate::tui::pending_requests::owner_for(app, agent_id));
+        }
+    } else if !request.is_repo_law_prompt() {
+        // The same edit runs without a card inside a git repository. Say why
+        // this folder asks, so two folders behaving differently is explained
+        // on the card. The engine already decided to ask; this only labels it.
+        request.asks_without_git = crate::core::authority::file_write_asks_without_git(
+            app.mode,
+            app.approval_mode,
+            &app.workspace,
+            tool_name,
+            tool_input,
+        );
+    }
     app.view_stack.push(
         ApprovalView::new_with_default_selection(request, app.ui_locale, default_selection)
             .with_timeout(timeout),

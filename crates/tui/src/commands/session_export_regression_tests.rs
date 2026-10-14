@@ -59,7 +59,7 @@ impl ExportHarness {
             memory_path: temp.path().join("memory.md"),
             notes_path: temp.path().join("notes.txt"),
             mcp_config_path: temp.path().join("mcp.json"),
-            ..crate::test_support::test_tui_options(temp.path())
+            ..crate::tui::test_support::test_tui_options(temp.path())
         };
         let app = App::new(options, &Config::default());
         Self {
@@ -118,6 +118,7 @@ fn adapter_projects_authoritative_metadata_and_omits_hidden_payloads() {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-1".to_string(),
                     name: "fetch_url".to_string(),
                     input: serde_json::json!({"url": "https://example.com/a"}),
@@ -283,8 +284,15 @@ fn adapter_reuses_turn_handoff_renderer_and_workspace_value() {
     let direct = crate::tui::ui::turn_handoff_markdown(&harness.app);
     let projection = turn_handoff_projection(&mut harness.app);
 
+    // The renderer stamps `generated <wall-clock second>` on every call, so two
+    // calls straddling a second boundary legitimately differ in that one field
+    // (seen on Windows CI: `10:35:58` vs `10:35:59`). Compare everything else
+    // byte-for-byte, and check both calls still carry the stamp.
+    assert!(direct.contains(" \u{b7} generated "));
+    assert!(projection.markdown.contains(" \u{b7} generated "));
     assert_eq!(
-        projection.markdown, direct,
+        normalize_turn_generated_at(&projection.markdown),
+        normalize_turn_generated_at(&direct),
         "renderer output must not drift"
     );
     assert!(projection.markdown.contains("# Turn handoff"));
@@ -300,7 +308,7 @@ fn adapter_projects_absent_restore_points_without_creating_a_repo() {
     let workspace = harness.temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     harness.app.workspace = workspace.clone();
-    let before = crate::snapshot::snapshot_git_dir(&workspace);
+    let before = crate::snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
     assert!(!before.exists(), "precondition: no side repo yet");
 
     let projection = conversation_projection(&mut harness.app);
@@ -310,7 +318,9 @@ fn adapter_projects_absent_restore_points_without_creating_a_repo() {
         RestorePointProjection::None
     ));
     assert!(
-        !crate::snapshot::snapshot_git_dir(&workspace).exists(),
+        !crate::snapshot::snapshot_git_dir(&workspace)
+            .expect("snapshot path")
+            .exists(),
         "projection must never create the snapshot repo"
     );
 }
@@ -694,6 +704,7 @@ fn baseline_golden_messages() -> Vec<Message> {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-1".to_string(),
                     name: "fetch_url".to_string(),
                     input: serde_json::json!({
@@ -712,6 +723,7 @@ fn baseline_golden_messages() -> Vec<Message> {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call-1".to_string(),
                 content: "Authorization: Bearer another-secret-token\nresult ok".to_string(),
                 is_error: Some(false),
@@ -988,6 +1000,7 @@ fn command_clipboard_export_preserves_structure_and_redacts_secrets() {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-1".to_string(),
                     name: "fetch_url".to_string(),
                     input: serde_json::json!({
@@ -1006,6 +1019,7 @@ fn command_clipboard_export_preserves_structure_and_redacts_secrets() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call-1".to_string(),
                 content: "Authorization: Bearer another-secret-token\nresult ok".to_string(),
                 is_error: Some(false),
@@ -1271,14 +1285,16 @@ fn command_export_does_not_create_a_snapshot_repo_for_a_fresh_workspace() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     let app = &mut harness.app;
     app.workspace = workspace.clone();
-    let before = crate::snapshot::snapshot_git_dir(&workspace);
+    let before = crate::snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
     assert!(!before.exists(), "precondition: no side repo yet");
 
     let result = dispatch(app, Some("clipboard"));
     assert!(!result.is_error, "{:?}", result.message);
 
     assert!(
-        !crate::snapshot::snapshot_git_dir(&workspace).exists(),
+        !crate::snapshot::snapshot_git_dir(&workspace)
+            .expect("snapshot path")
+            .exists(),
         "export must never create the side repo"
     );
 }

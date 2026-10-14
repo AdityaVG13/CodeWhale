@@ -41,9 +41,8 @@ pub fn apply_model_patches(
     facts: &ScopedFacts,
     fetched_at: u64,
 ) -> Vec<SkippedPatch> {
-    let mut skipped = Vec::new();
     if !facts.is_current_at(crate::catalog::now_unix()) {
-        return skipped;
+        return Vec::new();
     }
     let source = CatalogSource::CloudFacts {
         facts_version: facts.facts_version,
@@ -51,7 +50,23 @@ pub fn apply_model_patches(
         fetched_at,
         valid_until: facts.valid_until,
     };
-    for patch in &facts.models {
+    apply_patches(rows, &facts.models, &source, true)
+}
+
+/// Apply field patches under `source`.
+///
+/// Shared by the signed cloud layer and Codewhale's bundled corrections
+/// ([`crate::catalog::corrections`]), so both correct a row the same way.
+/// `materialize` lets an `Upsert` create a row that no lower layer listed;
+/// corrections pass `false` because they only ever fix rows that exist.
+pub(crate) fn apply_patches(
+    rows: &mut BTreeMap<Key, CatalogOffering>,
+    patches: &[ModelFact],
+    source: &CatalogSource,
+    materialize: bool,
+) -> Vec<SkippedPatch> {
+    let mut skipped = Vec::new();
+    for patch in patches {
         let key = (patch.provider.clone(), patch.id.clone());
         if rows.get(&key).is_some_and(|row| {
             !matches!(
@@ -106,14 +121,18 @@ pub fn apply_model_patches(
                 if let Some(row) = rows.get_mut(&key) {
                     // A capability patch must not refresh or relabel inherited prices.
                     let inherited_price_source = row.pricing_source().clone();
-                    patch_fields(row, patch);
-                    row.cost_source = Some(if patch.pricing.is_some() {
+                    // Patches never restate modalities, so their authority
+                    // stays with the layer that did.
+                    row.modalities_source = Some(row.modalities_source().clone());
+                    row.retain_fact_sources();
+                    patch_fields(row, patch, source);
+                    row.cost_source = Some(if patch_sets_price(patch) {
                         source.clone()
                     } else {
                         inherited_price_source
                     });
                     row.source = source.clone();
-                } else if patch.context_window.is_some() || patch.allow_unlisted {
+                } else if materialize && (patch.context_window.is_some() || patch.allow_unlisted) {
                     // A row materializes when the payload says enough to be
                     // worth a row: a context window, or an explicit unlisted
                     // assertion that this id exists. An id-only attested row is
@@ -127,8 +146,8 @@ pub fn apply_model_patches(
                         source: source.clone(),
                         ..CatalogOffering::default()
                     };
-                    patch_fields(&mut row, patch);
-                    if patch.pricing.is_some() {
+                    patch_fields(&mut row, patch, source);
+                    if patch_sets_price(patch) {
                         row.cost_source = Some(source.clone());
                     }
                     rows.insert(key, row);
@@ -136,14 +155,23 @@ pub fn apply_model_patches(
                     skipped.push(SkippedPatch {
                         provider: patch.provider.clone(),
                         id: patch.id.clone(),
-                        reason: "upsert ignored: new row needs context_window or allow_unlisted"
-                            .into(),
+                        reason: if materialize {
+                            "upsert ignored: new row needs context_window or allow_unlisted"
+                        } else {
+                            "upsert ignored: no such row"
+                        }
+                        .into(),
                     });
                 }
             }
         }
     }
     skipped
+}
+
+/// Whether a patch owns the row's price: a new price block, or a withheld one.
+fn patch_sets_price(patch: &ModelFact) -> bool {
+    patch.pricing.is_some() || patch.pricing_withheld.is_some()
 }
 
 /// Does this payload explicitly assert `(provider, id)` exists even when the
@@ -196,44 +224,48 @@ pub fn complete_provider_live_row(row: &mut CatalogOffering, facts: &ScopedFacts
     }) else {
         return false;
     };
-    let mut filled = false;
-    let mut limit = row.limit.clone().unwrap_or_default();
-    if limit.context.is_none()
-        && let Some(context) = patch.context_window
-    {
-        limit.context = Some(context);
-        filled = true;
-    }
-    if limit.output.is_none()
-        && let Some(output) = patch.max_output
-    {
-        limit.output = Some(output);
-        filled = true;
-    }
-    if filled {
-        row.limit = Some(limit);
-    }
-    if row.reasoning.is_none()
-        && let Some(reasoning) = patch.reasoning
-    {
-        row.reasoning = Some(reasoning);
-        filled = true;
-    }
-    filled
+    let lower = CatalogOffering {
+        provider: row.provider.clone(),
+        wire_model_id: row.wire_model_id.clone(),
+        endpoint_key: row.endpoint_key.clone(),
+        limit: (patch.context_window.is_some() || patch.max_output.is_some()).then_some(
+            crate::models_dev::ModelsDevLimit {
+                context: patch.context_window,
+                input: None,
+                output: patch.max_output,
+            },
+        ),
+        reasoning: patch.reasoning,
+        source: CatalogSource::CloudFacts {
+            facts_version: facts.facts_version,
+            key_id: facts.key_id.clone(),
+            fetched_at: 0,
+            valid_until: facts.valid_until,
+        },
+        ..Default::default()
+    };
+    row.complete_facts_from(&lower)
 }
 
-fn patch_fields(row: &mut CatalogOffering, patch: &ModelFact) {
+fn patch_fields(row: &mut CatalogOffering, patch: &ModelFact, source: &CatalogSource) {
     if patch.context_window.is_some() || patch.max_output.is_some() {
         let mut limit = row.limit.clone().unwrap_or_default();
         if let Some(context) = patch.context_window {
             limit.context = Some(context);
+            row.fact_sources
+                .insert("limit.context".to_string(), source.clone());
         }
         if let Some(output) = patch.max_output {
             limit.output = Some(output);
+            row.fact_sources
+                .insert("limit.output".to_string(), source.clone());
         }
         row.limit = Some(limit);
     }
-    if let Some(pricing) = &patch.pricing {
+    if patch.pricing_withheld.is_some() {
+        // No flat rate is honest for this row; unknown beats misleading.
+        row.cost = None;
+    } else if let Some(pricing) = &patch.pricing {
         // A price block has one authority. Missing classes stay unknown instead
         // of silently mixing an old row's prices with newly signed rates.
         row.cost = Some(ModelsDevCost {
@@ -241,10 +273,30 @@ fn patch_fields(row: &mut CatalogOffering, patch: &ModelFact) {
             output: pricing.output_per_m,
             cache_read: pricing.cache_read_per_m,
             cache_write: None,
+            ..Default::default()
         });
     }
     if patch.reasoning.is_some() {
         row.reasoning = patch.reasoning;
+        row.fact_sources
+            .insert("reasoning".to_string(), source.clone());
+    }
+    if let Some(options) = &patch.reasoning_options {
+        // Keep this layer's own annotations; replace only the controls.
+        let markers = row
+            .reasoning_options
+            .drain(..)
+            .filter(|value| value.get("cloud_facts").is_some())
+            .collect::<Vec<_>>();
+        row.reasoning_options = options.clone();
+        row.reasoning_options_present = true;
+        row.reasoning_options.extend(markers);
+        row.fact_sources
+            .insert("reasoning_options".to_string(), source.clone());
+    }
+    if let Some(name) = &patch.display_name {
+        row.name = Some(name.clone());
+        row.fact_sources.insert("name".to_string(), source.clone());
     }
     if patch.display_name.is_some() || patch.note.is_some() {
         annotate(row, patch, "upsert");

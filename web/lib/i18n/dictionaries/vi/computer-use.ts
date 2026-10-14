@@ -8,7 +8,7 @@ import type { ComputerUseDict } from "../types";
  * system UI names (Trợ năng, Ghi màn hình, Ứng dụng).
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Computer Use cho Mac · Codewhale",
+  metaTitle: "Computer Use · Bản xem trước · Codewhale",
   metaDescription: "Tải và thiết lập Codewhale Computer Use cho Mac. Điều khiển ứng dụng trong nền, thiết lập quyền truy cập, cùng nút Pause và Stop do bạn kiểm soát.",
   title: "Computer Use",
   lead: "Để Codewhale làm việc trong các ứng dụng của bạn trong khi bạn vẫn tiếp tục công việc. Trợ lý cho Mac đưa quyền truy cập, điều khiển ứng dụng trong nền và cách tạm dừng hoặc dừng thao tác nhập lên thanh menu.",
@@ -30,7 +30,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Chạy kiểm tra nền", body: "Trợ lý mở một cửa sổ thử nghiệm dùng một lần, nhập văn bản và chụp cửa sổ đó, đồng thời kiểm tra xem con trỏ hoặc ứng dụng đang hoạt động có thay đổi trong lúc chạy hay không." },
     { title: "Kết nối với Codewhale", body: "Xem lại, tin cậy và bật Computer Use trong chợ plugin của Codewhale. Hãy dùng plugin 0.3.1 trở lên để các thao tác cục bộ đi qua nút Pause và Stop của trợ lý." },
   ],
-  controlsTitle: "Tiếp tục làm việc. Giữ quyền kiểm soát.",
+  controlsTitle: "Tạm dừng hoặc dừng điều khiển ứng dụng",
   controlsBody: "Các thao tác được hỗ trợ chạy trong nền trên ứng dụng đã chọn. Ứng dụng và cử chỉ cần điều khiển ở nền trước phải được bạn cho phép. Menu hiển thị ứng dụng mục tiêu và chế độ nhập; Pause (tạm dừng) ngưng thao tác nhập của trợ lý, còn Stop (dừng) kết thúc các phiên hiện có của nó.",
   updateTitle: "Cập nhật khi bạn muốn",
   updateBody: "Chọn Check for updates (kiểm tra cập nhật) trong ứng dụng. Trước khi cài bản cập nhật, ứng dụng kiểm tra tệp tải về, chữ ký Codewhale và công chứng của Apple, đồng thời giữ lại bản cũ để khôi phục khi cần.",
@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Xem kiểm tra nền",
   source: "Mã nguồn và các nền tảng khác",
   platforms: "Bản tải này dành cho Mac. Windows và Linux hiện dùng plugin từ mã nguồn cùng thiết lập phía máy chủ.",
-  installTitle: "Computer Use cho Mac",
-  installLead: "Thêm khả năng điều khiển ứng dụng trong nền với trợ lý Computer Use. Thiết lập quyền trên Mac, chạy kiểm tra nền, rồi tạm dừng hoặc dừng thao tác nhập của trợ lý từ thanh menu.",
-  installLink: "Tải và thiết lập Computer Use",
 };

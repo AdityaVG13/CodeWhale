@@ -118,11 +118,7 @@ pub(crate) fn safe_agent_display_name(app: &App, agent_id: &str) -> String {
             .map(|agent| (agent.agent_id.as_str(), agent.nickname.as_deref())),
         app.ui_locale.tag(),
     );
-    app.subagent_cache
-        .iter()
-        .find(|agent| agent.agent_id == agent_id)
-        .and_then(crate::tui::sidebar::dispatched_agent_name)
-        .map(str::to_string)
+    app.agent_given_name(agent_id)
         .or_else(|| generated.get(agent_id).cloned())
         .or_else(|| app.agent_label_map.get(agent_id).cloned())
         .and_then(|name| safe_child_value(app, &name))
@@ -192,7 +188,7 @@ pub(crate) fn project_agent_details(app: &App, agent_id: &str) -> Option<AgentDe
     if let Some(duration_ms) = surface_row.duration_ms {
         state.push(format!(
             "elapsed {}",
-            crate::elapsed::format_elapsed_ms(duration_ms)
+            codewhale_command_contract::elapsed::format_elapsed_ms(duration_ms)
         ));
     }
     state.push(format!(
@@ -561,7 +557,7 @@ mod tests {
                 model: "test-model".to_string(),
                 use_mouse_capture: true,
                 max_subagents: 4,
-                ..crate::test_support::test_tui_options(workspace)
+                ..crate::tui::test_support::test_tui_options(workspace)
             },
             &Config::default(),
         )
@@ -578,11 +574,14 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "Implement the bounded details route".to_string(),
                 role: Some("worker".to_string()),
             },
             model: "deepseek-v4-pro".to_string(),
-            nickname: Some("Blue Whale".to_string()),
+            nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                agent_id, "en",
+            )),
             status,
             worker_status: None,
             runtime_permissions: None,
@@ -596,6 +595,8 @@ mod tests {
             duration_ms: 2_500,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -713,7 +714,9 @@ mod tests {
         assert!(details.body.contains(&format!(
             "State: {} · elapsed {} · {} steps",
             row.status,
-            crate::elapsed::format_elapsed_ms(row.duration_ms.expect("duration")),
+            codewhale_command_contract::elapsed::format_elapsed_ms(
+                row.duration_ms.expect("duration")
+            ),
             row.steps_taken
         )));
         assert!(details.body.contains("Model: kimi-k3"));

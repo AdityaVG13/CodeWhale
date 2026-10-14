@@ -5,10 +5,10 @@ use tempfile::TempDir;
 
 #[test]
 fn doctor_api_key_rows_never_name_the_retired_antigravity_slot() {
-    let rows: Vec<crate::config::ApiProvider> = doctor_api_key_providers().collect();
-    assert!(!rows.contains(&crate::config::ApiProvider::Antigravity));
-    assert!(rows.contains(&crate::config::ApiProvider::Deepseek));
-    assert!(rows.contains(&crate::config::ApiProvider::Google));
+    let rows: Vec<crate::config::ProviderKind> = doctor_api_key_providers().collect();
+    assert!(!rows.contains(&crate::config::ProviderKind::Antigravity));
+    assert!(rows.contains(&crate::config::ProviderKind::Deepseek));
+    assert!(rows.contains(&crate::config::ProviderKind::Google));
     assert!(
         rows.iter()
             .all(|provider| provider.as_str() != "antigravity")
@@ -92,7 +92,7 @@ fn offline_doctor_loads_never_materialize_secret_environment_overrides() {
                 .is_none()
         );
         assert_eq!(
-            config.base_url.as_deref(),
+            config.deepseek_table_base_url(),
             Some("https://safe-doctor.example:9443/v1")
         );
         assert_eq!(config.allow_shell, Some(false));
@@ -152,6 +152,7 @@ fn make_server(command: Option<&str>, args: &[&str], url: Option<&str>) -> McpSe
         disabled: false,
         enabled: true,
         required: false,
+        lazy: false,
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: std::collections::HashMap::new(),
@@ -284,12 +285,13 @@ fn doctor_mcp_reports_redact_url_argv_and_env_values() {
 }
 #[test]
 fn doctor_provider_json_redacts_every_credential_url_to_its_authority() {
-    let mut providers = crate::config::ApiProvider::all().to_vec();
-    providers.push(crate::config::ApiProvider::DeepseekCN);
-
-    for provider in providers {
+    for row in codewhale_config::descriptors::provider_compatibility() {
+        if row.kind == crate::config::ProviderKind::Antigravity {
+            continue;
+        }
+        let provider = row.id;
         let config = Config {
-            provider: Some(provider.as_str().to_string()),
+            provider: Some(provider.to_string()),
             ..Config::default()
         };
         let report = doctor_provider_model_report_json(&config);
@@ -326,9 +328,9 @@ fn doctor_provider_url_reports_omit_secret_capable_components() {
         sentinels[0], sentinels[1], sentinels[2], sentinels[3], sentinels[4], sentinels[5]
     );
     let config = Config {
-        base_url: Some(base_url),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some(base_url));
     let target = doctor_api_target(&config);
     let human = format!(
         "base_url: {}",
@@ -400,12 +402,12 @@ fn explicit_doctor_api_probes_may_load_workspace_dotenv_credentials() {
 #[test]
 fn hosted_provider_does_not_probe_without_explicit_opt_in() {
     assert!(!doctor_should_probe_api(
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         "https://api.deepseek.com/beta",
         crate::doctor::DoctorProbeRequest::default(),
     ));
     assert!(doctor_should_probe_api(
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         "https://api.deepseek.com/beta",
         crate::doctor::DoctorProbeRequest {
             probe_api: true,
@@ -521,9 +523,9 @@ fn resolve_api_key_source_does_not_probe_system_keyring() {
 #[test]
 fn credential_diagnostic_distinguishes_literal_from_empty_config_keys() {
     let literal = Config {
-        api_key: Some("TEST-LITERAL-CONFIG-KEY".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("TEST-LITERAL-CONFIG-KEY".to_string()), None);
     assert_eq!(
         resolve_credential_diagnostic(&literal),
         CredentialDiagnostic::new(
@@ -550,9 +552,9 @@ fn credential_diagnostic_distinguishes_literal_from_empty_config_keys() {
     assert!(!doctor_has_credentials_or_local_runtime(&empty));
 
     let empty_root = Config {
-        api_key: Some(String::new()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     assert_eq!(
         resolve_credential_diagnostic(&empty_root).source,
         ApiKeySource::SecretStoreUnprobed
@@ -568,9 +570,9 @@ fn credential_diagnostic_treats_sentinel_as_unprobed_store_not_config() {
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
     let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
     let config = Config {
-        api_key: Some(crate::config::API_KEYRING_SENTINEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(crate::config::API_KEYRING_SENTINEL.to_string()), None);
 
     assert_eq!(
         resolve_credential_diagnostic(&config),
@@ -735,13 +737,13 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
         assert_eq!(
             crate::provider_readiness::credential_state_for_provider(
                 &named_custom,
-                crate::config::ApiProvider::Custom,
+                &(named_custom).test_identity_for_kind(crate::config::ProviderKind::Custom),
             ),
             crate::provider_readiness::CredentialState::MissingKey
         );
         let readiness = crate::provider_readiness::resolve_for_model(
             &named_custom,
-            crate::config::ApiProvider::Custom,
+            &(named_custom).test_identity_for_kind(crate::config::ProviderKind::Custom),
             "sentinel-model",
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         );
@@ -752,9 +754,10 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
         assert!(!readiness.can_attempt());
         assert!(
             crate::model_inventory::ModelInventory::from_config(&named_custom)
+                .unwrap()
                 .candidates
                 .iter()
-                .all(|candidate| candidate.provider != crate::config::ApiProvider::Custom)
+                .all(|candidate| candidate.provider != crate::config::ProviderKind::Custom)
         );
 
         let xai = Config {
@@ -771,7 +774,7 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
         assert_eq!(
             crate::provider_readiness::credential_state_for_provider(
                 &xai,
-                crate::config::ApiProvider::Xai,
+                &(xai).test_identity_for_kind(crate::config::ProviderKind::Xai),
             ),
             crate::provider_readiness::CredentialState::MissingKey
         );
@@ -783,7 +786,10 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
             ..Default::default()
         };
         assert_eq!(
-            crate::route_billing::for_route(&xiaomi, crate::config::ApiProvider::XiaomiMimo),
+            crate::route_billing::for_route(
+                &xiaomi,
+                &(xiaomi).test_identity_for_kind(crate::config::ProviderKind::XiaomiMimo)
+            ),
             crate::route_billing::BillingPresentation::Subscription("MiMo token plan")
         );
     }
@@ -960,4 +966,31 @@ fn test_bare_stdio_command_is_structurally_valid_without_resolution() {
         McpServerDoctorStatus::Ok(detail) => assert!(detail.contains("command omitted")),
         other => panic!("Expected structural Ok, got {other:?}"),
     }
+}
+
+#[test]
+fn receipts_cli_parses_id_last_turn_and_format() {
+    use clap::Parser as _;
+    let cli = crate::Cli::try_parse_from(["codewhale", "receipts", "--last", "--format", "json"])
+        .expect("parse --last");
+    assert!(matches!(
+        cli.command,
+        Some(crate::Commands::Receipts {
+            last: true,
+            id: None,
+            format: crate::receipts::ReceiptFormat::Json,
+            ..
+        })
+    ));
+    let cli = crate::Cli::try_parse_from(["codewhale", "receipt", "thr_1", "--turn", "turn_2"])
+        .expect("parse alias");
+    assert!(matches!(
+        cli.command,
+        Some(crate::Commands::Receipts { ref id, ref turn, format: crate::receipts::ReceiptFormat::Md, .. })
+            if id.as_deref() == Some("thr_1") && turn.as_deref() == Some("turn_2")
+    ));
+    assert!(
+        crate::Cli::try_parse_from(["codewhale", "receipts", "abc", "--last"]).is_err(),
+        "an id and --last conflict"
+    );
 }

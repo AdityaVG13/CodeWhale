@@ -132,7 +132,26 @@ impl App {
         }
         let selected = startup_config.apply_saved_selection(&settings);
         let config = &startup_config;
-        let model = if selected {
+        // First launch writes `default_text_model = DEFAULT_TEXT_MODEL` into
+        // the generated config.toml; that line is the template, not a choice,
+        // so it must not turn off local discovery on a later launch.
+        let generated_default_model = config.provider.is_none()
+            && config.default_text_model.as_deref() == Some(DEFAULT_TEXT_MODEL);
+        let startup_route_configured = config.provider.is_some()
+            || (config.default_text_model.is_some() && !generated_default_model)
+            || config.legacy_model.is_some()
+            || crate::config::explicit_launch_provider_override().is_some()
+            || crate::config::explicit_launch_model_override().is_some()
+            || config
+                .active_provider_identity()
+                .ok()
+                .as_ref()
+                .and_then(|identity| config.provider_config_for(identity))
+                .is_some_and(|entry| entry.model.is_some())
+            || config.active_route_endpoint_configured();
+        // Provider and model come from the same resolved config, even on the
+        // first run. An options default must not replace a configured model.
+        let model = if selected || startup_route_configured {
             config.default_model()
         } else {
             model
@@ -159,26 +178,15 @@ impl App {
                 None
             }
         });
-        let provider = config.api_provider();
-        let provider_identity_record =
-            config
-                .active_provider_identity(provider)
-                .unwrap_or_else(|_| {
-                    let key = config.provider_identity_for(provider);
-                    let exact_id = (!(provider == ApiProvider::Custom
-                        && config.uses_legacy_literal_custom_route()))
-                    .then(|| key.clone());
-                    crate::config::ProviderIdentity {
-                        provider,
-                        key,
-                        exact_id,
-                        migrated_legacy_ollama_cloud_route: false,
-                    }
-                });
+        let admission = config.active_provider_identity();
+        let admission_error = admission.as_ref().err().cloned();
+        let provider_identity = admission.ok();
+        // An unadmitted selection remains visible as a refusal; this inert
+        // display kind cannot be used as request/config authority.
+        let provider = provider_identity
+            .as_ref()
+            .map_or(ProviderKind::Custom, |identity| identity.provider);
         let mut effective_auth_config = config.clone();
-        effective_auth_config.scope_to_provider_identity(&provider_identity_record);
-        let provider_identity = provider_identity_record.key;
-        let provider_exact_id = provider_identity_record.exact_id;
 
         // #5032: a stale `[providers.xai] oauth_credential_generation` pointer
         // whose owned credential file is gone makes `credentials_valid` return
@@ -195,9 +203,10 @@ impl App {
         // pointer, an expired/revoked token, or a never-completed login), repair
         // a stale pointer once, surface a truthful xAI message, and suppress the
         // picker-recovery path below.
-        let xai_oauth_needs_reauth = provider == ApiProvider::Xai
-            && effective_auth_config
-                .provider_config_for(ApiProvider::Xai)
+        let xai_oauth_needs_reauth = provider == ProviderKind::Xai
+            && provider_identity
+                .as_ref()
+                .and_then(|identity| effective_auth_config.provider_config_for(identity))
                 .and_then(|entry| entry.auth_mode.as_deref())
                 .is_some_and(crate::oauth::auth_mode_uses_xai_oauth)
             && !crate::oauth::credentials_present(
@@ -217,9 +226,12 @@ impl App {
                         // Keep the in-memory route consistent with the repaired
                         // persisted file so the running app never reaches for
                         // the missing generation.
-                        effective_auth_config
-                            .provider_config_for_mut(ApiProvider::Xai)
-                            .oauth_credential_generation = None;
+                        if let Some(identity) = provider_identity.as_ref()
+                            && let Ok(entry) =
+                                effective_auth_config.provider_config_for_mut(identity)
+                        {
+                            entry.oauth_credential_generation = None;
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -239,24 +251,24 @@ impl App {
             None
         };
         let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
-        let provider_chain = provider
-            .kind()
-            .map(|kind| ProviderChain::new(kind, &config.fallback_providers))
+        let provider_chain = provider_identity
+            .as_ref()
+            .filter(|identity| {
+                identity.key.as_str() == identity.provider.as_str()
+                    && identity.provider != ProviderKind::Antigravity
+            })
+            .map(|identity| ProviderChain::new(identity.provider, &config.fallback_providers))
             .filter(|chain| chain.providers().len() > 1);
-
-        // Snapshot per-provider readiness for the fallback chain (#2574). Uses
-        // the same `has_api_key_for` helper the provider picker uses, so hosted
-        // providers require a key and self-hosted ones (Ollama/vLLM/SGLang) are
-        // reported ready without one. Empty when there is no fallback chain.
         let provider_readiness = provider_chain
             .as_ref()
             .map(|chain| {
                 chain
                     .providers()
                     .iter()
-                    .map(|kind| {
-                        let provider = ApiProvider::from_kind(*kind);
-                        (provider, has_api_key_for(config, provider))
+                    .filter_map(|kind| config.builtin_provider_identity(*kind).ok())
+                    .map(|identity| {
+                        let ready = has_api_key_for(config, &identity);
+                        (identity, ready)
                     })
                     .collect()
             })
@@ -348,31 +360,28 @@ impl App {
         // Remembered route choices were resolved once into Config. The
         // chooser and hotbar must not revive archived Settings values.
         let mut provider_models = HashMap::new();
-        for &candidate in ApiProvider::all() {
-            if candidate != ApiProvider::Custom
-                && let Some(model) = config
-                    .provider_config_for(candidate)
-                    .and_then(|entry| entry.model.as_ref())
+        for identity in config.provider_identities() {
+            if let Some(model) = config
+                .provider_config_for(&identity)
+                .and_then(|entry| entry.model.as_ref())
             {
-                provider_models.insert(config.provider_identity_for(candidate), model.clone());
+                provider_models.insert(identity.key.to_string(), model.clone());
             }
         }
-        if let Some(providers) = config.providers.as_ref() {
-            for (identity, entry) in &providers.custom {
-                if let Some(model) = entry.model.as_ref() {
-                    provider_models.insert(identity.clone(), model.clone());
-                }
-            }
+        if let Some(identity) = &provider_identity {
+            provider_models.insert(identity.key.to_string(), model.clone());
         }
-        provider_models.insert(provider_identity.clone(), model.clone());
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
-        let mut enabled_provider_models = settings.enabled_models.clone().unwrap_or_default();
-        for (saved_provider, saved_model) in &provider_models {
-            push_enabled_provider_model(&mut enabled_provider_models, saved_provider, saved_model);
-        }
-        push_enabled_provider_model(&mut enabled_provider_models, &provider_identity, &model);
-        let active_context_window_override = config.context_window_for_provider_config(provider);
-        let active_model_context_windows = config.model_context_windows_for(provider).cloned();
+        // `settings.toml [enabled_models]` is no longer read (#6533): the
+        // picker ranks by use, which this index derives from saved sessions.
+        let route_usage = crate::model_relevance::SharedRouteUsage::default();
+        crate::model_relevance::spawn_build(route_usage.clone());
+        let active_context_window_override = provider_identity
+            .as_ref()
+            .and_then(|identity| config.context_window_for_provider_config(identity));
+        let active_model_context_windows = provider_identity
+            .as_ref()
+            .and_then(|identity| config.model_context_windows_for(identity).cloned());
         let configured_route_base_url = effective_auth_config.active_route_base_url();
         let (active_route_limits, active_route_base_url, active_context_window_source) =
             if auto_model {
@@ -389,23 +398,28 @@ impl App {
                     },
                 )
             } else {
-                crate::route_runtime::resolve_runtime_route(
-                    &effective_auth_config,
-                    provider,
-                    Some(&model),
-                )
-                .map(|resolution| {
-                    (
-                        crate::route_budget::known_route_limits(resolution.candidate.limits()),
-                        resolution.candidate.endpoint().base_url.clone(),
-                        resolution.context_window.source,
-                    )
-                })
-                .unwrap_or((
-                    None,
-                    configured_route_base_url,
-                    crate::route_runtime::ContextWindowSource::Fallback,
-                ))
+                provider_identity
+                    .as_ref()
+                    .ok_or_else(|| "provider identity unavailable".to_string())
+                    .and_then(|identity| {
+                        crate::route_runtime::resolve_runtime_route_for_identity(
+                            &effective_auth_config,
+                            identity,
+                            Some(&model),
+                        )
+                    })
+                    .map(|resolution| {
+                        (
+                            crate::route_budget::known_route_limits(resolution.candidate.limits()),
+                            resolution.candidate.endpoint().base_url.clone(),
+                            resolution.context_window.source,
+                        )
+                    })
+                    .unwrap_or((
+                        None,
+                        configured_route_base_url,
+                        crate::route_runtime::ContextWindowSource::Fallback,
+                    ))
             };
         let reasoning_effort_explicit = config.fleet_operator_reasoning_applied
             || settings.reasoning_effort.is_some()
@@ -547,7 +561,7 @@ impl App {
         // YOLO is a permission change. A locked policy must not be sidestepped
         // by --yolo, default_mode=yolo, /zidong, or Alt+Y.
         let yolo_compat = yolo_requested && !approval_policy_locked;
-        let needs_workspace_trust = !yolo_compat && crate::tui::onboarding::needs_trust(&workspace);
+        let needs_workspace_trust = !yolo_compat && crate::config::needs_trust(&workspace);
         // The language screen is required only when the locale cannot be
         // confidently inferred from settings or the environment; returning
         // users never see it.
@@ -637,16 +651,20 @@ impl App {
         let work_runtime =
             crate::work_graph::new_shared_work_runtime(todos.clone(), plan_state.clone());
 
-        let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
+        let skills_discovery_mode =
+            crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
         let cached_skills = Self::discover_cached_skills(
             &workspace,
             &skills_dir,
-            skills_scan_codewhale_only,
+            skills_discovery_mode,
             plugin_registry.as_ref(),
         );
 
-        let input_history = crate::composer_history::load_history();
+        // The recall cap applies from the first keystroke, not only after the
+        // first submit: the persisted file keeps its own larger cap (U01-m2).
+        let mut input_history = crate::composer_history::load_history();
+        input_history.drain(..input_history.len().saturating_sub(max_input_history));
         let mention_cwd = std::env::current_dir().ok();
         let start_remote_control = matches!(initial_input, Some(InitialInput::RemoteControl));
         let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
@@ -706,7 +724,7 @@ impl App {
             .unwrap_or((0, Vec::new()));
         let mut hotbar_actions = HotbarActionRegistry::with_configured_routes(
             config,
-            provider,
+            provider_identity.as_ref(),
             &model,
             &provider_models,
         );
@@ -788,12 +806,15 @@ impl App {
             api_message_stamps: Vec::new(),
             session_journal: crate::session_tree::SessionJournal::new(),
             completed_assistant_outputs: Vec::new(),
+            pending_plan_handoff: None,
             context_token_cache: std::cell::RefCell::new(Default::default()),
             remote_control: crate::remote_control::RemoteControlController::default(),
             start_remote_control_on_launch: start_remote_control,
             is_loading: false,
+            feedback_dispatch: None,
             dispatch_completion_tx: None,
             dispatch_in_flight: false,
+            dispatch_cancel: None,
             last_enter_instant: None,
             provider_wait_incident_logged: false,
             prompt_suggestion: None,
@@ -801,9 +822,11 @@ impl App {
             prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
             turn_error_posted: false,
+            turn_error_notice: None,
             // Surface parse warnings so the user knows their config file is
             // broken instead of silently losing all settings.
-            status_message: xai_dangling_repair_message
+            status_message: admission_error
+                .or(xai_dangling_repair_message)
                 .or(settings_parse_warning)
                 .or(tui_prefs_migration_notice)
                 .or(theme_warning),
@@ -817,7 +840,7 @@ impl App {
             plugin_cta: crate::tui::plugin_suggestions::PluginCtaState::from_settings(&settings),
             model,
             provider_models,
-            enabled_provider_models,
+            route_usage,
             configured_models: config.custom_models.clone().unwrap_or_default(),
             pinned_models: settings.pinned_models.clone(),
             auto_model,
@@ -829,8 +852,7 @@ impl App {
             pending_auto_route_receipt: None,
             active_turn: None,
             api_provider: provider,
-            provider_identity,
-            provider_exact_id,
+            provider_identity: provider_identity.clone(),
             provider_chain,
             provider_readiness,
             provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
@@ -853,7 +875,7 @@ impl App {
             configured_sandbox_mode: config.sandbox_mode.clone(),
             configured_sandbox_network: config.sandbox_network_access,
             sandbox_backend: crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-                config.prefer_bwrap.unwrap_or(false),
+                config.prefers_bwrap(),
             ),
             // #4022: the worker thread is spawned lazily on first submit, so
             // constructing an App never costs a thread.
@@ -868,7 +890,7 @@ impl App {
                 .map(PathBuf::from),
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
-            skills_scan_codewhale_only,
+            skills_discovery_mode,
             project_context_pack_enabled: config.project_context_pack_enabled(),
             memory_path,
             use_memory,
@@ -878,6 +900,7 @@ impl App {
             use_bracketed_paste,
             use_paste_burst_detection,
             bracketed_paste_seen: false,
+            bracketed_paste_trusted: crate::tui::paste::terminal_delivers_bracketed_paste(),
             system_prompt: None,
             auto_compact,
             auto_compact_user_configured,
@@ -912,8 +935,12 @@ impl App {
             show_tool_details,
             inline_diff_mode,
             ui_locale,
+            constitution_reviewed_digest: None,
             cost_currency,
-            billing_presentation: crate::route_billing::for_route(config, provider),
+            billing_presentation: provider_identity.as_ref().map_or(
+                crate::route_billing::BillingPresentation::Unknown,
+                |identity| crate::route_billing::for_route(config, identity),
+            ),
             composer_density,
             composer_border,
             composer_multiline_mode,
@@ -949,9 +976,13 @@ impl App {
             agent_activity_started_at: None,
             agent_counter: 0,
             agent_label_map: HashMap::new(),
+            background_finished: Vec::new(),
+            finished_shell_ids: HashMap::new(),
+            notified_shell_ids: HashSet::new(),
+            notified_task_ids: HashSet::new(),
+            subagent_cache_received_at: None,
             agent_focus: None,
             agent_queued_follow_ups: HashMap::new(),
-            agent_role_counters: HashMap::new(),
             last_agent_progress_redraw: None,
             last_workflow_budget_redraw: None,
             ui_theme,
@@ -963,13 +994,20 @@ impl App {
             redaction_gate_confirming: false,
             redaction_gate_scroll: std::cell::Cell::new(0),
             onboarding_needs_api_key: needs_api_key,
+            startup_route_configured,
             onboarding_provider: provider,
             onboarding_workspace_trust_gate,
             onboarding_missing_key_recovery,
+            onboarding_key_rejected: None,
             onboarding_explore_offline: false,
-            onboarding_had_language_step: onboarding_needs_language,
+            // Language is asked in /setup, never at launch: counting it here
+            // made the one launch screen read "Getting started · 2/3" with no
+            // step 1 in sight (#6566).
+            onboarding_had_language_step: onboarding_needs_language
+                && onboarding == OnboardingState::Language,
             onboarding_had_provider_step: !was_onboarded && needs_api_key,
             onboarding_had_trust_step: !was_onboarded && needs_workspace_trust,
+            local_runtime_detected: false,
             api_key_env_only,
             hooks,
             lifecycle_outbox,
@@ -992,6 +1030,8 @@ impl App {
             },
             view_stack: ViewStack::new(),
             pending_user_input_prompt: None,
+            pending_child_requests: std::collections::BTreeMap::new(),
+            child_agent_sessions: std::collections::HashMap::new(),
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
             offline_queue_lease: None,
@@ -1000,6 +1040,7 @@ impl App {
             pending_goal_controls: VecDeque::new(),
             current_session_metadata: None,
             session_artifacts: Vec::new(),
+            session_turn_outcomes: Vec::new(),
             trust_mode: yolo_compat || configured_trust_mode,
             translation_enabled: false,
             mini_window: config.mini_window.clone().unwrap_or_default(),
@@ -1088,10 +1129,13 @@ impl App {
             cumulative_turn_duration: std::time::Duration::ZERO,
             session_metrics: crate::tui::session_metrics::SessionMetrics::default(),
             balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            balance_route: None,
             draft_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             mcp_login: None,
+            mcp_retries: Vec::new(),
+            mcp_login_reconnect: None,
             prompt_suggestion_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             balance_initiated: false,
             last_balance_fetch: None,
@@ -1104,6 +1148,7 @@ impl App {
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             memory_size_hint: None,
+            workspace_notes: Vec::new(),
             task_panel: Vec::new(),
             task_panel_session_id: None,
             task_panel_unavailable: false,
@@ -1113,7 +1158,7 @@ impl App {
                 settings.contextual_tips,
             ),
             footer_hint_uses: settings.footer_hint_uses.clone(),
-            workflow_panel: None,
+            workflow_runs: Vec::new(),
             session_started_at: chrono::Utc::now(),
             needs_redraw: true,
             fleet_roster_stale: false,
@@ -1128,6 +1173,7 @@ impl App {
             user_scrolled_during_stream: false,
             last_send_at: None,
             last_submitted_prompt: None,
+            unanswered_submission: None,
             auto_submit_initial_input,
             quit_armed_until: None,
             prefix_change_count: 0,
@@ -1140,7 +1186,7 @@ impl App {
             prefix_drift_count: 0,
             prefix_context_updates: 0,
             collapsed_cells: HashSet::new(),
-            folded_thinking: HashSet::new(),
+            cell_folds: HashMap::new(),
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),
@@ -1167,6 +1213,11 @@ impl App {
             receipt_started_at: None,
             tool_evidence: Vec::new(),
         };
+        // Restore presentation only; the visible-frame tick owns companion startup.
+        app.pet_watch.enabled = settings.pet_mode;
+        if settings.pet_mode {
+            app.launch.visible = false;
+        }
         if yolo_compat {
             app.notify_yolo_compat_once();
         }

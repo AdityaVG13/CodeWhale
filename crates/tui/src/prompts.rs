@@ -3,7 +3,7 @@
 //!
 //! Prompts are assembled from composable layers loaded at compile time from
 //! the single [`text`] module:
-//!   constitution + personality overlay → `message[0]` (byte-stable).
+//!   constitution → `message[0]` (byte-stable).
 //!   approval policy → request-time runtime metadata.
 //! Tool availability comes only from the per-turn model catalog.
 //!
@@ -53,7 +53,7 @@ pub struct PromptSessionContext<'a> {
     pub recovery_hint: Option<&'a str>,
     /// Restrict skill discovery to Codewhale-owned roots plus explicit
     /// `skills_dir` configuration.
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Immutable plugin snapshot owned by this App/Engine workspace context.
     /// Never sourced from process-global mutable state.
     pub plugin_registry: Option<&'a crate::plugins::PluginRegistry>,
@@ -75,7 +75,7 @@ impl Default for PromptSessionContext<'_> {
             context_window_override: None,
             verbosity: None,
             recovery_hint: None,
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             mode: AppMode::Agent,
         }
@@ -90,12 +90,83 @@ pub const HANDOFF_RELATIVE_PATH: &str = ".codewhale/handoff.md";
 /// Legacy handoff path for reading from existing installs.
 const LEGACY_HANDOFF_RELATIVE_PATH: &str = ".deepseek/handoff.md";
 
+/// The relay artifact a new session reads: the primary path when a file
+/// exists there, otherwise the legacy fallback. Returns the file to read and
+/// its workspace-relative name, so every caller names the path actually read.
+pub(crate) fn resolve_handoff_path(workspace: &Path) -> (PathBuf, &'static str) {
+    let primary = workspace.join(HANDOFF_RELATIVE_PATH);
+    if primary.exists() {
+        (primary, HANDOFF_RELATIVE_PATH)
+    } else {
+        (
+            workspace.join(LEGACY_HANDOFF_RELATIVE_PATH),
+            LEGACY_HANDOFF_RELATIVE_PATH,
+        )
+    }
+}
+
 /// Per-file size cap for `instructions = [...]` entries (#454). Mirrors
 /// the existing project-context cap in `project_context::load_context_file`
 /// so a malicious / oversized include can't blow the prompt budget on
 /// its own. Files larger than this are truncated with an explicit `[…truncated: N bytes omitted]`
 /// marker rather than skipped entirely so the model still sees the head.
 const INSTRUCTIONS_FILE_MAX_BYTES: usize = 100 * 1024;
+
+/// Read at most `cap` bytes of a prompt file plus slack for the leading
+/// whitespace the renderers trim, so an oversized file is never read whole
+/// into memory just to be truncated. Returns the text and the file's full
+/// length (for the truncation note). A file that is not UTF-8 within the read
+/// window is an error, as a whole-file `read_to_string` would report; only a
+/// character cut by the window's end is dropped.
+fn read_prompt_file_bounded(path: &Path, cap: usize) -> std::io::Result<(String, usize)> {
+    use std::io::Read as _;
+
+    const LEADING_WHITESPACE_SLACK: usize = 4 * 1024;
+    let file = std::fs::File::open(path)?;
+    let full_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut bytes = Vec::new();
+    file.take((cap + LEADING_WHITESPACE_SLACK) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() < full_len;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            // Only a multi-byte character split by the read window is
+            // forgiven; invalid bytes anywhere else still fail the read.
+            if !truncated || bytes.len() - valid > 3 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ));
+            }
+            bytes.truncate(valid);
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        }
+    };
+    Ok((text, full_len))
+}
+
+/// Cap `trimmed` at `cap` bytes on a character boundary, noting what was
+/// omitted out of `total` (the file length when the read itself was bounded).
+fn cap_prompt_text(trimmed: &str, total: usize, cap: usize, hint: &str) -> String {
+    if trimmed.len() <= cap && total <= trimmed.len() {
+        return trimmed.to_string();
+    }
+    let head_end = (0..=cap.min(trimmed.len()))
+        .rev()
+        .find(|&i| trimmed.is_char_boundary(i))
+        .unwrap_or(0);
+    let total = total.max(trimmed.len());
+    format!(
+        "{}\n[…truncated: {} of {} bytes omitted — {hint}]",
+        &trimmed[..head_end],
+        total - head_end,
+        total
+    )
+}
 
 /// System prompt block appended when `translation_enabled` is true.
 /// Instructs the model to respond in the resolved session locale for all
@@ -189,19 +260,157 @@ fn translation_target_language_for_tag(locale_tag: &str) -> &'static str {
 /// churned the otherwise-static prefix on every release. The live workspace
 /// path is delivered per-turn via `<turn_meta>` (see `turn_metadata_block`).
 pub(crate) fn render_environment_block(_workspace: &Path, locale_tag: &str) -> String {
-    let platform = std::env::consts::OS;
-    let shell = crate::shell_dispatcher::global_dispatcher()
-        .kind()
-        .binary()
-        .to_string();
+    let (platform, shell) = environment_host_facts();
+    format_environment_block(locale_tag, &platform, &shell, npm_launcher_fact())
+}
 
-    format!(
+/// Format the `## Environment` block from already-resolved facts. Pure, so
+/// the plain and npm-launcher shapes can both be tested on any host.
+fn format_environment_block(
+    locale_tag: &str,
+    platform: &str,
+    shell: &str,
+    launcher: Option<&str>,
+) -> String {
+    let mut block = format!(
         "## Environment\n\
          \n\
          - lang: {locale_tag}\n\
          - platform: {platform}\n\
          - shell: {shell}"
+    );
+    if let Some(launcher) = launcher {
+        block.push_str("\n- launcher: ");
+        block.push_str(launcher);
+    }
+    block
+}
+
+/// On Windows an npm install keeps the launcher's `node.exe` as this
+/// process's parent for the whole session, and Windows ends `codewhale.exe`
+/// with it (#6827). Like `platform` and `shell`, this is stable for the life
+/// of the process and changes how commands must be written, so it belongs in
+/// the static block. It names no PID, so the prefix stays cacheable.
+const NPM_LAUNCHER_FACT: &str = "npm (node.exe is this session's parent; killing node.exe by name ends this and other npm-launched Codewhale sessions, so stop servers by PID or port)";
+
+fn launcher_fact(
+    is_windows: bool,
+    method: codewhale_release::InstallMethod,
+) -> Option<&'static str> {
+    (is_windows && method == codewhale_release::InstallMethod::Npm).then_some(NPM_LAUNCHER_FACT)
+}
+
+/// The launcher line for this process. Install detection reads the
+/// executable's path, so it runs once and only on Windows; recorded
+/// conformance environments never carry it.
+fn npm_launcher_fact() -> Option<&'static str> {
+    #[cfg(test)]
+    if RECORDED_ENVIRONMENT.with(|cell| cell.borrow().is_some()) {
+        return None;
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    static METHOD: std::sync::OnceLock<codewhale_release::InstallMethod> =
+        std::sync::OnceLock::new();
+    launcher_fact(
+        true,
+        *METHOD.get_or_init(codewhale_release::current_install_method),
     )
+}
+
+#[cfg(test)]
+mod npm_launcher_fact_tests {
+    use super::*;
+    use codewhale_release::InstallMethod;
+
+    #[test]
+    fn plain_environment_block_is_unchanged() {
+        assert_eq!(
+            format_environment_block("en", "windows", "powershell", None),
+            "## Environment\n\n- lang: en\n- platform: windows\n- shell: powershell"
+        );
+    }
+
+    #[test]
+    fn windows_npm_install_names_the_node_launcher() {
+        let block = format_environment_block(
+            "en",
+            "windows",
+            "powershell",
+            launcher_fact(true, InstallMethod::Npm),
+        );
+        assert!(
+            block.ends_with(&format!("\n- launcher: {NPM_LAUNCHER_FACT}")),
+            "{block}"
+        );
+        assert!(block.contains("stop servers by PID or port"), "{block}");
+    }
+
+    #[test]
+    fn launcher_fact_is_windows_npm_only() {
+        assert_eq!(launcher_fact(false, InstallMethod::Npm), None);
+        for method in [
+            InstallMethod::Binary,
+            InstallMethod::Cargo,
+            InstallMethod::Homebrew,
+            InstallMethod::Omarchy,
+        ] {
+            assert_eq!(launcher_fact(true, method), None);
+        }
+    }
+}
+
+/// The host facts the `## Environment` block names: this process's OS and
+/// the shell commands run under. Conformance goldens recorded on one host
+/// replay that host's facts on the recording thread
+/// ([`pin_recorded_environment`]); production always reports this host.
+fn environment_host_facts() -> (String, String) {
+    #[cfg(test)]
+    if let Some(recorded) = RECORDED_ENVIRONMENT.with(|cell| cell.borrow().clone()) {
+        return recorded;
+    }
+    (
+        std::env::consts::OS.to_string(),
+        crate::shell_dispatcher::global_dispatcher()
+            .kind()
+            .binary()
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDED_ENVIRONMENT: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replay a recorded host's OS and shell in this thread's environment block
+/// until the guard drops. The only caller, the scripted conformance families,
+/// is Unix-only and runs its engine on this thread's runtime.
+#[cfg(all(test, unix))]
+pub(crate) fn pin_recorded_environment(os: &str, shell: &str) -> RecordedEnvironmentGuard {
+    RECORDED_ENVIRONMENT
+        .with(|cell| *cell.borrow_mut() = Some((os.to_string(), shell.to_string())));
+    RecordedEnvironmentGuard
+}
+
+/// The replayed shell on this thread, when a recorded environment is pinned.
+/// Tool descriptions that name the shell use it too, so a replay never
+/// depends on which shell first initialized their process-wide caches.
+#[cfg(all(test, unix))]
+pub(crate) fn recorded_shell() -> Option<String> {
+    RECORDED_ENVIRONMENT.with(|cell| cell.borrow().as_ref().map(|(_, shell)| shell.clone()))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct RecordedEnvironmentGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for RecordedEnvironmentGuard {
+    fn drop(&mut self) {
+        RECORDED_ENVIRONMENT.with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// Source for an `EngineConfig.instructions` entry. Either a disk file (loaded
@@ -255,39 +464,44 @@ impl From<&PathBuf> for InstructionSource {
 fn render_instructions_block(sources: &[InstructionSource]) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     for source in sources {
+        let mut total_len: Option<usize> = None;
         let (raw_source_name, raw_content): (String, String) = match source {
-            InstructionSource::File(path) => match std::fs::read_to_string(path) {
-                Ok(raw) => (path.display().to_string(), raw),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "instructions",
-                        ?err,
-                        ?path,
-                        "skipping unreadable instructions file"
-                    );
-                    continue;
+            InstructionSource::File(path) => {
+                match read_prompt_file_bounded(path, INSTRUCTIONS_FILE_MAX_BYTES) {
+                    Ok((raw, full_len)) => {
+                        // `full_len` covers bytes the bounded read left unread.
+                        total_len = Some(full_len);
+                        (path.display().to_string(), raw)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "instructions",
+                            ?err,
+                            ?path,
+                            "skipping unreadable instructions file"
+                        );
+                        continue;
+                    }
                 }
-            },
+            }
             InstructionSource::Inline { name, content } => (name.clone(), content.clone()),
         };
         let trimmed = raw_content.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let body = if trimmed.len() > INSTRUCTIONS_FILE_MAX_BYTES {
-            let head_end = (0..=INSTRUCTIONS_FILE_MAX_BYTES)
-                .rev()
-                .find(|&i| trimmed.is_char_boundary(i))
-                .unwrap_or(0);
-            format!(
-                "{}\n[…truncated: {} of {} bytes omitted — consider splitting this instructions file]",
-                &trimmed[..head_end],
-                trimmed.len() - head_end,
-                trimmed.len()
-            )
-        } else {
-            trimmed.to_string()
+        // A bounded read that stopped short makes the file's own length the
+        // total; otherwise the trimmed text is everything there was.
+        let total = match total_len {
+            Some(full_len) if raw_content.len() < full_len => full_len,
+            _ => trimmed.len(),
         };
+        let body = cap_prompt_text(
+            trimmed,
+            total,
+            INSTRUCTIONS_FILE_MAX_BYTES,
+            "consider splitting this instructions file",
+        );
         sections.push(format!(
             "<instructions source=\"{raw_source_name}\">\n{body}\n</instructions>"
         ));
@@ -303,25 +517,37 @@ fn render_instructions_block(sources: &[InstructionSource]) -> Option<String> {
 /// system-prompt block. Returns `None` when the file is absent or empty so
 /// callers can keep the default-uncluttered prompt for fresh workspaces.
 fn load_handoff_block(workspace: &Path) -> Option<String> {
-    let primary = workspace.join(HANDOFF_RELATIVE_PATH);
-    let path = if primary.exists() {
-        primary
-    } else {
-        workspace.join(LEGACY_HANDOFF_RELATIVE_PATH)
-    };
-    let raw = std::fs::read_to_string(&path).ok()?;
+    let (path, shown) = resolve_handoff_path(workspace);
+    // The relay is workspace-writable, so it gets the same per-file cap as
+    // an instructions file rather than an unbounded read into the prompt.
+    let (raw, full_len) = read_prompt_file_bounded(&path, INSTRUCTIONS_FILE_MAX_BYTES).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
+    let total = if raw.len() < full_len {
+        full_len
+    } else {
+        trimmed.len()
+    };
+    let relay = cap_prompt_text(
+        trimmed,
+        total,
+        INSTRUCTIONS_FILE_MAX_BYTES,
+        "shorten the relay artifact",
+    );
     Some(format!(
-        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{HANDOFF_RELATIVE_PATH}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{trimmed}"
+        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{shown}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{relay}"
     ))
 }
 
 /// Load the structured user-global constitution, if present, and render it as
 /// its own model-facing block.
 pub(crate) fn load_user_constitution_block() -> Option<String> {
+    load_active_user_constitution()?.render_block(None)
+}
+
+pub(crate) fn load_active_user_constitution() -> Option<Box<codewhale_config::UserConstitution>> {
     if user_constitution_disabled_by_setup_state() {
         return None;
     }
@@ -338,9 +564,7 @@ pub(crate) fn load_user_constitution_block() -> Option<String> {
     };
 
     match codewhale_config::UserConstitution::load_from(&path) {
-        codewhale_config::UserConstitutionLoad::Loaded(constitution) => {
-            constitution.render_block(None)
-        }
+        codewhale_config::UserConstitutionLoad::Loaded(constitution) => Some(constitution),
         codewhale_config::UserConstitutionLoad::Missing
         | codewhale_config::UserConstitutionLoad::Empty => None,
         codewhale_config::UserConstitutionLoad::Invalid(err) => {
@@ -364,12 +588,7 @@ pub(crate) fn load_user_constitution_block() -> Option<String> {
 
 fn user_constitution_disabled_by_setup_state() -> bool {
     match codewhale_config::SetupState::load() {
-        Ok(Some(state)) => matches!(
-            state.constitution_choice,
-            codewhale_config::ConstitutionChoice::Bundled
-                | codewhale_config::ConstitutionChoice::Deferred
-                | codewhale_config::ConstitutionChoice::ExpertOverride
-        ),
+        Ok(Some(state)) => !state.constitution_choice.applies_user_global(),
         Ok(None) => false,
         Err(err) => {
             tracing::warn!(
@@ -391,8 +610,6 @@ fn user_constitution_disabled_by_setup_state() -> bool {
 // prompt text in `text.rs` directly; the test suite below guards content
 // and ordering invariants (constitution structure and binding gates #4032,
 // byte-stable prefix ordering, prefix privacy #4632).
-#[cfg(test)]
-use text::CALM_PERSONALITY;
 pub use text::{
     BASE_PROMPT, COMPACT_TEMPLATE, CORE_EXECUTION_PROFILE_PROMPT, GOAL_CONTINUATION_PROMPT,
     LANGUAGE_PROMPT, MEMORY_GUIDANCE, OUTPUT_PROMPT,
@@ -421,7 +638,7 @@ static PROMPT_OVERRIDE_NOTICES: LazyLock<Mutex<Vec<String>>> =
 
 /// Context passed to an embedder-provided static prompt composer.
 ///
-/// This hook only replaces the byte-stable base/personality prompt segment.
+/// This hook only replaces the byte-stable base prompt segment.
 /// Approval policy, Core Execution, and action-specific relay formatting stay
 /// owned by Codewhale.
 #[non_exhaustive]
@@ -429,14 +646,12 @@ static PROMPT_OVERRIDE_NOTICES: LazyLock<Mutex<Vec<String>>> =
 pub struct StaticPromptCtx<'a> {
     /// Active model identifier after caller-side routing.
     pub model_id: &'a str,
-    /// Personality overlay requested for the base static prompt.
-    pub personality: Personality,
-    /// Default base/personality prompt layers that would be used without an
+    /// Default base prompt layers that would be used without an
     /// override.
     pub default_layers: &'a str,
 }
 
-/// Embedder hook for replacing Codewhale's byte-stable base/personality prompt
+/// Embedder hook for replacing Codewhale's byte-stable base prompt
 /// segment.
 pub type StaticPromptComposer = dyn Fn(&StaticPromptCtx<'_>) -> String + Send + Sync + 'static;
 
@@ -466,6 +681,11 @@ pub fn set_base_prompt_override(s: String) -> Result<(), String> {
 // also set an explicit opt-in flag (`CODEWHALE_ALLOW_BASE_PROMPT_OVERRIDE`).
 // This keeps replacing the global Constitution a deliberate, auditable act
 // rather than something a stray file can do.
+
+/// Target lane for the once-per-version constitution checkpoint. Bumped per
+/// release when the bundled constitution materially changes, so existing users
+/// re-acknowledge it once. 0.9.4 re-ships the Fleet/operate constitution.
+pub const CONSTITUTION_CHECKPOINT_VERSION: &str = "0.9.4";
 
 /// Relative path, under the config directory, of the optional base-prompt
 /// (constitution) override file.
@@ -802,7 +1022,7 @@ const LOCALE_PREAMBLE_ZH_HANS: &str = "## 语言要求\n\n\
 你正在 codewhale 中运行。无论任务上下文（代码、错误日志、文件名）\
 是英文，无论系统提示的其余部分是英文，你都必须用简体中文进行 \
 `reasoning_content`（内部思考）和最终回复。代码、文件路径、工具名称\
-（例如 `File`、`Bash`）、环境变量、命令行参数和 URL \
+（例如 `read`、`bash`）、环境变量、命令行参数和 URL \
 保持原样 —— 只有自然语言散文要切换到简体中文。\n\n\
 如果用户在会话中切换到另一种语言，从下一轮开始跟随切换。\
 如果用户明确要求（例如 \"think in English\"），则覆盖此规则。";
@@ -811,8 +1031,8 @@ const LOCALE_PREAMBLE_JA: &str = "## 言語要件\n\n\
 codewhale を実行しています。タスクコンテキスト（コード、エラーログ、\
 ファイル名）が英語であっても、システムプロンプトの他の部分が英語で\
 あっても、`reasoning_content`（内部思考）と最終的な返信は日本語で\
-行ってください。コード、ファイルパス、ツール名（例：`File`、\
-`Bash`）、環境変数、コマンドライン引数、URL は元のまま —— \
+行ってください。コード、ファイルパス、ツール名（例：`read`、\
+`bash`）、環境変数、コマンドライン引数、URL は元のまま —— \
 自然言語の文章のみ日本語に切り替えます。\n\n\
 ユーザーがセッション中に別の言語に切り替えた場合は、次のターンから\
 それに従ってください。ユーザーが明示的に要求した場合（例：\
@@ -824,8 +1044,8 @@ Você está rodando dentro do codewhale. Escreva tanto \
 em português do Brasil, mesmo quando o contexto da tarefa (código, \
 logs de erro, nomes de arquivos) estiver em inglês e mesmo quando o \
 resto do system prompt for em inglês. Mantenha código, caminhos de \
-arquivos, nomes de ferramentas (por exemplo `File`, \
-`Bash`), variáveis de ambiente, flags de linha de comando e \
+arquivos, nomes de ferramentas (por exemplo `read`, \
+`bash`), variáveis de ambiente, flags de linha de comando e \
 URLs no formato original — apenas a prosa em linguagem natural muda \
 para português do Brasil.\n\n\
 Se o usuário mudar de idioma no meio da sessão, mude no próximo turno. \
@@ -865,7 +1085,7 @@ const LOCALE_PREAMBLE_VI: &str = "## Yêu cầu ngôn ngữ\n\n\
 Bạn đang chạy trong codewhale. Cho dù ngữ cảnh tác vụ (mã nguồn, nhật ký lỗi, tên tệp) \
 là tiếng Anh, cho dù phần còn lại của system prompt là tiếng Anh, bạn đều phải sử dụng \
 tiếng Việt cho phần `reasoning_content` (suy nghĩ nội bộ) và câu trả lời cuối cùng. Các từ \
-mã nguồn, đường dẫn tệp, tên công cụ (ví dụ `File`, `Bash`), biến môi trường, \
+mã nguồn, đường dẫn tệp, tên công cụ (ví dụ `read`, `bash`), biến môi trường, \
 tham số dòng lệnh và URL giữ nguyên dạng gốc —— chỉ các văn bản giải thích bằng ngôn ngữ \
 tự nhiên mới được chuyển sang tiếng Việt.\n\n\
 Nếu người dùng chuyển sang ngôn ngữ khác trong phiên làm việc, hãy chuyển theo từ lượt tiếp theo. \
@@ -878,17 +1098,6 @@ dự án có là tiếng Anh, quá trình suy nghĩ của bạn cũng không đ�
 ở cấp phiên làm việc —— ngôn ngữ của người dùng quyết định ngôn ngữ của bạn, không phụ thuộc vào nội dung tiếng Anh \
 tích lũy trong ngữ cảnh. Trừ khi người dùng yêu cầu rõ ràng việc chuyển đổi (ví dụ \"think in English\"), \
 hãy tiếp tục suy nghĩ và trả lời bằng tiếng Việt.";
-
-// ── Personality selection ─────────────────────────────────────────────
-
-/// Which personality overlay to apply. Tone is folded into the constitutional
-/// preamble, so this is a compile-time marker carried through the static-prompt
-/// composer context rather than a separate overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Personality {
-    /// Cool, spatial, reserved — the default and only shipped personality.
-    Calm,
-}
 
 // ── Composition ───────────────────────────────────────────────────────
 
@@ -915,20 +1124,16 @@ whole list: the user may override a fact, but no one may invent one. When
 guidance conflicts, consult ### Whose word wins — that is the only place
 precedence is stated.";
 
-pub(crate) fn compose_prompt_with_approval_model_and_shell(
-    personality: Personality,
-    model_id: &str,
-) -> String {
-    let default_layers = compose_default_static_layers(personality, model_id);
+pub(crate) fn compose_prompt_with_approval_model_and_shell(model_id: &str) -> String {
+    let default_layers = compose_default_static_layers(model_id);
     apply_static_prompt_composer(
         effective_static_prompt_composer(),
-        personality,
         model_id,
         &default_layers,
     )
 }
 
-pub(crate) fn compose_default_static_layers(_personality: Personality, model_id: &str) -> String {
+pub(crate) fn compose_default_static_layers(model_id: &str) -> String {
     compose_default_static_layers_with_context(model_id, None)
 }
 
@@ -936,9 +1141,9 @@ fn compose_default_static_layers_with_context(
     model_id: &str,
     context_window_override: Option<u32>,
 ) -> String {
-    // Personality is folded into the constitutional preamble/articles — no
-    // separate overlay is appended. Language and output rules are split into
-    // their own static segments so the 0.9.0 constitution stays compact.
+    // Voice and tone live in the constitutional preamble. Language and output
+    // rules are split into their own static segments so the constitution
+    // stays compact.
     let layers = format!(
         "{}\n\n{}\n\n{}",
         effective_base_prompt().trim(),
@@ -960,14 +1165,12 @@ pub(crate) enum PromptHost {
 
 fn apply_static_prompt_composer(
     composer: Option<&StaticPromptComposer>,
-    personality: Personality,
     model_id: &str,
     default_layers: &str,
 ) -> String {
     match composer {
         Some(composer) => composer(&StaticPromptCtx {
             model_id,
-            personality,
             default_layers,
         }),
         None => default_layers.to_string(),
@@ -1027,7 +1230,7 @@ pub fn system_prompt_for_mode_with_context_and_skills(
             context_window_override: None,
             verbosity: None,
             recovery_hint: None,
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             mode: AppMode::Agent,
         },
@@ -1086,7 +1289,6 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
     );
     let composed = apply_static_prompt_composer(
         effective_static_prompt_composer(),
-        Personality::Calm,
         session_context.model_id,
         &default_layers,
     );
@@ -1122,9 +1324,8 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
         full_prompt = format!("{preamble}\n\n{full_prompt}");
     }
 
-    if let Some(user_constitution_block) = load_user_constitution_block() {
-        full_prompt = format!("{full_prompt}\n\n{user_constitution_block}");
-    }
+    // Personal preferences are captured once at turn admission and recorded in
+    // history, so live profile edits never mutate an in-flight prompt prefix.
 
     if session_context.project_context_pack_enabled
         && let Some(pack) = crate::project_context::generate_project_context_pack(workspace)
@@ -1158,9 +1359,7 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
     // `skills_dir` is configured, union it with the workspace view instead of
     // treating it as a fallback; the workspace view often returns Some and
     // would otherwise shadow the configured directory entirely.
-    let skill_discovery_mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-        session_context.skills_scan_codewhale_only,
-    );
+    let skill_discovery_mode = session_context.skills_discovery_mode;
     // The index budget scales with the route's context window (5%, floored),
     // so a 1M route sees the whole catalogue while a small local window still
     // keeps every skill name. Session-pinned: the window is fixed per route.
@@ -1379,8 +1578,10 @@ mod tests {
     use tempfile::tempdir;
 
     /// Discriminator unique to the injected relay block (not present in the
-    /// agent prompt's own discussion of the convention).
-    const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `.codewhale/handoff.md`";
+    /// agent prompt's own discussion of the convention). It stops before the
+    /// path because the block names whichever file was read; the tests that
+    /// care about the path assert it themselves.
+    const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `";
 
     // Config-directory prompt override resolution (#3638). These exercise the
     // pure file resolver only; the global install path is intentionally not
@@ -1480,26 +1681,19 @@ mod tests {
 
     #[test]
     fn static_prompt_composer_unset_keeps_default_layers_byte_identical() {
-        let default_layers = compose_default_static_layers(Personality::Calm, "deepseek-v4-flash");
-        let composed = apply_static_prompt_composer(
-            None,
-            Personality::Calm,
-            "deepseek-v4-flash",
-            &default_layers,
-        );
+        let default_layers = compose_default_static_layers("deepseek-v4-flash");
+        let composed = apply_static_prompt_composer(None, "deepseek-v4-flash", &default_layers);
 
         assert_byte_identical("unset static prompt composer", &default_layers, &composed);
     }
 
     #[test]
     fn static_prompt_composer_receives_context_and_replaces_layers() {
-        let default_layers = compose_default_static_layers(Personality::Calm, "deepseek-v4-pro");
+        let default_layers = compose_default_static_layers("deepseek-v4-pro");
         let composer: Box<StaticPromptComposer> = Box::new(|ctx| {
             assert_eq!(ctx.model_id, "deepseek-v4-pro");
-            assert_eq!(ctx.personality, Personality::Calm);
-            // The 0.9.0 core is model-agnostic ("You are Codewhale") and
-            // folds tone in — no per-model id line, no separate personality
-            // section in default_layers.
+            // The core is model-agnostic ("You are Codewhale") and carries
+            // tone in the preamble — no per-model id line.
             assert!(ctx.default_layers.contains("You are Codewhale"));
             assert!(
                 ctx.default_layers
@@ -1512,7 +1706,6 @@ mod tests {
 
         let composed = apply_static_prompt_composer(
             Some(composer.as_ref()),
-            Personality::Calm,
             "deepseek-v4-pro",
             &default_layers,
         );
@@ -1593,7 +1786,7 @@ mod tests {
 
     #[test]
     fn constitutional_kernel_keeps_first_turn_authority_safety_and_completion() {
-        let fresh_prefix = compose_default_static_layers(Personality::Calm, "deepseek-v4-pro");
+        let fresh_prefix = compose_default_static_layers("deepseek-v4-pro");
         for phrase in [
             "Do what the user's current request asks, no more.",
             "require express user authorization in",
@@ -1620,7 +1813,7 @@ mod tests {
 
     #[test]
     fn procedural_playbooks_are_not_eager_constitution() {
-        let fresh_prefix = compose_default_static_layers(Personality::Calm, "deepseek-v4-pro");
+        let fresh_prefix = compose_default_static_layers("deepseek-v4-pro");
         for heading in [
             "### Keep momentum",
             "### Think in causes",
@@ -1684,7 +1877,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -1788,8 +1981,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_v4_model_stays_model_fact_free() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "deepseek-v4-pro");
+        let prompt = compose_prompt_with_approval_model_and_shell("deepseek-v4-pro");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("one-million-token context window"));
@@ -1798,8 +1990,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_kimi_stays_model_fact_free() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "moonshotai/kimi-k2.6");
+        let prompt = compose_prompt_with_approval_model_and_shell("moonshotai/kimi-k2.6");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("one-million"));
@@ -1811,7 +2002,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_openai_api_gpt_55_stays_model_fact_free() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "gpt-5.5");
+        let prompt = compose_prompt_with_approval_model_and_shell("gpt-5.5");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("1050000-token context window"));
@@ -1822,8 +2013,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_unknown_model_stays_model_fact_free() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "llama3.3:70b");
+        let prompt = compose_prompt_with_approval_model_and_shell("llama3.3:70b");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("one-million"));
@@ -1852,10 +2042,8 @@ mod tests {
     fn compose_prompt_is_model_agnostic_in_preamble() {
         // 0.9.0 keeps the preamble byte-for-byte the same regardless of
         // model id, and no {model_id} placeholder leaks.
-        let flash =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "deepseek-v4-flash");
-        let kimi =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "moonshotai/kimi-k2.6");
+        let flash = compose_prompt_with_approval_model_and_shell("deepseek-v4-flash");
+        let kimi = compose_prompt_with_approval_model_and_shell("moonshotai/kimi-k2.6");
         assert!(
             flash.contains("You are Codewhale"),
             "0.9.0 preamble must open with the model-agnostic Codewhale stance"
@@ -1872,10 +2060,64 @@ mod tests {
     }
 
     #[test]
+    fn locale_preambles_name_only_model_visible_tools() {
+        for tag in ["zh-Hans", "ja", "pt-BR", "vi"] {
+            let preamble = locale_reinforcement_preamble(tag).expect("preamble exists");
+            assert!(
+                preamble.contains("`read`") && preamble.contains("`bash`"),
+                "{tag} preamble must use model-visible tool names: {preamble:?}"
+            );
+            assert!(
+                !preamble.contains("`File`") && !preamble.contains("`Bash`"),
+                "{tag} preamble must not teach hidden compatibility names: {preamble:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_tool_descriptions_do_not_point_at_hidden_file_or_bash() {
+        use crate::tools::pandoc::PandocConvertTool;
+        use crate::tools::tasks::TaskShellWaitTool;
+        let surfaces = [
+            (
+                "handle_read",
+                format!(
+                    "{} {}",
+                    HandleReadTool.description(),
+                    HandleReadTool.input_schema()
+                ),
+            ),
+            (
+                "pandoc_convert",
+                format!(
+                    "{} {}",
+                    PandocConvertTool.description(),
+                    PandocConvertTool.input_schema()
+                ),
+            ),
+            (
+                "task_shell_wait",
+                format!(
+                    "{} {}",
+                    TaskShellWaitTool.description(),
+                    TaskShellWaitTool.input_schema()
+                ),
+            ),
+        ];
+        for (name, text) in surfaces {
+            assert!(
+                !text.contains("File action=") && !text.contains("`Bash`"),
+                "{name} must not point models at the hidden File/Bash tools: {text}"
+            );
+        }
+        assert!(HandleReadTool.description().contains("`read` (path=...)"));
+    }
+
+    #[test]
     fn tool_descriptions_carry_edit_and_shell_guidance() {
         let write = WriteFileTool.description();
         assert!(
-            write.contains("instead of heredocs")
+            write.contains("Unlike heredocs")
                 && write.contains("`Bash`")
                 && !write.contains("exec_shell"),
             "write guidance must name the live Bash tool and never the retired exec_shell name"
@@ -1886,7 +2128,8 @@ mod tests {
         // action. `read_file`/`write_file`/`apply_patch` are retired spellings
         // (crates/tui/src/tools/registry.rs:2066-2088).
         assert!(edit.contains("File `read`"));
-        assert!(edit.contains("File `patch` or `write`"));
+        assert!(edit.contains("File `patch` handles structural"));
+        assert!(!edit.contains("instead"), "{edit}");
         assert!(
             !edit.contains("read_file")
                 && !edit.contains("write_file")
@@ -1905,8 +2148,7 @@ mod tests {
 
     #[test]
     fn composed_prompt_does_not_claim_tool_availability() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "deepseek-v4-pro");
+        let prompt = compose_prompt_with_approval_model_and_shell("deepseek-v4-pro");
         assert!(!prompt.contains("## Core Tool Taxonomy"));
         assert!(!prompt.contains("## Toolbox"));
         assert!(prompt.contains("You are Codewhale"));
@@ -1944,6 +2186,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let _home = ScopedHome::set(tmp.path().join("home"));
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let configured_dir = tmp.path().join("configured-skills");
         write_test_skill(
             &workspace.join(".claude").join("skills"),
@@ -2005,15 +2248,9 @@ mod tests {
     }
 
     #[test]
-    fn constitution_has_no_separate_personality_tier() {
-        // 0.9.0 has no personality tier. Voice and tone live in the
-        // compact constitution rather than a separate section, so
-        // personality remains folded in by omission.
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        assert!(
-            !prompt.contains("Personality: Calm — Tier 8"),
-            "Personality tier should not appear as a separate section"
-        );
+    fn constitution_carries_tone_and_rejection_behavior() {
+        // Voice and tone live in the compact constitution's preamble.
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             prompt.contains("Take the work seriously. Don't take"),
             "Preamble should carry tone guidance (take the work, not yourself, seriously)"
@@ -2064,9 +2301,14 @@ mod tests {
                 "zh preamble must steer reasoning_content: {preamble:?}"
             );
             assert!(
-                preamble.contains("`File`"),
-                "zh preamble must call out tool-name immutability with a LIVE tool \
-                 name; `read_file` is retired (registry.rs:2067): {preamble:?}"
+                preamble.contains("`read`") && preamble.contains("`bash`"),
+                "zh preamble must call out tool-name immutability with a model-visible \
+                 tool name: {preamble:?}"
+            );
+            assert!(
+                !preamble.contains("`File`") && !preamble.contains("`Bash`"),
+                "zh preamble must not teach the hidden compatibility `File`/`Bash` \
+                 names: {preamble:?}"
             );
             assert!(
                 !preamble.contains("read_file") && !preamble.contains("exec_shell"),
@@ -2108,7 +2350,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2234,7 +2476,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2282,7 +2524,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2376,7 +2618,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2390,7 +2632,7 @@ mod tests {
     }
 
     #[test]
-    fn user_global_constitution_block_is_injected_separately() {
+    fn user_global_constitution_is_captured_outside_the_stable_prefix() {
         let _env_guard = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
         let workspace = tmp.path().join("workspace");
@@ -2426,22 +2668,11 @@ mod tests {
                 },
             ));
 
-        let base_at = prompt.find("### Whose word wins").expect("base prompt");
-        let user_block_at = prompt
-            .find("<codewhale_user_constitution")
-            .expect("user constitution block");
-        let env_at = prompt.find("- lang:").expect("rendered environment block");
-        assert!(
-            base_at < user_block_at && user_block_at < env_at,
-            "user constitution should be its own layer after the base/project context and before volatile environment data"
-        );
-        assert!(prompt.contains("source=\"user-global\""));
-        assert!(prompt.contains("Maintains Codewhale release lanes."));
-        assert!(prompt.contains("Prefer live verification before claims."));
-        assert!(
-            !prompt.contains(&codewhale_home.display().to_string()),
-            "prompt should use the stable user-global source label, not a device-specific home path"
-        );
+        assert!(!prompt.contains("<codewhale_user_constitution"));
+        let block = load_user_constitution_block().expect("admission snapshot");
+        assert!(block.contains("Maintains Codewhale release lanes."));
+        assert!(block.contains("Prefer live verification before claims."));
+        assert!(!block.contains(&codewhale_home.display().to_string()));
     }
 
     #[test]
@@ -2468,7 +2699,7 @@ mod tests {
 
         let mut state = codewhale_config::SetupState::default();
         state.complete_constitution_checkpoint(
-            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            crate::prompts::CONSTITUTION_CHECKPOINT_VERSION,
             codewhale_config::ConstitutionChoice::Bundled,
         );
         state
@@ -2558,7 +2789,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2589,7 +2820,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2634,7 +2865,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2704,7 +2935,6 @@ mod tests {
     fn only_the_constitution_states_precedence() {
         // Composed overlays must describe behavior, never their own rank.
         let overlays = [
-            ("CALM_PERSONALITY", CALM_PERSONALITY),
             ("COMPACT_TEMPLATE", COMPACT_TEMPLATE),
             ("MEMORY_GUIDANCE", MEMORY_GUIDANCE),
             ("LANGUAGE_PROMPT", LANGUAGE_PROMPT),
@@ -2765,7 +2995,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2797,7 +3027,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2827,6 +3057,30 @@ mod tests {
         assert!(prompt.contains(HANDOFF_BLOCK_MARKER));
         assert!(prompt.contains("Finish #32."));
         assert!(prompt.contains("write the basic version"));
+        // Only the legacy file exists, so the block must name it rather
+        // than send the model to a primary file that is not there.
+        assert!(prompt.contains("left a relay artifact at `.deepseek/handoff.md`"));
+        assert!(!prompt.contains("left a relay artifact at `.codewhale/handoff.md`"));
+    }
+
+    #[test]
+    fn primary_handoff_wins_over_legacy_and_is_named() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        for (dir, body) in [
+            (".codewhale", "# Session relay\n\nprimary relay body\n"),
+            (".deepseek", "# Session relay\n\nlegacy relay body\n"),
+        ] {
+            std::fs::create_dir_all(workspace.join(dir)).unwrap();
+            std::fs::write(workspace.join(dir).join("handoff.md"), body).unwrap();
+        }
+
+        let prompt = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
+
+        assert!(prompt.contains("left a relay artifact at `.codewhale/handoff.md`"));
+        assert!(prompt.contains("primary relay body"));
+        assert!(!prompt.contains("legacy relay body"));
+        assert!(!prompt.contains("left a relay artifact at `.deepseek/handoff.md`"));
     }
 
     #[test]
@@ -2850,7 +3104,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_includes_all_layers() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         // Base layer — balanced Constitution; procedural recipes stay out.
         assert!(prompt.contains("## Codewhale"));
         assert!(prompt.contains("### Whose word wins"));
@@ -2939,7 +3193,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_deterministic_order() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         let base_pos = prompt.find("## Codewhale").unwrap();
         let article_pos = prompt.find("### Ground truth").unwrap();
 
@@ -2950,7 +3204,7 @@ mod tests {
     fn base_prompt_is_mode_agnostic() {
         // Mode and approval text are no longer inlined into compose_prompt —
         // they travel as request-time runtime metadata.
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(!prompt.contains("Mode: Agent"));
         assert!(!prompt.contains("Mode: YOLO"));
         assert!(!prompt.contains("Mode: Plan"));
@@ -2962,7 +3216,7 @@ mod tests {
 
     #[test]
     fn approval_policy_no_longer_inlined_in_base_prompt() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(!prompt.contains("Mode: Agent"));
         assert!(!prompt.contains("Approval Policy:"));
         // The compact Constitutional preamble is still present.
@@ -2981,16 +3235,6 @@ mod tests {
             CORE_EXECUTION_PROFILE_PROMPT.contains("present the change in your plan"),
             "Execution profile must name the correct behavior on rejection"
         );
-    }
-
-    #[test]
-    fn personality_is_folded_into_constitution() {
-        // v4 has no separate personality tier. Voice and tone live in
-        // the preamble, so composition appends no personality overlay.
-        let calm = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        assert!(!calm.contains("## Personality:"));
-        assert!(calm.contains("Take the work seriously. Don't take"));
-        assert!(calm.contains("You are Codewhale"));
     }
 
     #[test]
@@ -3020,7 +3264,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3055,7 +3299,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3089,7 +3333,7 @@ mod tests {
                     context_window_override: None,
                     verbosity: None,
                     recovery_hint,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     mode: AppMode::Agent,
                 },
@@ -3120,7 +3364,7 @@ mod tests {
 
     #[test]
     fn universal_prompt_leaves_tool_selection_to_the_catalog() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(!prompt.contains("Tool Selection Guide"));
         for forbidden in [
             "`File`",
@@ -3142,7 +3386,7 @@ mod tests {
     /// reinforcement lives in its own static segment plus locale bookends.
     #[test]
     fn language_segment_present_outside_reduced_constitution() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             !BASE_PROMPT.contains("## Language"),
             "0.9.0 constitution.md should stay reduced; language belongs in its own segment"
@@ -3170,7 +3414,7 @@ mod tests {
 
     #[test]
     fn output_formatting_segment_present_outside_reduced_constitution() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             !BASE_PROMPT.contains("## Output Formatting"),
             "0.9.0 constitution.md should stay reduced; output formatting belongs in its own segment"
@@ -3199,7 +3443,7 @@ mod tests {
                     model_id: "glm-5.2",
                     context_window_override: Some(1_000_000),
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3232,7 +3476,7 @@ mod tests {
 
     #[test]
     fn english_base_prompt_avoids_native_script_language_priming() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             !contains_cjk(&prompt),
             "English base prompt should keep native-script reinforcement in locale bookends only"
@@ -3246,16 +3490,12 @@ mod tests {
     #[test]
     fn legacy_rlm_compatibility_descriptions_remain_available() {
         let descriptions = [
-            RlmTool::alias("rlm_open", "open", None)
+            RlmTool::alias("rlm_open", "open").description().to_string(),
+            RlmTool::alias("rlm_eval", "eval").description().to_string(),
+            RlmTool::alias("rlm_configure", "configure")
                 .description()
                 .to_string(),
-            RlmTool::alias("rlm_eval", "eval", None)
-                .description()
-                .to_string(),
-            RlmTool::alias("rlm_configure", "configure", None)
-                .description()
-                .to_string(),
-            RlmTool::alias("rlm_close", "close", None)
+            RlmTool::alias("rlm_close", "close")
                 .description()
                 .to_string(),
             HandleReadTool.description().to_string(),
@@ -3274,7 +3514,7 @@ mod tests {
     /// by project law/instructions sitting above memory/handoffs.
     #[test]
     fn project_instructions_outrank_memory_in_whose_word_wins() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         let project_at = prompt
             .find("3. Project law and instructions")
             .expect("Whose word wins must rank project instructions");
@@ -3290,7 +3530,7 @@ mod tests {
 
     #[test]
     fn workspace_orientation_guidance_present() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(prompt.contains("Project law and instructions"));
         assert!(
             prompt.contains("the nearest in\nscope winning over the broader")
@@ -3360,7 +3600,7 @@ mod tests {
 
     #[test]
     fn preamble_carries_tone_and_ownership_guidance() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(prompt.contains("The A is already yours"));
         assert!(prompt.contains("Your competence is a settled fact"));
         assert!(prompt.contains("Take the work seriously. Don't take"));
@@ -3379,11 +3619,11 @@ mod tests {
     #[test]
     fn compose_prompt_is_byte_stable_across_calls() {
         // Suspect #4 from #263: stable prompt churn within a single session.
-        // Two calls with identical personality inputs must produce
+        // Two calls with identical inputs must produce
         // identical bytes — anything else is a cache buster.
-        let a = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        let b = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        assert_byte_identical("compose_prompt(Personality::Calm)", &a, &b);
+        let a = compose_prompt_with_approval_model_and_shell("codewhale");
+        let b = compose_prompt_with_approval_model_and_shell("codewhale");
+        assert_byte_identical("compose_prompt", &a, &b);
     }
 
     #[test]
@@ -3439,6 +3679,23 @@ mod tests {
         assert!(
             !a.contains(summary),
             "summary must not be embedded in system prompt"
+        );
+    }
+
+    #[test]
+    fn oversized_relay_artifact_is_capped_like_an_instructions_file() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join(".codewhale");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 300 KiB relay: well past the per-file prompt cap.
+        std::fs::write(dir.join("handoff.md"), "R".repeat(300 * 1024)).unwrap();
+
+        let block = super::load_handoff_block(tmp.path()).expect("relay block");
+        assert!(block.contains("[…truncated:"), "truncation marker missing");
+        assert!(
+            block.len() < 110 * 1024,
+            "relay must be capped near 100 KiB, got {} bytes",
+            block.len()
         );
     }
 
@@ -3723,7 +3980,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: Some(" Concise "),
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3734,20 +3991,6 @@ mod tests {
         assert!(
             prompt.contains("## Concise Output Discipline"),
             "Concise Output Discipline should be appended"
-        );
-    }
-
-    /// #2953 — the Calm overlay (`CALM_PERSONALITY`) stays out of the default
-    /// model-prompt path to keep the static prefix slim. Voice and tone
-    /// guidance travels via the constitution preamble instead.
-    #[test]
-    fn default_prompt_does_not_include_calm_personality_overlay() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        let calm_text = CALM_PERSONALITY;
-        let first_calm_line = calm_text.lines().find(|l| !l.is_empty()).unwrap_or("");
-        assert!(
-            !prompt.contains(first_calm_line),
-            "default agent prompt must not include the calm personality overlay"
         );
     }
 
@@ -3768,7 +4011,7 @@ mod tests {
                 model_id: "deepseek-v4-pro",
                 context_window_override: None,
                 verbosity: Some("concise"),
-                skills_scan_codewhale_only: false,
+                skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                 plugin_registry: None,
                 recovery_hint: None,
                 mode: AppMode::Agent,
@@ -3822,7 +4065,7 @@ mod tests {
             model_id: "codewhale",
             context_window_override: None,
             verbosity: None,
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             recovery_hint: None,
             mode: AppMode::Agent,
@@ -3886,7 +4129,7 @@ mod tests {
     #[test]
     fn default_prompt_stays_under_2953_static_baseline() {
         const ISSUE_2953_BASELINE_CHARS: usize = 30_461;
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
 
         assert!(
             prompt.chars().count() < ISSUE_2953_BASELINE_CHARS,

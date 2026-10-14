@@ -26,19 +26,6 @@ pub struct SidebarAgentRow {
     pub children_settled: Option<(usize, usize)>,
 }
 
-/// The name a sub-agent was dispatched under, when it has one (#5287).
-///
-/// `SubAgentResult::name` carries the session name, which the manager seeds
-/// with the agent id and only replaces when the dispatch supplied a name. An
-/// id is a lookup handle, never the identity an operator dispatched by, so it
-/// is reported as absent here and the caller falls back to its own chain.
-pub(crate) fn dispatched_agent_name(
-    agent: &crate::tools::subagent::SubAgentResult,
-) -> Option<&str> {
-    let name = agent.name.trim();
-    (!name.is_empty() && name != agent.agent_id).then_some(name)
-}
-
 pub(crate) fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
     let cached_ids: std::collections::HashSet<&str> = app
         .subagent_cache
@@ -62,8 +49,8 @@ pub(crate) fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
             // The dispatch name leads (#5287). Generated whales name the
             // agents that have none, locale-derived from the neutral agent
             // id; never replay a persisted label from another language.
-            let display_name = dispatched_agent_name(agent)
-                .map(str::to_string)
+            let display_name = app
+                .agent_given_name(&agent.agent_id)
                 .or_else(|| {
                     agent
                         .child_route
@@ -292,7 +279,7 @@ mod tests {
 
     fn create_test_app() -> App {
         let options = TuiOptions {
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
         // Legacy strip geometry (see ui.rs); Bottom default has its own tests.
@@ -411,12 +398,12 @@ mod tests {
             app.ensure_agent_label("agent_named"),
             "branch-triage · general"
         );
-        // Unnamed children are disambiguated per role (each role's counter
-        // starts at 1).
-        assert_eq!(app.ensure_agent_label("agent_role"), "reviewer · 1");
-        assert_eq!(app.ensure_agent_label("agent_profile"), "release-lead · 1");
-        assert_eq!(app.ensure_agent_label("agent_canonical"), "planner · 1");
-        assert_eq!(app.ensure_agent_label("agent_typed"), "implement · 1");
+        // Unnamed children go by their role (#6565: the engine's one name);
+        // a suffix appears only when another agent already shows that name.
+        assert_eq!(app.ensure_agent_label("agent_role"), "reviewer");
+        assert_eq!(app.ensure_agent_label("agent_profile"), "release-lead");
+        assert_eq!(app.ensure_agent_label("agent_canonical"), "planner");
+        assert_eq!(app.ensure_agent_label("agent_typed"), "implement");
 
         // A progress-only agent first seen before its metadata arrives gets a
         // counter placeholder, then upgrades once the identity is observed.
@@ -424,7 +411,7 @@ mod tests {
         let mut late = cached_agent("agent_late", None);
         late.assignment.role = Some("verifier".to_string());
         app.subagent_cache.push(late);
-        assert_eq!(app.ensure_agent_label("agent_late"), "test · 1");
+        assert_eq!(app.ensure_agent_label("agent_late"), "test");
     }
 
     #[test]
@@ -441,17 +428,17 @@ mod tests {
         second.agent_type = crate::tools::subagent::FleetRole::Builder;
         app.subagent_cache.push(second);
 
-        assert_eq!(app.ensure_agent_label("agent_builder_a"), "implement · 1");
+        assert_eq!(app.ensure_agent_label("agent_builder_a"), "implement");
         assert_eq!(app.ensure_agent_label("agent_builder_b"), "implement · 2");
         // Stability: re-seeing a known builder keeps its assigned label.
-        assert_eq!(app.ensure_agent_label("agent_builder_a"), "implement · 1");
+        assert_eq!(app.ensure_agent_label("agent_builder_a"), "implement");
         assert_eq!(app.ensure_agent_label("agent_builder_b"), "implement · 2");
 
-        // A different role has its own sequence.
+        // A different role needs no suffix.
         let mut reviewer = cached_agent("agent_reviewer_a", None);
         reviewer.assignment.role = Some("reviewer".to_string());
         app.subagent_cache.push(reviewer);
-        assert_eq!(app.ensure_agent_label("agent_reviewer_a"), "reviewer · 1");
+        assert_eq!(app.ensure_agent_label("agent_reviewer_a"), "reviewer");
     }
 
     #[test]
@@ -498,6 +485,7 @@ mod tests {
             git_branch: None,
             agent_type: crate::tools::subagent::FleetRole::Worker,
             assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
                 objective: "task".to_string(),
                 role: Some("worker".to_string()),
             },
@@ -516,6 +504,8 @@ mod tests {
             duration_ms: 100,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -708,7 +698,8 @@ mod tests {
         let mut app = create_test_app();
         let agent_id = "agent_cafe0123";
         app.ensure_agent_label(agent_id);
-        let mut agent = cached_agent(agent_id, Some("Blue Whale"));
+        let whale = crate::tools::subagent::whale_name_for_id_in_locale(agent_id, "en");
+        let mut agent = cached_agent(agent_id, Some(&whale));
         agent.name = "branch-triage".to_string();
         app.subagent_cache.push(agent);
 
@@ -721,7 +712,8 @@ mod tests {
         let mut app = create_test_app();
         let agent_id = "agent_cafe0123";
         app.ensure_agent_label(agent_id);
-        let mut agent = cached_agent(agent_id, Some("Blue Whale"));
+        let whale = crate::tools::subagent::whale_name_for_id_in_locale(agent_id, "en");
+        let mut agent = cached_agent(agent_id, Some(&whale));
         agent.child_route = Some(crate::tools::subagent::ChildRouteReceipt {
             requested_type: "custom".to_string(),
             requested_profile: Some("DeepSeek V4 Flash".to_string()),

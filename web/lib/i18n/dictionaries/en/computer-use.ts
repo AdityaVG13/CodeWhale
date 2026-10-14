@@ -7,8 +7,8 @@ import type { ComputerUseDict } from "../types";
  * macOS setting names stay as the app shows them.
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Computer Use for Mac · Codewhale",
-  metaDescription: "Download and set up Codewhale Computer Use for Mac. Background app control, permission setup, and human Pause and Stop controls.",
+  metaTitle: "Computer Use · Preview · Codewhale",
+  metaDescription: "Preview: download and set up Codewhale Computer Use for Mac. Background app control, permission setup, and human Pause and Stop controls.",
   title: "Computer Use",
   lead: "Let Codewhale work in your apps while you keep working. The Mac helper brings permissions, background app control, and a way to pause or stop input to your menu bar.",
   publisher: "By Codewhale",
@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Run the background check", body: "The helper opens a disposable practice window, enters text, and captures that window. It checks whether the pointer or active app changed during the run." },
     { title: "Connect it to Codewhale", body: "Review, trust, and enable Computer Use in Codewhale’s plugin marketplace. Use plugin 0.3.1 or later so local actions go through the helper’s Pause and Stop controls." },
   ],
-  controlsTitle: "Keep working. Keep control.",
+  controlsTitle: "Pause or stop app control",
   controlsBody: "Supported actions operate on the selected app in the background. Apps and gestures that need foreground control require your authorization. The menu shows the target and input mode; Pause suspends helper input, and Stop ends its existing sessions.",
   updateTitle: "Updates when you choose",
   updateBody: "Choose Check for updates from the app. Before installing an update, it checks the download, Codewhale signature, and Apple notarization, and keeps the previous app for recovery.",
@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "See the background check",
   source: "Source and other platforms",
   platforms: "This download is for Mac. Windows and Linux currently use the source plugin and host-side setup.",
-  installTitle: "Computer Use for Mac",
-  installLead: "Add background app control with the Computer Use helper. Set up Mac permissions, run a background check, and pause or stop helper input from your menu bar.",
-  installLink: "Computer Use download and setup",
 };

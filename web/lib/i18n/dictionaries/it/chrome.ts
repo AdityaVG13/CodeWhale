@@ -23,19 +23,10 @@ export const chrome: ChromeDict = {
   navCommunity: "Comunità",
   navContribute: "Contribuisci",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
+  navFeatures: "Capacità",
   navProduct: "Prodotto",
   navModels: "Modelli",
   navPlugins: "Plugin",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Vai al contenuto principale",
 
@@ -45,30 +36,8 @@ export const chrome: ChromeDict = {
   installCta: "Installa →",
 
   authSignIn: "Accedi",
-  authRegister: "Registrati",
-  authGroupAria: "Account",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "qualsiasi modello, sulla tua macchina",
-
-  issueLabel: "Edizione del {date}",
   dateLocale: "it-IT",
-
-  starsAria: "Stelle GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "In diretta",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "unito",
-  tickerOpened: "aperto",
-  tickerClosed: "chiuso",
-  tickerReleased: "pubblicato",
-  tickerFirstContribution: "prima contribuzione",
-  tickerBy: "di {handle}",
-  tickerAria: "Attività recente del repository",
-
-  traceLabel: "traccia di ragionamento",
-  traceTabsAria: "Stralci di sessione",
 
   menuOpen: "Apri il menu",
   menuClose: "Chiudi il menu",
@@ -76,11 +45,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "chiaro",
   themeDark: "scuro",
-  themeAria: "Tema della documentazione: {mode} (clic per cambiare)",
-  themeTitle: "Tema della documentazione · auto / chiaro / scuro",
+  themeAria: "Tema: {mode} (clic per cambiare)",
+  themeTitle: "Tema · auto / chiaro / scuro",
 
   footerTagline:
-    "Crea quello che vuoi e automatizza il lavoro quotidiano con i modelli che scegli.",
+    "Crea app e automatizza il lavoro con i tuoi modelli e strumenti connessi.",
   footerProduct: "Prodotto",
   footerProject: "Progetto",
   footerDocs: "Documentazione",

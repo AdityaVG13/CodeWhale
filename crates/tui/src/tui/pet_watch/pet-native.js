@@ -12,11 +12,16 @@ const pet_telemetry_js_1 = require("./pet-telemetry.js");
 const pet_sim_js_1 = require("./pet-sim.js");
 const pet_audio_js_1 = require("./pet-audio.js");
 const pet_engine_js_1 = require("./pet-engine.js");
+const dot_field_js_1 = require("./dot-field.js");
+const dot_glyphs_js_1 = require("./dot-glyphs.js");
 /** Synchronous native boundary: JSON state and directly transferable PCM.
  * Native hosts share the actual world / score implementation, not a rewrite. */
 class PetNative {
     world;
     engine = new pet_engine_js_1.PetEngineTelemetry();
+    expressionActivity = this.engine.activity(0);
+    expressionTransition;
+    expressionOptions = { bodyStyle: 'smooth', textLanguage: 'en' };
     engineTick = 0;
     segment;
     liveTape = new pet_telemetry_js_1.PetLiveTape();
@@ -29,25 +34,59 @@ class PetNative {
     }
     step(dt, motion) { this.world.step(dt, { motion, sensitivity: 1 }); return this.snapshot(); }
     snapshot() { return JSON.stringify({ ...this.world.frame, voices: this.world.voices, digest: (0, pet_sim_js_1.digest)(this.world.sim) }); }
+    expression() {
+        const { frame } = this.world;
+        const target = (0, dot_field_js_1.projectDotField)(this.expressionActivity, frame.timeMs, false, this.expressionTransition?.at ?? 0, this.expressionOptions);
+        return this.expressionTransition
+            ? (0, dot_field_js_1.blendDotFields)(this.expressionTransition.from, target, (frame.timeMs - this.expressionTransition.at) / 560)
+            : target;
+    }
+    prepareExpression(activity) {
+        if ((0, dot_field_js_1.dotFieldKey)(activity) !== (0, dot_field_js_1.dotFieldKey)(this.expressionActivity))
+            this.expressionTransition = { at: this.world.frame.timeMs, from: this.expression() };
+        this.expressionActivity = activity;
+    }
     /** View-only projection. Display cadence and accessibility preferences never
      * advance the owner, consume randomness, or change its score/checkpoint. */
-    presentation() {
+    presentation(options = {}, interfaceLanguage = 'en') {
+        if (!['smooth', 'pixel'].includes(options.bodyStyle ?? 'smooth')
+            || !['auto', 'en', 'zh-Hans', 'zh-Hant', 'ja'].includes(options.textLanguage ?? 'auto'))
+            throw new Error('Invalid pet presentation preferences.');
+        const next = { bodyStyle: options.bodyStyle ?? 'smooth', textLanguage: (0, dot_field_js_1.textLanguage)(options.textLanguage, interfaceLanguage) };
+        if (next.bodyStyle !== this.expressionOptions.bodyStyle || next.textLanguage !== this.expressionOptions.textLanguage) {
+            const from = this.expression();
+            this.expressionOptions = next;
+            this.expressionTransition = { at: this.world.frame.timeMs, from };
+        }
         const { sim, frame } = this.world;
-        const state = { ...frame.state, roamX: 0, roamY: 0, flip: 1, lit: frame.behaviour === 'doze' ? .18 : 1 };
+        const activity = this.engine.activity(frame.timeMs);
+        const observed = activity.observed && activity.freshness === 'fresh';
+        const state = { ...frame.state, observed: observed ? 1 : 0, roamX: 0, roamY: 0, flip: 1,
+            lit: observed ? 1 : frame.behaviour === 'doze' ? .18 : 1 };
         const key = JSON.stringify([state, frame.pod]);
         if (this.stillProjection?.key !== key) {
             const still = new pet_sim_js_1.PetSim(sim.p.map(p => [p.hx, p.hy]), 0xC0FFEE, sim.expressionVersion);
             const peers = frame.pod.filter(p => p.present);
             still.step(1 / 30, state, { motion: false, sensitivity: 1,
                 podSlots: peers.length >= 3 ? peers.map(p => [[0, 2, 4, 1, 3, 5][p.slot], p.phase]) : undefined });
-            this.stillProjection = { key, points: still.p.map(p => [p.x, p.y]), style: still.frame };
+            this.stillProjection = { key, style: still.frame };
         }
-        return JSON.stringify({ ...frame, digest: (0, pet_sim_js_1.digest)(sim), style: sim.frame, activity: this.engine.activity(frame.timeMs),
-            points: sim.p.map(p => [p.x, p.y]),
-            still: { points: this.stillProjection.points, style: this.stillProjection.style, state } });
+        const still = (0, dot_field_js_1.projectDotField)(activity, frame.timeMs, true, 0, this.expressionOptions);
+        const language = this.expressionOptions.textLanguage;
+        const label = activity.authoritativePresence === 'needs_you' ? 'waiting'
+            : activity.authoritativePresence === 'done' ? 'done' : activity.activityKind;
+        return JSON.stringify({ ...frame, digest: (0, pet_sim_js_1.digest)(sim), state, style: { ...sim.frame, hollow: !observed }, activity,
+            ...this.expression(), displayLanguage: language,
+            displayPhrase: observed && label ? dot_glyphs_js_1.DOT_LABELS[language][label] : '',
+            still: { ...still, style: { ...this.stillProjection.style, hollow: !observed }, state } });
     }
     /** Losing a producer invalidates outstanding coverage, never the creature. */
-    disconnectEngine() { this.engine = new pet_engine_js_1.PetEngineTelemetry(); this.world.voices = []; }
+    disconnectEngine() {
+        this.engine = new pet_engine_js_1.PetEngineTelemetry();
+        this.world.voices = [];
+        this.expressionActivity = this.engine.activity(this.world.frame.timeMs);
+        this.expressionTransition = undefined;
+    }
     interact(kind, x, y) { this.world.interact(kind, x, y); }
     interactions() { return JSON.stringify(this.world.interactions); }
     accept(packet) { this.world.acceptTelemetry(JSON.parse(packet)); }
@@ -80,6 +119,8 @@ class PetNative {
         this.segment = undefined;
         this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
         this.engine = new pet_engine_js_1.PetEngineTelemetry();
+        this.expressionActivity = this.engine.activity(this.world.frame.timeMs);
+        this.expressionTransition = undefined;
     }
     /** Resume a live host at the first unrecorded bucket. Keep every accepted
      * interval, but never present its last observed frame as current evidence. */
@@ -87,10 +128,18 @@ class PetNative {
         this.world.resumeObservation();
         this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
         this.engine = new pet_engine_js_1.PetEngineTelemetry();
+        this.expressionActivity = this.engine.activity(this.world.frame.timeMs);
+        this.expressionTransition = undefined;
         this.world.voices = [];
         return this.world.frame.timeMs;
     }
-    observeEngine(metadataJSON, timeMs) { this.engine.observe(JSON.parse(metadataJSON), timeMs); }
+    /** A rejected observation leaves the reducer exactly as it was, like a batch. */
+    observeEngine(metadataJSON, timeMs) {
+        const next = this.engine.clone();
+        next.observe(JSON.parse(metadataJSON), timeMs);
+        this.prepareExpression(next.activity(this.world.frame.timeMs));
+        this.engine = next;
+    }
     observeEngineBatch(metadataJSON, timeMs) {
         const events = JSON.parse(metadataJSON);
         if (!Array.isArray(events) || events.length > 64)
@@ -98,6 +147,7 @@ class PetNative {
         const next = this.engine.clone();
         for (const event of events)
             next.observe(event, timeMs);
+        this.prepareExpression(next.activity(this.world.frame.timeMs));
         this.engine = next;
     }
     advanceEngine(timeMs, motion, waiting) {
@@ -110,10 +160,12 @@ class PetNative {
             if ((this.engineTick + 1) % 12 === 0)
                 this.world.acceptTelemetry(this.engine.bucket(Math.floor(this.engineTick / 12)));
             this.world.step(1 / 30, { motion, sensitivity: 1 });
+            this.prepareExpression(this.engine.activity(this.world.frame.timeMs));
             voices.push(...this.world.voices);
             this.engineTick++;
         }
         this.world.voices = voices;
+        this.prepareExpression(this.engine.activity(this.world.frame.timeMs));
     }
     terminal(width, height) {
         if (![width, height].every(n => Number.isSafeInteger(n) && n >= 1 && n <= 512))
@@ -1653,880 +1705,5413 @@ function renderPetPCM(voices, startSample, length, sampleRate = 48_000) {
 factories["pet-engine"]=function(exports,require){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PetEngineTelemetry = void 0;
+exports.PetEngineTelemetry = exports.ENGINE_OWNER_STALE_MS = void 0;
 const pet_sim_js_1 = require("./pet-sim.js");
-const codewhale_js_1 = require("./codewhale.js");
 const pet_telemetry_js_1 = require("./pet-telemetry.js");
-/** Read-only adapter for codewhale_protocol::EventMsg metadata. The foreground
- * Engine is the event owner. This replaces no turn loop: it only translates
- * lifecycle observations to event-v1 for the same pet bucketer used by imports.
- * Text, inputs and results are neither accepted nor retained. */
+// Engine emits a liveness pulse every 10 seconds for a running operation.
+// Keep a small scheduling margin so one delayed pulse does not erase a valid
+// long operation from the owner projection; after that, it becomes generic.
+// The physics tape keeps its own, shorter coverage rule (see `pulse`).
+exports.ENGINE_OWNER_STALE_MS = 12_000;
+const ACTIVITY_KINDS = [
+    'reading', 'editing', 'searching', 'testing', 'executing', 'browsing', 'computer',
+    'memory', 'tool', 'thinking', 'responding', 'delegating',
+];
+const TURN_OUTCOMES = ['completed', 'interrupted', 'failed'];
+const OPERATION_OUTCOMES = ['succeeded', 'failed', 'cancelled', 'denied'];
+const APPROVAL_OUTCOMES = ['approved', 'denied', 'cancelled'];
+function categoryFor(kind) {
+    switch (kind) {
+        case 'reading':
+        case 'editing':
+        case 'searching': return 'filesystem';
+        case 'testing':
+        case 'executing': return 'code';
+        case 'browsing': return 'browser';
+        case 'computer':
+        case 'tool': return 'tool';
+        case 'memory': return 'memory';
+        case 'thinking': return 'reasoning';
+        case 'responding': return 'communication';
+        case 'delegating': return 'agent';
+    }
+}
+/** Read-only reducer for the Engine owner's typed metadata. It keeps using the
+ * existing pet telemetry tape and physics owner; it neither recognizes tool
+ * names from content nor accepts transcript text, arguments, commands, or results. */
 class PetEngineTelemetry {
     events = [];
     active = new Map();
     waiting;
     sequence = 0;
     lastTime = 0;
-    /** Ephemeral receipts. Replay tapes retain measured categories, not tool
-     * names. Restoring/disconnecting clears these captions. Never mutates world. */
+    lastObservedAt;
+    turnId;
+    turnOutcome;
+    terminalAt;
+    lastFailedTool;
+    completedSpans = new Set();
+    completedTurns = new Set();
+    /** Ephemeral safe read projection. Span ids are retained only in this
+     * reducer to correlate trusted lifecycle events and never leave the owner. */
     activity(at) {
-        const fresh = (e) => at >= e.startTime && at - e.endTime <= pet_telemetry_js_1.PET_BIN_MS * 2;
-        const spans = [...this.active].filter(([, e]) => fresh(e));
-        const parallel = spans.filter(([key]) => key.startsWith('agent:')).length;
-        const cue = ([key, e]) => ({
-            ...(key.startsWith('tool:') ? (0, codewhale_js_1.toolActivity)(e.name) : key.startsWith('thinking:')
-                ? { kind: 'thinking', label: 'Thinking' } : key.startsWith('agent:')
-                ? { kind: 'delegating', label: 'Coordinating agents' } : { kind: 'responding', label: 'Writing the response' }),
-            tool: key.startsWith('tool:') ? e.name.replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 96) : null,
-            sinceMs: e.startTime,
-        });
-        const active = spans.filter(([key]) => !key.startsWith('agent:')).slice(-4).reverse().map(cue);
-        const error = [...this.events].reverse().find(e => e.category === 'error' && fresh(e));
-        const primary = this.waiting && fresh(this.waiting)
-            ? { kind: 'waiting', label: 'Waiting for you', tool: null, sinceMs: this.waiting.startTime }
-            : error ? { kind: 'error', label: 'An operation failed', tool: null, sinceMs: error.startTime }
-                : active[0] ?? (parallel ? cue(spans.find(([key]) => key.startsWith('agent:')))
-                    : { kind: 'unknown', label: 'Activity unobserved', tool: null, sinceMs: at });
-        return { ...primary, observed: primary.kind !== 'unknown', parallel, active };
+        const observed = this.lastObservedAt !== undefined;
+        const freshness = !observed ? 'missing'
+            : at - this.lastObservedAt <= exports.ENGINE_OWNER_STALE_MS ? 'fresh' : 'stale';
+        const fresh = freshness === 'fresh';
+        const active = fresh
+            ? [...this.active.values()]
+                .filter(span => at >= span.startedAtMs && at - span.event.endTime <= exports.ENGINE_OWNER_STALE_MS)
+                // The parent's own work leads; delegated agents are counted in
+                // `parallelAgentCount` and only lead when nothing else is active.
+                .sort((a, b) => Number(a.group === 'agent') - Number(b.group === 'agent')
+                || b.startedAtMs - a.startedAtMs || a.key.localeCompare(b.key))
+            : [];
+        const agents = active.filter(span => span.group === 'agent').length;
+        const terminalFresh = fresh && this.terminalAt !== undefined
+            && at >= this.terminalAt && at - this.terminalAt <= exports.ENGINE_OWNER_STALE_MS;
+        let authoritativePresence = 'unknown';
+        if (fresh) {
+            if (this.waiting)
+                authoritativePresence = 'needs_you';
+            else if (terminalFresh && this.turnOutcome === 'completed' && this.turnId)
+                authoritativePresence = 'done';
+            else if (terminalFresh)
+                authoritativePresence = 'idle';
+            else if (active.length > 0 || this.turnId)
+                authoritativePresence = 'working';
+        }
+        const activityKind = fresh && authoritativePresence !== 'needs_you'
+            && authoritativePresence !== 'done' && authoritativePresence !== 'idle'
+            ? active[0]?.activityKind
+                ?? (this.lastFailedTool && at >= this.lastFailedTool.failedAtMs
+                    && at - this.lastFailedTool.failedAtMs <= exports.ENGINE_OWNER_STALE_MS
+                    ? this.lastFailedTool.activityKind : null)
+            : null;
+        const failedAge = fresh && this.lastFailedTool
+            && at >= this.lastFailedTool.failedAtMs
+            && at - this.lastFailedTool.failedAtMs <= exports.ENGINE_OWNER_STALE_MS
+            ? { activityKind: this.lastFailedTool.activityKind,
+                ...(this.lastFailedTool.actionId ? { actionId: this.lastFailedTool.actionId } : {}),
+                ageMs: at - this.lastFailedTool.failedAtMs }
+            : null;
+        const actionId = activityKind ? (active.length ? active[0].actionId : failedAge?.actionId) : undefined;
+        const doneEffectId = authoritativePresence === 'done' && terminalFresh
+            && this.turnOutcome === 'completed' && this.turnId ? this.turnId : null;
+        return {
+            schemaVersion: 1,
+            sessionId: null,
+            cursor: 0,
+            observed,
+            freshness,
+            authoritativePresence,
+            activityKind: activityKind ?? null,
+            ...(actionId ? { actionId } : {}),
+            observedAtMs: this.lastObservedAt ?? null,
+            parallelAgentCount: fresh ? agents : 0,
+            activeSpans: active.slice(0, 4).map(span => ({
+                activityKind: span.activityKind,
+                ...(span.actionId ? { actionId: span.actionId } : {}),
+                startedAtMs: span.startedAtMs,
+            })),
+            turnId: this.turnId ?? null,
+            turnOutcome: this.turnOutcome ?? null,
+            doneEffectId,
+            failedToolAge: failedAge,
+        };
     }
     add(name, category, at, agentId = 'parent', continuation = false) {
         if (this.events.length >= 8192)
             throw new Error('Pet Engine observation window is full.');
-        const e = { schemaVersion: 1, id: `engine:${this.sequence++}`, traceId: 'foreground',
-            startTime: at, endTime: at, name, category, agentId, status: 'running',
-            attributes: continuation ? { 'whalesong.continuation': true } : {} };
-        this.events.push(e);
-        return e;
+        const event = {
+            schemaVersion: 1,
+            id: `engine:${this.sequence++}`,
+            traceId: 'foreground',
+            startTime: at,
+            endTime: at,
+            name,
+            category,
+            agentId,
+            status: 'running',
+            attributes: continuation ? { 'whalesong.continuation': true } : {},
+        };
+        this.events.push(event);
+        return event;
+    }
+    start(key, kind, group, at, agentId = 'parent', actionId) {
+        if (this.active.has(key))
+            return;
+        if (this.active.size >= 256)
+            throw new Error('Too many active Engine pet spans.');
+        const event = this.add(group === 'agent' ? 'agent' : group === 'thinking' ? 'thinking'
+            : group === 'responding' ? 'assistant_message' : 'operation', categoryFor(kind), at, agentId);
+        this.active.set(key, { key, activityKind: kind, actionId, startedAtMs: at, event, group });
     }
     pulse(key, at) {
-        const e = this.active.get(key);
-        if (!e)
+        const span = this.active.get(key);
+        if (!span)
             return;
-        // A resumed stream does not assert coverage across its silent interval.
-        if (at - e.endTime > pet_telemetry_js_1.PET_BIN_MS * 2) {
-            this.active.set(key, this.add(e.name, e.category, at, e.agentId, true));
+        // A resumed stream does not assert tape coverage across its silent
+        // interval; the span itself (and its start) stays active.
+        if (at - span.event.endTime > pet_telemetry_js_1.PET_BIN_MS * 2) {
+            const event = this.add(span.event.name, span.event.category, at, span.event.agentId, true);
+            this.active.set(key, { ...span, event });
         }
-        else
-            e.endTime = at;
+        else {
+            span.event.endTime = at;
+        }
     }
-    /** Transactional batch copy; failed validation cannot accept half a packet. */
+    finish(key, at, status = 'success') {
+        if (!this.active.has(key))
+            return undefined;
+        this.pulse(key, at);
+        const span = this.active.get(key);
+        if (!span)
+            return undefined;
+        span.event.endTime = at;
+        span.event.status = status;
+        this.active.delete(key);
+        return span;
+    }
+    addOnce(set, id, maximum) {
+        if (set.has(id))
+            return false;
+        set.add(id);
+        while (set.size > maximum)
+            set.delete(set.values().next().value);
+        return true;
+    }
+    /** Transactional batch copy; validation errors cannot accept half a batch. */
     clone() {
         const next = new PetEngineTelemetry();
         const copy = (value) => JSON.parse(JSON.stringify(value));
         next.events = copy(this.events);
         const spans = new Map(next.events.map(event => [event.id, event]));
-        // Active and waiting spans must still reference their journal entry so a
-        // later heartbeat extends the coverage consumed by bucket().
-        const span = (event) => spans.get(event.id) ?? copy(event);
-        next.active = new Map(Array.from(this.active, ([key, event]) => [key, span(event)]));
-        next.waiting = this.waiting ? span(this.waiting) : undefined;
+        next.active = new Map(Array.from(this.active, ([key, span]) => [key, {
+                ...span,
+                event: spans.get(span.event.id) ?? copy(span.event),
+            }]));
+        next.waiting = this.waiting ? spans.get(this.waiting.id) ?? copy(this.waiting) : undefined;
         next.sequence = this.sequence;
         next.lastTime = this.lastTime;
+        next.lastObservedAt = this.lastObservedAt;
+        next.turnId = this.turnId;
+        next.turnOutcome = this.turnOutcome;
+        next.terminalAt = this.terminalAt;
+        next.lastFailedTool = this.lastFailedTool ? { ...this.lastFailedTool } : undefined;
+        next.completedSpans = new Set(this.completedSpans);
+        next.completedTurns = new Set(this.completedTurns);
         return next;
     }
+    /** Mutates in place: clock, freshness and the event window change before
+     * type-specific fields are checked. Callers that continue after a throw must
+     * observe on a clone() and swap it in on success, as PetNative does. */
     observe(value, at) {
         if (!Number.isFinite(at) || at < this.lastTime || at > pet_sim_js_1.PET_MAX_SECONDS * 1000)
             throw new Error('Invalid Engine pet clock.');
         if (!value || typeof value !== 'object' || Array.isArray(value))
             throw new Error('Invalid Engine pet metadata.');
-        const e = value;
-        const allowed = ['event', 'index', 'channel', 'tool_call_id', 'tool_name', 'id', 'worker_status', 'failed'];
-        if (Object.keys(e).some(k => !allowed.includes(k)) || typeof e.event !== 'string'
-            || Object.values(e).some(v => typeof v === 'string' && v.length > 4096)
-            || e.channel !== undefined && !['text', 'reasoning'].includes(e.channel)
-            || ['tool_call_id', 'tool_name', 'id', 'worker_status'].some(k => e[k] !== undefined && typeof e[k] !== 'string')
-            || e.failed !== undefined && typeof e.failed !== 'boolean'
-            || e.index !== undefined && (!Number.isSafeInteger(e.index) || e.index < 0))
+        const event = value;
+        const allowed = ['event', 'index', 'channel', 'span_id', 'activity_kind', 'action_id', 'outcome', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
+        const stringFields = ['action_id', 'event', 'span_id', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
+        if (Object.keys(event).some(key => !allowed.includes(key)) || typeof event.event !== 'string'
+            || Object.values(event).some(v => typeof v === 'string' && v.length > 256)
+            || stringFields.some(key => event[key] !== undefined && typeof event[key] !== 'string')
+            || event.action_id !== undefined && (typeof event.action_id !== 'string' || !event.action_id
+                || /[\u0000-\u001f\u007f-\u009f]/.test(event.action_id)
+                || [...event.action_id].reduce((bytes, char) => {
+                    const cp = char.codePointAt(0);
+                    return bytes + (cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4);
+                }, 0) > 256)
+            || event.channel !== undefined && !['text', 'reasoning'].includes(event.channel)
+            || event.activity_kind !== undefined && !ACTIVITY_KINDS.includes(event.activity_kind)
+            || event.outcome !== undefined && (typeof event.outcome !== 'string'
+                || (event.event === 'approval_resolved'
+                    ? !APPROVAL_OUTCOMES.includes(event.outcome)
+                    : event.event === 'operation_activity_completed'
+                        ? !OPERATION_OUTCOMES.includes(event.outcome)
+                        : true))
+            || event.turn_outcome !== undefined && !TURN_OUTCOMES.includes(event.turn_outcome)
+            || event.index !== undefined && (!Number.isSafeInteger(event.index) || event.index < 0))
             throw new Error('Invalid Engine pet metadata fields.');
         this.lastTime = at;
-        this.events = this.events.filter(span => span.endTime >= at - 12_800);
-        const id = (field) => { const s = e[field]; if (typeof s !== 'string' || !s)
-            throw new Error(`Missing Engine ${field}.`); return s; };
-        const index = () => { if (!Number.isSafeInteger(e.index))
-            throw new Error('Missing Engine index.'); return String(e.index); };
-        const start = (key, name, category, agentId) => {
-            if (this.active.size >= 256 && !this.active.has(key))
-                throw new Error('Too many active Engine pet spans.');
-            this.active.set(key, this.add(name, category, at, agentId));
+        this.lastObservedAt = at;
+        this.events = this.events.filter(item => item.endTime >= at - 12_800);
+        const required = (key) => {
+            const value = event[key];
+            if (typeof value !== 'string' || !value)
+                throw new Error(`Missing Engine ${key}.`);
+            return value;
         };
-        const finish = (key) => { this.pulse(key, at); this.active.delete(key); };
-        switch (e.event) {
-            case 'turn_started':
-                this.active.clear();
-                this.waiting = undefined;
+        const index = () => {
+            if (!Number.isSafeInteger(event.index))
+                throw new Error('Missing Engine index.');
+            return String(event.index);
+        };
+        const activityKind = () => {
+            if (!ACTIVITY_KINDS.includes(event.activity_kind))
+                throw new Error('Missing Engine activity kind.');
+            return event.activity_kind;
+        };
+        const startMessage = (key, kind, group) => {
+            this.start(key, kind, group, at);
+            this.waiting = undefined;
+        };
+        switch (event.event) {
+            case 'turn_started': {
+                const id = required('turn_id');
+                if (this.turnId !== id) {
+                    this.active.clear();
+                    this.waiting = undefined;
+                    this.lastFailedTool = undefined;
+                    this.turnId = id;
+                    this.turnOutcome = undefined;
+                    this.terminalAt = undefined;
+                }
                 break;
+            }
             case 'message_started':
-                start(`message:${index()}`, 'assistant_message', 'communication');
-                this.waiting = undefined;
+                startMessage(`message:${index()}`, 'responding', 'responding');
                 break;
             case 'thinking_started':
-                start(`thinking:${index()}`, 'thinking', 'reasoning');
-                this.waiting = undefined;
+                startMessage(`thinking:${index()}`, 'thinking', 'thinking');
                 break;
             case 'response_delta': {
-                const reasoning = e.channel === 'reasoning';
+                const reasoning = event.channel === 'reasoning';
                 const key = `${reasoning ? 'thinking' : 'message'}:${index()}`;
                 if (!this.active.has(key))
-                    start(key, reasoning ? 'thinking' : 'assistant_message', reasoning ? 'reasoning' : 'communication');
+                    this.start(key, reasoning ? 'thinking' : 'responding', reasoning ? 'thinking' : 'responding', at);
                 else
                     this.pulse(key, at);
                 this.waiting = undefined;
                 break;
             }
             case 'message_complete':
-                finish(`message:${index()}`);
+                this.finish(`message:${index()}`, at);
                 break;
             case 'thinking_complete':
-                finish(`thinking:${index()}`);
+                this.finish(`thinking:${index()}`, at);
                 break;
-            case 'tool_call_started':
-                start(`tool:${id('tool_call_id')}`, id('tool_name'), (0, codewhale_js_1.toolCategory)(id('tool_name')));
+            case 'operation_activity_started': {
+                const spanId = required('span_id');
+                const kind = activityKind();
+                if (!this.completedSpans.has(spanId))
+                    this.start(`operation:${spanId}`, kind, 'operation', at, 'parent', event.action_id);
                 this.waiting = undefined;
                 break;
+            }
+            case 'operation_activity_completed': {
+                const spanId = required('span_id');
+                const kind = activityKind();
+                if (!OPERATION_OUTCOMES.includes(event.outcome))
+                    throw new Error('Missing Engine operation outcome.');
+                const outcome = event.outcome;
+                // A failure is recorded once, as its own onset event below; marking
+                // the span `error` too would count it twice on the tape.
+                const completed = this.finish(`operation:${spanId}`, at, outcome === 'succeeded' ? 'success' : 'unknown');
+                if (completed && this.addOnce(this.completedSpans, spanId, 4096)) {
+                    if (outcome === 'failed') {
+                        this.add('operation_failed', 'error', at).status = 'error';
+                        this.lastFailedTool = { activityKind: kind, actionId: completed.actionId, failedAtMs: at };
+                    }
+                    if (outcome === 'denied' || outcome === 'cancelled')
+                        this.waiting = undefined;
+                }
+                break;
+            }
             case 'tool_call_heartbeat':
-                for (const key of this.active.keys())
-                    if (key.startsWith('tool:'))
+                for (const [key, span] of this.active)
+                    if (span.group === 'operation')
                         this.pulse(key, at);
                 break;
-            case 'tool_call_complete':
-                finish(`tool:${id('tool_call_id')}`);
+            case 'approval_resolved': {
+                required('id');
+                if (!APPROVAL_OUTCOMES.includes(event.outcome))
+                    throw new Error('Invalid Engine approval outcome.');
                 this.waiting = undefined;
                 break;
-            case 'agent_spawned':
-                start(`agent:${id('id')}`, 'agent', 'agent', id('id'));
+            }
+            case 'agent_spawned': {
+                const id = required('id');
+                this.start(`agent:${id}`, 'delegating', 'agent', at, id);
                 break;
+            }
             case 'agent_progress': {
-                const key = `agent:${id('id')}`;
-                if (['completed', 'failed', 'cancelled', 'interrupted', 'budget_exhausted'].includes(e.worker_status)) {
-                    finish(key);
+                const id = required('id');
+                const key = `agent:${id}`;
+                if (['completed', 'failed', 'cancelled', 'interrupted', 'budget_exhausted'].includes(event.worker_status)) {
+                    this.finish(key, at);
                     break;
                 }
                 if (!this.active.has(key))
-                    start(key, 'agent', 'agent', id('id'));
+                    this.start(key, 'delegating', 'agent', at, id);
                 else
                     this.pulse(key, at);
                 break;
             }
             case 'agent_complete':
-                finish(`agent:${id('id')}`);
+                this.finish(`agent:${required('id')}`, at);
                 break;
             case 'approval_required':
-            case 'user_input_required':
-                this.waiting = this.add('human', 'human', at);
-                this.waiting.status = 'pending';
+            case 'user_input_required': {
+                required('id');
+                if (!this.waiting) {
+                    this.waiting = this.add('human_request', 'human', at);
+                    this.waiting.status = 'pending';
+                }
                 break;
-            case 'turn_complete':
+            }
+            case 'turn_complete': {
+                const outcome = event.turn_outcome;
+                if (!TURN_OUTCOMES.includes(outcome))
+                    throw new Error('Missing Engine turn outcome.');
+                const id = typeof event.turn_id === 'string' && event.turn_id.length ? event.turn_id : undefined;
                 this.active.clear();
                 this.waiting = undefined;
+                this.turnId = id;
+                // An outcome belongs to a turn. `/purge`, an edit rejection or a
+                // session switch mid-turn completes with no turn id; recording the
+                // outcome alone would break the projection invariant the Rust
+                // contract checks (`turn_outcome` requires `turn_id`).
+                this.turnOutcome = id ? outcome : undefined;
+                this.terminalAt = at;
+                if (outcome === 'completed' && id && this.addOnce(this.completedTurns, id, 256))
+                    this.add('turn_completed', 'communication', at).status = 'success';
                 break;
-            case 'error': break;
+            }
             default: throw new Error('Unsupported Engine pet event.');
         }
-        // Receipt time is the error onset; never rewrite the operation's old start.
-        if (e.event === 'error' || e.failed === true)
-            this.add('error', 'error', at).status = 'error';
     }
-    /** Waiting coverage comes from the existing typed shell's current request.
-     * It can extend a witnessed request, never invent one on a mid-turn attach. */
+    /** The typed shell may extend a request already witnessed in Engine events,
+     * but a mid-turn attach cannot invent a NeedsYou state. */
     confirmWaiting(at, waiting) {
         if (!waiting) {
             this.waiting = undefined;
             return;
         }
-        if (this.waiting && at >= this.waiting.endTime)
+        if (this.waiting && at >= this.waiting.endTime) {
             this.waiting.endTime = at;
+            this.lastObservedAt = at;
+            this.lastTime = Math.max(this.lastTime, at);
+        }
     }
     bucket(sequence) {
         const end = (sequence + 1) * pet_telemetry_js_1.PET_BIN_MS;
-        const input = this.events.filter(e => e.startTime < end && e.endTime >= end - 12_400)
-            .map(e => ({ ...e, endTime: Math.min(e.endTime, end) }));
+        const input = this.events.filter(event => event.startTime < end && event.endTime >= end - 12_400)
+            .map(event => ({ ...event, endTime: Math.min(event.endTime, end) }));
         return (0, pet_telemetry_js_1.compilePetTelemetry)(input, end, sequence)[0];
     }
 }
 exports.PetEngineTelemetry = PetEngineTelemetry;
 
 };
-factories["codewhale"]=function(exports,require){
+factories["dot-field"]=function(exports,require){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.CodewhaleRuntimeTrace = void 0;
-exports.isCodewhaleSession = isCodewhaleSession;
-exports.isCodewhaleRuntimeRecord = isCodewhaleRuntimeRecord;
-exports.isCodewhaleRuntimeDocument = isCodewhaleRuntimeDocument;
-exports.toolActivity = toolActivity;
-exports.toolCategory = toolCategory;
-exports.fromCodewhaleSession = fromCodewhaleSession;
-exports.fromCodewhaleRuntime = fromCodewhaleRuntime;
-exports.observeRuntimeRequests = observeRuntimeRequests;
-/** Read-only Codewhale session/runtime adapter. Does not record, mutate, or own receipts. */
+exports.dotFieldKey = dotFieldKey;
+exports.textLanguage = textLanguage;
+exports.projectDotField = projectDotField;
+exports.blendDotFields = blendDotFields;
 const model_js_1 = require("./model.js");
-const PAYLOAD_LIMIT = 2000;
-const COLLAPSED_SPAN_MS = 1000;
-const ENVELOPE_MIN_MS = 60_000;
-const obj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v) ? v : {};
-const str = (v) => typeof v === 'string' && v.length ? v : undefined;
-const num = (v) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
-function isCodewhaleSession(value) {
-    const root = obj(value);
-    const metadata = obj(root.metadata);
-    if (!str(metadata.id))
-        return false;
-    if (root.format === 'whalesong.evidence/v1' || Array.isArray(root.resourceSpans) || root.schemaVersion === 1)
-        return false;
-    const journal = obj(root.journal);
-    return Array.isArray(root.messages) || Array.isArray(journal.entries);
+const dot_glyphs_js_1 = require("./dot-glyphs.js");
+const dot_body_js_1 = require("./dot-body.js");
+const dot_pixel_body_js_1 = require("./dot-pixel-body.js");
+const TAU = Math.PI * 2;
+const clamp = (n, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, n));
+const ease = (n) => { const u = clamp(n); return u * u * (3 - 2 * u); };
+const GLYPH_POINTS = Object.fromEntries(Object.entries(dot_glyphs_js_1.DOT_GLYPHS).map(([language, glyphs]) => [language,
+    Object.fromEntries(Object.entries(glyphs).map(([key, rows]) => [key,
+        rows.flatMap((row, y) => [...row].flatMap((pixel, x) => pixel === '#' ? [[(x - 23.5) / 24, (y - 23.5) / 24]] : [])),
+    ])),
+]));
+const HUES = {
+    reading: 185, editing: 190, searching: 194, testing: 201, executing: 198,
+    browsing: 195, computer: 198, memory: 180, tool: 195, thinking: 185,
+    responding: 188, delegating: 192, waiting: 38, done: 180,
+};
+function verb(a, timeMs) {
+    if (a.freshness !== 'fresh' || !a.observed)
+        return null;
+    if (a.authoritativePresence === 'needs_you')
+        return 'waiting';
+    if (a.authoritativePresence === 'done')
+        return timeMs - (a.observedAtMs ?? timeMs) < 2600 ? 'done' : null;
+    if (a.authoritativePresence === 'idle')
+        return null;
+    return a.activityKind;
 }
-function isCodewhaleRuntimeRecord(value) {
-    const rec = obj(value);
-    return Number.isSafeInteger(rec.seq) && rec.seq >= 0 && typeof rec.event === 'string' && !!rec.event
-        && typeof rec.thread_id === 'string' && !!rec.thread_id && rec.timestamp != null;
+function dotFieldKey(a) {
+    return [a.freshness, a.authoritativePresence, a.activityKind, a.actionId,
+        a.parallelAgentCount, a.doneEffectId, a.activeSpans.length === 0 && !!a.failedToolAge].join(':');
 }
-function isCodewhaleRuntimeDocument(value) {
-    if (!Array.isArray(value) || !value.length)
-        return false;
-    const n = Math.min(value.length, 8);
-    let hits = 0;
-    for (let i = 0; i < n; i++)
-        if (isCodewhaleRuntimeRecord(value[i]))
-            hits++;
-    return hits === n;
+function pigment(hue, light) {
+    const h = ((hue % 360) + 360) % 360 / 60, c = (1 - Math.abs(2 * light - 1)) * .62;
+    const x = c * (1 - Math.abs(h % 2 - 1)), m = light - c / 2;
+    const rgb = h < 1 ? [c, x, 0] : h < 2 ? [x, c, 0] : h < 3 ? [0, c, x]
+        : h < 4 ? [0, x, c] : h < 5 ? [x, 0, c] : [c, 0, x];
+    return rgb.map(v => Math.round((v + m) * 255));
 }
-function clip(value) {
-    if (value == null)
-        return value;
-    const text = typeof value === 'string' ? value : JSON.stringify(value);
-    if (text.length <= PAYLOAD_LIMIT)
-        return typeof value === 'string' ? value : JSON.parse(text);
-    return `${text.slice(0, PAYLOAD_LIMIT)}…[truncated ${text.length - PAYLOAD_LIMIT} source bytes]`;
+function textLanguage(value = 'auto', interfaceLanguage = 'en') {
+    const tag = (value === 'auto' ? interfaceLanguage : value).toLowerCase();
+    return tag.startsWith('ja') ? 'ja' : /^(zh-hant|zh-tw|zh-hk|zh-mo)/.test(tag) ? 'zh-Hant'
+        : tag.startsWith('zh') ? 'zh-Hans' : 'en';
 }
-function parseTime(value) {
-    if (typeof value === 'number' && Number.isFinite(value))
-        return value;
-    if (typeof value !== 'string' || !value)
-        return undefined;
-    const ms = Date.parse(value);
-    return Number.isFinite(ms) ? ms : undefined;
-}
-function statusOf(value, isError) {
-    if (isError === true)
-        return 'error';
-    if (isError === false)
-        return 'success';
-    const s = String(value ?? '').toLowerCase();
-    if (s === 'completed' || s === 'success' || s === 'ok')
-        return 'success';
-    if (s === 'failed' || s === 'error' || s === 'errored')
-        return 'error';
-    if (s === 'canceled' || s === 'cancelled' || s === 'interrupted')
-        return 'error';
-    if (s === 'in_progress' || s === 'running')
-        return 'running';
-    if (s === 'pending')
-        return 'pending';
-    return 'unknown';
-}
-function classify(name) {
-    const n = name.toLowerCase();
-    if (/exception|^error\b/.test(n))
-        return 'error';
-    if (/spawn|fork|subagent|^agent$/.test(n))
-        return 'agent';
-    if (/message\.send|handoff|agent\.message|assistant_message/.test(n))
-        return 'communication';
-    if (/retrieve|retrieval|context|embedding|vector|memory|rag/.test(n))
-        return 'memory';
-    if (/browser|navigate|screenshot|click|playwright/.test(n))
-        return 'browser';
-    if (/read_file|write_file|list_dir|^read$|^write$|^edit$|glob|grep|file\.|filesystem/.test(n))
-        return 'filesystem';
-    if (/bash|exec|shell|run_test|cargo|pytest|compile/.test(n))
-        return 'code';
-    if (/reason|thinking|completion|generate|chat|llm/.test(n))
-        return 'reasoning';
-    if (/http|request|api|fetch|network|mcp_/.test(n))
-        return 'network';
-    if (/user_message|human|approval/.test(n))
-        return 'human';
-    if (/orchestrat|workflow|phase|join|session|thread|turn|todo|plan|operate_contract|status/.test(n))
-        return 'orchestration';
-    if (/tool/.test(n))
-        return 'tool';
-    return model_js_1.CATEGORIES.includes(n) ? n : 'other';
-}
-/** Presentation vocabulary beside the canonical category classifier. Only the
- * witnessed tool name is used; command contents are never inferred. */
-function toolActivity(name) {
-    const n = name.toLowerCase().replace(/-/g, '_');
-    if (/search|grep|glob|find_file/.test(n))
-        return { kind: 'searching', label: 'Searching' };
-    if (/read_file|list_dir|read_text|open_file/.test(n))
-        return { kind: 'reading', label: 'Reading files' };
-    if (/apply_patch|write_file|edit_file|replace_text/.test(n))
-        return { kind: 'editing', label: 'Editing files' };
-    if (/run_test|pytest|test_suite/.test(n))
-        return { kind: 'testing', label: 'Running tests' };
-    const category = toolCategory(name);
-    return { browser: { kind: 'browsing', label: 'Using the browser' },
-        filesystem: { kind: 'files', label: 'Working with files' },
-        code: { kind: 'executing', label: 'Running a command' },
-        network: { kind: 'network', label: 'Calling a service' },
-        agent: { kind: 'delegating', label: 'Coordinating agents' },
-        memory: { kind: 'memory', label: 'Retrieving context' },
-        reasoning: { kind: 'thinking', label: 'Thinking' },
-        communication: { kind: 'communicating', label: 'Communicating' },
-    }[category] ?? { kind: 'tool', label: 'Using a tool' };
-}
-function toolCategory(name) {
-    const category = classify(name);
-    return category === 'other' ? 'tool' : category;
-}
-function pointer(source, ids) {
-    return { format: source, ...ids };
-}
-function titleOfSession(metadata, filename) {
-    const title = str(metadata.title)?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-    if (title && !title.startsWith('codewhale:runtime_event'))
-        return title.slice(0, 120);
-    return `Codewhale session · ${(str(metadata.id) ?? filename).slice(0, 8)}`;
-}
-function activeJournalEntries(journal) {
-    const entries = Array.isArray(journal.entries) ? journal.entries.map(obj) : [];
-    const leaf = str(journal.leaf_id);
-    if (!leaf || !entries.length)
-        return { entries, warnings: [] };
-    const byId = new Map(entries.filter(e => str(e.id)).map(e => [e.id, e]));
-    const chain = [];
-    const seen = new Set();
-    let id = leaf;
-    while (id && !seen.has(id)) {
-        seen.add(id);
-        const entry = byId.get(id);
-        if (!entry)
-            break;
-        chain.push(entry);
-        id = str(entry.parent_id);
-    }
-    if (!chain.length)
-        return { entries, warnings: ['Journal leaf_id did not resolve; using append order instead of the active branch.'] };
-    if (chain.length < entries.length) {
-        return {
-            entries: chain.reverse(),
-            warnings: [`Active journal branch has ${chain.length} of ${entries.length} entries. Forked history was not invented into the timeline.`],
-        };
-    }
-    return { entries: chain.reverse(), warnings: [] };
-}
-function collapsedTimestamps(entries, created, updated) {
-    const times = entries.map(e => parseTime(e.created_at)).filter((n) => n !== undefined);
-    if (times.length < 2)
-        return false;
-    const span = Math.max(...times) - Math.min(...times);
-    const envelope = created !== undefined && updated !== undefined ? updated - created : 0;
-    return envelope >= ENVELOPE_MIN_MS && span < COLLAPSED_SPAN_MS;
-}
-function pushEvent(events, event) {
-    events.push(event);
-}
-function fromCodewhaleSession(document, filename = 'Codewhale session', maxEvents = 250_000) {
-    const root = obj(document);
-    const metadata = obj(root.metadata);
-    const sessionId = str(metadata.id) ?? filename;
-    const journal = obj(root.journal);
-    const { entries, warnings } = activeJournalEntries(journal);
-    const sourceEntries = entries.length ? entries : (Array.isArray(root.messages) ? root.messages.map((message, i) => ({ id: `${sessionId}/message/${i}`, kind: 'message', message })) : []);
-    if (!sourceEntries.length)
-        throw new Error('Codewhale session contains no journal entries or messages.');
-    const created = parseTime(metadata.created_at);
-    const updated = parseTime(metadata.updated_at);
-    const orderOnly = collapsedTimestamps(sourceEntries, created, updated);
-    if (orderOnly) {
-        warnings.push('Journal created_at values are collapsed to last-save time, not execution time. The time axis is journal order (1 ms per emitted event), not wall-clock duration. Gap, burst, and cycle-period findings are not execution-time claims.');
-    }
-    else {
-        const times = sourceEntries.map(e => parseTime(e.created_at)).filter((n) => n !== undefined);
-        if (!times.length)
-            warnings.push('Journal entries have no usable timestamps. The time axis is journal order.');
-    }
-    const events = [];
-    const pending = new Map();
-    let seq = 0;
-    const originWall = orderOnly ? undefined : sourceEntries.map(e => parseTime(e.created_at)).find((n) => n !== undefined);
-    const agentId = 'parent';
-    const model = str(metadata.model);
-    const provider = str(metadata.model_provider);
-    const when = (entry, fallback) => {
-        if (orderOnly || originWall === undefined)
-            return { start: fallback, open: false };
-        const t = parseTime(entry.created_at);
-        if (t === undefined)
-            return { start: fallback, open: true };
-        return { start: t - originWall, open: false };
-    };
-    for (const entry of sourceEntries) {
-        if (events.length >= maxEvents)
-            throw new Error(`Import exceeds the ${maxEvents.toLocaleString()} event limit.`);
-        const entryId = str(entry.id) ?? `${sessionId}/entry/${seq}`;
-        const message = obj(entry.message ?? (entry.kind === 'message' ? entry : {}));
-        const role = str(message.role) ?? (str(entry.kind) === 'user' ? 'user' : str(entry.kind) === 'assistant' ? 'assistant' : undefined);
-        const blocks = Array.isArray(message.content) ? message.content.map(obj) : [];
-        if (!blocks.length) {
-            const text = str(entry.text) ?? str(message.text);
-            if (text)
-                blocks.push({ type: role === 'user' ? 'text' : 'text', text });
+function projectDotField(activity, timeMs, still = false, expressionAtMs = 0, options = {}) {
+    const kind = verb(activity, timeMs), identity = activity.actionId || activity.activityKind || 'whale';
+    const seed = (0, model_js_1.stableHash)(identity), variant = (seed % 997) / 997;
+    const t = still ? 0 : timeMs / 1000, cycle = still ? .43 : (t / (2.8 + variant * .6)) % 1;
+    const sweep = -.86 + cycle * 1.72, scanRow = Math.floor(cycle * 5) % 5;
+    const bodyStyle = options.bodyStyle ?? 'smooth', language = textLanguage(options.textLanguage);
+    const body = bodyStyle === 'pixel' ? dot_pixel_body_js_1.DOT_PIXEL_BODY : dot_body_js_1.DOT_BODY;
+    const glyph = kind ? GLYPH_POINTS[language][kind] : null;
+    const fresh = activity.freshness === 'fresh' && activity.observed;
+    const failed = fresh && !activity.activeSpans.length && !!activity.failedToolAge;
+    const phase = ((Math.max(0, timeMs - expressionAtMs) / 1000 + 1.7) % 8.4);
+    const morph = !kind ? 0 : still ? 1 : kind === 'done'
+        ? 1 - ease((timeMs - (activity.observedAtMs ?? timeMs) - 800) / 900)
+        : ease(phase / 1.7) * (1 - ease((phase - 5.4) / .9));
+    const points = [], materials = [];
+    const lens = [Math.sin(cycle * TAU) * .62, -.62 + scanRow * .31];
+    for (let i = 0; i < body.length; i++) {
+        const [hx, hy] = body[i];
+        const tail = clamp((-hx - hy + .1) / .65);
+        const homeX = hx * 1.9 + (still ? 0 : .008 * Math.sin(t * .75 + hy * 5));
+        const homeY = hy * 1.9 + (still ? 0 : .009 * Math.sin(t * 1.1 + hx * 4)
+            + tail * .012 * Math.sin(t * 1.55 + hx * 7));
+        const bodyLight = .61 + .14 * clamp((hx + .45) / .9) + .035 * Math.cos(hy * 7);
+        let x = homeX, y = homeY, light = bodyLight, alpha = fresh ? .88 : .42;
+        if (glyph && kind) {
+            [x, y] = glyph[Math.floor(i * glyph.length / body.length)];
+            x += ((i * 17) % 7 - 3) * .0016;
+            y += ((i * 11) % 7 - 3) * .0016;
+            let beam = Math.exp(-Math.pow((y - sweep) * 10, 2));
+            switch (kind) {
+                case 'reading':
+                    beam = Math.exp(-Math.pow((y + .64 - scanRow * .32) * 18, 2))
+                        * (.35 + .65 * Math.exp(-Math.pow((x - sweep) * 4, 2)));
+                    break;
+                case 'searching':
+                case 'computer':
+                    beam = Math.exp(-((x - lens[0]) ** 2 + (y - lens[1]) ** 2) * 24);
+                    break;
+                case 'editing':
+                case 'responding':
+                case 'testing':
+                    beam = Math.exp(-Math.pow((x - sweep) * 12, 2));
+                    break;
+                case 'executing':
+                case 'tool':
+                    beam = (1 + Math.sin(x * 8 - y * 3 - cycle * TAU)) / 2;
+                    break;
+                case 'memory':
+                    beam = Math.exp(-Math.pow((Math.hypot(x, y) - (1 - cycle)) * 12, 2));
+                    break;
+                case 'thinking':
+                    beam = (1 + Math.cos(Math.atan2(y, x) - cycle * TAU)) / 2;
+                    break;
+                case 'delegating':
+                    beam = (1 + Math.sin(y * Math.max(1, Math.min(6, activity.parallelAgentCount)) * 5 - cycle * TAU)) / 2;
+                    break;
+                case 'waiting':
+                    beam = .2 + .2 * (1 + Math.sin(t * 1.5)) / 2;
+                    break;
+                case 'done':
+                    beam = still ? .35 : clamp(1 - (timeMs - (activity.observedAtMs ?? timeMs)) / 1700);
+                    break;
+            }
+            light = .66 + beam * .18;
+            alpha = .84 + beam * .15;
+            if (!still) {
+                const px = x, py = y;
+                x += .009 * Math.sin(py * 12 - t * 1.3) + .003 * Math.sin(px * 24 + py * 8 + t * 2.1);
+                y += .007 * Math.sin(px * 13 + t * 1.05) + .003 * Math.cos(py * 26 - px * 6 - t * 1.7);
+            }
+            x = homeX + (x - homeX) * morph;
+            y = homeY + (y - homeY) * morph;
+            light = bodyLight + (light - bodyLight) * morph;
+            alpha = .88 + (alpha - .88) * morph;
         }
-        if (!blocks.length)
-            continue;
-        const parentEventId = events.length ? events[events.length - 1].id : undefined;
-        for (const block of blocks) {
-            const t = when(entry, seq);
-            const idBase = `${entryId}/${seq}`;
-            const type = str(block.type) ?? 'text';
-            const raw = pointer('codewhale.session/v1', { sessionId, entryId, seq, blockType: type, toolUseId: block.id ?? block.tool_use_id });
-            if (type === 'tool_use' || type === 'server_tool_use') {
-                const tool = str(block.name) ?? 'tool';
-                const callId = str(block.id) ?? idBase;
-                const started = tool === 'agent' && obj(block.input).action === 'start';
-                const event = {
-                    schemaVersion: 1, id: callId, traceId: sessionId, parentId: parentEventId,
-                    startTime: t.start, endTime: t.start, openEnded: true,
-                    agentId, name: started ? 'agent.spawn' : tool, tool, category: toolCategory(tool),
-                    subtype: started ? 'fork' : undefined, model, provider,
-                    status: 'running', attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq, 'tool.name': tool },
-                    payload: { arguments: clip(block.input) }, raw,
-                };
-                pending.set(callId, events.length);
-                pushEvent(events, event);
-            }
-            else if (type === 'tool_result') {
-                const callId = str(block.tool_use_id);
-                const isError = block.is_error === true;
-                const target = callId !== undefined ? pending.get(callId) : undefined;
-                if (target !== undefined) {
-                    const prior = events[target];
-                    prior.endTime = t.start;
-                    prior.openEnded = false;
-                    prior.status = statusOf('completed', isError);
-                    prior.payload = { ...(obj(prior.payload)), result: clip(block.content) };
-                    prior.attributes = { ...prior.attributes, 'codewhale.result_entry_id': entryId };
-                    pending.delete(callId);
-                }
-                else {
-                    pushEvent(events, {
-                        schemaVersion: 1, id: idBase, traceId: sessionId, parentId: callId ?? parentEventId,
-                        startTime: t.start, endTime: t.start, agentId,
-                        name: 'tool_result', category: 'tool', model, provider,
-                        status: statusOf(undefined, isError),
-                        attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq, tool_use_id: callId },
-                        payload: { result: clip(block.content) }, raw,
-                    });
-                }
-            }
-            else if (type === 'thinking') {
-                pushEvent(events, {
-                    schemaVersion: 1, id: idBase, traceId: sessionId, parentId: parentEventId,
-                    startTime: t.start, endTime: t.start, agentId, name: 'thinking', category: 'reasoning',
-                    model, provider, status: 'success',
-                    attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq },
-                    payload: { thinking: clip(block.thinking ?? block.text) }, raw,
-                });
-            }
-            else {
-                const text = str(block.text) ?? '';
-                const operate = text.includes('codewhale:runtime_event');
-                const user = role === 'user' || role === 'User';
-                pushEvent(events, {
-                    schemaVersion: 1, id: idBase, traceId: sessionId, parentId: parentEventId,
-                    startTime: t.start, endTime: t.start, agentId,
-                    name: operate ? 'operate_contract' : user ? 'user_message' : 'assistant_message',
-                    category: operate ? 'orchestration' : user ? 'human' : 'communication',
-                    model, provider, status: 'success',
-                    attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq, role: role ?? 'unknown' },
-                    payload: { text: clip(text) }, raw,
-                });
-            }
-            seq += 1;
-        }
+        if (!still)
+            light = clamp(light + .025 * Math.sin(hx * 10 - hy * 5 - t * 1.1), .5, .9);
+        points.push([clamp(x, -.94, .94), clamp(y, -.94, .94)]);
+        const hue = morph > 0 ? (failed ? 16 : kind ? HUES[kind] : 188) : 188;
+        const base = bodyStyle === 'pixel' ? dot_pixel_body_js_1.DOT_PIXEL_BODY[i].slice(2)
+            : pigment(185 + clamp((hy - hx + .45) / .9) * 70, light);
+        const accent = pigment(hue + variant * 6 - 3, light);
+        const color = !fresh ? [145, 166, 178] : base.map((v, k) => Math.round(v + (accent[k] - v) * morph));
+        materials.push([...color, alpha]);
     }
-    if (!events.length)
-        throw new Error('Codewhale session produced no inspectable events.');
-    for (const event of events) {
-        if (event.openEnded && event.tool)
-            warnings.push(`Tool ${event.id} has no matching tool_result in this snapshot; duration remains unknown.`);
-    }
-    const base = events.reduce((m, e) => Math.min(m, e.startTime), events[0].startTime);
-    for (const event of events) {
-        event.startTime -= base;
-        event.endTime -= base;
-    }
-    const cost = obj(metadata.cost);
-    const sessionCost = num(cost.session_cost_usd);
-    const duration = Math.max(1, events.reduce((m, e) => Math.max(m, e.endTime, e.startTime), 0));
-    const uniqueWarnings = [...new Set(warnings)];
+    return { points, materials, morph, bodyStyle };
+}
+function blendDotFields(from, to, progress) {
+    const mix = ease(progress);
+    if (mix >= 1)
+        return to;
     return {
-        id: sessionId,
-        name: titleOfSession(metadata, filename),
-        events,
-        duration,
-        originTime: orderOnly ? 'journal-order' : (str(metadata.created_at) ?? `${base} ms`),
-        source: 'codewhale',
-        privacy: 'redact',
-        warnings: uniqueWarnings,
-        metadata: {
-            sourceFormat: 'codewhale.session/v1',
-            timeBasis: orderOnly || originWall === undefined ? 'journal-order' : 'wall-clock',
-            sourceFilename: filename,
-            sessionId,
-            model,
-            provider,
-            workspace: metadata.workspace,
-            mode: metadata.mode,
-            envelopeCreatedAt: metadata.created_at,
-            envelopeUpdatedAt: metadata.updated_at,
-            cumulativeTurnSecs: metadata.cumulative_turn_secs,
-            messageCount: metadata.message_count,
-            journalEntries: sourceEntries.length,
-            totalTokens: metadata.total_tokens,
-            sessionCostUsd: sessionCost,
-            pricedTurns: cost.priced_turns,
-            unpricedTurns: cost.unpriced_turns,
-            runtimeStore: metadata.runtime_store,
-            timeUnit: 'ms',
-        },
+        morph: from.morph + (to.morph - from.morph) * mix,
+        bodyStyle: to.bodyStyle,
+        points: to.points.map((p, i) => p.map((v, k) => from.points[i][k] + (v - from.points[i][k]) * mix)),
+        materials: to.materials.map((p, i) => p.map((v, k) => from.materials[i][k] + (v - from.materials[i][k]) * mix)),
     };
 }
-function itemToolName(item, payload) {
-    const named = str(payload.tool) ?? str(item.tool) ?? str(item.name);
-    if (named)
-        return named;
-    if (str(item.kind) !== 'tool_call')
-        return undefined;
-    const head = str(item.summary)?.split(':')[0]?.trim();
-    if (head && head.length < 80 && !/\s/.test(head))
-        return head;
-    return undefined;
-}
-function itemCategory(kind, tool) {
-    if (kind === 'user_message')
-        return 'human';
-    if (kind === 'agent_reasoning')
-        return 'reasoning';
-    if (kind === 'agent_message')
-        return 'communication';
-    if (kind === 'status')
-        return 'orchestration';
-    if (kind === 'tool_call' && tool)
-        return toolCategory(tool);
-    if (kind === 'tool_call')
-        return 'tool';
-    return classify(kind);
-}
-/** Incremental form of the existing Runtime importer. File imports and live
- * recording share this exact lifecycle parser; only a live driver retires old
- * completed events after it has recorded their projection. */
-class CodewhaleRuntimeTrace {
-    filename;
-    maxEvents;
-    project;
-    maxBytes;
-    events = [];
-    open = new Map();
-    requests = new Map();
-    sizes = new Map();
-    bytes = 0;
-    recordCount = 0;
-    skippedDeltas = 0;
-    origin;
-    model;
-    threadId;
-    threadName;
-    constructor(filename = 'Codewhale runtime', maxEvents = 250_000, project = event => event, maxBytes = Infinity) {
-        this.filename = filename;
-        this.maxEvents = maxEvents;
-        this.project = project;
-        this.maxBytes = maxBytes;
+
+};
+factories["dot-glyphs"]=function(exports,require){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DOT_GLYPHS = exports.DOT_LABELS = void 0;
+exports.DOT_LABELS = {
+    "en": {
+        "reading": "read",
+        "editing": "patch",
+        "searching": "find",
+        "testing": "verify",
+        "executing": "run",
+        "browsing": "Using the browser",
+        "computer": "Using the computer",
+        "memory": "Retrieving context",
+        "tool": "tool",
+        "thinking": "think",
+        "responding": "Reply",
+        "delegating": "agents underway",
+        "waiting": "needs you",
+        "done": "Done"
+    },
+    "zh-Hans": {
+        "reading": "读取",
+        "editing": "编辑",
+        "searching": "搜索",
+        "testing": "验证",
+        "executing": "运行",
+        "browsing": "使用浏览器",
+        "computer": "操作电脑",
+        "memory": "检索上下文",
+        "tool": "调用工具",
+        "thinking": "思考",
+        "responding": "回复",
+        "delegating": "智能体工作中",
+        "waiting": "等你处理",
+        "done": "完成"
+    },
+    "zh-Hant": {
+        "reading": "讀取",
+        "editing": "編輯",
+        "searching": "搜尋",
+        "testing": "驗證",
+        "executing": "執行",
+        "browsing": "使用瀏覽器",
+        "computer": "操作電腦",
+        "memory": "檢索上下文",
+        "tool": "呼叫工具",
+        "thinking": "思考",
+        "responding": "回覆",
+        "delegating": "代理程式工作中",
+        "waiting": "等你處理",
+        "done": "完成"
+    },
+    "ja": {
+        "reading": "読込",
+        "editing": "パッチ",
+        "searching": "検索",
+        "testing": "検証",
+        "executing": "実行",
+        "browsing": "ブラウザーを操作中",
+        "computer": "コンピューターを操作中",
+        "memory": "コンテキストを検索中",
+        "tool": "ツール",
+        "thinking": "思考",
+        "responding": "返信",
+        "delegating": "サブエージェント実行中",
+        "waiting": "応答待ち",
+        "done": "完了"
     }
-    get retainedEvents() { return this.events.length; }
-    get retainedBytes() { return this.bytes; }
-    measure(event, proposed = event) {
-        const safe = this.project(proposed);
-        if (this.maxBytes !== Infinity) {
-            const size = new TextEncoder().encode(JSON.stringify(safe)).length;
-            const total = this.bytes - (this.sizes.get(event) ?? 0) + size;
-            if (total > this.maxBytes)
-                throw new Error('Runtime observation exceeds its retained input limit.');
-            this.bytes = total;
-            this.sizes.set(event, size);
-        }
-        for (const key of Object.keys(event))
-            if (!Object.hasOwn(safe, key))
-                delete event[key];
-        Object.assign(event, safe);
-    }
-    push(event) {
-        if (this.events.length >= this.maxEvents)
-            throw new Error(`Import exceeds the ${this.maxEvents.toLocaleString()} event limit.`);
-        this.measure(event);
-        pushEvent(this.events, event);
-    }
-    /** Keep unfinished lifetimes plus the recent window needed by the bucketer's
-     * 12-second recurrence measure. A completion may still arrive for any open item. */
-    prune(beforeWall) {
-        if (!Number.isFinite(beforeWall))
-            throw new Error('Invalid Runtime retention horizon.');
-        if (this.origin === undefined)
-            return;
-        const cutoff = beforeWall - this.origin;
-        let keep = 0;
-        for (const event of this.events) {
-            if (event.openEnded || Math.max(event.endTime, (0, model_js_1.errorOnsetOf)(event)) >= cutoff)
-                this.events[keep++] = event;
-            else {
-                this.bytes -= this.sizes.get(event) ?? 0;
-                this.sizes.delete(event);
-                if (this.open.get(event.id) === event)
-                    this.open.delete(event.id);
-            }
-        }
-        this.events.length = keep;
-    }
-    append(records) {
-        if (!records.length)
-            return;
-        const { events, open, requests } = this;
-        const threadId = this.threadId ?? str(obj(records[0]).thread_id) ?? this.filename;
-        this.threadId = threadId;
-        let { origin, model, skippedDeltas } = this;
-        let threadName = this.threadName ?? threadId;
-        const stamp = (rec) => {
-            const t = parseTime(rec.timestamp);
-            if (t === undefined)
-                throw new Error(`Runtime event seq ${rec.seq} is missing a usable timestamp.`);
-            if (origin === undefined)
-                origin = t;
-            return t - origin;
-        };
-        for (const raw of records) {
-            if (!isCodewhaleRuntimeRecord(raw))
-                throw new Error('Runtime import cancelled: a line is not a Codewhale runtime event record. No rows were skipped.');
-            this.recordCount++;
-            const rec = obj(raw);
-            if (rec.thread_id !== threadId)
-                throw new Error('Runtime import contains multiple threads. Export one thread before importing.');
-            const eventName = rec.event;
-            if (eventName === 'item.delta') {
-                skippedDeltas++;
-                continue;
-            }
-            const payload = obj(rec.payload);
-            const item = obj(payload.item);
-            const turn = obj(payload.turn);
-            const thread = obj(payload.thread);
-            const relative = stamp(rec);
-            const turnId = str(rec.turn_id) ?? str(payload.turn_id);
-            const itemId = str(rec.item_id) ?? str(item.id);
-            const agentId = 'parent';
-            if (str(thread.model))
-                model = str(thread.model);
-            if (str(turn.model))
-                model = str(turn.model) ?? model;
-            if (eventName === 'thread.started') {
-                model = str(thread.model) ?? model;
-                threadName = str(thread.id) ?? threadId;
-                this.push({
-                    schemaVersion: 1, id: `thread:${threadId}`, traceId: threadId,
-                    startTime: relative, endTime: relative, openEnded: true,
-                    agentId, name: 'thread', category: 'orchestration', model, status: 'running',
-                    attributes: { 'codewhale.seq': rec.seq, 'whalesong.container': true }, raw: rec,
-                });
-                continue;
-            }
-            if (eventName === 'turn.started' || eventName === 'turn.completed') {
-                const id = `turn:${turnId ?? rec.seq}`;
-                if (eventName === 'turn.completed')
-                    for (const [key, request] of requests) {
-                        if (request.parentId !== id)
-                            continue;
-                        this.measure(request, { ...request, endTime: Math.max(request.startTime, relative), openEnded: false, status: 'unknown' });
-                        requests.delete(key);
-                    }
-                const startWall = parseTime(turn.started_at) ?? parseTime(turn.created_at);
-                const endWall = parseTime(turn.ended_at);
-                const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
-                const end = eventName === 'turn.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
-                const usage = obj(turn.usage);
-                const existing = events.findIndex(e => e.id === id);
-                const next = {
-                    schemaVersion: 1, id, traceId: threadId, parentId: `thread:${threadId}`,
-                    startTime: start, endTime: Math.max(start, end), openEnded: eventName !== 'turn.completed',
-                    agentId, name: 'turn', category: 'orchestration', model,
-                    inputTokens: num(usage.input_tokens), outputTokens: num(usage.output_tokens),
-                    status: statusOf(turn.status ?? payload.status), latency: num(turn.duration_ms),
-                    attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'whalesong.container': true,
-                        ...(statusOf(turn.status ?? payload.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-                    payload: { input_summary: clip(turn.input_summary) }, raw: rec,
-                };
-                if (existing >= 0) {
-                    const prior = events[existing];
-                    this.measure(prior, { ...next, startTime: prior.startTime });
-                }
-                else
-                    this.push(next);
-                continue;
-            }
-            if (eventName === 'turn.lifecycle')
-                continue;
-            if (['approval.required', 'approval.decided', 'approval.timeout', 'user_input.required', 'user_input.answered', 'user_input.canceled'].includes(eventName)) {
-                const kind = eventName.startsWith('approval.') ? 'approval' : 'user_input';
-                const requestId = str(payload[kind === 'approval' ? 'approval_id' : 'input_id']) ?? str(payload.id);
-                if (!requestId)
-                    throw new Error(`Runtime ${eventName} is missing its request identity.`);
-                const key = JSON.stringify([turnId ?? '', kind, requestId]);
-                const prior = requests.get(key), required = eventName.endsWith('.required');
-                if (required && prior)
-                    continue;
-                if (!required && prior) {
-                    const next = { ...prior, attributes: { ...prior.attributes },
-                        endTime: Math.max(prior.startTime, relative), openEnded: false,
-                        status: eventName === 'approval.decided' || eventName === 'user_input.answered' ? 'success' : 'unknown' };
-                    if (payload.auto === true) {
-                        // Automatic consent has a receipt, but never asked the human to wait.
-                        next.category = 'orchestration';
-                        delete next.attributes['whalesong.waiting'];
-                        next.attributes['whalesong.container'] = true;
-                    }
-                    this.measure(prior, next);
-                    requests.delete(key);
-                    continue;
-                }
-                const automatic = payload.auto === true;
-                const event = {
-                    schemaVersion: 1, id: `request:${key}:${rec.seq}`, traceId: threadId,
-                    parentId: turnId ? `turn:${turnId}` : undefined, startTime: relative, endTime: relative,
-                    openEnded: required, agentId, name: eventName, category: automatic ? 'orchestration' : 'human',
-                    status: required ? 'pending' : 'success', model,
-                    attributes: { 'codewhale.seq': rec.seq, 'whalesong.waiting': required, 'whalesong.container': automatic }, raw: rec,
-                };
-                this.push(event);
-                if (required)
-                    requests.set(key, event);
-                continue;
-            }
-            if (eventName === 'tool_call.requested' || eventName === 'tool_call.canceled') {
-                const callId = str(payload.call_id) ?? `call:${rec.seq}`;
-                const tool = str(payload.tool);
-                const canceled = eventName === 'tool_call.canceled';
-                this.push({
-                    schemaVersion: 1, id: `${eventName}:${callId}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-                    startTime: relative, endTime: relative, agentId, name: tool ?? eventName, tool,
-                    category: tool ? toolCategory(tool) : 'tool', model, status: canceled ? 'error' : 'pending',
-                    attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.call_id': callId, reason: payload.reason },
-                    payload: { arguments: clip(payload.arguments) }, raw: rec,
-                });
-                continue;
-            }
-            if (eventName === 'item.started' || eventName === 'item.completed') {
-                const kind = str(item.kind) ?? 'item';
-                const tool = itemToolName(item, payload);
-                const id = itemId ?? `item:${rec.seq}`;
-                const startWall = parseTime(item.started_at);
-                const endWall = parseTime(item.ended_at);
-                const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
-                const end = eventName === 'item.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
-                const openEnded = eventName === 'item.started' && endWall === undefined;
-                const existing = open.get(id);
-                if (existing && eventName === 'item.completed') {
-                    const prior = existing;
-                    const status = statusOf(item.status);
-                    this.measure(prior, { ...prior, endTime: Math.max(prior.startTime, end), openEnded: false, status,
-                        attributes: { ...prior.attributes, ...(status === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-                        payload: { summary: clip(item.summary), detail: clip(item.detail) } });
-                    open.delete(id);
-                    continue;
-                }
-                const event = {
-                    schemaVersion: 1, id, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-                    startTime: start, endTime: Math.max(start, end), openEnded,
-                    agentId, name: tool ?? kind, tool, category: itemCategory(kind, tool), model,
-                    status: statusOf(item.status ?? (eventName === 'item.started' ? 'running' : undefined)),
-                    attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.item_kind': kind,
-                        ...(statusOf(item.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-                    payload: { summary: clip(item.summary), detail: clip(item.detail) }, raw: rec,
-                };
-                this.push(event);
-                if (eventName === 'item.started')
-                    open.set(id, event);
-                continue;
-            }
-            this.push({
-                schemaVersion: 1, id: `${eventName}:${rec.seq}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-                startTime: relative, endTime: relative, agentId, name: eventName, category: classify(eventName),
-                model, status: 'unknown', attributes: { 'codewhale.seq': rec.seq }, raw: rec,
-            });
-        }
-        this.origin = origin;
-        this.model = model;
-        this.threadName = threadName;
-        this.skippedDeltas = skippedDeltas;
-    }
-    snapshot() {
-        const { events, open, requests, origin, model, skippedDeltas, filename } = this;
-        const threadId = this.threadId ?? filename, threadName = this.threadName ?? threadId;
-        const warnings = [];
-        if (skippedDeltas)
-            warnings.push(`Dropped ${skippedDeltas.toLocaleString()} item.delta records; they are token stream fragments, not spans. Item start/end remain the source of duration.`);
-        for (const [id] of open)
-            warnings.push(`Item ${id} started and never completed in this file; duration remains unknown.`);
-        for (const request of requests.values())
-            warnings.push(`Request ${request.id} has no terminal receipt; its duration remains unknown in this file.`);
-        if (!events.length)
-            throw new Error('Codewhale runtime file contained only stream deltas or unreadable records.');
-        const base = events.reduce((m, e) => Math.min(m, e.startTime), events[0].startTime);
-        const normalized = events.map(event => ({ ...event, startTime: event.startTime - base, endTime: event.endTime - base,
-            attributes: { ...event.attributes, ...(event.attributes['whalesong.error_onset_ms'] !== undefined
-                    ? { 'whalesong.error_onset_ms': (0, model_js_1.errorOnsetOf)(event) - base } : {}) } }));
-        return {
-            id: threadId,
-            name: `Codewhale runtime · ${threadName}`,
-            events: normalized,
-            duration: Math.max(1, normalized.reduce((m, e) => Math.max(m, e.endTime, e.startTime, e.status === 'error' ? (0, model_js_1.errorOnsetOf)(e) : 0), 0)),
-            originTime: origin !== undefined ? new Date(origin + base).toISOString() : '0 ms',
-            source: 'codewhale',
-            privacy: 'redact',
-            warnings: [...new Set(warnings)],
-            metadata: {
-                sourceFormat: 'codewhale.runtime-events/v2',
-                timeBasis: 'wall-clock',
-                sourceFilename: filename,
-                threadId,
-                model,
-                skippedDeltas,
-                recordCount: this.recordCount,
-                timeUnit: 'ms',
-            },
-        };
-    }
-}
-exports.CodewhaleRuntimeTrace = CodewhaleRuntimeTrace;
-function fromCodewhaleRuntime(records, filename = 'Codewhale runtime', maxEvents = 250_000) {
-    if (!records.length)
-        throw new Error('Codewhale runtime event file is empty.');
-    const trace = new CodewhaleRuntimeTrace(filename, maxEvents);
-    trace.append(records);
-    return trace.snapshot();
-}
-/** The journal owns request state until a matching terminal receipt. A live
- * driver may confirm that state only while its cursor-checked stream is healthy.
- * Ordinary open tool spans remain unknown-duration; no execution is inferred. */
-function observeRuntimeRequests(trace, observedThrough) {
-    const origin = Date.parse(trace.originTime ?? '');
-    if (trace.metadata.sourceFormat !== 'codewhale.runtime-events/v2' || !Number.isFinite(origin)
-        || !Number.isFinite(observedThrough))
-        throw new Error('Invalid Runtime observation horizon.');
-    const at = observedThrough - origin;
-    const events = trace.events.map(e => e.openEnded && e.attributes['whalesong.waiting'] === true && at >= e.startTime
-        ? { ...e, endTime: at, openEnded: false } : e);
-    return { ...trace, events, duration: Math.max(trace.duration, at) };
-}
+};
+exports.DOT_GLYPHS = {
+    'en': {
+        reading: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..........................................##....',
+            '..........................................##....',
+            '..........................................##....',
+            '..........................................##....',
+            '..........................................##....',
+            '....##..##....####.......####........####.##....',
+            '....######...######....#######......########....',
+            '....###.....##....##...#....###....###...###....',
+            '....##.....##.....##.........##...###.....##....',
+            '....##.....#########.......####...###.....##....',
+            '....##.....#########....#######...##......##....',
+            '....##.....##..........##....##...##......##....',
+            '....##.....###........##.....##...###.....##....',
+            '....##......###.......###...###....###...###....',
+            '....##.......#######...########....#########....',
+            '....##........#####.....###..##......###..##....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        editing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....................................#..........',
+            '....................................##..........',
+            '.......................##...........##..........',
+            '.......................##...........##..........',
+            '...##.###......####..######...####..##.####.....',
+            '...#######...######...###....#####..#######.....',
+            '...##....##.......##...##...##......###...##....',
+            '...##....##.......##...##...##......##....##....',
+            '...##....##...######...##...##......##....##....',
+            '...##....##..##...##...##...##......##....##....',
+            '...##....##..##...##...##...##......##....##....',
+            '...#######...#######...####..######.##....##....',
+            '...##.###.....###.##....###...####..##....##....',
+            '...##...........................................',
+            '...##...........................................',
+            '...##...........................................',
+            '...##...........................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        searching: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......####......................................',
+            '.....#####..###..........................##.....',
+            '.....###....###..........................##.....',
+            '.....##.....##...........................##.....',
+            '....###..................................##.....',
+            '....###..................................##.....',
+            '...#######..###....##...####........####.##.....',
+            '...#######..###....##.#######.....#########.....',
+            '....###.....###....#####..###....####..####.....',
+            '....###.....###....###.....##....###.....##.....',
+            '....###.....###....###.....##...###......##.....',
+            '....###.....###....###.....##...###......##.....',
+            '....###.....###....###.....##...###......##.....',
+            '....###.....###....###.....##...###......##.....',
+            '....###.....###....###.....##...###......##.....',
+            '....###.....###....###.....##....###.....##.....',
+            '....###.....###....###.....##....####..####.....',
+            '....###.....###....###.....##.....#########.....',
+            '....###.....###....###.....##......####..##.....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        testing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...........................##....##.............',
+            '...........................##...##..............',
+            '................................#...............',
+            '................................#...............',
+            '....##....##...###...##.##.##.#######....##.....',
+            '.....#....#...##.##..#####.##..###..#....#......',
+            '.....##...#..##...##.###...##...#...##...#......',
+            '.....##..##..##...##.##....##...#...##..##......',
+            '......#..##..#######.##....##...#....#..##......',
+            '......##.#...##......##....##...#....##.#.......',
+            '......####...##......##....##...#.....#.#.......',
+            '.......###....##..#..##....##...#.....###.......',
+            '.......##......####..##....##...#.....##........',
+            '......................................##........',
+            '......................................##........',
+            '.....................................##.........',
+            '....................................##..........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        executing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '....###..####..###......###....###...####.......',
+            '....###.####...###......###....###.#######......',
+            '....########...###......###....############.....',
+            '....#####......###......###....#####....###.....',
+            '....####.......###......###....###......###.....',
+            '....###........###......###....###......###.....',
+            '....###........###......###....###......###.....',
+            '....###........###......###....###......###.....',
+            '....###........###......###....###......###.....',
+            '....###........###......###....###......###.....',
+            '....###........###......###....###......###.....',
+            '....###........####....####....###......###.....',
+            '....###.........###########....###......###.....',
+            '....###.........#######.###....###......###.....',
+            '....###..........#####..###....###......###.....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        browsing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..........#....#................................',
+            '..........#....#.......#........................',
+            '..........#....#................................',
+            '..........#....#..###..#..#.##....####..........',
+            '..........#....#..#....#..##.##..#..#...........',
+            '..........#....#..##...#..#...#..#..#...........',
+            '..........#....#....##.#..#...#..####...........',
+            '...........#..##....##.#..#...#..#..............',
+            '...........####...###..#..#...#..#####..........',
+            '.................................#...#..........',
+            '.................................#...#..........',
+            '.................................####...........',
+            '................................................',
+            '................................................',
+            '....................#...........................',
+            '....................#...........................',
+            '................#...#...........................',
+            '...............####.#.##....###.................',
+            '................#...##.##..#..##................',
+            '................#...#...#..#####................',
+            '................#...#...#..#....................',
+            '................##..#...#..##...................',
+            '.................##.#...#...###.................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...#............................................',
+            '...#............................................',
+            '...#............................................',
+            '...####...#.#...###..##..#..##.###...###..#.#...',
+            '...##..#..##...#..##..#..##.#..#....#..##.##....',
+            '...#...#..#....#...#..#.#.#.#..##...#####.#.....',
+            '...#...#..#....#...#..#.#.#.#....##.#.....#.....',
+            '...#..##..#....#..##...##.###....##.##....#.....',
+            '...####...#.....###....##..#...###...###..#.....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        computer: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '............#...#......#........................',
+            '............#...#...............................',
+            '............#...#..###.#..###...####............',
+            '............#...#..#...#..#..#..#.#.............',
+            '............#...#..##..#..#..#..###.............',
+            '............#..#.....#.#..#..#..#...............',
+            '.............###...##..#..#..#..###.............',
+            '...................................#............',
+            '................................###.............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....................#..........................',
+            '.................#...#..........................',
+            '................###..###...###..................',
+            '.................#...#..#..#..#.................',
+            '.................#...#..#.#####.................',
+            '.................#...#..#..#....................',
+            '.................##..#..#..###..................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..................................#.............',
+            '...###..###...###.##..###...#..#.###..###..###..',
+            '...#....#..#..#..#..#.#..#..#..#..#...#..#.#....',
+            '..##...##..#..#..#..#.#..#..#..#..#..#####.#....',
+            '...#....#..#..#..#..#.#..#..#..#..#...#....#....',
+            '...###..###...#..#..#.###...####..##..###..#....',
+            '......................#.........................',
+            '......................#.........................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        memory: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....................#..........#...............',
+            '.....###.......#................................',
+            '.....#..#.###.###.##.#.###.#..#.#.###..###......',
+            '.....#..#...#..#..#..#...#....#.#.#.#....#......',
+            '.....###.####..#..#..#####..#...#.#.#..#.#......',
+            '.....#.#..#....#..#..#.#....##..#.#.#..#........',
+            '.....#..#.###..##.#..#.###..##..#.#.#..###......',
+            '......................................#..#......',
+            '.......................................###......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '........................#...........#...........',
+            '..........###.###..###.###.###.#..####..........',
+            '..........#...#.#..#.#..#....#..##..#...........',
+            '.........#...#.....#.#..#.####..##..#...........',
+            '..........#...#.#..#.#..#..#....##..#...........',
+            '..........###.###..#.#..##.###.#..#.##..........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        tool: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.........................................##.....',
+            '.........................................###....',
+            '.........................................###....',
+            '.....##..................................###....',
+            '.....##..................................###....',
+            '.....##..................................###....',
+            '...#######......####..........####.......###....',
+            '...#######....########......########.....###....',
+            '....###......####..####....####..####....###....',
+            '....###......###....###....###....###....###....',
+            '....###.....###......###..###......###...###....',
+            '....###.....###......###..###......###...###....',
+            '....###.....###......###..###......###...###....',
+            '....###.....###......###..###......###...###....',
+            '....###.....###......###..###......###...###....',
+            '.....##......###....###....###....###....###....',
+            '.....###.....####..####....####..####....###....',
+            '.....#####....########......########.....####...',
+            '......####......####..........####........###...',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        thinking: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..........##..........#..............##.........',
+            '....#.....##.........###.............##.........',
+            '....##....##.........................##.........',
+            '....##....##.........................##.........',
+            '..######..##..###....##...##..###....##....##...',
+            '...#####..########...##...########...##...##....',
+            '....##....###...##...##...###...##...##..##.....',
+            '....##....##....##...##...##....##...##.###.....',
+            '....##....##....##...##...##....##...#####......',
+            '....##....##....##...##...##....##...######.....',
+            '....##....##....##...##...##....##...###..##....',
+            '....##....##....##...##...##....##...##...##....',
+            '....####..##....##...##...##....##...##....##...',
+            '.....###..##....##...##...##....##...##....##...',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        responding: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.................................##.............',
+            '....######.......................##.............',
+            '....#######......................##.............',
+            '....#.....#......................##.............',
+            '....#.....##....####...##.###....##..##.....#...',
+            '....#....##....######..#######...##...##...##...',
+            '....##.####...##...##..##....##..##...##...##...',
+            '....######....##....#..##....##..##....#...#....',
+            '....#...##....#######..##....##..##....##.##....',
+            '....#...##....##.......##....##..##....##.##....',
+            '....#....##...##.......##....##..##.....#.#.....',
+            '....#....##....###.##..#######...###....###.....',
+            '....#.....##....####...##.###.....##....###.....',
+            '.......................##................#......',
+            '.......................##...............##......',
+            '.......................##.............###.......',
+            '.......................##.............##........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        delegating: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...............................#................',
+            '..........###..####.###..###..###..###..........',
+            '............#..#.#..#..#.#..#..#...#............',
+            '..........###..###.#####.#..#..#...##...........',
+            '..........#.#..#....#....#..#..#.....#..........',
+            '..........###..###..###..#..#..##..##...........',
+            '..................#.............................',
+            '...............###..............................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..................#.............................',
+            '..................#.............................',
+            '...#..#..###...####..###..####..#..#.###.#...#..',
+            '...#..#..#..#..#..#..#..#.#...#.##.#...#..#.#...',
+            '...#..#..#..#.##..#.#####.#...#..#.#.###..#.#...',
+            '...#..#..#..#..#..#..#....#...##.##..#.#...##...',
+            '...####..#..#..####..###..#...##..#..###...#....',
+            '...........................................#....',
+            '..........................................#.....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        waiting: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..................................##............',
+            '..................................##............',
+            '..................................##............',
+            '....##.###.....###.....###.....#####...####.....',
+            '....#######...##.##...##.##...######..##..#.....',
+            '....##...##..##...##.##...##.##...##..##........',
+            '....##...##..##...##.##...##.##...##..###.......',
+            '....##...##..#######.#######.##...##...####.....',
+            '....##...##..##......##......##...##.....##.....',
+            '....##...##..##......##......##...##......##....',
+            '....##...##...##..#...##..#..#######..##.##.....',
+            '....##...##....####....####...####.#...###......',
+            '................................................',
+            '................................................',
+            '...........##....##...###....##...##............',
+            '............#....#...#####...##...##............',
+            '............##...#..##...##..##...##............',
+            '............##..##..##....#..##...##............',
+            '.............#..##..##....#..##...##............',
+            '.............##.#...##....#..##...##............',
+            '..............#.#...##...##..##...##............',
+            '..............###....######...######............',
+            '..............##......###.....###..#............',
+            '..............##................................',
+            '..............##................................',
+            '.............##.................................',
+            '............##..................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        done: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '....######......................................',
+            '....#######.....................................',
+            '....##...###....................................',
+            '....##....##.....####....##..###......####......',
+            '....##.....##...######...########....######.....',
+            '....##.....##..###...##..###...##...##....##....',
+            '....##.....##..##....##..##....##...##....##....',
+            '....##.....##..##.....##.##....##...########....',
+            '....##.....##..##.....##.##....##...##..........',
+            '....##....##...##....##..##....##...##..........',
+            '....##...###...###...##..##....##...###.........',
+            '....#######.....######...##....##....######.....',
+            '....######.......####....##....##.....#####.....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+    },
+    'zh-Hans': {
+        reading: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...............##...............................',
+            '.....#.........##........##########.............',
+            '....###....###########...##########.............',
+            '......##...###########....##....##.#########....',
+            '......###......##.........##....##.#########....',
+            '...............##.........##....##..##....##....',
+            '..........#############...########..##....##....',
+            '..........############....########...#....##....',
+            '...#####............##....##....##...##...##....',
+            '...#####....##..##..##....##....##...##..##.....',
+            '......##.....#####..#.....##....##...##..##.....',
+            '......##..##..#.##........########....##.##.....',
+            '......##...###..##........########....#####.....',
+            '......##....##..##........##....##....####......',
+            '......##..#############...##....##.....###......',
+            '......##.##############...##...####....##.......',
+            '......####....###........##########...####......',
+            '......####...###.###.....#########...######.....',
+            '......###...###...###....#......##..###..###....',
+            '.....###...###.....###..........##.###....###...',
+            '.....##..####........##.........##.##......##...',
+            '..........#.....................#...............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        editing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................#...........#...................',
+            '......##.......###..........##....##########....',
+            '......##........##..........##....###....###....',
+            '.....##....###########...########.##......##....',
+            '.....##....###########...########.##########....',
+            '.....##....##.......##.....##.....##########....',
+            '....##..##.##.......##.....##...................',
+            '....##.##..###########.....#.##..############...',
+            '...######..###########....##.##..############...',
+            '...#####...##.............##.##....#......##....',
+            '......##...###########...########..#......##....',
+            '.....##....############..########..#########....',
+            '....###.#..###..#.##.##......##....#########....',
+            '...######..###..#.##.##......##....#......##....',
+            '...#####...###..#.##.##......##.#..#########....',
+            '..........#############...#######..#########....',
+            '........#.##.##########..#######...#......##....',
+            '.....#######.#..#.##.##..##..##...##.....####...',
+            '...####..###.#..#.##.##......##..############...',
+            '...##....##..#..#.##.##......##..###########....',
+            '.........##..#..#.####.......##...........##....',
+            '..............................#...........##....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        searching: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......#........##.................##............',
+            '.....##......####.................##............',
+            '.....##....######.####....##################....',
+            '.....##....##..##.####....##################....',
+            '.....##....#...##...##............##............',
+            '...######..#...##...##............##............',
+            '...######..###.##.####...####################...',
+            '.....##....###.##.####...####################...',
+            '.....##....#...##...##...##.....###........##...',
+            '.....##....###########...##...###....###...##...',
+            '.....####..###########......####....###.........',
+            '.....#####.....##...........#########...........',
+            '...#####.......##..............####....##.......',
+            '...####...############........###.......##......',
+            '.....##....###########.....################.....',
+            '.....##.....##.....##.....###########.....##....',
+            '.....##.....###...##..............##......##....',
+            '.....##......###.###.........###..##..###.......',
+            '.....##.......#####.........###...##...###......',
+            '.....##......#######......####....##....####....',
+            '...####..######..######...###..#####......##....',
+            '....###..###........##..........###.............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        testing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................##..............................',
+            '...#######......##.........#....................',
+            '...#######.....###........###...#############...',
+            '........##....#####........###..#############...',
+            '........##....##..##........###.......##........',
+            '....##..##...##....##........#........##........',
+            '....##..##.###......###...............##........',
+            '....##..###############...............##........',
+            '....##..##.#..######..#..#####....#...##........',
+            '....##..##...............#####....##..##........',
+            '....#...##..................##....##..######....',
+            '....#######..#..##...##.....##....##..######....',
+            '....#######.##..##..##......##....##..##........',
+            '.........##..##..#..##......##....##..##........',
+            '.........##..##..#..##......##....##..##........',
+            '......##.##..##..####.......##....##..##........',
+            '...#####.##..##....##.......####..##..##........',
+            '...##....##........#........####..##..##........',
+            '.........##.......##........###...##..##........',
+            '........##..###########....###..#############...',
+            '.....#####..###########....##...#############...',
+            '......###.......................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        executing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.............................##.................',
+            '....##....############......###...##########....',
+            '....###...############.....###....##########....',
+            '.....###..................###...................',
+            '......##.................###....................',
+            '.........................##...##................',
+            '.........##############......###................',
+            '...####..##############.....###..############...',
+            '...#####.....##............###...############...',
+            '......##....###..##.......####..........##......',
+            '......##....##....##.....#####..........##......',
+            '......##...###....##.....#####..........##......',
+            '......##...##......##....##.##..........##......',
+            '......##..############......##..........##......',
+            '......##..############......##..........##......',
+            '......##..##........##......##..........##......',
+            '.....####...................##..........##......',
+            '....#######.................##..........##......',
+            '...###...##############.....##..........##......',
+            '...##......############.....##......######......',
+            '............................##......#####.......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        browsing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..............#...#.............................',
+            '.............##...##......##########............',
+            '.............###########..##..##...#............',
+            '............##....##......#...##...#............',
+            '...........###.########...##..##...#............',
+            '..........####.#..##..#...##########............',
+            '............##.#..##..#...#...##...#............',
+            '............##.########...#...##...#............',
+            '............##.#..#.......##########............',
+            '............##.##.#.......#...##...#............',
+            '............##..###.......#...##...#............',
+            '............##..####.....##...##...#............',
+            '............##.##..####..#....##...#............',
+            '............##.#.....##..#....##.###............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...............#......#..#......................',
+            '....##..##.....#...#.##..#.......####..####.....',
+            '.....#...#...#.#...#.##.######...#..#..#..#.....',
+            '.......#####.#.#...#.##.#........#..#..#..#.....',
+            '..........#..#.#...#.####..#.....####..####.....',
+            '....#..#..#..#.#....................##..##......',
+            '.....#.####..#.#....#########...############....',
+            '........##...#.#....#......##.....##...##.......',
+            '.........#...#.#....#..##..##....##.....###.....',
+            '.....#..###..#.#....#..##..##...#####..#####....',
+            '.....#..###..#.#....#..###.#.....#..#..#..##....',
+            '....##.##.##...#......####.......#..#..#..#.....',
+            '....#.##.......#...####.##...#...####..####.....',
+            '.............###..###....#####...#..#..#..#.....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        computer: [
+            '................................................',
+            '................................................',
+            '......##........................................',
+            '......##.....########........##....##...........',
+            '......##.....##...###........##...##............',
+            '......##.....#.....##.......##....##............',
+            '......##.....##...###.......##...###########....',
+            '....######...########......###...###########....',
+            '....######.................##...##..##..........',
+            '......##...#####.######...###...##..##..........',
+            '......##...#..##.##..##..####..##...##..........',
+            '......##...#..##.##..##..####..##...########....',
+            '......####.#..##.##..##..#.##.......########....',
+            '....######.#####.######....##.......##..........',
+            '....####........#..........##.......##..........',
+            '......##...############....##.......##..........',
+            '......##..#############....##.......########....',
+            '......##......#####........##.......########....',
+            '......##.....#######.......##.......##..........',
+            '......##....###.#.###......##.......##..........',
+            '......##..####..#..####....##.......##..........',
+            '.....###.###....#....##....##.......##..........',
+            '.....##.........#...........#.......##..........',
+            '................................................',
+            '................................................',
+            '............##.......................#..........',
+            '............##............#####.....##..........',
+            '............##............#####......##.........',
+            '......###############.....#...#.############....',
+            '.....################.....#...#.############....',
+            '.....###....##.....##.....#...#.................',
+            '.....###....##.....##.....#####........##.......',
+            '.....###....##.....##.....#####.##.#...#..#.....',
+            '.....################.....#...#.#####.##..#.....',
+            '.....################.....#...#.##..####..#.....',
+            '.....###....##.....##.....#...#.##..###...#.....',
+            '.....###....##.....##.....#####.##...##...#.....',
+            '.....###....##.....##.....#####.##...###..#.....',
+            '.....################.....#...#.##..####..#.....',
+            '.....################.....#...#.##.###.####.....',
+            '.....###....##.......##..##...#.#####..####.....',
+            '............##.......##..##...#.##.#......#.....',
+            '............###......##..##...#.##........#.....',
+            '.............##########..##...#.###########.....',
+            '.............#########...#..###..##########.....',
+            '.........................#..##............#.....',
+            '................................................',
+            '................................................',
+        ],
+        memory: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '............##....##..........##................',
+            '............##....##.....############...........',
+            '............##...#.##.........##................',
+            '...........####.##..##........##................',
+            '............##.##....##..############...........',
+            '............#########.#..#...##.....#...........',
+            '............###.............#...##..............',
+            '...........####...#..##....#####................',
+            '...........###..#.##.#......##....#.............',
+            '...........###..#..#.#....##########............',
+            '............##..#...#..........#....#...........',
+            '............##......#......##..#.##.............',
+            '............##.########..###..##..###...........',
+            '............##...........#...###....#...........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.........#...........................##.........',
+            '.........#........############.......##.........',
+            '.........#.............##............##.........',
+            '.........#.............#........############....',
+            '.........#.............##.........#.....##......',
+            '.........######........###.........#....##......',
+            '.........#.............#####.......#....#.......',
+            '.........#.............#..###.......#..##.......',
+            '.........#.............#....#.......####........',
+            '.........#.............#.............##.........',
+            '.........#.............#............####........',
+            '.........#.............#..........###..###......',
+            '....############.......#........###......###....',
+            '.......................#........#..........#....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        tool: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......##....###########.........................',
+            '.......##...###########....###############......',
+            '........##..#...##...##....###############......',
+            '........##..#...##...##....##....##.....##......',
+            '............#.######.##....##....##.....##......',
+            '............#...##...##....##....##.....##......',
+            '.....####...#...##...##....###############......',
+            '.....####...#...##...##....###############......',
+            '.......##...#.######.##....##....##.....##......',
+            '.......##...#........##....##....##.....##......',
+            '.......##..##.######.##....##....##.....##......',
+            '.......##..##.##..##.##....###############......',
+            '.......##..##.##..##.##....###############......',
+            '.......##.###.##..##.##....#.....##.....##......',
+            '.......######.######.##...##.....##.....##......',
+            '.......#####..##.....##...##.....##.....##......',
+            '.......##.##.........##..###.....##.....##......',
+            '.......#..##......####...##......##..#####......',
+            '...................##....#.......##..####.......',
+            '................................................',
+            '................................................',
+            '.............................###########........',
+            '............................############........',
+            '......################......##........##........',
+            '......################......##........##........',
+            '.............##.............############........',
+            '.............##.............##........##........',
+            '.............##.............##........##........',
+            '.............##.............############........',
+            '.............##.............##........##........',
+            '.............##.............##........##........',
+            '.............##.............############........',
+            '.............##.............##........##........',
+            '.............##..........##################.....',
+            '.............##..........##################.....',
+            '.............##...............#......#..........',
+            '.....##################.....####....####........',
+            '.....##################...####........####......',
+            '.........................####...........###.....',
+            '..........................#..............#......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        thinking: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....################............##.............',
+            '.....################............##......##.....',
+            '.....##.....##.....##......################.....',
+            '.....##.....##.....##.......##############......',
+            '.....##.....##.....##............##...###.......',
+            '.....################............##..###........',
+            '.....################.....###################...',
+            '.....##.....##.....##.....###################...',
+            '.....##.....##.....##............###............',
+            '.....################..........####.............',
+            '.....################.........#############.....',
+            '...........#................##############......',
+            '...........###...........#####.##...............',
+            '.....##.##..###....##....####..##...............',
+            '.....##.##...###...##.........############......',
+            '....###.##.........###........###########.......',
+            '....##..##.......##.##.................##.......',
+            '...###..##......##..###................##.......',
+            '...##...##########...#................###.......',
+            '.........#########................######........',
+            '..................................#####.........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        responding: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '....##################.......##.................',
+            '....##################......################....',
+            '....##..............##.....#################....',
+            '....##..............##....###...................',
+            '....##..............##...####...................',
+            '....##..............##...###.##############.....',
+            '....##...########...##.......##.........###.....',
+            '....##...########...##.......##.........###.....',
+            '....##...##....##...##.......##############.....',
+            '....##...##....##...##.......##.........###.....',
+            '....##...##....##...##.......##############.....',
+            '....##...##....##...##........###...............',
+            '....##...########...##........###...............',
+            '....##...########...##.......#############......',
+            '....##..............##......##############......',
+            '....##..............##....#######.....###.......',
+            '....##..............##.....#...###..####........',
+            '....##################..........######..........',
+            '....##################........###########.......',
+            '....##..............##...########....########...',
+            '.........................####.............##....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        delegating: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....#..............#....#........#....#........',
+            '....######.#####...##.#..#..#.....#....#........',
+            '....#.##...#..##..##..#..####....##....#........',
+            '....#.##...#..##..######.##......#.#########....',
+            '....######.#..##.......#.#...#..##....###.......',
+            '......##...#..##.........#...#..##....####......',
+            '.....##.##.#####..#####..#####..##...#####......',
+            '....##............##..#..#.......#...#.#.##.....',
+            '......########....#####..#..#....#..##.#..#.....',
+            '......#......#....##..#..####....#..#..#..##....',
+            '......########....#####..##......###########....',
+            '......#......#....##..#..#...#...#.....#........',
+            '......########....##..#..#...#...#.....#........',
+            '......#......#....##.##..#####...#.....#........',
+            '................................................',
+            '................................................',
+            '.....................#..#............##.........',
+            '....................##..#............##.........',
+            '....############....#..##............##.........',
+            '.........##........##..########.############....',
+            '.........##.......###.##.#......##...##...##....',
+            '.........##.......###.#..#......##...##...##....',
+            '.........##.......###....#####..##...##...##....',
+            '.........##........##....#......##...##...##....',
+            '.........##........##....#......############....',
+            '.........##........##....#####..##...##...##....',
+            '.........##........##....#...........##.........',
+            '.........##........##....#...........##.........',
+            '....############...##....#...........##.........',
+            '...................##....#...........##.........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        waiting: [
+            '................................................',
+            '................................................',
+            '.......#.......#................................',
+            '......##.......##............##..##.............',
+            '......#######.#########.....##...##.............',
+            '.....##################.....##...##.............',
+            '....###.##..###..##........##...############....',
+            '....##..##...##...##.......##...############....',
+            '............##............###..###...##...##....',
+            '......###############....####..##....##...##....',
+            '......###############....####.###....##...#.....',
+            '............##...........#.##..#.....##.........',
+            '....###################..#.##....##..##.##......',
+            '....###################....##....##..##.##......',
+            '.................##........##...##...##..##.....',
+            '.....#################.....##...##...##..##.....',
+            '.....#################.....##...##...##..##.....',
+            '........##.......##........##..##....##...##....',
+            '........###......##........##..##....##...##....',
+            '.........###.....##........##..#.....##...#.....',
+            '..........##.....##........##........##.........',
+            '..............#####........##.....####..........',
+            '..............####.........##......###..........',
+            '................................................',
+            '................................................',
+            '................##..............................',
+            '.......##.......##...............##########.....',
+            '.......##.......##.......#######.##########.....',
+            '.......##.......##.......#######.#...##...#.....',
+            '.......#######..##.........##....#...##...#.....',
+            '......########..##.........##....##########.....',
+            '......##....##..###........##....##########.....',
+            '......##...##...####.......##....#...##...#.....',
+            '.....###...##...#####....######..#...##...#.....',
+            '.....###...##...##.##....######..##########.....',
+            '....#####..##...##..##.....##....##########.....',
+            '....##.##.##....##..###....##........##.........',
+            '........####....##.........##........##.........',
+            '........####....##.........##........##.........',
+            '.........##.....##.........##...############....',
+            '........####....##.........#################....',
+            '.......######...##.......######......##.........',
+            '......###..#####.........####........##.........',
+            '.....###....###########........#############....',
+            '....###........########........#############....',
+            '.....#..........................................',
+            '................................................',
+            '................................................',
+        ],
+        done: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '............#.......................##..........',
+            '...........###......................##.###......',
+            '............##......................##..###.....',
+            '....##################..............##....#.....',
+            '....##################.....##################...',
+            '....##..............##.....##################...',
+            '....##..............##.....##.......##..........',
+            '....##.############.##.....##.......##..........',
+            '.......############........##.......##...###....',
+            '...........................#######..##...##.....',
+            '...........................#######..###..##.....',
+            '...####################....##...##...##.##......',
+            '...####################...###...##...##.##......',
+            '.........##....##.........###...##...####.......',
+            '.........##....##.........###...##...####.......',
+            '.........##....##.........##....##...###...#....',
+            '........##.....##....#....##.#####...###...##...',
+            '........##.....##....##...##..###..######..##...',
+            '......###......##....##..###......####.##..##...',
+            '...######......########..##......####..######...',
+            '...####........#######...##.......#.....####....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+    },
+    'zh-Hant': {
+        reading: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................#...............................',
+            '.....##........###.......##########.............',
+            '.....###...############..##########.............',
+            '......##........##........##....##.#########....',
+            '...#######.###########....##....##.#########....',
+            '...#######................##....##..##....##....',
+            '...........############...########..##....##....',
+            '....#####..#..##..#..##...########...#....##....',
+            '....#####..#..##..#..##...##....##...##...##....',
+            '...........#..##..#..##...##....##...##..##.....',
+            '....#####..############...##....##...##..##.....',
+            '...#######................########....##.##.....',
+            '...........###########....########....#####.....',
+            '...........###......##....##....##....####......',
+            '....#####..###......##....##....##.....###......',
+            '....#####..###########....##...####....##.......',
+            '....#...#..##.......##...##########...####......',
+            '....#...#..###########...#########...######.....',
+            '....#...#....##...##.....#......##..###..###....',
+            '....#####..####...####..........##.###....###...',
+            '....#####.###.......###.........##.##......##...',
+            '....#...........................#...............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        editing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................#............##.................',
+            '......##........##...........##.....########....',
+            '......##........##...........##.....##....##....',
+            '.....##....###########...#########..#.....##....',
+            '.....##.##.###########...#########..########....',
+            '....##..##.##.......##.......##.....########....',
+            '....##.##..##.......##....########..............',
+            '...######..###########....#####.##.##########...',
+            '...#####...###########....#..#..#############...',
+            '.....####..##.............#.###.##..##....##....',
+            '.....##.##.##.............########..##....##....',
+            '....##..##.############...#..#..##..########....',
+            '...#######.###..#..#.##...#####.##..##....##....',
+            '...#######.###..#..#.##...########..##....##....',
+            '...........###..#..#.##......##.....########....',
+            '........#..############......##.....##....##....',
+            '....#.#.###############..#########..##....##....',
+            '...##.########..#..#.##..#############....###...',
+            '...##.##.###.#..#..#.##......##...###########...',
+            '...##.##..##.#..#..#.##......##...###.....##....',
+            '...#......#..#..#...###......##...........##....',
+            '.............................#............##....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        searching: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......#........##...............................',
+            '.....##......####...........##############......',
+            '.....##....######.####..................##......',
+            '.....##....##..##.####..................##......',
+            '.....##....#...##...##......##############......',
+            '...######..#...##...##..................##......',
+            '...######..###.##.####..................##......',
+            '.....##....###.##.####.....###############......',
+            '.....##....#...##...##..........................',
+            '.....##....###########....########.#########....',
+            '.....####..###########......###....###...###....',
+            '.....#####.....##............##....##.....##....',
+            '...#####.......##............#####.#########....',
+            '...####...############...########.....###.......',
+            '.....##....###########.................##.......',
+            '.....##.....##.....##....####################...',
+            '.....##.....###...##.....####################...',
+            '.....##......###.###.........###.......##.......',
+            '.....##.......#####...........###......##.......',
+            '.....##......#######...........##.....###.......',
+            '...####..######..######............#####........',
+            '....###..###........##..............###.........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        testing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................##..............................',
+            '....#######.....##.........##....#####.##.#.....',
+            '....#######....####.........##...#####.####.....',
+            '....#..##.....##..##........##......##..##......',
+            '....#..##....##....###...#######.#####..##.##...',
+            '....###################..#######.####...####....',
+            '....#########.#########...........###....##.....',
+            '....#..##.................#####...##########....',
+            '....#######...............######.##.#####.###...',
+            '....#######.#####.####..........###........##...',
+            '....#..##...##.##.#..#....#####...#########.....',
+            '....#..##...##.##.#..#....######..#########.....',
+            '....#######.##.##.#.##............##.....##.....',
+            '....#######.#####.####....######..##.....##.....',
+            '..........#...............######..#########.....',
+            '...######.#..##....##.....#...##...########.....',
+            '...#.#.####..##....##.....#...##...##...##......',
+            '...#.#.#.##..###..###.....#...##....##..##......',
+            '...#.#...##.#####.####....######....##..##......',
+            '...#.....##.##.########...######.############...',
+            '.......######....##..##...#.....#############...',
+            '........#.......................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        executing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.......##......##...............................',
+            '.......##......##............##.................',
+            '....########...##...........###...##########....',
+            '....########...##..........###....##########....',
+            '.......##......##.........###...................',
+            '.......##....########....###....................',
+            '...##################....##...##................',
+            '...##########..##..##........###................',
+            '.....#....#....##..##.......###..############...',
+            '.....##..##....##..##......###...############...',
+            '.....##..##..####..##.....####..........##......',
+            '....########.####..##....#####..........##......',
+            '....########..###..##....#####..........##......',
+            '.......##......###.##....##.##..........##......',
+            '.......##.....#######.......##..........##......',
+            '...##########.##.####.......##..........##......',
+            '...##########.##...##.......##..........##......',
+            '.......##....##.....#.#.....##..........##......',
+            '.......##....##.....###.....##..........##......',
+            '.......##...##......###.....##..........##......',
+            '.......##..###.......##.....##......######......',
+            '.......##...................##......#####.......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        browsing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..............#...#.............................',
+            '.............##...##......##########............',
+            '.............###########..##..##...#............',
+            '............##....##......#...##...#............',
+            '...........###.########...##..##...#............',
+            '..........####.#..##..#...##########............',
+            '............##.#..##..#...#...##...#............',
+            '............##.########...#...##...#............',
+            '............##.#..#.......##########............',
+            '............##.##.#.......#...##...#............',
+            '............##..###.......#...##...#............',
+            '............##..####.....##...##...#............',
+            '............##.##..####..#....##...#............',
+            '............##.#.....##..#....##.###............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '........#......#..######.#......................',
+            '....#..#..###..#..#..#..######...####..####.....',
+            '.....###..#.##.#..#######..#.....#..#..#..#.....',
+            '.......##.#..#.#..#####..#####...#..#..#..#.....',
+            '.......##.##.#.#..#..#..#.#..#...####..####.....',
+            '....#....###.#.#..######.#####......##..##......',
+            '.....#..#.##.#.#....########....############....',
+            '.......#####.#.#....#......#......##...##.......',
+            '.....#...#...#.#....########.....##.....###.....',
+            '.....#.#####.#.#....########....#####..#####....',
+            '.....#...#.#...#....#......#.....#..#..#..##....',
+            '....#..#.#.#...#....########.....#..#..#..#.....',
+            '....#..#####...#.....#...#...#...####..####.....',
+            '.............###..###....#####...#..#..#..#.....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        computer: [
+            '................................................',
+            '................................................',
+            '......##........................................',
+            '......##.....########........##....##...........',
+            '......##.....##...###........##...##............',
+            '......##.....#.....##.......##....##............',
+            '......##.....##...###.......##...###########....',
+            '....######...########......###...###########....',
+            '....######.................##...##..##..........',
+            '......##...#####.######...###...##..##..........',
+            '......##...#..##.##..##..####..##...##..........',
+            '......##...#..##.##..##..####..##...########....',
+            '......####.#..##.##..##..#.##.......########....',
+            '....######.#####.######....##.......##..........',
+            '....####........#..........##.......##..........',
+            '......##...############....##.......##..........',
+            '......##..#############....##.......########....',
+            '......##......#####........##.......########....',
+            '......##.....#######.......##.......##..........',
+            '......##....###.#.###......##.......##..........',
+            '......##..####..#..####....##.......##..........',
+            '.....###.###....#....##....##.......##..........',
+            '.....##.........#...........#.......##..........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......###############.....#####...##.##..##.....',
+            '......###############.....#####..##..##..##.....',
+            '............##............##..#..#..##..##......',
+            '....###################...##..#.##..##..##......',
+            '....###.....###.....###...##..#..##.##..##......',
+            '....##.#######.#####.##...#####..##..##..##.....',
+            '....##......##.......##...#####...##..##..##....',
+            '............##............##..#...##.##...#.....',
+            '.......#######.#####......##..#......##.........',
+            '..........................##..#..###########....',
+            '......###############.....#####..###########....',
+            '......###...###...###.....#####..##....##.##....',
+            '......##....##.....##.....#...#..##.####..##....',
+            '......###############.....#...#..##..###..##....',
+            '......##....##.....##.....#...#..##.####..##....',
+            '......###############....##...#..####..##.##....',
+            '......###...###.......#..##...#..##.......##....',
+            '.......#....##.......##..##...#..###########....',
+            '.............##########..#..###..###########....',
+            '...............######.......###..#..............',
+            '................................................',
+            '................................................',
+        ],
+        memory: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '............#.....##..........##................',
+            '............#....####....############...........',
+            '............#...##..###.......##................',
+            '...........##########.#.......##................',
+            '............##.#.........############...........',
+            '............##.###.####..#...##.....#...........',
+            '............##.#.###..#.....#...##..............',
+            '...........#####.###..#....#####................',
+            '...........##..########.....##....#.............',
+            '...........##...#...#.....##########............',
+            '............#...#...#..........#....#...........',
+            '............#..###.###.....##..#.##.............',
+            '............#.##..##.##..###..##..###...........',
+            '............#.#..........#...###....#...........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.........#...........................##.........',
+            '.........#........############.......##.........',
+            '.........#.............##............##.........',
+            '.........#.............#........############....',
+            '.........#.............##.........#.....##......',
+            '.........######........###.........#....##......',
+            '.........#.............#####.......#....#.......',
+            '.........#.............#..###.......#..##.......',
+            '.........#.............#....#.......####........',
+            '.........#.............#.............##.........',
+            '.........#.............#............####........',
+            '.........#.............#..........###..###......',
+            '....############.......#........###......###....',
+            '.......................#........#..........#....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        tool: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '.................#####...................##.....',
+            '.....#####.###########....#######..##....##.....',
+            '....######.#######........#######..##....##.....',
+            '....##..##..#...##..##....##...##..##....##.....',
+            '....##..##.##...##..##....##...##..##....##.....',
+            '....##..##..##..##..##....##...##..##....##.....',
+            '....##..##..##..##..#.....##...##..##....##.....',
+            '....##..##..##..##.##.....##...##..##....##.....',
+            '....##..##...#..##.##.....##...##..##....##.....',
+            '....##..##......##........##...##..##....##.....',
+            '....##..##.############...##...##..##....##.....',
+            '....##..##.############...##...##..##....##.....',
+            '....######......##........#######..########.....',
+            '....######......##........#######.#########.....',
+            '....##..........##........##......###....##.....',
+            '.....#..........##........##.............##.....',
+            '................##.......................##.....',
+            '................##.......................##.....',
+            '.............#####.......................##.....',
+            '.............####........................##.....',
+            '................................................',
+            '................................................',
+            '.............................############.......',
+            '............................#############.......',
+            '.....#################......##.........##.......',
+            '.....#################......###.......###.......',
+            '............###.............#############.......',
+            '............###.............##.........##.......',
+            '............###.............###.......###.......',
+            '............###.............#############.......',
+            '............###.............##.........##.......',
+            '............###.............##.........##.......',
+            '............###.............#############.......',
+            '............###.............###.......###.......',
+            '............###.............##.........##.......',
+            '............###..........###################....',
+            '............###..........###################....',
+            '............###...............##.....##.........',
+            '....###################.....####.....####.......',
+            '....###################...####.........####.....',
+            '.........................####............###....',
+            '..........................#...............#.....',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        thinking: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....################............##.............',
+            '.....################............##......##.....',
+            '.....##.....##.....##......################.....',
+            '.....##.....##.....##.......##############......',
+            '.....##.....##.....##............##...###.......',
+            '.....################............##..###........',
+            '.....################.....###################...',
+            '.....##.....##.....##.....###################...',
+            '.....##.....##.....##............###............',
+            '.....################..........####.............',
+            '.....################.........#############.....',
+            '...........#................##############......',
+            '...........###...........#####.##...............',
+            '.....##.##..###....##....####..##...............',
+            '.....##.##...###...##.........############......',
+            '....###.##.........###........###########.......',
+            '....##..##.......##.##.................##.......',
+            '...###..##......##..###................##.......',
+            '...##...##########...#................###.......',
+            '.........#########................######........',
+            '..................................#####.........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        responding: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '....##################...####################...',
+            '....##################.........###..###.........',
+            '....##..............##.........##...###.........',
+            '....##..............##....##################....',
+            '....##..............##....##...##...##....##....',
+            '....##..............##....##################....',
+            '....##...########...##.......#...##.............',
+            '....##...########...##......##...###............',
+            '....##...##....##...##.....###..############....',
+            '....##...##....##...##....###..###..............',
+            '....##...##....##...##...###.##############.....',
+            '....##...##....##...##......####.##......##.....',
+            '....##...########...##.....###...##########.....',
+            '....##...########...##....###....##########.....',
+            '....##..............##...####.....####..........',
+            '....##..............##......#....##########.....',
+            '....##..............##......#..#####...###......',
+            '....##################......#......######.......',
+            '....##################......#.....########......',
+            '....##..............##......#..#####...######...',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        delegating: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..........#............#####...##.#####.........',
+            '..........#..#.#..#####..#.#...#..#...#.........',
+            '.........#...#..#...#.#..#.#...#..#...#.........',
+            '........##...####...#.######..###.#####.........',
+            '........##.####....####..#.#...#................',
+            '.........#...#......#..#####..###.#####.........',
+            '.........#...##.....#....#....###...#...........',
+            '.........#....#.....#.######.#.#..#####.........',
+            '.........#....#..#.###...#.....#....#...........',
+            '.........#....######.....#.....#....#...........',
+            '.........#.....##.....#######..#.#######........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '........#.#................#............#.......',
+            '........#..#..#########...#..#..........#.......',
+            '...#########......#.......#..######.#########...',
+            '........#.........#......##.#.#.....#...#...#...',
+            '........#.........#......##.#.#.....#...#...#...',
+            '...#######........#......##...####..#...#...#...',
+            '.....#...#........#.......#...#.....#########...',
+            '.....#...#........#.......#...####..#...#...#...',
+            '.....#...#..#.....#.......#...#.........#.......',
+            '...#####.##.#.#########...#...#.........#.......',
+            '...#......##..............#...#.........#.......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        waiting: [
+            '................................................',
+            '................................................',
+            '.......#.......#................................',
+            '......##.......##............##..##.............',
+            '......#######.#########.....##...##.............',
+            '.....##################.....##...##.............',
+            '....###.##..###..##........##...############....',
+            '....##..##...##...##.......##...############....',
+            '............##............###..###...##...##....',
+            '......###############....####..##....##...##....',
+            '......###############....####.###....##...#.....',
+            '............##...........#.##..#.....##.........',
+            '....###################..#.##....##..##.##......',
+            '....###################....##....##..##.##......',
+            '.................##........##...##...##..##.....',
+            '.....#################.....##...##...##..##.....',
+            '.....#################.....##...##...##..##.....',
+            '........##.......##........##..##....##...##....',
+            '........###......##........##..##....##...##....',
+            '.........###.....##........##..#.....##...#.....',
+            '..........##.....##........##........##.........',
+            '..............#####........##.....####..........',
+            '..............####.........##......###..........',
+            '................................................',
+            '................................................',
+            '............##..................................',
+            '............###..................##########.....',
+            '............#########....#######.##########.....',
+            '............##...........#######.#...##...#.....',
+            '......################.....##....#...##...#.....',
+            '......#################....##....##########.....',
+            '......#.....##......##.....##....##########.....',
+            '......#.....#######.##.....##....#...##...#.....',
+            '......#.#######..........######..#...##...#.....',
+            '......#.....###.....##...######..##########.....',
+            '.....##...#..#########.....##....##########.....',
+            '.....##..##................##........##.........',
+            '.....##..#####.#####.......##........##.........',
+            '.....##.##..##.##.##.......##........##.........',
+            '.....#####..##.##..#.......##...############....',
+            '.....########..##..#..#....#################....',
+            '.....##...###.##...####..######......##.........',
+            '.....##...##..##...###...####........##.........',
+            '....##...#####.................#############....',
+            '....##.###..###########........#############....',
+            '.......#........#######.........................',
+            '................................................',
+            '................................................',
+        ],
+        done: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '............#.......................##..........',
+            '...........###......................##.###......',
+            '............##......................##..###.....',
+            '....##################..............##....#.....',
+            '....##################.....##################...',
+            '....##..............##.....##################...',
+            '....##..............##.....##.......##..........',
+            '....##.############.##.....##.......##..........',
+            '.......############........##.......##...###....',
+            '...........................#######..##...##.....',
+            '...........................#######..###..##.....',
+            '...####################....##...##...##.##......',
+            '...####################...###...##...##.##......',
+            '.........##....##.........###...##...####.......',
+            '.........##....##.........###...##...####.......',
+            '.........##....##.........##....##...###...#....',
+            '........##.....##....#....##.#####...###...##...',
+            '........##.....##....##...##..###..######..##...',
+            '......###......##....##..###......####.##..##...',
+            '...######......########..##......####..######...',
+            '...####........#######...##.......#.....####....',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+    },
+    'ja': {
+        reading: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......#.........##..............................',
+            '.....##.........##........##......##............',
+            '......##...############...###.....###...........',
+            '......##...############....###.....###..........',
+            '...#######......##..........##......##..........',
+            '...#######......##..................###.........',
+            '............##########..............###.........',
+            '....#####...##########..............####........',
+            '....######..........................####........',
+            '...........############..#####.....#####........',
+            '....#####..############..#####.....##..##.......',
+            '....######.##........##.....##....###..##.......',
+            '...........##.##..##.##.....##....##...###......',
+            '....######....##..##........##...###....###.....',
+            '....######....##..##........##..###......###....',
+            '....#...##....##..##........##.###.......####...',
+            '....#...##...###..##........##..#.........##....',
+            '....#...##...##...##..#....####.................',
+            '....######..###...##..#...#######...............',
+            '....######.###....#####..##....##############...',
+            '....#.....###.....#####...#......############...',
+            '...........#....................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        editing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..............#.................................',
+            '........................................##......',
+            '.................................#########......',
+            '.......##..##.##.....................##.........',
+            '.......#....#..........#..............#.........',
+            '.......#....##......#..#...##........##.........',
+            '......##....##......#..##..#....############....',
+            '......##.....#......##.....#.........##.........',
+            '......#......##...........##.........##.........',
+            '.....##......##..........##..........#..........',
+            '.....##.......#.........##..........##..........',
+            '....##........##......###..........##...........',
+            '....#.........#......###..........##............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        searching: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......##........#.................##............',
+            '......##.......###................##............',
+            '......##......#####.......##################....',
+            '......##.....###.###......##################....',
+            '......##...####...###.............##............',
+            '...###########.....####...........##............',
+            '...####################..####################...',
+            '......##.....#######.....####################...',
+            '.....###........#........##.....###........##...',
+            '.....####..###########...##...###....###...##...',
+            '.....####..###########......####....###.........',
+            '.....#####.##...#...##......#########...........',
+            '....####.#.##...#...##.........####....##.......',
+            '....#.##.#.##...#...##........###.......##......',
+            '...##.##...###########.....################.....',
+            '...##.##...###########....###########.....##....',
+            '...#..##.......####...............##......##....',
+            '......##......##.##..........###..##..###.......',
+            '......##.....###..##........###...##...###......',
+            '......##...####....###....####....##....####....',
+            '......##..###.......###...###..#####......##....',
+            '......##..#.....................###.............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        testing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '......##........#...........#...................',
+            '......##.......###.........##...................',
+            '......##......#####.........##...############...',
+            '......##.....###.###........##...############...',
+            '......##...####...###....########.....##........',
+            '...###########.....####..########.....##........',
+            '...####################...............##........',
+            '......##.....#######......######...#..##........',
+            '.....###........#.........######..##..##........',
+            '.....####..###########............##..##........',
+            '.....####..###########....######..##..#######...',
+            '.....#####.##...#...##....######..##..#######...',
+            '....####.#.##...#...##............##..##........',
+            '....#.##.#.##...#...##............##..##........',
+            '...##.##...###########....######..##..##........',
+            '...##.##...###########....######..##..##........',
+            '...#..##.......####.......##..##..##..##........',
+            '......##......##.##.......##..##..##..##........',
+            '......##.....###..##......##..##..##..##........',
+            '......##...####....###....######.############...',
+            '......##..###.......###...######.############...',
+            '......##..#...............#.....................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        executing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '............##..................................',
+            '............##...............##.................',
+            '....##################......###...##########....',
+            '....##################.....###....##########....',
+            '....##..............##....###...................',
+            '....##......##......##...###....................',
+            '....##......##......##...##...##................',
+            '......###############........###................',
+            '......##############........###..############...',
+            '............##.............###...############...',
+            '......##############......####..........##......',
+            '......##############.....#####..........##......',
+            '............##...........#####..........##......',
+            '............##...........##.##..........##......',
+            '...####################.....##..........##......',
+            '....###################.....##..........##......',
+            '..........######............##..........##......',
+            '.........###..###...........##..........##......',
+            '.......####....###..........##..........##......',
+            '....#####.......#####.......##..........##......',
+            '....####..........#####.....##......######......',
+            '....#................#......##......#####.......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        browsing: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...........#....................................',
+            '.....######...####............#..#..............',
+            '..........#..........######.#######.............',
+            '.........#...######..#....#...#..#...######.....',
+            '.........#........#..#........#..#..............',
+            '........#........#.......#......................',
+            '.......#........#.......#.......#...............',
+            '......#........#.......#.......#................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...........#.....#..###...#.#...................',
+            '.........#####...#..###..#..####.######.........',
+            '..........#......#.#..#..#.#..........#.........',
+            '..........#####..#..##..##...##.......#.........',
+            '.........#.##....#.####..#.......######.........',
+            '..........#.#....#.####..#...##.................',
+            '..........#......#..##...#......................',
+            '...........###...#.#.#...#......................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        computer: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...................................#............',
+            '....####..#.....#..#...............###..........',
+            '.......#........##.....##...####..#..#..####....',
+            '.......#.....#..#...................#...........',
+            '.......#...##...#...................##..........',
+            '....####..#.....####..####........#.............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.............###.....##..#.#....................',
+            '...................#.....####..####.............',
+            '.............####..#######.##...................',
+            '..............##..##.#...#.#...####.............',
+            '....................###..#.##...................',
+            '..............###...#....#.#....................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        memory: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '...................###..........................',
+            '....#####..#....................#####...#.......',
+            '........#...#.....#####...###......#....#.......',
+            '........#......#....#......#.......#....###.....',
+            '........#.....#.....#.....####....##....#..#....',
+            '....#####...##.....#.......#.....#..#...#.......',
+            '...................#............#.......#.......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..................#..#...#####....#.............',
+            '...........####...#####....#....#####...........',
+            '............#..#..#..#..#######...#.............',
+            '...........#.##...#####...#.#.....#.............',
+            '............##...##.###...####..#####...........',
+            '............#.....#..#...###......#.............',
+            '............####..#.#.#....#......#.............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        tool: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '........##....#....................#..##........',
+            '....##...#....##...................#..##........',
+            '.....#...##...#....................#..##........',
+            '.....##..##..##....................#..##........',
+            '......#......#....############....##..##........',
+            '............##.....##########.....##..##........',
+            '...........##.....................##..##...#....',
+            '..........###.....................#...##..##....',
+            '.........###.....................##...#####.....',
+            '.......###......................##....###.......',
+            '.......##.......................##.....#........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        thinking: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....################............##.............',
+            '.....################............##......##.....',
+            '.....##.....##.....##......################.....',
+            '.....##.....##.....##.......##############......',
+            '.....##.....##.....##............##...###.......',
+            '.....################............##..###........',
+            '.....################.....###################...',
+            '.....##.....##.....##.....###################...',
+            '.....##.....##.....##............###............',
+            '.....################..........####.............',
+            '.....################.........#############.....',
+            '...........#................##############......',
+            '...........###...........#####.##...............',
+            '.....##.##..###....##....####..##...............',
+            '.....##.##...###...##.........############......',
+            '....###.##.........###........###########.......',
+            '....##..##.......##.##.................##.......',
+            '...###..##......##..###................##.......',
+            '...##...##########...#................###.......',
+            '.........#########................######........',
+            '..................................#####.........',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        responding: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.....................................#..........',
+            '....#...........######.......##.....##..........',
+            '....##....############.......##......##.........',
+            '.....##...######............##.......##.........',
+            '.....###..##................##.##############...',
+            '......#...##...............###.##############...',
+            '..........############.....###..................',
+            '..........############....####...##########.....',
+            '..........##.......##....#####..###########.....',
+            '...#####..##.......##....#####..................',
+            '...#####..##.###..###....##.##..................',
+            '......##..##..###.##........##..###########.....',
+            '......##..##...####.........##...##########.....',
+            '......##..##....###.........##..................',
+            '......##.##....#####........##..############....',
+            '......##.##..####.###.......##..############....',
+            '......####..###....###......##..##........##....',
+            '.....###....#.......#.......##..##........##....',
+            '...########.................##..##........##....',
+            '...##...###############.....##..############....',
+            '...##......############.....##..############....',
+            '............................#...##..............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        delegating: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '.............................#..................',
+            '...................#.#...#####..................',
+            '..................#####......#..................',
+            '...................#.#......#...................',
+            '.....................#......#...................',
+            '.....................#.....#....................',
+            '....................#.....#.....................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '....#####.......................#.......#.......',
+            '......#...........#...#...###....#......#.......',
+            '......#....#####......#....#........#...###.....',
+            '......#.............#......#.......#....#..#....',
+            '....#####.........##.......#.....##.....#.......',
+            '.........................#####..........#.......',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '..............#####..#.###....#.................',
+            '....................#.......#####...............',
+            '...............####..#.###....#.................',
+            '...............###..##...#....#.................',
+            '..............#####..#...#..#####...............',
+            '...............#.#...#...#....#.................',
+            '..............#...#..#..##....#.................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+        waiting: [
+            '................................................',
+            '................................................',
+            '............................#.......##..........',
+            '.............##............###......##..........',
+            '.............###...........#######.#########....',
+            '.....##################...########.#########....',
+            '.....##################...##.##...###.###.......',
+            '.....##..................##...##..##...##.......',
+            '.....##.....###...........#......###............',
+            '.....##......####...............####............',
+            '.....##........###.............###.###..........',
+            '.....##.....##..##...........####...####........',
+            '.....##.....##.............################.....',
+            '.....##..#..##.....##....##############.####....',
+            '.....##..##.##.....##....###..............#.....',
+            '.....##..#..##......##..........................',
+            '.....##.##..##......##......#############.......',
+            '.....##.##..##....##.##.....#############.......',
+            '.....##.##..##....##.##.....##.........##.......',
+            '....##.##...##....##.##.....##.........##.......',
+            '....##......#######.........#############.......',
+            '....##.......######.........#############.......',
+            '............................##.........##.......',
+            '................................................',
+            '................................................',
+            '................#...............................',
+            '.......###......##.............##...............',
+            '......###.......##.............##...............',
+            '.....###...###########.........##...............',
+            '....###....###########.........##....####.......',
+            '....##..##......##........###############.......',
+            '........##......##........###########...........',
+            '.......##.#############.......##................',
+            '......###.#############.......##................',
+            '.....####.........##.........##...#####.........',
+            '....#####.........##.........###########........',
+            '....##.##.#############......#####....###.......',
+            '.......##.#############.....####.......###......',
+            '.......##.........##........###.........##......',
+            '.......##...##....##.........#..........##......',
+            '.......##...###...##...................###......',
+            '.......##....##...##...................##.......',
+            '.......##....##...##.................####.......',
+            '.......##.........##...........#########........',
+            '.......##.......####...........#######..........',
+            '.......##.......###.............................',
+            '................................................',
+            '................................................',
+        ],
+        done: [
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '............#...................................',
+            '...........###..................................',
+            '............##............#################.....',
+            '....##################....#################.....',
+            '....##################.................####.....',
+            '....##..............##................###.......',
+            '....##..............##...............###........',
+            '....##.############.##.............####.........',
+            '.......############...............####..........',
+            '..................................##............',
+            '..................................##............',
+            '...####################...........##............',
+            '...####################...........##............',
+            '.........##....##.................##............',
+            '.........##....##.................##............',
+            '.........##....##.................##............',
+            '........##.....##....#............##............',
+            '........##.....##....##...........##............',
+            '......###......##....##...........##............',
+            '...######......########...........##............',
+            '...####........#######........######............',
+            '..............................#####.............',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+            '................................................',
+        ],
+    },
+};
+
+};
+factories["dot-body"]=function(exports,require){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DOT_BODY = void 0;
+exports.DOT_BODY = [
+    [-0.104699, -0.388947],
+    [0.101025, 0.375171],
+    [-0.424305, 0.103321],
+    [0.424305, -0.050972],
+    [0.042247, -0.006888],
+    [-0.376548, -0.212612],
+    [-0.207561, 0.345781],
+    [0.189192, -0.256696],
+    [0.339812, 0.220878],
+    [-0.178172, 0.095974],
+    [-0.001837, 0.198836],
+    [0.240623, 0.037196],
+    [-0.001837, -0.227306],
+    [-0.314096, -0.043624],
+    [-0.196540, -0.234654],
+    [-0.343485, 0.250267],
+    [0.174498, 0.228225],
+    [-0.056941, 0.382518],
+    [0.049594, -0.374252],
+    [0.409611, 0.095974],
+    [-0.134088, 0.228225],
+    [0.108372, 0.110668],
+    [-0.053268, 0.081279],
+    [-0.299402, 0.132710],
+    [-0.435326, -0.021583],
+    [-0.292054, -0.308127],
+    [0.299402, -0.065666],
+    [0.156130, -0.043624],
+    [-0.281033, -0.153834],
+    [0.258992, 0.147405],
+    [0.255318, 0.301698],
+    [0.101025, -0.197917],
+    [-0.240623, 0.220878],
+    [-0.093678, -0.278737],
+    [0.020205, 0.301698],
+    [-0.200213, -0.359558],
+    [-0.409611, -0.117097],
+    [0.343485, 0.022501],
+    [-0.350833, 0.044543],
+    [0.082657, 0.235572],
+    [0.071636, -0.286085],
+    [-0.071636, 0.294350],
+    [0.170824, 0.323740],
+    [-0.031226, -0.344863],
+    [-0.255318, 0.059237],
+    [0.023879, 0.118016],
+    [-0.108372, 0.147405],
+    [-0.387569, 0.176794],
+    [0.119393, 0.029848],
+    [0.192866, 0.103321],
+    [-0.277360, 0.294350],
+    [0.332464, 0.118016],
+    [-0.130414, 0.353129],
+    [0.023879, 0.382518],
+    [-0.277360, -0.234654],
+    [0.431653, 0.022501],
+    [-0.185519, 0.169447],
+    [0.258992, 0.220878],
+    [0.229603, -0.043624],
+    [-0.119393, 0.051890],
+    [-0.339812, -0.109750],
+    [-0.192866, 0.272309],
+    [-0.163477, -0.300779],
+    [0.126741, 0.176794],
+    [0.383895, 0.162099],
+    [-0.067962, 0.213530],
+    [-0.020205, 0.015154],
+    [0.053268, 0.059237],
+    [-0.380222, -0.058319],
+    [-0.042247, 0.147405],
+    [-0.303075, 0.198836],
+    [-0.229603, -0.300779],
+    [0.009184, -0.293432],
+    [0.361854, -0.058319],
+    [-0.361854, 0.110668],
+    [-0.236950, 0.125363],
+    [0.064289, 0.169447],
+    [-0.413285, 0.037196],
+    [-0.336138, -0.264043],
+    [0.130414, -0.271390],
+    [0.284707, -0.006888],
+    [0.178172, 0.015154],
+    [-0.023879, 0.257614],
+    [-0.137762, 0.294350],
+    [0.108372, 0.316392],
+    [-0.339812, -0.168528],
+    [-0.145109, -0.352210],
+    [-0.086331, -0.337516],
+    [0.053268, -0.234654],
+    [0.101025, -0.021583],
+    [0.299402, 0.257614],
+    [0.214908, 0.264961],
+    [-0.031226, 0.331087],
+    [-0.042247, -0.264043],
+    [0.152456, -0.212612],
+    [-0.001837, 0.066585],
+    [0.387569, -0.006888],
+    [-0.306749, 0.015154],
+    [-0.306749, 0.073932],
+    [0.148782, 0.073932],
+    [0.303075, 0.176794],
+    [0.027552, 0.242919],
+    [-0.369201, -0.006888],
+    [0.295728, 0.044543],
+    [0.130414, 0.257614],
+    [-0.189192, 0.220878],
+    [-0.244297, -0.197917],
+    [0.159803, 0.140058],
+    [0.225929, 0.184141],
+    [-0.053268, -0.388947],
+    [-0.141435, -0.256696],
+    [-0.398590, -0.168528],
+    [-0.431653, -0.073014],
+    [-0.258992, 0.169447],
+    [0.001837, -0.381599],
+    [-0.130414, 0.103321],
+    [-0.336138, 0.162099],
+    [-0.229603, 0.301698],
+    [-0.321444, -0.219959],
+    [0.328791, -0.021583],
+    [-0.075310, 0.037196],
+    [-0.288381, 0.242919],
+    [-0.086331, 0.338434],
+    [0.060615, 0.279656],
+    [0.023879, -0.337516],
+    [-0.387569, 0.073932],
+    [-0.093678, 0.250267],
+    [0.145109, 0.360476],
+    [-0.236950, -0.256696],
+    [0.200213, 0.059237],
+    [-0.141435, 0.184141],
+    [-0.350833, 0.206183],
+    [0.240623, 0.081279],
+    [0.214908, 0.323740],
+    [-0.056941, -0.308127],
+    [0.101025, -0.242001],
+    [-0.369201, -0.139139],
+    [-0.207561, 0.066585],
+    [-0.082657, 0.110668],
+    [-0.156130, 0.140058],
+    [-0.101025, 0.382518],
+    [-0.247971, -0.337516],
+    [-0.123067, -0.308127],
+    [-0.299402, -0.117097],
+    [0.222255, 0.000459],
+    [0.071636, 0.022501],
+    [0.023879, 0.029848],
+    [0.093678, 0.066585],
+    [0.067962, 0.103321],
+    [-0.023879, 0.110668],
+    [-0.405937, 0.140058],
+    [-0.001837, 0.154752],
+    [0.045921, 0.206183],
+    [-0.247971, 0.264961],
+    [-0.016531, 0.375171],
+    [-0.196540, -0.278737],
+    [-0.273686, 0.095974],
+    [-0.075310, 0.169447],
+    [-0.163477, 0.331087],
+    [0.056941, 0.360476],
+    [0.192866, -0.028930],
+    [0.137762, -0.006888],
+    [0.347159, 0.176794],
+    [-0.222255, 0.184141],
+    [-0.104699, 0.198836],
+    [0.178172, 0.279656],
+    [-0.288381, -0.197917],
+    [0.042247, -0.197917],
+    [0.420632, 0.059237],
+    [-0.196540, 0.132710],
+    [0.097351, 0.147405],
+    [0.093678, 0.198836],
+    [-0.196540, -0.322821],
+    [-0.295728, -0.271390],
+    [-0.376548, -0.095055],
+    [-0.310423, -0.080361],
+    [0.427979, -0.014235],
+    [0.380222, 0.125363],
+    [-0.038573, 0.184141],
+    [-0.027552, 0.294350],
+    [0.031226, -0.264043],
+    [0.262665, -0.065666],
+    [-0.156130, 0.066585],
+    [-0.156130, 0.257614],
+    [-0.310423, 0.272309],
+    [-0.023879, -0.300779],
+    [-0.262665, -0.278737],
+    [0.156130, -0.249348],
+    [-0.343485, -0.073014],
+    [-0.347159, -0.036277],
+    [-0.402264, -0.028930],
+    [0.152456, 0.037196],
+    [-0.042247, 0.044543],
+    [-0.093678, 0.073932],
+    [-0.339812, 0.081279],
+    [-0.233276, 0.088627],
+    [0.031226, 0.162099],
+    [0.200213, 0.206183],
+    [-0.034900, 0.220878],
+    [-0.214908, 0.242919],
+    [-0.060615, 0.257614],
+    [0.266339, 0.264961],
+    [-0.104699, 0.301698],
+    [0.145109, 0.301698],
+    [0.001837, 0.338434],
+    [-0.005510, -0.264043],
+    [-0.350833, -0.234654],
+    [-0.314096, -0.146486],
+    [0.391243, -0.043624],
+    [0.258992, -0.028930],
+    [-0.332464, -0.006888],
+    [-0.398590, 0.007806],
+    [0.255318, 0.007806],
+    [0.314096, 0.007806],
+    [-0.292054, 0.044543],
+    [0.266339, 0.059237],
+    [-0.427979, 0.066585],
+    [0.027552, 0.081279],
+    [0.347159, 0.088627],
+    [-0.325117, 0.110668],
+    [0.145109, 0.110668],
+    [-0.372874, 0.147405],
+    [0.317770, 0.147405],
+    [-0.270013, 0.206183],
+    [-0.317770, 0.228225],
+    [-0.123067, 0.264961],
+    [0.005510, 0.272309],
+    [-0.178172, 0.301698],
+    [-0.178172, 0.360476],
+    [-0.137762, -0.381599],
+    [-0.078983, -0.366905],
+    [-0.112046, -0.359558],
+    [-0.229603, -0.227306],
+    [-0.347159, -0.197917],
+    [0.292054, -0.036277],
+    [0.380222, 0.022501],
+    [0.207561, 0.029848],
+    [-0.266339, 0.140058],
+    [-0.229603, 0.154752],
+    [-0.292054, 0.162099],
+    [0.306749, 0.228225],
+    [0.222255, 0.294350],
+    [0.115720, 0.345781],
+    [-0.262665, -0.308127],
+    [-0.093678, -0.308127],
+    [0.038573, -0.293432],
+    [0.101025, -0.286085],
+    [-0.170824, -0.256696],
+    [0.071636, -0.197917],
+    [-0.369201, -0.168528],
+    [0.328791, -0.065666],
+    [0.361854, -0.028930],
+    [0.071636, -0.006888],
+    [-0.435326, 0.007806],
+    [-0.383895, 0.037196],
+    [-0.321444, 0.044543],
+    [-0.394916, 0.103321],
+    [-0.053268, 0.110668],
+    [-0.075310, 0.140058],
+    [0.130414, 0.140058],
+    [-0.001837, 0.228225],
+    [-0.130414, 0.323740],
+    [-0.056941, 0.353129],
+    [-0.163477, -0.330168],
+    [-0.005510, -0.322821],
+    [-0.123067, -0.278737],
+    [0.071636, -0.256696],
+    [0.119393, -0.219959],
+    [-0.306749, -0.175876],
+    [-0.262665, -0.175876],
+    [0.101025, 0.007806],
+    [-0.350833, 0.015154],
+    [-0.343485, 0.132710],
+    [-0.170824, 0.198836],
+    [0.277360, 0.198836],
+    [0.233276, 0.242919],
+    [-0.023879, -0.388947],
+    [-0.163477, -0.374252],
+    [-0.005510, -0.352210],
+    [-0.060615, -0.344863],
+    [0.049594, -0.344863],
+    [-0.222255, -0.330168],
+    [-0.067962, -0.271390],
+    [-0.303075, -0.242001],
+    [0.023879, -0.234654],
+    [-0.339812, -0.139139],
+    [-0.402264, -0.087708],
+    [0.130414, -0.036277],
+    [0.163477, -0.014235],
+    [0.361854, 0.000459],
+    [0.005510, 0.007806],
+    [0.405937, 0.015154],
+    [-0.001837, 0.037196],
+    [0.119393, 0.059237],
+    [0.174498, 0.066585],
+    [-0.027552, 0.073932],
+    [-0.207561, 0.095974],
+    [-0.299402, 0.103321],
+    [0.049594, 0.125363],
+    [0.119393, 0.206183],
+    [-0.214908, 0.213530],
+    [-0.163477, 0.228225],
+    [0.053268, 0.235572],
+    [-0.222255, 0.272309],
+    [0.034900, 0.272309],
+    [-0.056941, 0.323740],
+    [0.082657, 0.323740],
+    [0.082657, 0.353129],
+    [0.023879, -0.366905],
+    [0.078983, -0.227306],
+    [-0.409611, -0.058319],
+    [0.277360, 0.022501],
+    [0.093678, 0.037196],
+    [0.321444, 0.037196],
+    [0.126741, 0.088627],
+    [0.214908, 0.088627],
+    [-0.001837, 0.095974],
+    [0.167151, 0.095974],
+    [-0.156130, 0.110668],
+    [-0.108372, 0.118016],
+    [-0.001837, 0.125363],
+    [-0.130414, 0.132710],
+    [-0.358180, 0.176794],
+    [-0.328791, 0.191488],
+    [0.023879, 0.191488],
+    [-0.262665, 0.235572],
+    [0.152456, 0.242919],
+    [-0.005510, 0.309045],
+    [0.192866, 0.338434],
+    [-0.152456, 0.367823],
+    [-0.078983, 0.367823],
+    [-0.042247, -0.366905],
+    [-0.174498, -0.352210],
+    [-0.123067, -0.337516],
+    [-0.152456, -0.278737],
+    [-0.207561, -0.256696],
+    [0.130414, -0.242001],
+    [0.178172, -0.234654],
+    [-0.255318, -0.219959],
+    [-0.387569, -0.190570],
+    [-0.409611, -0.146486],
+    [0.203887, -0.050972],
+    [0.317770, -0.043624],
+    [-0.064289, 0.059237],
+    [0.229603, 0.059237],
+    [-0.361854, 0.066585],
+    [-0.281033, 0.066585],
+    [-0.130414, 0.073932],
+    [0.398590, 0.073932],
+    [-0.383895, 0.125363],
+    [0.078983, 0.125363],
+    [0.181845, 0.125363],
+    [0.270013, 0.125363],
+    [-0.130414, 0.162099],
+    [0.148782, 0.162099],
+    [-0.012858, 0.176794],
+    [-0.281033, 0.184141],
+    [-0.247971, 0.191488],
+    [-0.196540, 0.191488],
+    [-0.376548, 0.198836],
+    [0.328791, 0.198836],
+    [0.358180, 0.198836],
+    [0.071636, 0.213530],
+    [-0.093678, 0.220878],
+    [-0.361854, 0.228225],
+    [-0.181845, 0.250267],
+    [0.071636, 0.257614],
+    [-0.277360, 0.264961],
+    [-0.167151, 0.279656],
+    [-0.049594, 0.279656],
+    [0.244297, 0.279656],
+    [-0.203887, 0.294350],
+    [0.067962, 0.382518],
+    [-0.034900, -0.322821],
+    [-0.200213, -0.300779],
+    [-0.045921, -0.286085],
+    [-0.233276, -0.278737],
+    [0.097351, -0.264043],
+    [-0.273686, -0.256696],
+    [0.020205, -0.212612],
+    [-0.317770, -0.197917],
+    [-0.380222, -0.117097],
+    [0.387569, -0.065666],
+    [-0.435326, -0.050972],
+    [-0.376548, -0.036277],
+    [-0.310423, -0.021583],
+    [0.218582, -0.021583],
+    [0.189192, -0.006888],
+    [0.045921, 0.015154],
+    [0.141435, 0.015154],
+    [0.049594, 0.037196],
+    [0.181845, 0.037196],
+    [0.409611, 0.037196],
+    [0.020205, 0.051890],
+    [-0.181845, 0.073932],
+    [0.056941, 0.081279],
+    [-0.365527, 0.088627],
+    [-0.152456, 0.088627],
+    [0.090004, 0.088627],
+    [-0.104699, 0.095974],
+    [-0.277360, 0.118016],
+    [0.405937, 0.118016],
+    [0.020205, 0.140058],
+    [-0.159803, 0.162099],
+    [-0.104699, 0.169447],
+    [0.093678, 0.169447],
+    [-0.078983, 0.191488],
+    [0.067962, 0.191488],
+    [-0.145109, 0.206183],
+    [0.020205, 0.213530],
+    [-0.292054, 0.220878],
+    [-0.071636, 0.235572],
+    [-0.314096, 0.250267],
+    [0.001837, 0.250267],
+    [-0.097351, 0.272309],
+    [-0.251644, 0.287003],
+    [-0.082657, 0.316392],
+    [0.141435, 0.338434],
+    [0.167151, 0.345781],
+    [-0.027552, 0.353129],
+    [-0.104699, 0.360476],
+    [0.027552, 0.360476],
+    [-0.126741, 0.375171],
+    [-0.082657, -0.388947],
+    [-0.174498, -0.278737],
+    [-0.325117, -0.242001],
+    [-0.299402, -0.219959],
+    [-0.266339, -0.197917],
+    [0.123067, -0.197917],
+    [-0.284707, -0.175876],
+    [0.339812, -0.043624],
+    [0.339812, 0.000459],
+    [-0.372874, 0.015154],
+    [-0.328791, 0.015154],
+    [-0.435326, 0.037196],
+    [-0.097351, 0.051890],
+    [-0.229603, 0.066585],
+    [0.045921, 0.103321],
+    [-0.321444, 0.132710],
+    [-0.207561, 0.154752],
+    [-0.314096, 0.162099],
+    [-0.339812, 0.228225],
+    [-0.236950, 0.242919],
+    [0.042247, 0.301698],
+    [-0.108372, 0.323740],
+    [0.045921, 0.382518],
+    [-0.020205, -0.366905],
+    [-0.137762, -0.322821],
+    [-0.108372, -0.322821],
+    [-0.071636, -0.322821],
+    [-0.306749, -0.293432],
+    [-0.277360, -0.293432],
+    [-0.137762, -0.293432],
+    [-0.108372, -0.293432],
+    [-0.078983, -0.293432],
+    [-0.321444, -0.278737],
+    [-0.020205, -0.278737],
+    [0.056941, -0.271390],
+    [-0.108372, -0.264043],
+    [-0.027552, -0.249348],
+    [0.009184, -0.249348],
+    [-0.251644, -0.242001],
+    [0.056941, -0.212612],
+    [-0.383895, -0.153834],
+    [-0.354506, -0.153834],
+    [-0.394916, -0.131792],
+    [-0.354506, -0.124445],
+    [-0.325117, -0.124445],
+    [-0.424305, -0.102403],
+    [-0.314096, -0.102403],
+    [-0.354506, -0.095055],
+    [-0.365527, -0.073014],
+    [-0.328791, -0.058319],
+    [0.277360, -0.050972],
+    [0.178172, -0.043624],
+    [0.405937, -0.028930],
+    [0.306749, -0.021583],
+    [0.244297, -0.014235],
+    [-0.420632, -0.006888],
+    [0.115720, -0.006888],
+    [0.299402, 0.022501],
+    [0.262665, 0.037196],
+    [-0.398590, 0.051890],
+    [-0.016531, 0.051890],
+    [0.078983, 0.051890],
+    [-0.336138, 0.059237],
+    [-0.413285, 0.081279],
+    [-0.258992, 0.081279],
+    [0.189192, 0.081279],
+    [-0.078983, 0.088627],
+    [-0.038573, 0.095974],
+    [-0.247971, 0.103321],
+    [-0.222255, 0.110668],
+    [-0.192866, 0.110668],
+    [-0.409611, 0.118016],
+    [-0.170824, 0.125363],
+    [-0.038573, 0.125363],
+    [-0.016531, 0.140058],
+    [0.394916, 0.140058],
+    [-0.181845, 0.147405],
+    [0.369201, 0.147405],
+    [-0.402264, 0.162099],
+    [-0.027552, 0.162099],
+    [0.244297, 0.162099],
+    [-0.053268, 0.169447],
+    [0.009184, 0.176794],
+    [0.369201, 0.176794],
+    [-0.119393, 0.184141],
+    [-0.053268, 0.198836],
+    [-0.023879, 0.198836],
+    [-0.119393, 0.213530],
+    [0.097351, 0.220878],
+    [-0.108372, 0.235572],
+    [-0.049594, 0.235572],
+    [0.321444, 0.242919],
+    [0.049594, 0.257614],
+    [0.281033, 0.279656],
+    [-0.042247, 0.309045],
+    [0.200213, 0.309045],
+    [0.016531, 0.323740],
+    [-0.042247, 0.367823],
+    [-0.031226, 0.389865],
+    [-0.001837, 0.389865],
+    [-0.218582, -0.352210],
+    [-0.244297, -0.315474],
+    [-0.178172, -0.315474],
+    [0.012858, -0.315474],
+    [-0.247971, -0.293432],
+    [-0.214908, -0.286085],
+    [0.012858, -0.271390],
+    [0.170824, -0.264043],
+    [0.115720, -0.256696],
+    [0.038573, -0.219959],
+    [0.097351, -0.219959],
+    [-0.365527, -0.190570],
+    [-0.295728, -0.139139],
+    [-0.328791, -0.087708],
+    [0.244297, -0.058319],
+    [0.405937, -0.058319],
+    [-0.361854, -0.050972],
+    [-0.420632, -0.036277],
+    [-0.328791, -0.028930],
+    [-0.387569, -0.014235],
+    [-0.350833, -0.014235],
+    [0.409611, -0.006888],
+    [0.023879, 0.000459],
+    [0.159803, 0.007806],
+    [0.203887, 0.007806],
+    [-0.416958, 0.015154],
+    [0.236950, 0.015154],
+    [-0.038573, 0.022501],
+    [-0.056941, 0.029848],
+    [0.134088, 0.044543],
+    [0.075310, 0.073932],
+    [0.108372, 0.081279],
+    [-0.321444, 0.088627],
+    [-0.343485, 0.103321],
+    [0.391243, 0.103321],
+    [0.126741, 0.118016],
+    [0.163477, 0.118016],
+    [-0.218582, 0.132710],
+    [-0.093678, 0.132710],
+    [-0.056941, 0.132710],
+    [0.112046, 0.132710],
+    [-0.247971, 0.147405],
+    [-0.354506, 0.154752],
+    [-0.090004, 0.154752],
+    [0.115720, 0.154752],
+    [0.045921, 0.176794],
+    [0.108372, 0.184141],
+    [-0.020205, 0.235572],
+    [-0.137762, 0.250267],
+    [0.281033, 0.250267],
+    [-0.328791, 0.264961],
+    [-0.141435, 0.272309],
+    [0.196540, 0.272309],
+    [-0.292054, 0.279656],
+    [-0.012858, 0.279656],
+    [-0.119393, 0.287003],
+    [0.163477, 0.294350],
+    [0.126741, 0.309045],
+    [0.236950, 0.309045],
+    [-0.181845, 0.338434],
+    [-0.145109, 0.338434],
+    [0.001837, 0.367823],
+    [0.119393, 0.367823],
+    [-0.119393, -0.374252],
+    [-0.097351, -0.374252],
+    [-0.060615, -0.374252],
+    [-0.181845, -0.366905],
+    [0.042247, -0.359558],
+    [-0.093678, -0.352210],
+    [0.016531, -0.352210],
+    [-0.192866, -0.344863],
+    [-0.012858, -0.337516],
+    [-0.053268, -0.330168],
+    [-0.270013, -0.322821],
+    [-0.214908, -0.315474],
+    [-0.156130, -0.315474],
+    [-0.181845, -0.293432],
+    [0.078983, -0.271390],
+    [-0.314096, -0.264043],
+    [-0.255318, -0.264043],
+    [-0.189192, -0.264043],
+    [-0.086331, -0.264043],
+    [0.148782, -0.264043],
+    [0.049594, -0.256696],
+    [-0.343485, -0.249348],
+    [-0.222255, -0.242001],
+    [-0.009184, -0.242001],
+    [0.148782, -0.234654],
+    [-0.358180, -0.219959],
+    [-0.339812, -0.212612],
+    [-0.281033, -0.212612],
+    [-0.236950, -0.212612],
+    [-0.332464, -0.183223],
+    [-0.321444, -0.161181],
+    [-0.299402, -0.161181],
+    [-0.361854, -0.109750],
+    [-0.394916, -0.102403],
+    [-0.383895, -0.080361],
+    [0.222255, -0.058319],
+    [-0.394916, -0.043624],
+    [0.251644, -0.043624],
+    [0.369201, -0.043624],
+    [0.211234, -0.036277],
+    [0.431653, -0.036277],
+    [0.148782, -0.028930],
+    [0.170824, -0.028930],
+    [0.236950, -0.028930],
+    [0.383895, -0.028930],
+    [0.123067, -0.021583],
+    [0.277360, -0.021583],
+    [0.347159, -0.014235],
+    [0.369201, -0.014235],
+    [0.093678, -0.006888],
+    [0.262665, -0.006888],
+    [0.321444, -0.006888],
+    [-0.314096, 0.000459],
+    [0.435326, 0.000459],
+    [0.064289, 0.007806],
+    [0.123067, 0.007806],
+    [0.292054, 0.007806],
+    [-0.391243, 0.022501],
+    [-0.365527, 0.029848],
+    [-0.343485, 0.029848],
+    [-0.314096, 0.029848],
+    [-0.023879, 0.037196],
+    [0.112046, 0.044543],
+    [0.214908, 0.044543],
+    [0.427979, 0.044543],
+    [-0.420632, 0.051890],
+    [-0.376548, 0.051890],
+    [-0.273686, 0.051890],
+    [0.159803, 0.051890],
+    [0.247971, 0.051890],
+    [-0.314096, 0.059237],
+    [-0.137762, 0.059237],
+    [-0.034900, 0.059237],
+    [0.141435, 0.059237],
+    [-0.405937, 0.066585],
+    [-0.112046, 0.066585],
+    [0.034900, 0.066585],
+    [-0.071636, 0.073932],
+    [0.207561, 0.073932],
+    [-0.288381, 0.081279],
+    [-0.214908, 0.081279],
+    [-0.009184, 0.081279],
+    [0.416958, 0.081279],
+    [-0.123067, 0.088627],
+    [-0.060615, 0.095974],
+    [0.020205, 0.095974],
+    [0.339812, 0.103321],
+    [0.005510, 0.110668],
+    [0.086331, 0.110668],
+    [-0.306749, 0.118016],
+    [-0.255318, 0.118016],
+    [-0.137762, 0.118016],
+    [-0.365527, 0.132710],
+    [0.325117, 0.132710],
+    [0.042247, 0.140058],
+    [-0.328791, 0.147405],
+    [-0.306749, 0.147405],
+    [-0.284707, 0.147405],
+    [-0.137762, 0.147405],
+    [-0.067962, 0.154752],
+    [-0.380222, 0.162099],
+    [0.310423, 0.162099],
+    [0.354506, 0.162099],
+    [-0.236950, 0.169447],
+    [-0.214908, 0.169447],
+    [-0.321444, 0.176794],
+    [-0.299402, 0.176794],
+    [-0.167151, 0.176794],
+    [-0.097351, 0.184141],
+    [-0.060615, 0.184141],
+    [0.086331, 0.184141],
+    [-0.229603, 0.198836],
+    [-0.126741, 0.198836],
+    [0.218582, 0.198836],
+    [-0.321444, 0.206183],
+    [-0.086331, 0.206183],
+    [-0.369201, 0.213530],
+    [-0.016531, 0.213530],
+    [0.321444, 0.213530],
+    [0.038573, 0.220878],
+    [0.192866, 0.220878],
+    [-0.222255, 0.228225],
+    [-0.196540, 0.235572],
+    [0.251644, 0.235572],
+    [-0.270013, 0.250267],
+    [-0.115720, 0.250267],
+    [-0.042247, 0.250267],
+    [-0.295728, 0.257614],
+    [-0.229603, 0.257614],
+    [-0.207561, 0.257614],
+    [0.020205, 0.257614],
+    [-0.174498, 0.264961],
+    [-0.067962, 0.272309],
+    [-0.031226, 0.272309],
+    [-0.270013, 0.279656],
+    [-0.185519, 0.287003],
+    [0.012858, 0.287003],
+    [0.262665, 0.287003],
+    [-0.159803, 0.294350],
+    [-0.064289, 0.309045],
+    [-0.023879, 0.316392],
+    [-0.123067, 0.338434],
+    [-0.064289, 0.338434],
+    [-0.159803, 0.353129],
+    [0.075310, 0.367823],
+    [-0.067962, -0.388947],
+    [-0.038573, -0.388947],
+    [0.016531, -0.381599],
+    [-0.145109, -0.366905],
+    [-0.005510, -0.366905],
+    [0.009184, -0.366905],
+    [-0.126741, -0.359558],
+    [-0.060615, -0.359558],
+    [0.056941, -0.359558],
+    [-0.159803, -0.352210],
+    [-0.078983, -0.352210],
+    [-0.045921, -0.344863],
+    [-0.145109, -0.337516],
+    [-0.108372, -0.337516],
+    [0.001837, -0.337516],
+    [-0.178172, -0.330168],
+    [-0.123067, -0.322821],
+    [-0.093678, -0.322821],
+    [-0.020205, -0.322821],
+    [-0.229603, -0.315474],
+    [-0.277360, -0.308127],
+    [-0.137762, -0.308127],
+    [-0.108372, -0.308127],
+    [-0.078983, -0.308127],
+    [-0.042247, -0.308127],
+    [-0.005510, -0.308127],
+    [-0.214908, -0.300779],
+    [-0.292054, -0.293432],
+    [-0.262665, -0.293432],
+    [-0.123067, -0.293432],
+    [-0.093678, -0.293432],
+    [-0.064289, -0.293432],
+    [-0.005510, -0.293432],
+    [0.023879, -0.293432],
+    [0.053268, -0.293432],
+    [0.086331, -0.286085],
+    [-0.277360, -0.278737],
+    [-0.247971, -0.278737],
+    [-0.137762, -0.278737],
+    [-0.108372, -0.278737],
+    [-0.005510, -0.278737],
+    [0.031226, -0.278737],
+    [-0.214908, -0.271390],
+    [0.115720, -0.271390],
+    [-0.123067, -0.264043],
+    [-0.027552, -0.264043],
+    [-0.295728, -0.256696],
+    [-0.222255, -0.256696],
+    [-0.156130, -0.256696],
+    [0.130414, -0.256696],
+    [-0.189192, -0.249348],
+    [0.023879, -0.249348],
+    [0.170824, -0.249348],
+    [-0.236950, -0.242001],
+    [0.071636, -0.242001],
+    [0.086331, -0.242001],
+    [0.115720, -0.242001],
+    [0.038573, -0.234654],
+    [0.163477, -0.234654],
+    [-0.214908, -0.227306],
+    [0.134088, -0.219959],
+    [0.071636, -0.212612],
+    [-0.332464, -0.197917],
+    [-0.303075, -0.197917],
+    [0.056941, -0.197917],
+    [0.086331, -0.197917],
+    [-0.347159, -0.183223],
+    [-0.383895, -0.168528],
+    [-0.354506, -0.168528],
+    [-0.369201, -0.153834],
+    [-0.339812, -0.153834],
+    [-0.354506, -0.139139],
+    [-0.409611, -0.131792],
+    [-0.339812, -0.124445],
+    [-0.394916, -0.117097],
+    [-0.409611, -0.102403],
+    [-0.424305, -0.087708],
+    [-0.416958, -0.073014],
+    [-0.402264, -0.073014],
+    [-0.328791, -0.073014],
+    [-0.310423, -0.065666],
+    [0.277360, -0.065666],
+    [0.314096, -0.065666],
+    [0.343485, -0.065666],
+    [-0.394916, -0.058319],
+    [-0.343485, -0.058319],
+    [0.292054, -0.050972],
+    [-0.328791, -0.043624],
+    [0.354506, -0.043624],
+    [0.405937, -0.043624],
+    [-0.435326, -0.036277],
+    [-0.361854, -0.036277],
+    [0.277360, -0.036277],
+    [0.347159, -0.028930],
+    [-0.420632, -0.021583],
+    [-0.369201, -0.021583],
+    [0.086331, -0.021583],
+    [0.292054, -0.021583],
+    [-0.402264, -0.014235],
+    [-0.435326, -0.006888],
+    [0.056941, -0.006888],
+    [0.203887, -0.006888],
+    [0.299402, -0.006888],
+    [-0.350833, 0.000459],
+    [0.236950, 0.000459],
+    [0.078983, 0.007806],
+    [0.270013, 0.007806],
+    [0.380222, 0.007806],
+    [0.023879, 0.015154],
+    [0.222255, 0.015154],
+    [0.361854, 0.015154],
+    [-0.435326, 0.022501],
+    [-0.001837, 0.022501],
+    [0.086331, 0.022501],
+    [0.101025, 0.022501],
+    [0.159803, 0.022501],
+    [0.255318, 0.022501],
+    [0.314096, 0.022501],
+    [0.328791, 0.022501],
+    [-0.328791, 0.029848],
+    [-0.299402, 0.029848],
+    [0.134088, 0.029848],
+    [0.222255, 0.029848],
+    [-0.398590, 0.037196],
+    [0.064289, 0.037196],
+    [0.078983, 0.037196],
+    [0.167151, 0.037196],
+    [0.277360, 0.037196],
+    [-0.336138, 0.044543],
+    [-0.306749, 0.044543],
+    [-0.056941, 0.044543],
+    [0.200213, 0.044543],
+    [-0.082657, 0.051890],
+    [-0.001837, 0.051890],
+    [0.034900, 0.051890],
+    [0.093678, 0.051890],
+    [0.174498, 0.051890],
+    [-0.299402, 0.059237],
+    [-0.049594, 0.059237],
+    [0.214908, 0.059237],
+    [0.405937, 0.059237],
+    [0.012858, 0.066585],
+    [0.247971, 0.066585],
+    [-0.321444, 0.073932],
+    [0.126741, 0.073932],
+    [0.222255, 0.073932],
+    [-0.427979, 0.081279],
+    [-0.273686, 0.081279],
+    [-0.200213, 0.081279],
+    [0.005510, 0.081279],
+    [0.042247, 0.081279],
+    [0.167151, 0.081279],
+    [-0.394916, 0.088627],
+    [-0.380222, 0.088627],
+    [-0.306749, 0.088627],
+    [-0.137762, 0.088627],
+    [0.075310, 0.088627],
+    [0.141435, 0.088627],
+    [-0.192866, 0.095974],
+    [-0.023879, 0.095974],
+    [0.108372, 0.095974],
+    [-0.409611, 0.103321],
+    [-0.380222, 0.103321],
+    [0.126741, 0.103321],
+    [0.207561, 0.103321],
+    [-0.207561, 0.110668],
+    [-0.178172, 0.110668],
+    [-0.067962, 0.110668],
+    [-0.038573, 0.110668],
+    [-0.009184, 0.110668],
+    [-0.343485, 0.118016],
+    [-0.292054, 0.118016],
+    [-0.123067, 0.118016],
+    [-0.156130, 0.125363],
+    [-0.075310, 0.125363],
+    [-0.023879, 0.125363],
+    [0.064289, 0.125363],
+    [0.093678, 0.125363],
+    [0.145109, 0.125363],
+    [-0.284707, 0.132710],
+    [-0.115720, 0.132710],
+    [-0.391243, 0.140058],
+    [-0.001837, 0.140058],
+    [0.145109, 0.140058],
+    [0.174498, 0.140058],
+    [-0.123067, 0.147405],
+    [-0.266339, 0.154752],
+    [0.012858, 0.154752],
+    [0.130414, 0.154752],
+    [-0.145109, 0.162099],
+    [0.045921, 0.162099],
+    [0.369201, 0.162099],
+    [-0.273686, 0.169447],
+    [-0.200213, 0.169447],
+    [-0.090004, 0.169447],
+    [0.078983, 0.169447],
+    [0.108372, 0.169447],
+    [-0.372874, 0.176794],
+    [-0.343485, 0.176794],
+    [0.023879, 0.176794],
+    [0.141435, 0.176794],
+    [-0.266339, 0.184141],
+    [-0.358180, 0.191488],
+    [-0.343485, 0.191488],
+    [0.038573, 0.191488],
+    [0.053268, 0.191488],
+    [0.126741, 0.191488],
+    [-0.288381, 0.198836],
+    [-0.214908, 0.198836],
+    [-0.038573, 0.198836],
+    [0.343485, 0.198836],
+    [-0.336138, 0.206183],
+    [-0.255318, 0.206183],
+    [-0.196540, 0.206183],
+    [-0.170824, 0.213530],
+    [-0.053268, 0.213530],
+    [-0.001837, 0.213530],
+    [-0.277360, 0.220878],
+    [-0.262665, 0.220878],
+    [0.053268, 0.220878],
+    [-0.148782, 0.228225],
+    [0.012858, 0.228225],
+    [0.321444, 0.228225],
+    [-0.181845, 0.235572],
+    [-0.093678, 0.235572],
+    [-0.034900, 0.235572],
+    [0.067962, 0.235572],
+    [0.097351, 0.235572],
+    [-0.163477, 0.242919],
+    [0.167151, 0.242919],
+    [0.299402, 0.242919],
+    [-0.328791, 0.250267],
+    [-0.255318, 0.250267],
+    [-0.078983, 0.250267],
+    [0.034900, 0.257614],
+    [-0.262665, 0.264961],
+    [0.281033, 0.264961],
+    [-0.207561, 0.272309],
+    [0.020205, 0.272309],
+    [-0.236950, 0.287003],
+    [-0.222255, 0.287003],
+    [0.027552, 0.287003],
+    [0.042247, 0.287003],
+    [-0.086331, 0.294350],
+    [-0.056941, 0.294350],
+    [-0.042247, 0.294350],
+    [-0.012858, 0.294350],
+    [0.236950, 0.294350],
+    [-0.251644, 0.301698],
+];
+
+};
+factories["dot-pixel-body"]=function(exports,require){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DOT_PIXEL_BODY = void 0;
+exports.DOT_PIXEL_BODY = [
+    [-0.070881, -0.368120, 0, 215, 232],
+    [0.057161, 0.363547, 11, 111, 255],
+    [-0.404703, 0.066307, 56, 65, 255],
+    [0.395557, -0.052589, 0, 215, 232],
+    [0.034297, -0.002287, 11, 111, 255],
+    [-0.331536, -0.221787, 11, 111, 255],
+    [0.308672, 0.221786, 3, 167, 255],
+    [-0.221787, 0.285807, 56, 65, 255],
+    [0.185204, -0.240078, 41, 247, 187],
+    [-0.180631, 0.066307, 56, 65, 255],
+    [0.116610, 0.176057, 11, 111, 255],
+    [0.221786, 0.020579, 3, 167, 255],
+    [-0.061735, 0.203494, 56, 65, 255],
+    [0.006860, -0.208068, 0, 215, 232],
+    [-0.294953, -0.057162, 56, 65, 255],
+    [-0.166911, -0.230932, 3, 167, 255],
+    [-0.093745, 0.363547, 76, 25, 214],
+    [0.390985, 0.098318, 3, 167, 255],
+    [-0.345256, 0.203494, 76, 25, 214],
+    [0.194348, 0.313244, 11, 111, 255],
+    [0.057161, -0.336109, 0, 215, 232],
+    [-0.057161, 0.080025, 11, 111, 255],
+    [-0.390984, -0.121182, 11, 111, 255],
+    [-0.230932, 0.171485, 56, 65, 255],
+    [-0.253796, -0.304100, 3, 167, 255],
+    [-0.294953, 0.080025, 56, 65, 255],
+    [0.038869, 0.253797, 11, 111, 255],
+    [0.121182, 0.066307, 11, 111, 255],
+    [0.290380, -0.061734, 0, 215, 232],
+    [0.249224, 0.134900, 3, 167, 255],
+    [-0.249224, -0.162339, 11, 111, 255],
+    [0.134902, -0.034296, 3, 167, 255],
+    [0.020578, 0.144047, 11, 111, 255],
+    [0.102890, -0.185203, 0, 215, 232],
+    [-0.075453, -0.267515, 3, 167, 255],
+    [0.322391, 0.029724, 3, 167, 255],
+    [-0.162339, -0.336109, 3, 167, 255],
+    [-0.125756, 0.272088, 56, 65, 255],
+    [-0.409276, -0.029725, 56, 65, 255],
+    [-0.139475, 0.153193, 56, 65, 255],
+    [-0.038870, 0.294954, 56, 65, 255],
+    [0.221786, 0.230932, 11, 111, 255],
+    [0.112037, 0.299525, 11, 111, 255],
+    [0.102891, -0.267515, 0, 215, 232],
+    [-0.336110, 0.011432, 56, 65, 255],
+    [-0.166912, 0.340682, 56, 65, 255],
+    [0.413850, 0.025150, 0, 215, 232],
+    [-0.363546, 0.130329, 76, 25, 214],
+    [-0.002287, -0.290381, 0, 215, 232],
+    [-0.294953, 0.258369, 76, 25, 214],
+    [0.176057, 0.116610, 3, 167, 255],
+    [0.340682, 0.153193, 0, 215, 232],
+    [0.208068, -0.052589, 0, 215, 232],
+    [-0.317818, -0.134901, 56, 65, 255],
+    [0.043443, 0.070880, 11, 111, 255],
+    [-0.016006, 0.368119, 76, 25, 214],
+    [-0.171485, 0.217213, 56, 65, 255],
+    [-0.240078, -0.235506, 3, 167, 255],
+    [-0.294953, 0.148619, 56, 65, 255],
+    [0.148619, 0.235505, 3, 167, 255],
+    [-0.002286, -0.363546, 0, 215, 232],
+    [-0.235506, 0.107463, 11, 111, 255],
+    [-0.025151, 0.020579, 11, 111, 255],
+    [-0.121183, 0.089172, 11, 111, 255],
+    [0.084599, 0.121182, 11, 111, 255],
+    [-0.075453, 0.139474, 11, 111, 255],
+    [0.057161, 0.194349, 11, 111, 255],
+    [-0.358975, -0.066307, 56, 65, 255],
+    [0.093745, 0.011432, 3, 167, 255],
+    [-0.002286, 0.208068, 11, 111, 255],
+    [-0.134900, -0.281234, 3, 167, 255],
+    [-0.194348, -0.285807, 3, 167, 255],
+    [0.340682, -0.029725, 0, 215, 232],
+    [0.162338, 0.020579, 3, 167, 255],
+    [0.226359, 0.080025, 3, 167, 255],
+    [0.267516, 0.267516, 11, 111, 255],
+    [0.043443, -0.253796, 0, 215, 232],
+    [0.016005, 0.313244, 56, 65, 255],
+    [-0.276662, 0.025150, 56, 65, 255],
+    [-0.240078, 0.230932, 56, 65, 255],
+    [0.272088, -0.006859, 0, 215, 232],
+    [-0.363546, -0.171484, 56, 65, 255],
+    [0.262943, 0.189775, 3, 167, 255],
+    [-0.116609, 0.212641, 56, 65, 255],
+    [-0.294953, -0.267515, 11, 111, 255],
+    [-0.349828, 0.070880, 56, 65, 255],
+    [-0.290381, 0.203494, 76, 25, 214],
+    [-0.093745, -0.317818, 3, 167, 255],
+    [0.272089, 0.048016, 3, 167, 255],
+    [0.322391, 0.102891, 3, 167, 255],
+    [-0.189776, 0.134900, 11, 111, 255],
+    [-0.006860, 0.098318, 11, 111, 255],
+    [0.134901, -0.226359, 0, 215, 232],
+    [-0.281234, -0.203495, 3, 167, 255],
+    [-0.089172, 0.308672, 56, 65, 255],
+    [-0.038870, -0.326964, 0, 215, 232],
+    [0.148620, 0.336110, 11, 111, 255],
+    [0.212641, 0.180630, 3, 167, 255],
+    [-0.029724, 0.162338, 11, 111, 255],
+    [-0.029725, -0.244651, 0, 215, 232],
+    [-0.386411, 0.016005, 56, 65, 255],
+    [0.052588, -0.185203, 3, 167, 255],
+    [0.084600, 0.235505, 11, 111, 255],
+    [-0.080026, 0.249224, 56, 65, 255],
+    [-0.176057, 0.267516, 56, 65, 255],
+    [-0.240078, 0.057161, 56, 65, 255],
+    [-0.093745, 0.048016, 11, 111, 255],
+    [0.180630, 0.066307, 3, 167, 255],
+    [0.368120, 0.011432, 0, 215, 232],
+    [0.102890, 0.349829, 56, 65, 255],
+    [-0.121182, -0.358975, 3, 167, 255],
+    [-0.025151, 0.249224, 56, 65, 255],
+    [0.130329, 0.130329, 11, 111, 255],
+    [0.157766, 0.281235, 11, 111, 255],
+    [-0.208068, -0.331537, 3, 167, 255],
+    [0.294954, 0.148619, 3, 167, 255],
+    [-0.281234, -0.107464, 56, 65, 255],
+    [-0.052589, 0.340682, 56, 65, 255],
+    [0.080025, -0.226359, 0, 215, 232],
+    [0.221786, 0.276661, 11, 111, 255],
+    [-0.208068, -0.203495, 3, 167, 255],
+    [0.176057, -0.020578, 0, 215, 232],
+    [-0.317817, -0.180631, 11, 111, 255],
+    [-0.299526, -0.011432, 11, 111, 255],
+    [-0.326964, 0.107463, 56, 65, 255],
+    [0.016005, 0.038869, 3, 167, 255],
+    [0.180630, 0.208068, 11, 111, 255],
+    [-0.400131, -0.080026, 56, 65, 255],
+    [-0.130328, 0.317818, 56, 65, 255],
+    [-0.326964, -0.093745, 11, 111, 255],
+    [0.249224, -0.043443, 3, 167, 255],
+    [-0.180631, 0.176057, 56, 65, 255],
+    [-0.336109, 0.162338, 56, 65, 255],
+    [-0.363546, -0.020578, 11, 111, 255],
+    [0.386411, 0.057161, 3, 167, 255],
+    [-0.162338, 0.102891, 56, 65, 255],
+    [-0.102890, 0.171485, 56, 65, 255],
+    [0.080027, 0.052588, 3, 167, 255],
+    [0.016005, -0.326964, 0, 215, 232],
+    [0.413848, -0.016006, 0, 215, 232],
+    [-0.313244, 0.043443, 56, 65, 255],
+    [0.043443, 0.112036, 11, 111, 255],
+    [0.189775, 0.253797, 11, 111, 255],
+    [-0.038870, 0.121182, 11, 111, 255],
+    [-0.112036, -0.249225, 3, 167, 255],
+    [0.080025, 0.162338, 11, 111, 255],
+    [-0.258370, 0.272088, 76, 25, 214],
+    [-0.020578, 0.061735, 11, 111, 255],
+    [-0.390984, 0.102891, 76, 25, 214],
+    [0.336110, 0.194349, 3, 167, 255],
+    [-0.208068, 0.203494, 76, 25, 214],
+    [0.002286, 0.276661, 56, 65, 255],
+    [0.020578, 0.354400, 56, 65, 255],
+    [-0.203495, -0.249225, 3, 167, 255],
+    [-0.112037, 0.125755, 56, 65, 255],
+    [-0.258370, 0.139474, 56, 65, 255],
+    [-0.038870, -0.281234, 0, 215, 232],
+    [-0.285807, -0.153193, 11, 111, 255],
+    [-0.203495, 0.240079, 56, 65, 255],
+    [0.217213, -0.016006, 0, 215, 232],
+    [0.372692, 0.130329, 3, 167, 255],
+    [-0.326964, -0.038870, 11, 111, 255],
+    [-0.198921, 0.098318, 11, 111, 255],
+    [0.308672, -0.011432, 0, 215, 232],
+    [0.125755, 0.029724, 3, 167, 255],
+    [-0.354401, -0.125756, 56, 65, 255],
+    [0.006860, -0.249225, 3, 167, 255],
+    [-0.235506, -0.272089, 11, 111, 255],
+    [0.358974, -0.061734, 0, 215, 232],
+    [-0.057161, 0.038869, 11, 111, 255],
+    [-0.244650, -0.198921, 11, 111, 255],
+    [-0.130329, -0.317818, 3, 167, 255],
+    [-0.016005, 0.331536, 56, 65, 255],
+    [-0.130328, 0.354400, 76, 25, 214],
+    [-0.144046, 0.240079, 76, 25, 214],
+    [0.148620, 0.089172, 3, 167, 255],
+    [-0.144047, 0.189775, 56, 65, 255],
+    [-0.267515, 0.176057, 56, 65, 255],
+    [-0.317818, 0.226360, 56, 65, 255],
+    [0.052588, 0.029724, 3, 167, 255],
+    [0.070880, -0.016006, 3, 167, 255],
+    [0.020579, 0.180630, 11, 111, 255],
+    [-0.084600, 0.102891, 11, 111, 255],
+    [-0.144047, 0.061735, 11, 111, 255],
+    [-0.272089, 0.107463, 56, 65, 255],
+    [0.116610, 0.249224, 11, 111, 255],
+    [-0.368120, 0.171485, 76, 25, 214],
+    [-0.358975, 0.038869, 56, 65, 255],
+    [0.089172, 0.084599, 3, 167, 255],
+    [0.043443, -0.217214, 0, 215, 232],
+    [0.029724, 0.221786, 56, 65, 255],
+    [0.276661, 0.230932, 11, 111, 255],
+    [0.070881, -0.276662, 0, 215, 232],
+    [0.093744, 0.203494, 11, 111, 255],
+    [0.102891, -0.025151, 3, 167, 255],
+    [0.377266, -0.020578, 0, 215, 232],
+    [-0.162339, -0.299526, 3, 167, 255],
+    [-0.299526, -0.230932, 3, 167, 255],
+    [-0.066307, -0.299526, 0, 215, 232],
+    [-0.070880, 0.281235, 56, 65, 255],
+    [0.290380, 0.020579, 0, 215, 232],
+    [-0.034297, -0.368120, 0, 215, 232],
+    [-0.166912, -0.267515, 3, 167, 255],
+    [0.322391, -0.057162, 0, 215, 232],
+    [-0.221786, 0.139474, 56, 65, 255],
+    [0.006860, 0.244650, 56, 65, 255],
+    [0.038869, 0.290380, 11, 111, 255],
+    [-0.272089, 0.235505, 56, 65, 255],
+    [0.130328, -0.002287, 3, 167, 255],
+    [-0.102891, -0.285807, 3, 167, 255],
+    [-0.066307, 0.171485, 56, 65, 255],
+    [0.139473, -0.194350, 0, 215, 232],
+    [0.253797, 0.020579, 0, 215, 232],
+    [0.011432, 0.070880, 3, 167, 255],
+    [-0.272088, 0.057161, 56, 65, 255],
+    [0.048016, 0.162338, 11, 111, 255],
+    [-0.034296, 0.217213, 11, 111, 255],
+    [0.235506, 0.048016, 3, 167, 255],
+    [-0.272088, -0.244651, 11, 111, 255],
+    [-0.011432, 0.134900, 11, 111, 255],
+    [0.198921, 0.093744, 3, 167, 255],
+    [-0.368120, -0.098318, 56, 65, 255],
+    [-0.112036, 0.244650, 56, 65, 255],
+    [0.194349, 0.038869, 3, 167, 255],
+    [0.189776, 0.006860, 3, 167, 255],
+    [-0.221787, -0.299526, 3, 167, 255],
+    [0.336110, 0.002286, 0, 215, 232],
+    [0.148619, 0.052588, 3, 167, 255],
+    [-0.212640, 0.070880, 56, 65, 255],
+    [0.116610, 0.098318, 11, 111, 255],
+    [0.144047, 0.157766, 3, 167, 255],
+    [-0.253796, 0.203494, 76, 25, 214],
+    [-0.194350, 0.326963, 76, 25, 214],
+    [0.070880, 0.336110, 56, 65, 255],
+    [-0.308671, 0.176057, 76, 25, 214],
+    [0.029723, -0.354401, 0, 215, 232],
+    [-0.386411, -0.052589, 56, 65, 255],
+    [-0.349828, -0.198921, 11, 111, 255],
+    [0.025152, -0.276662, 0, 215, 232],
+    [0.153192, -0.249225, 0, 215, 232],
+    [-0.409276, 0.034297, 56, 65, 255],
+    [0.102891, 0.144047, 3, 167, 255],
+    [0.162339, -0.212640, 0, 215, 232],
+    [-0.144047, -0.249225, 3, 167, 255],
+    [-0.107463, 0.336110, 56, 65, 255],
+    [-0.070881, -0.336109, 3, 167, 255],
+    [-0.253797, 0.084599, 56, 65, 255],
+    [-0.336109, -0.157765, 11, 111, 255],
+    [0.230932, 0.157766, 11, 111, 255],
+    [0.244650, 0.212641, 3, 167, 255],
+    [-0.153193, 0.285807, 76, 25, 214],
+    [-0.267515, -0.276662, 11, 111, 255],
+    [0.107463, -0.235506, 0, 215, 232],
+    [0.006860, 0.006860, 11, 111, 255],
+    [-0.358975, 0.098318, 76, 25, 214],
+    [0.281235, -0.034296, 0, 215, 232],
+    [0.121182, 0.326963, 11, 111, 255],
+    [-0.230932, 0.258369, 56, 65, 255],
+    [-0.089171, 0.221786, 56, 65, 255],
+    [-0.011432, -0.317818, 0, 215, 232],
+    [-0.061734, 0.368119, 76, 25, 214],
+    [-0.299525, 0.116610, 56, 65, 255],
+    [-0.052588, 0.258369, 56, 65, 255],
+    [-0.194348, 0.290380, 56, 65, 255],
+    [0.057161, 0.230932, 56, 65, 255],
+    [-0.322390, 0.134900, 76, 25, 214],
+    [-0.299526, -0.084600, 11, 111, 255],
+    [-0.322390, -0.066307, 56, 65, 255],
+    [0.244650, -0.011432, 3, 167, 255],
+    [-0.139475, 0.121182, 11, 111, 255],
+    [-0.304100, 0.016005, 56, 65, 255],
+    [-0.025151, 0.189775, 11, 111, 255],
+    [0.162339, 0.308672, 11, 111, 255],
+    [0.016005, 0.116610, 11, 111, 255],
+    [-0.011432, 0.304099, 56, 65, 255],
+    [0.066307, 0.258369, 56, 65, 255],
+    [-0.061734, 0.313244, 56, 65, 255],
+    [-0.377265, 0.061735, 56, 65, 255],
+    [-0.089171, 0.075454, 56, 65, 255],
+    [-0.322390, 0.075454, 56, 65, 255],
+    [-0.409276, -0.002287, 56, 65, 255],
+    [-0.002286, 0.162338, 11, 111, 255],
+    [0.308672, 0.194349, 3, 167, 255],
+    [-0.080025, 0.336110, 56, 65, 255],
+    [0.075454, -0.198921, 3, 167, 255],
+    [-0.116609, 0.061735, 11, 111, 255],
+    [-0.034296, 0.093744, 56, 65, 255],
+    [-0.203495, 0.162338, 56, 65, 255],
+    [-0.057161, 0.230932, 56, 65, 255],
+    [-0.098318, -0.345256, 3, 167, 255],
+    [-0.166911, 0.148619, 56, 65, 255],
+    [0.043443, 0.340682, 11, 111, 255],
+    [-0.185204, -0.317818, 3, 167, 255],
+    [0.038869, -0.313245, 0, 215, 232],
+    [0.066307, 0.098318, 3, 167, 255],
+    [-0.377265, -0.144046, 11, 111, 255],
+    [-0.016006, -0.267515, 0, 215, 232],
+    [-0.272088, -0.176057, 11, 111, 255],
+    [-0.089172, 0.194349, 56, 65, 255],
+    [0.125756, -0.253796, 0, 215, 232],
+    [0.395557, 0.002286, 0, 215, 232],
+    [0.208067, 0.061735, 3, 167, 255],
+    [0.281235, 0.171485, 3, 167, 255],
+    [-0.267516, -0.134901, 11, 111, 255],
+    [0.116610, -0.208068, 0, 215, 232],
+    [-0.020578, -0.345256, 0, 215, 232],
+    [0.157766, 0.134900, 3, 167, 255],
+    [-0.057162, -0.249225, 3, 167, 255],
+    [-0.317818, 0.198922, 56, 65, 255],
+    [0.244650, 0.258369, 11, 111, 255],
+    [-0.048016, 0.144047, 11, 111, 255],
+    [-0.194350, -0.226359, 3, 167, 255],
+    [0.070880, -0.249225, 0, 215, 232],
+    [0.166911, -0.043443, 3, 167, 255],
+    [0.025150, 0.093744, 11, 111, 255],
+    [0.029724, -0.194350, 0, 215, 232],
+    [-0.157765, 0.317818, 76, 25, 214],
+    [0.061735, 0.006860, 11, 111, 255],
+    [0.313244, 0.125755, 0, 215, 232],
+    [-0.112036, 0.299525, 56, 65, 255],
+    [-0.363547, 0.006860, 56, 65, 255],
+    [-0.386411, -0.011432, 56, 65, 255],
+    [0.102891, 0.043443, 3, 167, 255],
+    [-0.203495, 0.267516, 56, 65, 255],
+    [-0.308672, -0.208068, 11, 111, 255],
+    [-0.308672, -0.112037, 11, 111, 255],
+    [-0.326964, -0.011432, 56, 65, 255],
+    [0.134901, 0.290380, 11, 111, 255],
+    [-0.061734, 0.112036, 56, 65, 255],
+    [-0.262943, -0.221787, 3, 167, 255],
+    [0.153193, -0.011432, 3, 167, 255],
+    [0.409276, 0.048016, 0, 215, 232],
+    [0.368119, 0.102891, 3, 167, 255],
+    [-0.171484, 0.244650, 56, 65, 255],
+    [-0.098318, 0.148619, 56, 65, 255],
+    [-0.148619, 0.212641, 56, 65, 255],
+    [-0.102890, 0.267516, 56, 65, 255],
+    [-0.308672, -0.157765, 11, 111, 255],
+    [0.390985, 0.029724, 0, 215, 232],
+    [0.089172, 0.304099, 11, 111, 255],
+    [-0.144047, -0.354401, 3, 167, 255],
+    [-0.290381, -0.130328, 11, 111, 255],
+    [-0.336109, 0.048016, 56, 65, 255],
+    [-0.294953, 0.230932, 76, 25, 214],
+    [0.171485, 0.093744, 3, 167, 255],
+    [-0.354400, -0.043443, 56, 65, 255],
+    [0.043442, 0.139474, 11, 111, 255],
+    [-0.148620, 0.262943, 56, 65, 255],
+    [-0.029725, 0.272088, 56, 65, 255],
+    [0.171485, 0.043443, 3, 167, 255],
+    [0.198922, 0.290380, 11, 111, 255],
+    [0.080025, 0.358974, 11, 111, 255],
+    [-0.043443, -0.304100, 0, 215, 232],
+    [-0.230932, 0.208068, 56, 65, 255],
+    [0.153193, 0.112036, 3, 167, 255],
+    [0.313244, -0.034296, 3, 167, 255],
+    [-0.304098, -0.034296, 56, 65, 255],
+    [-0.386412, 0.125755, 76, 25, 214],
+    [-0.038869, 0.363547, 56, 65, 255],
+    [-0.294954, -0.185203, 11, 111, 255],
+    [-0.212641, 0.116610, 56, 65, 255],
+    [-0.070881, 0.057161, 56, 65, 255],
+    [0.075454, 0.029724, 11, 111, 255],
+    [0.363547, 0.153193, 3, 167, 255],
+    [0.244650, 0.281235, 11, 111, 255],
+    [-0.121183, 0.185204, 56, 65, 255],
+    [-0.034297, 0.043443, 11, 111, 255],
+    [0.363546, -0.038870, 0, 215, 232],
+    [-0.166911, 0.194349, 56, 65, 255],
+    [-0.052589, -0.349828, 0, 215, 232],
+    [-0.313245, -0.249225, 11, 111, 255],
+    [-0.011432, -0.230932, 3, 167, 255],
+    [0.020579, -0.230932, 0, 215, 232],
+    [-0.006859, 0.034297, 3, 167, 255],
+    [-0.162339, 0.080025, 11, 111, 255],
+    [-0.034297, 0.317818, 56, 65, 255],
+    [-0.331537, -0.116609, 11, 111, 255],
+    [0.230932, -0.057162, 0, 215, 232],
+    [0.267516, -0.057162, 0, 215, 232],
+    [0.189775, -0.038870, 3, 167, 255],
+    [0.038869, 0.048016, 11, 111, 255],
+    [0.400130, 0.075454, 0, 215, 232],
+    [0.377266, 0.080025, 0, 215, 232],
+    [0.326963, 0.171485, 3, 167, 255],
+    [-0.253796, 0.249224, 76, 25, 214],
+    [-0.011432, 0.230932, 11, 111, 255],
+    [-0.217214, -0.230932, 3, 167, 255],
+    [-0.230932, 0.084599, 56, 65, 255],
+    [-0.212640, -0.272089, 3, 167, 255],
+    [0.048016, -0.276662, 0, 215, 232],
+    [0.253797, 0.061735, 3, 167, 255],
+    [-0.048015, 0.185204, 11, 111, 255],
+    [0.349828, 0.176057, 3, 167, 255],
+    [-0.290380, 0.043443, 56, 65, 255],
+    [0.034296, 0.198922, 11, 111, 255],
+    [0.354401, -0.011432, 0, 215, 232],
+    [-0.157766, 0.171485, 56, 65, 255],
+    [-0.002287, 0.185204, 11, 111, 255],
+    [-0.089172, -0.249225, 3, 167, 255],
+    [-0.185203, -0.340682, 3, 167, 255],
+    [-0.386412, 0.038869, 56, 65, 255],
+    [0.066307, 0.075454, 11, 111, 255],
+    [-0.166912, 0.125755, 56, 65, 255],
+    [0.016005, -0.304100, 0, 215, 232],
+    [0.107463, 0.121182, 3, 167, 255],
+    [0.093744, 0.180630, 3, 167, 255],
+    [0.221786, 0.299525, 11, 111, 255],
+    [0.029724, 0.020579, 11, 111, 255],
+    [-0.281234, 0.130329, 76, 25, 214],
+    [-0.377265, 0.148619, 76, 25, 214],
+    [0.070880, 0.212641, 11, 111, 255],
+    [0.025150, 0.272088, 56, 65, 255],
+    [-0.144046, 0.336110, 56, 65, 255],
+    [-0.002287, 0.349829, 56, 65, 255],
+    [-0.253796, -0.258370, 3, 167, 255],
+    [-0.377265, 0.084599, 56, 65, 255],
+    [-0.180630, -0.249225, 3, 167, 255],
+    [-0.349828, -0.089171, 11, 111, 255],
+    [-0.249225, 0.162338, 56, 65, 255],
+    [-0.226359, -0.253796, 11, 111, 255],
+    [-0.390984, -0.098318, 56, 65, 255],
+    [0.230932, -0.034296, 3, 167, 255],
+    [-0.144046, 0.089172, 11, 111, 255],
+    [-0.345256, 0.180630, 56, 65, 255],
+    [-0.272089, 0.212641, 76, 25, 214],
+    [0.308672, 0.011432, 0, 215, 232],
+    [0.294954, 0.240079, 11, 111, 255],
+    [-0.340683, 0.125755, 56, 65, 255],
+    [-0.121182, -0.299526, 3, 167, 255],
+    [-0.340682, 0.089172, 56, 65, 255],
+    [0.349829, 0.020579, 3, 167, 255],
+    [0.176058, 0.272088, 11, 111, 255],
+    [0.093744, 0.331536, 56, 65, 255],
+    [-0.043443, 0.061735, 11, 111, 255],
+    [0.061735, 0.121182, 11, 111, 255],
+    [-0.308672, 0.098318, 56, 65, 255],
+    [-0.354401, 0.153193, 56, 65, 255],
+    [-0.121182, 0.162338, 56, 65, 255],
+    [-0.230932, -0.317818, 3, 167, 255],
+    [0.098318, 0.066307, 3, 167, 255],
+    [0.157766, 0.070880, 3, 167, 255],
+    [0.198922, 0.198922, 11, 111, 255],
+    [0.212641, 0.249224, 11, 111, 255],
+    [0.098318, -0.217214, 0, 215, 232],
+    [0.262943, -0.025151, 0, 215, 232],
+    [-0.285807, 0.166911, 56, 65, 255],
+    [-0.189776, 0.194349, 56, 65, 255],
+    [-0.194350, 0.221786, 56, 65, 255],
+    [0.395557, -0.029725, 41, 247, 187],
+    [-0.377265, -0.080026, 11, 111, 255],
+    [-0.116609, -0.336109, 3, 167, 255],
+    [-0.226359, -0.189776, 11, 111, 255],
+    [-0.203494, -0.308671, 3, 167, 255],
+    [-0.253796, 0.116610, 56, 65, 255],
+    [-0.326964, -0.198921, 56, 65, 255],
+    [0.006860, -0.345256, 0, 215, 232],
+    [-0.212641, 0.180630, 56, 65, 255],
+    [0.139473, 0.317818, 11, 111, 255],
+    [-0.354400, -0.148620, 11, 111, 255],
+    [0.048015, 0.272088, 11, 111, 255],
+    [-0.340682, -0.180631, 11, 111, 255],
+    [-0.153193, -0.317818, 3, 167, 255],
+    [0.121182, 0.153193, 3, 167, 255],
+    [0.171484, 0.326963, 11, 111, 255],
+    [-0.285807, 0.006860, 56, 65, 255],
+    [-0.304098, 0.061735, 56, 65, 255],
+    [-0.093745, 0.285807, 56, 65, 255],
+    [0.052588, -0.235506, 0, 215, 232],
+    [-0.226359, -0.212640, 3, 167, 255],
+    [-0.180631, 0.089172, 11, 111, 255],
+    [-0.020578, -0.299526, 0, 215, 232],
+    [0.070881, 0.180630, 11, 111, 255],
+    [0.048016, 0.212641, 56, 65, 255],
+    [-0.006860, 0.258369, 56, 65, 255],
+    [-0.107464, 0.102891, 56, 65, 255],
+    [-0.029724, 0.345255, 56, 65, 255],
+    [-0.377266, -0.034296, 56, 65, 255],
+    [-0.322391, 0.025150, 56, 65, 255],
+    [-0.244651, 0.185204, 76, 25, 214],
+    [-0.125756, -0.262943, 3, 167, 255],
+    [-0.125756, 0.230932, 56, 65, 255],
+    [0.235505, 0.006860, 3, 167, 255],
+    [0.166911, 0.221786, 11, 111, 255],
+    [-0.217214, 0.221786, 76, 25, 214],
+    [-0.057162, -0.317818, 0, 215, 232],
+    [0.093744, -0.249225, 0, 215, 232],
+    [0.116609, 0.011432, 3, 167, 255],
+    [0.144046, 0.011432, 3, 167, 255],
+    [0.002286, 0.052588, 3, 167, 255],
+    [0.057161, 0.057161, 11, 111, 255],
+    [-0.372693, 0.112036, 76, 25, 214],
+    [-0.185203, 0.112036, 56, 65, 255],
+    [-0.020579, 0.112036, 11, 111, 255],
+    [-0.089171, 0.125755, 11, 111, 255],
+    [-0.272089, 0.153193, 56, 65, 255],
+    [0.258369, 0.244650, 3, 167, 255],
+    [0.016005, 0.290380, 56, 65, 255],
+    [0.180630, 0.299525, 11, 111, 255],
+    [0.006859, 0.368119, 56, 65, 255],
+    [-0.349828, -0.006859, 56, 65, 255],
+    [0.281234, 0.253797, 3, 167, 255],
+    [-0.125755, 0.139474, 56, 65, 255],
+    [-0.084600, 0.162338, 56, 65, 255],
+    [-0.189775, 0.253797, 56, 65, 255],
+    [-0.340682, -0.057162, 56, 65, 255],
+    [-0.340682, -0.025151, 56, 65, 255],
+    [-0.308671, 0.244650, 56, 65, 255],
+    [-0.272088, 0.258369, 76, 25, 214],
+    [0.322390, 0.208068, 3, 167, 255],
+    [-0.240079, 0.130329, 56, 65, 255],
+    [-0.313245, 0.153193, 56, 65, 255],
+    [0.217213, 0.043443, 3, 167, 255],
+    [-0.262943, -0.194350, 3, 167, 255],
+    [0.166911, -0.235506, 0, 215, 232],
+    [0.166912, 0.002286, 3, 167, 255],
+    [0.112036, 0.194349, 11, 111, 255],
+    [0.034297, -0.336109, 0, 215, 232],
+    [-0.089172, -0.299526, 3, 167, 255],
+    [-0.061734, -0.281234, 3, 167, 255],
+    [-0.240078, 0.276661, 56, 65, 255],
+    [0.002286, -0.272089, 3, 167, 255],
+    [0.061735, -0.212640, 3, 167, 255],
+    [0.089172, -0.011432, 3, 167, 255],
+    [0.208068, 0.002286, 3, 167, 255],
+    [0.304099, 0.034297, 0, 215, 232],
+    [0.048016, 0.089172, 3, 167, 255],
+    [0.098318, 0.102891, 3, 167, 255],
+    [0.290380, 0.217213, 3, 167, 255],
+    [-0.098318, -0.267515, 0, 215, 232],
+    [-0.016005, 0.285807, 56, 65, 255],
+    [0.125755, 0.345255, 56, 65, 255],
+    [0.194349, -0.011432, 0, 215, 232],
+    [-0.139475, -0.336109, 3, 167, 255],
+    [0.043443, 0.180630, 11, 111, 255],
+    [-0.176057, 0.322391, 56, 65, 255],
+    [-0.240078, -0.290381, 3, 167, 255],
+    [-0.189777, -0.267515, 3, 167, 255],
+    [-0.404703, -0.061734, 56, 65, 255],
+    [0.180630, 0.025150, 3, 167, 255],
+    [0.290380, -0.002287, 3, 167, 255],
+    [-0.011432, 0.080025, 11, 111, 255],
+    [-0.400131, 0.084599, 76, 25, 214],
+    [0.121183, -0.020578, 3, 167, 255],
+    [0.107464, -0.006859, 3, 167, 255],
+    [0.130329, 0.084599, 11, 111, 255],
+    [-0.029725, 0.139474, 11, 111, 255],
+    [-0.048016, 0.276661, 56, 65, 255],
+    [-0.340682, 0.029724, 56, 65, 255],
+    [-0.272089, 0.080025, 56, 65, 255],
+    [0.121182, -0.189776, 3, 167, 255],
+    [0.038870, 0.358974, 56, 65, 255],
+    [0.354400, 0.134900, 3, 167, 255],
+    [0.377266, -0.057162, 41, 247, 187],
+    [0.340682, -0.052589, 0, 215, 232],
+    [0.326963, -0.016006, 0, 215, 232],
+    [0.134902, 0.107463, 3, 167, 255],
+    [-0.038870, 0.235505, 56, 65, 255],
+    [-0.281235, -0.226359, 11, 111, 255],
+    [-0.185203, 0.153193, 56, 65, 255],
+    [0.084599, -0.180631, 3, 167, 255],
+    [0.130328, 0.048016, 3, 167, 255],
+    [0.016005, 0.203494, 11, 111, 255],
+    [-0.267516, -0.157765, 11, 111, 255],
+    [0.025151, 0.162338, 11, 111, 255],
+    [0.272088, 0.016005, 3, 167, 255],
+    [-0.089171, -0.363546, 3, 167, 255],
+    [-0.043443, -0.262943, 3, 167, 255],
+    [-0.112037, 0.358974, 56, 65, 255],
+    [-0.125756, 0.107463, 11, 111, 255],
+    [-0.372693, -0.116609, 56, 65, 255],
+    [-0.075453, 0.354400, 56, 65, 255],
+    [0.144047, 0.034297, 3, 167, 255],
+    [0.011432, 0.226360, 11, 111, 255],
+    [0.025150, 0.240079, 11, 111, 255],
+    [0.025150, -0.212640, 3, 167, 255],
+    [-0.130328, 0.253797, 56, 65, 255],
+    [-0.290381, -0.249225, 3, 167, 255],
+    [-0.217214, 0.098318, 56, 65, 255],
+    [-0.244651, -0.217214, 11, 111, 255],
+    [-0.249225, -0.180631, 11, 111, 255],
+    [0.208067, -0.034296, 3, 167, 255],
+    [-0.107464, 0.317818, 56, 65, 255],
+    [-0.221787, 0.240079, 56, 65, 255],
+    [0.025152, -0.258370, 0, 215, 232],
+    [-0.349828, -0.107464, 11, 111, 255],
+    [0.153193, -0.029725, 3, 167, 255],
+    [-0.139474, 0.171485, 56, 65, 255],
+    [-0.326964, 0.180630, 56, 65, 255],
+    [-0.409276, 0.016005, 56, 65, 255],
+    [0.253797, 0.043443, 3, 167, 255],
+    [0.098318, 0.162338, 11, 111, 255],
+    [-0.048015, 0.166911, 11, 111, 255],
+    [-0.285807, 0.185204, 56, 65, 255],
+    [-0.011432, -0.249225, 3, 167, 255],
+    [-0.180630, -0.299526, 3, 167, 255],
+    [0.203494, 0.020579, 3, 167, 255],
+    [-0.052589, -0.368120, 0, 215, 232],
+    [-0.112037, -0.317818, 3, 167, 255],
+    [-0.144047, -0.299526, 3, 167, 255],
+    [-0.153192, -0.281234, 3, 167, 255],
+    [-0.162339, -0.249225, 3, 167, 255],
+    [-0.075453, 0.038869, 11, 111, 255],
+    [-0.290380, 0.098318, 56, 65, 255],
+    [-0.002286, 0.116610, 11, 111, 255],
+    [-0.057162, 0.294954, 56, 65, 255],
+    [0.413849, 0.002286, 0, 215, 232],
+    [-0.125755, 0.336110, 56, 65, 255],
+    [-0.336109, -0.139475, 11, 111, 255],
+    [-0.176057, 0.285807, 56, 65, 255],
+    [-0.075453, -0.317818, 0, 215, 232],
+    [-0.157766, 0.230932, 56, 65, 255],
+    [-0.336110, 0.144047, 56, 65, 255],
+    [-0.107463, 0.080025, 11, 111, 255],
+    [-0.070881, 0.089172, 11, 111, 255],
+    [-0.130328, 0.203494, 56, 65, 255],
+    [-0.075453, 0.299525, 56, 65, 255],
+    [-0.331536, 0.212641, 76, 25, 214],
+    [-0.253797, 0.066307, 56, 65, 255],
+    [0.006860, 0.089172, 11, 111, 255],
+    [0.084600, -0.267515, 0, 215, 232],
+    [-0.276662, -0.262943, 3, 167, 255],
+    [-0.304100, 0.134900, 76, 25, 214],
+    [-0.317817, 0.002286, 56, 65, 255],
+    [0.093744, 0.029724, 11, 111, 255],
+    [0.226359, 0.061735, 3, 167, 255],
+    [0.194348, 0.075454, 3, 167, 255],
+    [-0.194350, 0.080025, 56, 65, 255],
+    [0.107463, 0.084599, 3, 167, 255],
+    [-0.016005, 0.171485, 11, 111, 255],
+    [-0.304100, 0.212641, 56, 65, 255],
+    [-0.006859, -0.336109, 3, 167, 255],
+    [0.080025, 0.002286, 3, 167, 255],
+    [0.253797, 0.002286, 0, 215, 232],
+    [0.052588, -0.006859, 3, 167, 255],
+    [-0.034296, 0.075454, 11, 111, 255],
+    [-0.043443, 0.203494, 56, 65, 255],
+    [-0.294953, -0.166912, 11, 111, 255],
+    [-0.267516, 0.038869, 56, 65, 255],
+    [-0.358975, 0.057161, 56, 65, 255],
+    [0.299527, -0.048015, 0, 215, 232],
+    [0.020578, 0.057161, 11, 111, 255],
+    [0.144047, -0.212640, 0, 215, 232],
+    [0.285807, 0.038869, 3, 167, 255],
+    [0.185203, 0.102891, 3, 167, 255],
+    [-0.203494, 0.144047, 56, 65, 255],
+    [0.002287, 0.322391, 56, 65, 255],
+    [-0.235506, 0.148619, 76, 25, 214],
+    [-0.107464, 0.194349, 56, 65, 255],
+    [-0.093745, 0.240079, 56, 65, 255],
+    [0.235505, 0.029724, 3, 167, 255],
+    [0.093744, -0.198921, 3, 167, 255],
+    [-0.029723, -0.313245, 0, 215, 232],
+    [-0.080026, -0.285807, 0, 215, 232],
+    [-0.148620, 0.139474, 56, 65, 255],
+    [-0.221786, 0.157766, 56, 65, 255],
+    [-0.212641, 0.253797, 56, 65, 255],
+    [0.048016, -0.349828, 0, 215, 232],
+    [0.377266, -0.002287, 0, 215, 232],
+    [0.381838, 0.116610, 3, 167, 255],
+    [-0.057162, 0.130329, 11, 111, 255],
+    [-0.070881, 0.189775, 11, 111, 255],
+    [-0.070881, 0.217213, 11, 111, 255],
+    [0.034296, 0.125755, 11, 111, 255],
+    [0.006860, 0.134900, 11, 111, 255],
+    [0.153193, -0.226359, 0, 215, 232],
+    [0.057161, -0.262943, 3, 167, 255],
+    [0.290380, -0.020578, 0, 215, 232],
+    [0.043443, 0.011432, 3, 167, 255],
+    [-0.372693, 0.025150, 56, 65, 255],
+    [0.006860, 0.025150, 11, 111, 255],
+    [0.066307, 0.043443, 3, 167, 255],
+    [-0.253796, 0.048016, 56, 65, 255],
+    [-0.322390, 0.057161, 56, 65, 255],
+    [0.139474, 0.066307, 11, 111, 255],
+    [0.240079, 0.070880, 0, 215, 232],
+    [-0.345256, 0.107463, 56, 65, 255],
+    [-0.226359, 0.189775, 56, 65, 255],
+    [-0.272089, 0.194349, 76, 25, 214],
+    [-0.098318, 0.208068, 11, 111, 255],
+    [-0.020578, 0.208068, 56, 65, 255],
+    [-0.258370, 0.221786, 56, 65, 255],
+    [-0.185203, 0.235505, 56, 65, 255],
+    [0.016005, 0.258369, 11, 111, 255],
+    [-0.080026, -0.349828, 0, 215, 232],
+    [-0.171484, -0.285807, 3, 167, 255],
+    [0.034297, -0.240078, 3, 167, 255],
+    [-0.322391, -0.235506, 11, 111, 255],
+    [-0.299527, -0.144046, 11, 111, 255],
+    [-0.340682, -0.075453, 56, 65, 255],
+    [-0.313245, -0.052589, 11, 111, 255],
+    [-0.400130, -0.043443, 56, 65, 255],
+    [-0.317818, -0.025151, 56, 65, 255],
+    [-0.354402, 0.020579, 56, 65, 255],
+    [-0.043442, 0.029724, 11, 111, 255],
+    [-0.400131, 0.048016, 76, 25, 214],
+    [-0.285808, 0.066307, 56, 65, 255],
+    [-0.134901, 0.075454, 56, 65, 255],
+    [-0.066307, 0.153193, 56, 65, 255],
+    [-0.285807, 0.244650, 76, 25, 214],
+    [-0.006859, 0.016005, 3, 167, 255],
+    [0.080025, 0.194349, 11, 111, 255],
+    [0.093744, 0.221786, 56, 65, 255],
+    [-0.368119, -0.052589, 56, 65, 255],
+    [-0.144047, -0.267515, 3, 167, 255],
+    [-0.052589, 0.098318, 11, 111, 255],
+    [-0.107464, 0.226360, 56, 65, 255],
+    [0.130328, 0.166911, 11, 111, 255],
+    [-0.016006, 0.153193, 11, 111, 255],
+    [-0.093745, 0.345255, 56, 65, 255],
+    [-0.093745, 0.326963, 56, 65, 255],
+    [-0.116609, -0.276662, 3, 167, 255],
+    [0.381839, -0.038870, 0, 215, 232],
+    [-0.020578, -0.363546, 0, 215, 232],
+    [-0.171484, -0.313245, 3, 167, 255],
+    [0.025152, 0.075454, 11, 111, 255],
+    [-0.208068, -0.290381, 11, 111, 255],
+    [-0.070881, 0.235505, 11, 111, 255],
+    [0.038870, 0.235505, 11, 111, 255],
+    [-0.139473, 0.281235, 56, 65, 255],
+    [-0.294953, -0.212640, 11, 111, 255],
+    [0.409277, -0.034296, 0, 215, 232],
+    [0.212641, 0.089172, 3, 167, 255],
+    [0.139474, -0.016006, 3, 167, 255],
+    [-0.372692, -0.006859, 56, 65, 255],
+    [0.107464, 0.025150, 3, 167, 255],
+    [-0.075453, 0.116610, 11, 111, 255],
+    [0.070880, 0.240079, 11, 111, 255],
+    [0.002286, 0.294954, 56, 65, 255],
+    [-0.400131, -0.016006, 76, 25, 214],
+    [-0.294953, -0.102890, 11, 111, 255],
+    [-0.336109, 0.066307, 76, 25, 214],
+    [0.002287, -0.226359, 3, 167, 255],
+    [-0.066307, 0.262943, 56, 65, 255],
+    [-0.093745, 0.089172, 11, 111, 255],
+    [-0.368120, -0.157765, 11, 111, 255],
+    [-0.089171, -0.331537, 0, 215, 232],
+    [0.331536, 0.016005, 0, 215, 232],
+    [0.386411, 0.016005, 0, 215, 232],
+    [0.304098, 0.208068, 3, 167, 255],
+    [-0.313245, 0.121182, 56, 65, 255],
+    [-0.034297, -0.349828, 0, 215, 232],
+    [0.208068, 0.308672, 11, 111, 255],
+    [0.308672, -0.061734, 0, 215, 232],
+    [-0.226359, 0.066307, 56, 65, 255],
+    [0.016005, -0.358975, 0, 215, 232],
+    [-0.066307, -0.354401, 0, 215, 232],
+    [-0.217213, -0.313245, 3, 167, 255],
+    [-0.107464, -0.304100, 0, 215, 232],
+    [-0.272089, -0.290381, 11, 111, 255],
+    [-0.253796, -0.285807, 3, 167, 255],
+    [-0.025151, -0.285807, 0, 215, 232],
+    [-0.130328, -0.244651, 3, 167, 255],
+    [0.139473, -0.244651, 0, 215, 232],
+    [-0.258370, -0.235506, 3, 167, 255],
+    [0.066307, -0.230932, 0, 215, 232],
+    [0.121182, -0.230932, 0, 215, 232],
+    [0.084599, -0.212640, 0, 215, 232],
+    [-0.354402, -0.185203, 11, 111, 255],
+    [-0.322391, -0.166912, 11, 111, 255],
+    [-0.313245, -0.080026, 11, 111, 255],
+    [0.326963, -0.038870, 0, 215, 232],
+    [-0.299526, 0.029724, 56, 65, 255],
+    [-0.066308, 0.326963, 56, 65, 255],
+    [-0.052589, -0.331537, 0, 215, 232],
+    [0.048016, -0.203495, 0, 215, 232],
+    [-0.395557, 0.002286, 56, 65, 255],
+    [0.020579, 0.002286, 11, 111, 255],
+    [0.189775, 0.052588, 3, 167, 255],
+    [0.166911, 0.057161, 11, 111, 255],
+    [0.084599, 0.070880, 3, 167, 255],
+    [0.084599, 0.098318, 3, 167, 255],
+    [0.029724, 0.107463, 3, 167, 255],
+    [0.358974, 0.121182, 3, 167, 255],
+    [0.144047, 0.125755, 11, 111, 255],
+    [0.089172, 0.134900, 11, 111, 255],
+    [0.139474, 0.144047, 3, 167, 255],
+    [0.061734, 0.166911, 11, 111, 255],
+    [-0.358975, 0.185204, 76, 25, 214],
+    [-0.304100, 0.194349, 56, 65, 255],
+    [0.258369, 0.203494, 11, 111, 255],
+    [0.134900, 0.240079, 11, 111, 255],
+    [0.052588, 0.249224, 11, 111, 255],
+    [-0.162339, 0.258369, 76, 25, 214],
+    [-0.244651, 0.262943, 56, 65, 255],
+    [0.057161, 0.345255, 11, 111, 255],
+    [0.084599, 0.345255, 11, 111, 255],
+    [-0.322390, 0.166911, 56, 65, 255],
+    [-0.025151, 0.299525, 11, 111, 255],
+    [0.230932, -0.006859, 3, 167, 255],
+    [-0.025150, -0.331537, 0, 215, 232],
+    [0.112036, -0.249225, 0, 215, 232],
+    [0.267516, 0.034297, 0, 215, 232],
+    [-0.098318, 0.061735, 11, 111, 255],
+    [-0.208068, 0.130329, 56, 65, 255],
+    [-0.084600, 0.180630, 56, 65, 255],
+    [-0.258370, -0.208068, 11, 111, 255],
+    [-0.313245, -0.098318, 11, 111, 255],
+    [-0.267516, 0.093744, 56, 65, 255],
+    [-0.267516, 0.121182, 56, 65, 255],
+    [-0.390984, -0.066307, 11, 111, 255],
+    [-0.354401, 0.084599, 76, 25, 214],
+    [-0.249224, 0.098318, 56, 65, 255],
+    [-0.226359, 0.125755, 56, 65, 255],
+    [0.002286, 0.148619, 56, 65, 255],
+    [-0.171484, 0.162338, 56, 65, 255],
+    [-0.185203, 0.208068, 56, 65, 255],
+    [-0.244650, 0.217213, 56, 65, 255],
+    [-0.048016, 0.326963, 56, 65, 255],
+    [0.116609, 0.052588, 3, 167, 255],
+    [0.153193, 0.322391, 11, 111, 255],
+    [0.107463, 0.336110, 56, 65, 255],
+    [0.390984, -0.011432, 0, 215, 232],
+    [0.267515, -0.038870, 0, 215, 232],
+    [0.404703, 0.061735, 0, 215, 232],
+    [0.011432, 0.102891, 11, 111, 255],
+    [0.358973, -0.025151, 0, 215, 232],
+    [0.176057, 0.080025, 3, 167, 255],
+    [0.322391, 0.185204, 3, 167, 255],
+    [-0.052589, 0.217213, 11, 111, 255],
+    [-0.189776, 0.276661, 76, 25, 214],
+    [-0.125756, 0.304099, 76, 25, 214],
+    [-0.345256, -0.212640, 11, 111, 255],
+    [-0.016005, 0.048016, 11, 111, 255],
+    [-0.034296, 0.176057, 56, 65, 255],
+    [-0.011432, 0.272088, 56, 65, 255],
+    [-0.057161, 0.354400, 56, 65, 255],
+    [-0.208068, 0.281235, 56, 65, 255],
+    [0.322391, -0.002287, 0, 215, 232],
+    [0.354402, 0.006860, 0, 215, 232],
+    [0.034297, 0.034297, 11, 111, 255],
+    [-0.006859, 0.066307, 11, 111, 255],
+    [0.121182, 0.112036, 11, 111, 255],
+    [-0.153193, 0.116610, 11, 111, 255],
+    [0.116610, 0.134900, 11, 111, 255],
+    [0.276661, 0.185204, 11, 111, 255],
+    [-0.285807, 0.217213, 76, 25, 214],
+    [0.235505, 0.226360, 11, 111, 255],
+    [-0.048016, 0.308672, 56, 65, 255],
+    [0.176058, 0.313244, 11, 111, 255],
+    [-0.180631, 0.336110, 56, 65, 255],
+    [-0.313244, -0.221787, 11, 111, 255],
+    [-0.372693, 0.048016, 76, 25, 214],
+    [-0.107464, -0.363546, 3, 167, 255],
+    [-0.006859, -0.304100, 0, 215, 232],
+    [-0.226359, -0.285807, 3, 167, 255],
+    [-0.057162, -0.267515, 3, 167, 255],
+    [-0.070881, -0.253796, 3, 167, 255],
+    [-0.180631, -0.221787, 3, 167, 255],
+    [-0.212640, -0.217214, 3, 167, 255],
+    [-0.313245, -0.194350, 11, 111, 255],
+    [-0.276662, -0.189776, 11, 111, 255],
+    [0.070880, -0.185203, 3, 167, 255],
+    [-0.322390, -0.148620, 11, 111, 255],
+    [-0.368120, -0.130328, 56, 65, 255],
+    [-0.304100, -0.125756, 11, 111, 255],
+    [-0.276662, -0.121182, 11, 111, 255],
+    [-0.363546, -0.084600, 11, 111, 255],
+    [-0.390984, -0.029725, 56, 65, 255],
+    [0.244650, -0.029725, 3, 167, 255],
+    [-0.075453, 0.070880, 11, 111, 255],
+    [-0.208068, 0.084599, 56, 65, 255],
+    [-0.139475, 0.102891, 11, 111, 255],
+    [-0.358975, 0.116610, 76, 25, 214],
+    [-0.025150, 0.125755, 11, 111, 255],
+    [-0.349828, 0.166911, 56, 65, 255],
+    [-0.235506, 0.244650, 56, 65, 255],
+    [-0.098317, 0.253797, 56, 65, 255],
+    [-0.226359, 0.272088, 56, 65, 255],
+    [0.020578, -0.340682, 0, 215, 232],
+    [0.130328, 0.016005, 3, 167, 255],
+    [0.395558, 0.043443, 0, 215, 232],
+    [0.011433, 0.166911, 11, 111, 255],
+    [-0.112037, 0.144047, 56, 65, 255],
+    [-0.194349, 0.180630, 56, 65, 255],
+    [-0.349828, -0.162339, 11, 111, 255],
+    [-0.322390, 0.093744, 56, 65, 255],
+    [-0.285807, 0.112036, 56, 65, 255],
+    [-0.258370, 0.189775, 56, 65, 255],
+    [-0.157765, -0.349828, 3, 167, 255],
+    [0.002287, -0.322390, 0, 215, 232],
+    [-0.235505, -0.304100, 3, 167, 255],
+    [0.093745, -0.230932, 0, 215, 232],
+    [0.180631, -0.006859, 3, 167, 255],
+    [-0.299525, 0.162338, 56, 65, 255],
+    [-0.144046, 0.313244, 76, 25, 214],
+    [0.134900, 0.331536, 11, 111, 255],
+    [0.157766, 0.038869, 3, 167, 255],
+    [-0.038870, 0.253797, 56, 65, 255],
+    [-0.153193, -0.235506, 11, 111, 255],
+    [-0.157765, 0.066307, 11, 111, 255],
+    [-0.116609, 0.258369, 56, 65, 255],
+    [-0.153192, 0.157766, 56, 65, 255],
+    [-0.390985, 0.070880, 56, 65, 255],
+    [-0.349828, 0.139474, 56, 65, 255],
+    [-0.331536, 0.194349, 76, 25, 214],
+    [-0.198922, 0.066307, 56, 65, 255],
+    [-0.134902, 0.217213, 56, 65, 255],
+    [0.244652, -0.057162, 0, 215, 232],
+    [0.048016, 0.125755, 3, 167, 255],
+    [-0.198922, 0.116610, 56, 65, 255],
+    [-0.020578, 0.317818, 56, 65, 255],
+    [-0.057161, 0.057161, 11, 111, 255],
+    [0.340683, -0.016006, 0, 215, 232],
+    [0.212640, 0.075454, 3, 167, 255],
+    [0.020579, 0.130329, 11, 111, 255],
+    [-0.075454, 0.313244, 56, 65, 255],
+    [-0.006859, -0.349828, 0, 215, 232],
+    [0.075453, 0.016005, 3, 167, 255],
+    [-0.034297, 0.107463, 11, 111, 255],
+    [-0.052589, 0.244650, 11, 111, 255],
+    [-0.162339, 0.272088, 56, 65, 255],
+    [0.002286, 0.308672, 11, 111, 255],
+    [-0.034296, 0.331536, 56, 65, 255],
+    [-0.016005, 0.354400, 56, 65, 255],
+    [-0.299525, 0.002286, 56, 65, 255],
+    [-0.102890, -0.331537, 3, 167, 255],
+    [-0.281234, -0.276662, 3, 167, 255],
+    [-0.253796, -0.272089, 11, 111, 255],
+    [-0.029725, -0.267515, 3, 167, 255],
+    [-0.112037, -0.262943, 3, 167, 255],
+    [0.070880, -0.262943, 0, 215, 232],
+    [-0.240078, -0.258370, 11, 111, 255],
+    [-0.043443, -0.249225, 0, 215, 232],
+    [0.020579, -0.244651, 3, 167, 255],
+    [-0.180631, -0.235506, 11, 111, 255],
+    [0.130329, -0.212640, 0, 215, 232],
+    [-0.294953, -0.198921, 11, 111, 255],
+    [0.061735, -0.198921, 0, 215, 232],
+    [-0.326964, -0.080026, 56, 65, 255],
+    [-0.299526, -0.070881, 56, 65, 255],
+    [-0.372693, -0.066307, 11, 111, 255],
+    [-0.326964, -0.052589, 56, 65, 255],
+    [0.281235, -0.048015, 0, 215, 232],
+    [0.294954, -0.034296, 3, 167, 255],
+    [0.189775, -0.025151, 0, 215, 232],
+    [0.230932, -0.020578, 0, 215, 232],
+    [0.276661, -0.020578, 0, 215, 232],
+    [-0.313245, -0.011432, 56, 65, 255],
+    [0.258369, -0.011432, 0, 215, 232],
+    [-0.349828, 0.006860, 56, 65, 255],
+    [0.221786, 0.006860, 0, 215, 232],
+    [0.400130, 0.016005, 0, 215, 232],
+    [-0.020578, 0.034297, 11, 111, 255],
+    [0.052588, 0.043443, 11, 111, 255],
+    [-0.130328, 0.061735, 11, 111, 255],
+    [-0.363547, 0.070880, 56, 65, 255],
+    [-0.240078, 0.070880, 56, 65, 255],
+    [-0.308671, 0.075454, 76, 25, 214],
+    [-0.121182, 0.075454, 11, 111, 255],
+    [-0.377265, 0.098318, 76, 25, 214],
+    [-0.020579, 0.098318, 11, 111, 255],
+    [-0.326964, 0.121182, 76, 25, 214],
+    [-0.125756, 0.121182, 56, 65, 255],
+    [0.089172, 0.148619, 11, 111, 255],
+    [0.057162, 0.180630, 11, 111, 255],
+    [-0.084600, 0.208068, 56, 65, 255],
+    [0.070880, 0.226360, 11, 111, 255],
+    [-0.025151, 0.230932, 56, 65, 255],
+    [-0.258370, 0.235505, 76, 25, 214],
+    [-0.157766, 0.244650, 56, 65, 255],
+    [-0.011432, 0.244650, 56, 65, 255],
+    [-0.272089, 0.272088, 56, 65, 255],
+    [-0.144046, 0.349829, 76, 25, 214],
+    [0.020578, 0.368119, 56, 65, 255],
+    [-0.340682, -0.038870, 56, 65, 255],
+    [-0.331537, 0.226360, 76, 25, 214],
+    [-0.317818, 0.212641, 76, 25, 214],
+    [0.057162, -0.249225, 0, 215, 232],
+    [-0.066307, 0.340682, 56, 65, 255],
+    [-0.171484, 0.230932, 76, 25, 214],
+    [-0.194348, -0.240078, 3, 167, 255],
+    [-0.281234, -0.139475, 11, 111, 255],
+    [-0.294953, -0.116609, 11, 111, 255],
+    [0.107463, -0.198921, 0, 215, 232],
+    [-0.043442, 0.349829, 56, 65, 255],
+    [-0.386412, 0.052588, 56, 65, 255],
+    [0.377266, 0.093744, 3, 167, 255],
+    [0.240079, 0.148619, 11, 111, 255],
+    [0.267516, 0.253797, 3, 167, 255],
+    [0.253797, 0.267516, 3, 167, 255],
+];
 
 };
 function load(id){id=id.replace(/^\.\//,'').replace(/\.js$/,'');if(cache[id])return cache[id];if(!factories[id])throw Error('Missing core module');const e=cache[id]={};factories[id](e,load);return e;}

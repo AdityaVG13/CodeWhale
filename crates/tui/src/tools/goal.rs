@@ -129,6 +129,13 @@ pub struct GoalState {
     last_gap_pass: Option<u32>,
     /// Latest reported progress, kept out of the stall accounting entirely.
     progress: Option<GoalProgressReport>,
+    /// The current blocker was set by the runtime (a continuation turn that
+    /// failed, timed out or never started), not reported by the model or the
+    /// user. Such a stop is not a judgement about the work, so the user's next
+    /// message resumes the goal (see [`Self::resume_after_runtime_block`]).
+    /// Known limitation: session-local, like the rest of this state's
+    /// lifecycle detail; a restored Blocked goal needs `/goal resume`.
+    runtime_blocked: bool,
 }
 
 impl GoalState {
@@ -152,6 +159,20 @@ impl GoalState {
         objective: Option<&str>,
         token_budget: Option<u32>,
         status: GoalStatus,
+    ) {
+        self.sync_from_host_status_with_reason(objective, token_budget, status, None);
+    }
+
+    /// [`Self::sync_from_host_status`], for a host that knows **why** the goal
+    /// is paused. Without a reason a `Paused` projection is read as a user
+    /// pause, which erases a hand-back and leaves the goal un-resumable by the
+    /// user's next message.
+    pub fn sync_from_host_status_with_reason(
+        &mut self,
+        objective: Option<&str>,
+        token_budget: Option<u32>,
+        status: GoalStatus,
+        pause_reason: Option<GoalPauseReason>,
     ) {
         let objective = objective.map(str::trim).filter(|value| !value.is_empty());
         match objective {
@@ -199,7 +220,7 @@ impl GoalState {
                 if changed || status_changed || self.status.is_none() {
                     self.status = Some(status);
                     self.pause_reason = if status == GoalStatus::Paused {
-                        Some(GoalPauseReason::User)
+                        Some(pause_reason.unwrap_or(GoalPauseReason::User))
                     } else {
                         None
                     };
@@ -284,6 +305,9 @@ impl GoalState {
             repeated_gap_count: 0,
             last_gap_pass: None,
             progress: None,
+            // The origin of a persisted blocker is not recorded; treat it as
+            // reported so only an explicit resume clears it.
+            runtime_blocked: false,
         }
     }
 
@@ -367,8 +391,11 @@ impl GoalState {
         }
     }
 
-    pub fn record_usage(&mut self, token_delta: u64, time_delta_seconds: u64) {
-        if self.is_active() {
+    pub fn record_usage(&mut self, token_delta: u64, time_delta_seconds: u64, since: Instant) {
+        if self.is_active()
+            || (self.objective.is_some()
+                && self.finished_at.is_some_and(|finished| finished >= since))
+        {
             self.tokens_used = self.tokens_used.saturating_add(token_delta);
             self.time_used_seconds = self.time_used_seconds.saturating_add(time_delta_seconds);
         }
@@ -477,10 +504,80 @@ impl GoalState {
         Ok(())
     }
 
+    /// Block on a runtime stop rather than a reported blocker; see
+    /// [`Self::runtime_blocked`].
+    pub fn mark_runtime_blocked(&mut self, blocker: String) -> Result<(), &'static str> {
+        self.mark_blocked(blocker)?;
+        self.runtime_blocked = true;
+        Ok(())
+    }
+
+    /// Resume a goal whose only blocker was a runtime stop, as a new control
+    /// revision. Returns false, changing nothing, for any other state: a
+    /// reported blocker stays until an explicit resume.
+    pub fn resume_after_runtime_block(&mut self) -> bool {
+        if !(self.runtime_blocked && self.status == Some(GoalStatus::Blocked)) {
+            return false;
+        }
+        self.resume(None);
+        self.runtime_blocked = false;
+        true
+    }
+
+    /// Resume a goal the model handed back at a milestone, as a new control
+    /// revision. A yield is a hand-back rather than a judgement about the work,
+    /// so the user's next message continues it.
+    ///
+    /// Returns false, changing nothing, for any other state: a pause the user
+    /// asked for, and a pause the loop imposed on itself, both stay until an
+    /// explicit resume.
+    pub fn resume_after_yield(&mut self) -> bool {
+        if !(self.status == Some(GoalStatus::Paused)
+            && self.pause_reason == Some(GoalPauseReason::Yielded))
+        {
+            return false;
+        }
+        self.resume(None);
+        true
+    }
+
+    /// Hand the goal back to the user at a milestone.
+    ///
+    /// Only an **active** goal can be handed back. A goal that is already paused
+    /// or blocked carries a reason someone else set — a user pause, a budget
+    /// stop, a reported blocker — and converting it would make it resumable by
+    /// the next message, which is exactly the contract this state exists to keep
+    /// narrow.
+    pub fn mark_yielded(&mut self) -> Result<(), &'static str> {
+        if self.objective.is_none() {
+            return Err("No active goal exists to hand back.");
+        }
+        if self.status != Some(GoalStatus::Active) {
+            return Err(
+                "Only an active goal can be handed back; this one is already paused or \
+                 blocked for a reason someone else set.",
+            );
+        }
+        self.mark_paused(GoalPauseReason::Yielded)
+    }
+
+    /// Whether a judged completion has sealed this goal. A sealed goal is
+    /// terminal: blocking or pausing it would overwrite the verified
+    /// completion, so only an explicit resume or a new goal moves it on.
+    fn completion_sealed(&self) -> bool {
+        self.status == Some(GoalStatus::Complete) || self.completion_verification.is_some()
+    }
+
     pub fn mark_blocked(&mut self, blocker: String) -> Result<(), &'static str> {
         if self.objective.is_none() {
             return Err("No active goal exists to block.");
         }
+        if self.completion_sealed() {
+            return Err(
+                "The goal is already complete with a judged verification; it cannot be blocked.",
+            );
+        }
+        self.runtime_blocked = false;
         self.status = Some(GoalStatus::Blocked);
         self.finished_at = Some(Instant::now());
         self.blocker = Some(blocker);
@@ -493,6 +590,11 @@ impl GoalState {
     pub fn mark_paused(&mut self, reason: GoalPauseReason) -> Result<(), &'static str> {
         if self.objective.is_none() {
             return Err("No active goal exists to pause.");
+        }
+        if self.completion_sealed() {
+            return Err(
+                "The goal is already complete with a judged verification; it cannot be paused.",
+            );
         }
         self.status = Some(GoalStatus::Paused);
         self.finished_at = Some(Instant::now());
@@ -661,7 +763,8 @@ impl GoalSnapshot {
 
     #[must_use]
     pub fn from_thread_goal(goal: &codewhale_protocol::ThreadGoal) -> Self {
-        let (status, pause_reason) = thread_goal_status_projection(goal.status.clone());
+        let (status, pause_reason) =
+            thread_goal_status_projection(goal.status.clone(), goal.pause_reason);
         Self {
             goal_id: Some(goal.goal_id.clone()),
             objective: Some(goal.objective.clone()),
@@ -675,7 +778,7 @@ impl GoalSnapshot {
             elapsed_seconds: None,
             evidence: None,
             blocker: None,
-            pause_reason: goal.pause_reason.or(pause_reason),
+            pause_reason,
             completion_verification: None,
             advisories: Vec::new(),
             last_gap_fingerprint: goal.last_gap_fingerprint.clone(),
@@ -689,12 +792,16 @@ impl GoalSnapshot {
 #[must_use]
 pub fn thread_goal_status_projection(
     status: codewhale_protocol::ThreadGoalStatus,
+    pause_reason: Option<GoalPauseReason>,
 ) -> (GoalStatus, Option<GoalPauseReason>) {
     match status {
         codewhale_protocol::ThreadGoalStatus::Active => (GoalStatus::Active, None),
-        codewhale_protocol::ThreadGoalStatus::Paused => {
-            (GoalStatus::Paused, Some(GoalPauseReason::User))
-        }
+        // The durable status alone cannot say why a goal is paused; the record's
+        // own reason can, and dropping it turns a hand-back into a user pause.
+        codewhale_protocol::ThreadGoalStatus::Paused => (
+            GoalStatus::Paused,
+            pause_reason.or(Some(GoalPauseReason::User)),
+        ),
         codewhale_protocol::ThreadGoalStatus::Complete => (GoalStatus::Complete, None),
         codewhale_protocol::ThreadGoalStatus::Blocked => (GoalStatus::Blocked, None),
         codewhale_protocol::ThreadGoalStatus::UsageLimited => {
@@ -876,7 +983,7 @@ impl ToolSpec for CreateGoalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create the session's one persistent goal: a completion objective Codewhale keeps working toward across turns until it is verified complete, blocked, or the user stops it. You decide when a request is a durable objective worth carrying across turns — a multi-step outcome the user will want continued and verified. Do not create a goal for a question, a greeting, a one-shot edit, or a conversational probe; those are ordinary turns. When the user explicitly asks to use `/goal` or asks you to make something the goal, call `create_goal` before doing the rest of the work; acknowledging it in prose is not sufficient. Keep the user's full objective, not a shortened one-turn version. Set token_budget only when the user explicitly provides one. Creating a goal shows the user a one-line receipt (they can /goal pause or /goal clear); do not also ask for confirmation. Only one unfinished goal exists at a time: complete or clear it before creating another."
+        "Create the session's one persistent goal: a completion objective Codewhale keeps working toward across turns until it is verified complete, blocked, or the user stops it. A goal is for a durable objective that outlasts one turn: a multi-step outcome the user wants continued and verified. A question, a greeting, or a one-shot edit completes as an ordinary turn. When the user explicitly asks to use `/goal` or to make something the goal, `create_goal` is what records it; acknowledging it in prose records nothing. The objective is the user's full objective, not a shortened one-turn version. token_budget carries a budget the user stated; with none stated it stays unset. Creating a goal shows the user a one-line receipt (they can /goal pause or /goal clear), so it needs no separate confirmation. Only one unfinished goal exists at a time: an existing one is completed or cleared before another is created."
     }
 
     fn input_schema(&self) -> Value {
@@ -996,7 +1103,7 @@ impl ToolSpec for UpdateGoalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input."
+        "Update the runtime goal completion gate by calling this tool; a prose status in your answer does not change the goal or stop continuation. Critical verification may seal one immutable completion contract. Advisory review is append-only context and never completes, blocks, or pauses the goal. Mark blocked when progress requires user input. Mark yield when you finished a stage and the next step needs the user's decision: the goal stays unfinished, the turn ends, and their next message resumes it."
     }
 
     fn input_schema(&self) -> Value {
@@ -1005,8 +1112,8 @@ impl ToolSpec for UpdateGoalTool {
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["complete", "blocked", "not_achieved", "advisory"],
-                    "description": "Use complete only when a critical verifier proves the goal; not_achieved to record verifier gaps; blocked when meaningful progress cannot continue; advisory to append best-effort context without changing lifecycle state."
+                    "enum": ["complete", "blocked", "not_achieved", "advisory", "yield"],
+                    "description": "Use complete only when a critical verifier proves the goal; not_achieved to record verifier gaps; blocked when meaningful progress cannot continue; yield when a stage is finished and the next step is the user's call; advisory to append best-effort context without changing lifecycle state."
                 },
                 "evidence": {
                     "type": "string",
@@ -1053,7 +1160,7 @@ impl ToolSpec for UpdateGoalTool {
                 },
                 "progress": {
                     "type": "object",
-                    "description": "Optional with not_achieved or advisory: your current best estimate of overall completion, shown to the user as reported progress. Keep percent honest — it is an estimate, never a verified fraction.",
+                    "description": "Optional with not_achieved, advisory or yield: your current best estimate of overall completion, shown to the user as reported progress. Keep percent honest — it is an estimate, never a verified fraction.",
                     "properties": {
                         "percent": {
                             "type": "integer",
@@ -1104,13 +1211,22 @@ impl ToolSpec for UpdateGoalTool {
         }
         let status = required_str(&input, "status")?.trim().to_ascii_lowercase();
         let progress = parse_progress_report(&input)?;
-        if progress.is_some() && !matches!(status.as_str(), "not_achieved" | "advisory") {
+        if progress.is_some() && !matches!(status.as_str(), "not_achieved" | "advisory" | "yield") {
             return Err(ToolError::invalid_input(
-                "progress is only accepted with status not_achieved or advisory",
+                "progress is only accepted with status not_achieved, advisory or yield",
             ));
         }
         let snapshot = {
             let mut state = lock_goal_state(&self.goal_state)?;
+            // #6542: with no goal there is nothing to update. Say so as a
+            // successful no-op rather than an error the model retries.
+            if state.objective.is_none() {
+                return Ok(ToolResult::success(format!(
+                    "No goal is set, so update_goal(status: {status}) changed nothing. \
+                     Continue the user's request directly; create_goal only if the user \
+                     asked for a tracked goal."
+                )));
+            }
             match status.as_str() {
                 "complete" => {
                     let evidence = input
@@ -1154,6 +1270,12 @@ impl ToolSpec for UpdateGoalTool {
                         state.record_progress(progress);
                     }
                 }
+                "yield" => {
+                    state.mark_yielded().map_err(ToolError::invalid_input)?;
+                    if progress.is_some() {
+                        state.progress = progress;
+                    }
+                }
                 "advisory" => {
                     let advisory = input
                         .get("advisory")
@@ -1175,7 +1297,7 @@ impl ToolSpec for UpdateGoalTool {
                 }
                 other => {
                     return Err(ToolError::invalid_input(format!(
-                        "unsupported goal status '{other}'; update_goal can only mark complete or blocked, record not_achieved verifier gaps, or append advisory context"
+                        "unsupported goal status '{other}'; update_goal can only mark complete, blocked, or yield, record not_achieved verifier gaps, or append advisory context"
                     )));
                 }
             }
@@ -1190,6 +1312,118 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// A yield is a hand-back, not a judgement about the work: it stops the
+    /// auto-continuation, and the user's next message resumes it. A pause the
+    /// user asked for stays put.
+    #[test]
+    fn a_yield_stops_continuation_and_the_users_message_resumes_it() {
+        let mut state = GoalState::default();
+        state.replace("ship the slice", None, Some("goal-1".to_string()));
+        assert!(state.is_active());
+
+        state.mark_yielded().expect("yield an active goal");
+        assert_eq!(state.snapshot().status, GoalStatus::Paused.as_str());
+        assert_eq!(
+            state.snapshot().pause_reason,
+            Some(GoalPauseReason::Yielded),
+            "the pause names the hand-back so the UI can say what it is"
+        );
+        assert!(
+            !state.is_active(),
+            "neither continuation dispatcher re-arms a non-active goal"
+        );
+
+        assert!(
+            state.resume_after_yield(),
+            "the user's next message continues the work"
+        );
+        assert!(state.is_active());
+        assert_eq!(state.snapshot().pause_reason, None);
+    }
+
+    #[test]
+    fn a_user_pause_is_not_resumed_by_a_yield_resume() {
+        let mut state = GoalState::default();
+        state.replace("ship the slice", None, Some("goal-1".to_string()));
+        state
+            .mark_paused(GoalPauseReason::User)
+            .expect("user pause");
+
+        assert!(
+            !state.resume_after_yield(),
+            "only a hand-back is resumed by answering it"
+        );
+        assert_eq!(state.snapshot().status, GoalStatus::Paused.as_str());
+    }
+
+    #[test]
+    fn a_yield_cannot_overwrite_a_pause_reason_someone_else_set() {
+        let mut state = GoalState::default();
+        state.replace("ship the slice", None, Some("goal-1".to_string()));
+
+        for reason in [
+            GoalPauseReason::User,
+            GoalPauseReason::BudgetLimit,
+            GoalPauseReason::NoProgress,
+            GoalPauseReason::UsageLimit,
+        ] {
+            state.mark_paused(reason).expect("pause for another reason");
+            assert!(
+                state.mark_yielded().is_err(),
+                "only an active goal can be handed back, not one paused for {reason:?}"
+            );
+            assert_eq!(
+                state.snapshot().pause_reason,
+                Some(reason),
+                "the pause someone else set survives the rejected hand-back"
+            );
+        }
+
+        // And a blocked goal keeps its blocker rather than becoming resumable.
+        state
+            .mark_blocked("waiting on the vendor".to_string())
+            .expect("block");
+        assert!(state.mark_yielded().is_err());
+        assert_eq!(
+            state.snapshot().blocker.as_deref(),
+            Some("waiting on the vendor")
+        );
+    }
+
+    #[test]
+    fn a_pause_reason_written_by_a_newer_build_still_reads() {
+        let reason: GoalPauseReason = serde_json::from_str("\"invented-later\"")
+            .expect("an unknown pause reason must not fail the durable load");
+        assert_eq!(reason, GoalPauseReason::Unrecognized);
+        // And the known values still round-trip.
+        assert_eq!(
+            serde_json::from_str::<GoalPauseReason>("\"yielded\"").expect("yielded reads"),
+            GoalPauseReason::Yielded
+        );
+    }
+
+    #[tokio::test]
+    async fn update_goal_yield_pauses_without_completing_or_blocking() {
+        let state = new_shared_goal_state();
+        let ctx = ToolContext::new(".");
+        CreateGoalTool::new(state.clone())
+            .execute(json!({"objective": "ship the runtime slice"}), &ctx)
+            .await
+            .expect("create goal");
+
+        let result = UpdateGoalTool::new(state.clone())
+            .execute(json!({"status": "yield"}), &ctx)
+            .await
+            .expect("yield is a supported status");
+        assert!(result.success, "yield must not be refused");
+
+        let snapshot = state.lock().expect("goal state").snapshot();
+        assert_eq!(snapshot.status, GoalStatus::Paused.as_str());
+        assert_eq!(snapshot.pause_reason, Some(GoalPauseReason::Yielded));
+        assert_eq!(snapshot.blocker, None, "a hand-back reports no blocker");
+        assert_eq!(snapshot.evidence, None, "and claims no completion");
+    }
 
     #[tokio::test]
     async fn update_goal_rejects_objective_knob_instead_of_ignoring_it() {
@@ -1223,6 +1457,29 @@ mod tests {
         assert!(message.contains("create_goal"), "{message}");
         // The rejected call must not have mutated goal state.
         assert!(state.lock().expect("goal lock").is_active());
+    }
+
+    #[tokio::test]
+    async fn update_goal_without_a_goal_is_a_clear_no_op() {
+        let state = new_shared_goal_state();
+        let update = UpdateGoalTool::new(state.clone());
+        for input in [
+            json!({"status": "complete", "evidence": "done"}),
+            json!({"status": "blocked", "blocker": "x"}),
+            json!({"status": "advisory", "advisory": "note"}),
+        ] {
+            let result = update
+                .execute(input, &ToolContext::new("."))
+                .await
+                .expect("no goal is a no-op, not an error");
+            assert!(result.success);
+            assert!(
+                result.content.contains("No goal is set"),
+                "{}",
+                result.content
+            );
+        }
+        assert!(state.lock().expect("goal lock").objective.is_none());
     }
 
     #[tokio::test]
@@ -1292,7 +1549,7 @@ mod tests {
                 Some(1_200),
                 status,
             );
-            state.record_usage(300, 12);
+            state.record_usage(300, 12, std::time::Instant::now());
             state.record_continuation();
             let before = state.snapshot();
 
@@ -1318,7 +1575,7 @@ mod tests {
         blocked
             .create("resume the release goal".to_string(), Some(4_000))
             .expect("create blocked fixture");
-        blocked.record_usage(750, 44);
+        blocked.record_usage(750, 44, std::time::Instant::now());
         blocked.record_continuation();
         blocked
             .mark_blocked("provider failed".to_string())
@@ -1365,13 +1622,53 @@ mod tests {
         assert_eq!(resumed.completion_verification, None);
     }
 
+    /// #6561 D04-12: blocking or pausing used to overwrite a sealed, judged
+    /// completion and clear its verification.
+    #[test]
+    fn sealed_completion_cannot_be_blocked_or_paused() {
+        let mut state = GoalState::default();
+        state
+            .create("ship the verified change".to_string(), None)
+            .expect("create goal");
+        state
+            .mark_complete(
+                "focused tests passed".to_string(),
+                GoalCompletionVerification {
+                    status: "passed".to_string(),
+                    check: "cargo test".to_string(),
+                    summary: "goal tests passed".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("complete goal");
+        let sealed = state.snapshot();
+
+        assert!(state.mark_blocked("late blocker".to_string()).is_err());
+        assert!(
+            state
+                .mark_runtime_blocked("runtime stop".to_string())
+                .is_err()
+        );
+        assert!(state.mark_paused(GoalPauseReason::NoProgress).is_err());
+
+        let after = state.snapshot();
+        assert_eq!(after.status, "complete");
+        assert_eq!(after.evidence, sealed.evidence);
+        assert_eq!(after.blocker, None);
+        assert!(after.completion_verification.is_some());
+        assert_eq!(
+            after.completion_verification,
+            sealed.completion_verification
+        );
+    }
+
     #[test]
     fn completed_goal_can_be_replaced_with_fresh_accounting() {
         let mut state = GoalState::default();
         state
             .create("finish the first objective".to_string(), Some(1_200))
             .expect("create first goal");
-        state.record_usage(300, 12);
+        state.record_usage(300, 12, std::time::Instant::now());
         state.record_continuation();
         state
             .mark_complete(
@@ -1789,7 +2086,10 @@ mod tests {
             .await
             .expect_err("model resume should fail");
 
-        assert!(err.to_string().contains("complete or blocked"));
+        assert!(
+            err.to_string().contains("complete, blocked, or yield"),
+            "model resume stays rejected: {err}"
+        );
     }
 
     #[test]
@@ -1816,7 +2116,7 @@ mod tests {
         );
         {
             let mut goal = state.lock().expect("goal lock");
-            goal.record_usage(300, 12);
+            goal.record_usage(300, 12, std::time::Instant::now());
             goal.record_continuation();
         }
 
@@ -1908,7 +2208,7 @@ mod tests {
                 GoalPauseReason::BudgetLimit,
             ),
         ] {
-            let (projected, projected_reason) = thread_goal_status_projection(status);
+            let (projected, projected_reason) = thread_goal_status_projection(status, None);
             assert_eq!(projected, GoalStatus::Paused);
             assert_eq!(projected_reason, Some(reason));
         }
@@ -2045,7 +2345,7 @@ mod tests {
             .await
             .expect_err("progress is not terminal evidence");
         assert!(
-            err.to_string().contains("not_achieved or advisory"),
+            err.to_string().contains("not_achieved, advisory or yield"),
             "{err}"
         );
 

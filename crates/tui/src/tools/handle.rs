@@ -238,6 +238,11 @@ impl HandleStore {
     }
 }
 
+/// `handle_read` is deferred on the default catalog, so model-facing text
+/// that points at it also teaches how to activate it (#6747).
+pub(crate) const HANDLE_READ_ACTIVATION_HINT: &str =
+    "if `handle_read` is not in your tool list, load it with `tool_search` first";
+
 pub struct HandleReadTool;
 
 #[async_trait]
@@ -251,7 +256,7 @@ impl ToolSpec for HandleReadTool {
          as RLM sessions or sub-agents. This does not read artifact ids \
          (`art_...`), tool-call ids (`call_...`), SHA refs, or files; use \
          retrieve_tool_result for spilled tool results/artifacts and \
-         File action=\"read\" for workspace files. Provide \
+         `read` (path=...) for workspace files. Provide \
          exactly one projection: `slice` for char/line slices, `range` for \
          one-based line ranges, `count` for metadata counts, or `jsonpath` \
          for a small JSON-path projection. This retrieves from the handle's \

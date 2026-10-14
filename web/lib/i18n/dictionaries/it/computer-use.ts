@@ -7,7 +7,7 @@ import type { ComputerUseDict } from "../types";
  * the app shows them.
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Computer Use per Mac · Codewhale",
+  metaTitle: "Computer Use · Anteprima · Codewhale",
   metaDescription: "Scarica e configura Codewhale Computer Use per Mac. Controllo delle app in background, configurazione dei permessi e comandi Pause e Stop sotto il tuo controllo.",
   title: "Computer Use",
   lead: "Lascia che Codewhale lavori nelle tue app mentre tu continui a lavorare. L’helper per Mac porta nella barra dei menu i permessi, il controllo delle app in background e un modo per mettere in pausa o fermare l’input.",
@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Esegui il test in background", body: "L’helper apre una finestra di prova usa e getta, vi inserisce del testo e ne acquisisce un’immagine. Verifica se il puntatore o l’app attiva sono cambiati durante l’esecuzione." },
     { title: "Collegalo a Codewhale", body: "Esamina, autorizza e attiva Computer Use nel marketplace dei plugin di Codewhale. Usa il plugin 0.3.1 o successivo, così le azioni locali passano dai comandi Pause e Stop dell’helper." },
   ],
-  controlsTitle: "Continua a lavorare. Mantieni il controllo.",
+  controlsTitle: "Metti in pausa o interrompi il controllo delle app",
   controlsBody: "Le azioni supportate agiscono in background sull’app selezionata. Le app e i gesti che richiedono il controllo in primo piano hanno bisogno della tua autorizzazione. Il menu mostra l’app di destinazione e la modalità di input; Pause sospende l’input dell’helper, Stop chiude le sue sessioni in corso.",
   updateTitle: "Aggiornamenti quando decidi tu",
   updateBody: "Scegli Check for updates (Controlla aggiornamenti) nell’app. Prima di installare un aggiornamento, l’helper verifica il file scaricato, la firma Codewhale e la notarizzazione Apple, e conserva la versione precedente per il ripristino.",
@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Guarda il test in background",
   source: "Codice sorgente e altre piattaforme",
   platforms: "Questo download è per Mac. Windows e Linux usano al momento il plugin da sorgente e la configurazione lato host.",
-  installTitle: "Computer Use per Mac",
-  installLead: "Aggiungi il controllo delle app in background con l’helper Computer Use. Configura i permessi del Mac, esegui un test in background e metti in pausa o ferma l’input dell’helper dalla barra dei menu.",
-  installLink: "Download e configurazione di Computer Use",
 };

@@ -90,7 +90,7 @@ impl AppModeUi for AppMode {
 /// intentionally do not persist raw endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheReplayTarget {
-    pub(crate) provider: ApiProvider,
+    pub(crate) provider: ProviderKind,
     pub(crate) provider_identity: String,
     /// Additive exact provider id used by persisted-route resolution.
     /// `None` is meaningful for the legacy root-level `custom` route.
@@ -277,11 +277,21 @@ impl VimMode {}
 pub struct QueuedMessage {
     pub display: String,
     pub skill_instruction: Option<String>,
-    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
+    pub skill_provenance: Option<crate::skills::SkillProvenance>,
     /// True once this turn has been painted into `history` as `HistoryCell::User`.
     /// Queue/offline submit echoes before the model runs; Immediate prepare skips
     /// a second paint when this is set so drained queued turns do not double.
     pub history_echoed: bool,
+}
+
+/// The message the current turn was dispatched with, and the transcript cell
+/// that shows it. When the engine reports the turn was never sent (a key
+/// rejected before any model output), this is what goes back in the composer,
+/// skill included, and the bubble that comes out of the transcript (#6566).
+#[derive(Debug, Clone)]
+pub struct UnansweredSubmission {
+    pub message: QueuedMessage,
+    pub history_cell: usize,
 }
 
 /// A steer handed to the engine that the engine has not yet recorded.
@@ -375,11 +385,15 @@ pub struct TaskPanelEntry {
     pub current_tool: Option<String>,
     pub role: Option<String>,
     pub files_touched: u32,
+    /// A finished shell's exit code. `None` while running, and for durable
+    /// tasks.
+    pub exit_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskPanelEntryKind {
     Background,
+    Shell,
 }
 
 impl QueuedMessage {
@@ -395,7 +409,7 @@ impl QueuedMessage {
     #[must_use]
     pub fn with_skill_provenance(
         mut self,
-        provenance: Option<crate::plugins::types::PluginAuthority>,
+        provenance: Option<crate::skills::SkillProvenance>,
     ) -> Self {
         self.skill_provenance = provenance;
         self
@@ -509,6 +523,10 @@ impl ScreenMode {
 /// Actions emitted by the UI event loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppAction {
+    SetWorkspaceTrust {
+        trusted: bool,
+        save: bool,
+    },
     Quit,
     #[allow(dead_code)] // For explicit /load command
     LoadSession(PathBuf),
@@ -535,7 +553,7 @@ pub enum AppAction {
     /// Open the `/provider` picker in setup/catalog mode, optionally focused on
     /// a built-in provider that needs credentials before first use.
     OpenProviderSetup {
-        provider: Option<ApiProvider>,
+        provider: Option<codewhale_config::ProviderId>,
     },
     /// Open the named, keyless DS4 local-runtime preset for review and save.
     OpenDs4Setup,
@@ -544,6 +562,21 @@ pub enum AppAction {
     /// Run native ChatGPT PKCE sign-in with the TUI temporarily suspended.
     StartChatgptPkceLogin,
     StartChatgptRevoke,
+    StartClaudeLogin,
+    StartClaudeRevoke,
+    /// Run OrcaRouter OAuth 2.0 + PKCE sign-in (loopback redirect) with the TUI
+    /// temporarily suspended. Produces a durable `sk-orca-...` key in the
+    /// ordinary `orcarouter` credential slot — the same slot the API-key path
+    /// writes — so nothing downstream knows which adapter was used.
+    StartPluginLogin {
+        provider: String,
+    },
+    StartPluginLogout {
+        provider: String,
+    },
+    StartOrcarouterPkceLogin,
+    /// Clear the saved OrcaRouter credential.
+    StartOrcarouterRevoke,
     /// Open the `/mode` picker modal for Act / Plan / Operate.
     OpenModePicker,
     /// Switch the live terminal between `/fullscreen` and `/inline`. Handled
@@ -567,9 +600,14 @@ pub enum AppAction {
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.
     OpenFeedbackPicker,
+    /// Read/review a scoped immutable issue draft without parking the UI.
+    ReviewIssueReport {
+        id: String,
+        change: Option<String>,
+    },
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
-    /// Open the `/skills` manager — audit inventory + owned mutations.
+    /// Open the `/skills manage` manager — audit inventory + owned mutations.
     OpenSkillsManager,
     /// Open the `/workflows` run dashboard — live and retained workflow runs.
     OpenWorkflowsManager,
@@ -607,6 +645,9 @@ pub enum AppAction {
     },
     /// Record that the bundled/default constitution should be used.
     UseBundledConstitution,
+    OpenConstitutionManager {
+        review: bool,
+    },
     /// Open the exact effective base-prompt preview for the next turn (#3928).
     ///
     /// Handled where the session config lives, so the preview is built by the
@@ -623,8 +664,26 @@ pub enum AppAction {
         url: String,
         label: String,
     },
+    /// Run an extension command in the extension host (`/name input`). The UI
+    /// event loop awaits it, then shows its text and/or submits its prompt
+    /// as the user's next message.
+    RunExtensionCommand {
+        command: crate::extension_host::command::ExtensionCommandRef,
+        name: String,
+        input: String,
+    },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
+    /// Same-session rollback. A retry is admitted only after the Engine
+    /// acknowledges this history and its persisted snapshot is durable.
+    ConversationUndo {
+        sync: codewhale_command_contract::facets::SessionSyncPayload,
+        retry_input: Option<String>,
+        /// `retry_input` is the text of a pending `/edit`, already taken from
+        /// the composer. If the rollback is refused it must go back there, with
+        /// edit mode re-armed, or the user's revision is lost.
+        edit_replacement: bool,
+    },
     /// Send a built-in Workflow planning turn with separate user-visible text
     /// and bounded runtime guidance. Draft instructions carry a typed marker
     /// that makes the dispatch path expose no tools for that turn.
@@ -668,12 +727,23 @@ pub enum AppAction {
         title: String,
         content: String,
     },
+    /// Show a unified diff in a pager with the transcript's diff rendering,
+    /// without copying it into transcript history (`/diff`).
+    OpenDiffPager {
+        title: String,
+        diff: String,
+    },
     /// Review a host-generated command; the pager carries its exact token
     /// through explicit confirmation and the normal command dispatcher.
     OpenCommandReview {
         title: String,
         content: String,
         command: String,
+    },
+    /// Router setup (`/router`, `/model router`, #6525): open the view, test a
+    /// preset with one routing call, or save one to `[auto.router]`.
+    RouterSetup {
+        request: crate::tui::views::router_setup::RouterRequest,
     },
     /// Live remaining-credit lookup for prepaid providers (`/balance`).
     FetchBalance,
@@ -686,13 +756,13 @@ pub enum AppAction {
     /// the updated config. `model` overrides the post-switch model
     /// (already normalized but not yet provider-prefixed).
     SwitchProvider {
-        provider: ApiProvider,
+        provider: codewhale_config::ProviderId,
         model: Option<String>,
     },
     /// Switch provider+model through the same apply path as a `/model` route
     /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
     SwitchModelRoute {
-        provider: ApiProvider,
+        identity: crate::config::ProviderIdentity,
         model: String,
     },
     UpdateCompaction(CompactionConfig),
@@ -759,11 +829,10 @@ pub enum AppAction {
     /// action; handled in the UI event loop where the live `Config` supplies
     /// provider credentials.
     VoiceCapture,
-    /// Export and share the current session as a web URL.
+    /// Upload an already-rendered, redacted session page as a secret gist.
+    /// Emitted only by `/share confirm`.
     ShareSession {
-        history_len: usize,
-        model: String,
-        mode: String,
+        html: String,
     },
 }
 
@@ -789,10 +858,6 @@ pub enum ShellJobAction {
     List,
     Show {
         id: String,
-    },
-    Poll {
-        id: String,
-        wait: bool,
     },
     SendStdin {
         id: String,

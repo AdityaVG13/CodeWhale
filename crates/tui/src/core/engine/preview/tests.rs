@@ -244,7 +244,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
     // Pressure advice is only surfaced when the user opts out of automatic
     // maintenance. The route-budget assertion still applies in that mode.
     engine.config.compaction.enabled = false;
-    engine.api_provider = ApiProvider::Deepseek;
+    engine.api_provider = ProviderKind::Deepseek;
     let installed_limits = codewhale_config::route::RouteLimits {
         context_tokens: Some(4_096),
         input_tokens: None,
@@ -261,7 +261,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
         }],
     });
     let prompt_context = NextTurnPromptContext::for_planned_turn(
-        ApiProvider::Openrouter,
+        ProviderKind::Openrouter,
         "qwen/qwen3.6-flash".to_string(),
         Some(codewhale_config::route::RouteLimits {
             context_tokens: Some(123_456),
@@ -286,7 +286,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
         "the planned 123K route must not inherit the installed route's pressure"
     );
     let installed_context = NextTurnPromptContext::for_planned_turn(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-v4-flash".to_string(),
         Some(installed_limits),
         AppMode::Agent,
@@ -301,7 +301,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
         .unwrap();
     assert!(pressure.contains("Context pressure: critical"));
     assert!(pressure.contains("Estimated input:"));
-    assert!(pressure.contains("Automatic compaction is explicitly disabled"));
+    assert!(pressure.contains("Making room automatically is off"));
     let message = engine.user_text_message_from_snapshot(
         "cross-route budget".to_string(),
         &prompt_context.model,
@@ -347,7 +347,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
 fn context_pressure_delta_matches_clone_and_push_reference() {
     let config = deepseek_config();
     let (mut engine, _handle, _tmp) = preview_engine(&config);
-    engine.api_provider = ApiProvider::Deepseek;
+    engine.api_provider = ProviderKind::Deepseek;
     let installed_limits = codewhale_config::route::RouteLimits {
         context_tokens: Some(64_000),
         input_tokens: None,
@@ -385,6 +385,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
                 state: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_1".to_string(),
                 name: "bash".to_string(),
                 input: json!({"command": "echo hello"}),
@@ -402,6 +403,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
                 state: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_2".to_string(),
                 name: "read".to_string(),
                 input: json!({"path": "x"}), // 13-byte JSON -> 3
@@ -411,7 +413,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
         ],
     });
     let _prompt_context = NextTurnPromptContext::for_planned_turn(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-v4-flash".to_string(),
         Some(installed_limits),
         AppMode::Agent,
@@ -580,7 +582,7 @@ async fn compaction_preview_uses_the_planned_routes_system_prompt() {
         .preview_runtime_transforms(&messages, Some(&planned_prompt), &compaction)
         .await;
     assert!(
-        planned_reasons.contains(&"auto-compaction would rewrite the conversation first"),
+        planned_reasons.contains(&"making room would summarize the conversation first"),
         "the planned route prompt crosses the compaction threshold: {planned_reasons:?}"
     );
 
@@ -588,7 +590,7 @@ async fn compaction_preview_uses_the_planned_routes_system_prompt() {
         .preview_runtime_transforms(&messages, Some(&installed_prompt), &compaction)
         .await;
     assert!(
-        !installed_reasons.contains(&"auto-compaction would rewrite the conversation first"),
+        !installed_reasons.contains(&"making room would summarize the conversation first"),
         "the installed route prompt is the below-threshold control: {installed_reasons:?}"
     );
 }
@@ -633,7 +635,6 @@ async fn planned_route_builds_subagent_catalog_without_installed_client() {
                 reasoning_effort_auto: planned.auto_controls_reasoning,
             },
             "",
-            None,
         )
         .await;
     assert!(
@@ -721,12 +722,9 @@ fn deepseek_config() -> crate::config::Config {
 }
 
 fn deepseek_identity() -> crate::config::ProviderIdentity {
-    crate::config::ProviderIdentity {
-        provider: ApiProvider::Deepseek,
-        key: "deepseek".to_string(),
-        exact_id: None,
-        migrated_legacy_ollama_cloud_route: false,
-    }
+    crate::config::Config::default()
+        .builtin_provider_identity(ProviderKind::Deepseek)
+        .unwrap()
 }
 
 /// Run the *production* route planner, provider-free: with `auto_model`
@@ -740,7 +738,7 @@ async fn plan(
     plan_for(
         config,
         identity,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-chat",
         auto_model,
         prompt,
@@ -751,7 +749,7 @@ async fn plan(
 async fn plan_for(
     config: &crate::config::Config,
     identity: &crate::config::ProviderIdentity,
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     auto_model: bool,
     prompt: &str,
@@ -778,7 +776,7 @@ async fn plan_for(
 async fn plan_with_reasoning(
     config: &crate::config::Config,
     identity: &crate::config::ProviderIdentity,
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
     auto_model: bool,
     reasoning_effort: crate::reasoning_preference::ReasoningEffort,
@@ -817,9 +815,14 @@ fn preview_engine(config: &crate::config::Config) -> (Engine, EngineHandle, temp
     (engine, handle, tmp)
 }
 
-fn wire_preview_engine(config: &crate::config::Config) -> (Engine, tempfile::TempDir) {
+/// The engine plus its handle: a turn is admitted only while its event
+/// consumer is alive, as in every production embedding, so callers keep the
+/// handle for the engine's lifetime even though these fixtures read no events.
+fn wire_preview_engine(
+    config: &crate::config::Config,
+) -> (Engine, crate::core::engine::EngineHandle, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut engine, _handle) = Engine::new(
+    let (mut engine, handle) = Engine::new(
         EngineConfig {
             workspace: tmp.path().to_path_buf(),
             max_steps: 1,
@@ -831,7 +834,7 @@ fn wire_preview_engine(config: &crate::config::Config) -> (Engine, tempfile::Tem
     );
     engine.config.features.disable(Feature::Mcp);
     engine.config.subagents_enabled = false;
-    (engine, tmp)
+    (engine, handle, tmp)
 }
 
 fn inputs(
@@ -959,6 +962,7 @@ async fn assert_preview_matches_first_wire_body(
 
     let _ = engine
         .handle_send_message(TurnSpec {
+            profile_constitution: None,
             content: prompt.to_string(),
             mode: AppMode::Agent,
             route: Box::new(production_route),
@@ -982,6 +986,7 @@ async fn assert_preview_matches_first_wire_body(
             provenance: UserInputProvenance::ExternalUser,
             images: Vec::new(),
             max_output_tokens: None,
+            submission_id: None,
         })
         .await;
 
@@ -1023,7 +1028,7 @@ async fn graph_backed_todo_is_not_reinjected_into_the_first_http_body() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     let graph_todos = crate::tools::todo::TodoListSnapshot {
         items: vec![crate::tools::todo::TodoItem {
             id: 1,
@@ -1086,7 +1091,7 @@ async fn exhausted_active_goal_remains_previewable() {
         .goal_state
         .lock()
         .expect("goal state")
-        .record_usage(100, 0);
+        .record_usage(100, 0, std::time::Instant::now());
 
     let prompt = "continue the release";
     let planned = plan(&config, &identity, false, prompt).await;
@@ -1112,7 +1117,7 @@ async fn resumed_goal_with_raised_budget_becomes_previewable_again() {
     );
     {
         let mut state = engine.config.goal_state.lock().expect("goal state");
-        state.record_usage(100, 0);
+        state.record_usage(100, 0, std::time::Instant::now());
         state
             .mark_paused(GoalPauseReason::BudgetLimit)
             .expect("pause goal");
@@ -1149,7 +1154,7 @@ async fn lowering_active_goal_budget_below_used_tokens_keeps_preview_open() {
         .goal_state
         .lock()
         .expect("goal state")
-        .record_usage(100, 0);
+        .record_usage(100, 0, std::time::Instant::now());
     sync_goal_state_from_host(
         &engine.config.goal_state,
         Some("finish the release"),
@@ -1189,7 +1194,7 @@ async fn translation_prompt_context_matches_captured_first_production_body() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     engine.config.translation_enabled = false;
     let planned = plan(&config, &identity, false, "/translate explain this").await;
     let _ = assert_preview_matches_first_wire_body(
@@ -1228,7 +1233,7 @@ async fn paused_detach_goal_context_matches_captured_first_production_body() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     engine.config.goal_objective = Some("stale paused objective".to_string());
     sync_goal_state_from_host(
         &engine.config.goal_state,
@@ -1283,18 +1288,15 @@ async fn anthropic_preview_matches_the_first_native_messages_wire_body() {
         }),
         ..crate::config::Config::default()
     };
-    let identity = crate::config::ProviderIdentity {
-        provider: ApiProvider::Anthropic,
-        key: "anthropic".to_string(),
-        exact_id: None,
-        migrated_legacy_ollama_cloud_route: false,
-    };
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let identity = config
+        .builtin_provider_identity(ProviderKind::Anthropic)
+        .unwrap();
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     let prompt = "inspect the native Messages payload";
     let planned = plan_for(
         &config,
         &identity,
-        ApiProvider::Anthropic,
+        ProviderKind::Anthropic,
         model,
         false,
         prompt,
@@ -1331,7 +1333,7 @@ async fn anthropic_preview_matches_the_first_native_messages_wire_body() {
 struct MatrixRoute {
     /// Test-facing name; also the failure-message prefix.
     name: &'static str,
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_key: &'static str,
     base_url: &'static str,
     model: &'static str,
@@ -1351,7 +1353,7 @@ struct MatrixRoute {
 fn glm_5_2_zai_coding() -> MatrixRoute {
     MatrixRoute {
         name: "GLM-5.2 @ Z.ai coding",
-        provider: ApiProvider::Zai,
+        provider: ProviderKind::Zai,
         provider_key: "zai",
         base_url: crate::config::DEFAULT_ZAI_BASE_URL,
         model: crate::config::ZAI_GLM_5_2_MODEL,
@@ -1368,7 +1370,7 @@ fn glm_5_2_zai_coding() -> MatrixRoute {
 fn glm_5_turbo_zai() -> MatrixRoute {
     MatrixRoute {
         name: "GLM-5-Turbo @ Z.ai",
-        provider: ApiProvider::Zai,
+        provider: ProviderKind::Zai,
         provider_key: "zai",
         base_url: crate::config::DEFAULT_ZAI_BASE_URL,
         model: crate::config::ZAI_GLM_5_TURBO_MODEL,
@@ -1386,7 +1388,7 @@ fn glm_5_turbo_zai() -> MatrixRoute {
 fn kimi_k3_moonshot_direct() -> MatrixRoute {
     MatrixRoute {
         name: "kimi-k3 @ api.moonshot.ai",
-        provider: ApiProvider::Moonshot,
+        provider: ProviderKind::Moonshot,
         provider_key: "moonshot",
         base_url: crate::config::DEFAULT_MOONSHOT_BASE_URL,
         model: crate::config::MOONSHOT_KIMI_K3_MODEL,
@@ -1404,7 +1406,7 @@ fn kimi_k3_moonshot_direct() -> MatrixRoute {
 fn k3_kimi_code() -> MatrixRoute {
     MatrixRoute {
         name: "k3 @ api.kimi.com/coding/v1",
-        provider: ApiProvider::Moonshot,
+        provider: ProviderKind::Moonshot,
         provider_key: "moonshot",
         base_url: crate::config::DEFAULT_KIMI_CODE_BASE_URL,
         model: crate::config::KIMI_CODE_K3_MODEL,
@@ -1421,7 +1423,7 @@ fn k3_kimi_code() -> MatrixRoute {
 fn minimax_m3() -> MatrixRoute {
     MatrixRoute {
         name: "MiniMax-M3 @ api.minimax.io",
-        provider: ApiProvider::Minimax,
+        provider: ProviderKind::Minimax,
         provider_key: "minimax",
         base_url: crate::config::DEFAULT_MINIMAX_BASE_URL,
         model: crate::config::DEFAULT_MINIMAX_MODEL,
@@ -1454,9 +1456,9 @@ fn matrix_config(route: &MatrixRoute) -> crate::config::Config {
     };
     let mut providers = crate::config::ProvidersConfig::default();
     match route.provider {
-        ApiProvider::Zai => providers.zai = entry,
-        ApiProvider::Moonshot => providers.moonshot = entry,
-        ApiProvider::Minimax => providers.minimax = entry,
+        ProviderKind::Zai => providers.zai = entry,
+        ProviderKind::Moonshot => providers.moonshot = entry,
+        ProviderKind::Minimax => providers.minimax = entry,
         other => panic!("{}: unhandled matrix provider {other:?}", route.name),
     }
     crate::config::Config {
@@ -1467,12 +1469,9 @@ fn matrix_config(route: &MatrixRoute) -> crate::config::Config {
 }
 
 fn matrix_identity(route: &MatrixRoute) -> crate::config::ProviderIdentity {
-    crate::config::ProviderIdentity {
-        provider: route.provider,
-        key: route.provider_key.to_string(),
-        exact_id: None,
-        migrated_legacy_ollama_cloud_route: false,
-    }
+    matrix_config(route)
+        .resolve_provider_pin_identity(route.provider_key)
+        .unwrap()
 }
 
 /// Plan the exact route through production, then redirect only the
@@ -1546,7 +1545,7 @@ async fn assert_matrix_route(route: &MatrixRoute) {
         .await;
 
     let config = matrix_config(route);
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     let prompt = "inspect the exact next request for this route";
     let uri = server.uri();
     let planned = matrix_planned_route(route, &config, Some(uri.as_str()), prompt).await;
@@ -1897,7 +1896,7 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
 
     let prompt = "count the tokens this turn will report";
     let planned = plan(&config, &identity, false, prompt).await;
@@ -1926,6 +1925,7 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
 
     let _ = engine
         .handle_send_message(TurnSpec {
+            profile_constitution: None,
             content: prompt.to_string(),
             mode: AppMode::Agent,
             route: Box::new(production_route),
@@ -1949,6 +1949,7 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
             provenance: UserInputProvenance::ExternalUser,
             images: Vec::new(),
             max_output_tokens: None,
+            submission_id: None,
         })
         .await;
 
@@ -2187,7 +2188,6 @@ async fn preview_tool_snapshot_has_no_mcp_or_event_side_effects() {
                 reasoning_effort_auto: false,
             },
             "",
-            None,
         )
         .await;
 

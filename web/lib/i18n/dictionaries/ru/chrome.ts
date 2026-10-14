@@ -9,8 +9,7 @@ import type { ChromeDict } from "../types";
  * the modes Plan / Work / Operate and the permission postures
  * Ask / Auto-Review / Full Access stay Latin, wrapped in Russian prose
  * ("режим Operate", "режим разрешений"). The 深 seal is the masthead's mark,
- * not prose, and is shared across locales. Native nav labels pair with short
- * English secondaries, per the masthead convention.
+ * not prose, and is shared across locales.
  */
 export const chrome: ChromeDict = {
   navDocs: "Документация",
@@ -20,22 +19,12 @@ export const chrome: ChromeDict = {
   navCommunity: "Сообщество",
   navContribute: "Участие",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
+  navFeatures: "Возможности",
   navProduct: "Продукт",
   navModels: "Модели",
   navPlugins: "Плагины",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Перейти к основному содержимому",
-
 
   navPrimaryAria: "Основная навигация",
   navHomeAria: "Главная Codewhale",
@@ -43,30 +32,8 @@ export const chrome: ChromeDict = {
   installCta: "Установить →",
 
   authSignIn: "Войти",
-  authRegister: "Регистрация",
-  authGroupAria: "Аккаунт",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "любая модель, на вашей машине",
-
-  issueLabel: "Выпуск {date}",
   dateLocale: "ru-RU",
-
-  starsAria: "Звёзды на GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "Эфир",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "влит",
-  tickerOpened: "открыт",
-  tickerClosed: "закрыт",
-  tickerReleased: "выпуск",
-  tickerFirstContribution: "первый вклад",
-  tickerBy: "автор {handle}",
-  tickerAria: "Недавняя активность репозитория",
-
-  traceLabel: "ход рассуждений",
-  traceTabsAria: "Фрагменты сеанса",
 
   menuOpen: "Открыть меню",
   menuClose: "Закрыть меню",
@@ -74,11 +41,11 @@ export const chrome: ChromeDict = {
   themeAuto: "авто",
   themeLight: "светлая",
   themeDark: "тёмная",
-  themeAria: "Тема документации: {mode} (нажмите, чтобы переключить)",
-  themeTitle: "Тема документации · авто / светлая / тёмная",
+  themeAria: "Тема: {mode} (нажмите, чтобы переключить)",
+  themeTitle: "Тема · авто / светлая / тёмная",
 
   footerTagline:
-    "Создавайте то, что хотите, и автоматизируйте повседневную работу с помощью выбранных вами моделей.",
+    "Создавайте приложения и автоматизируйте работу со своими моделями и подключёнными инструментами.",
   footerProduct: "Продукт",
   footerProject: "Проект",
   footerDocs: "Документация",

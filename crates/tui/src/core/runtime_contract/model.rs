@@ -17,6 +17,12 @@ use codewhale_models::{MessageRequest, MessageResponse};
 pub trait ModelClient: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model(&self) -> &str;
+    fn wire_format(&self) -> Option<codewhale_config::provider::WireFormat> {
+        None
+    }
+    fn cache_route_receipt(&self) -> Option<crate::route_receipt::TurnRouteReceipt> {
+        None
+    }
     /// Concrete route base for billing classification, when this client can
     /// prove one. Provider-neutral injected clients leave it unknown.
     fn billing_base_url(&self) -> Option<&str> {
@@ -38,10 +44,9 @@ pub trait ModelClient: Send + Sync {
         requested_model: &str,
         dispatched_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
-        let provider = crate::config::ApiProvider::parse(self.provider_name())
-            .unwrap_or(crate::config::ApiProvider::Custom);
-        crate::cost_status::EffectiveRouteEnvelope::capture(
-            None,
+        let provider = crate::config::ProviderKind::parse(self.provider_name())
+            .unwrap_or(crate::config::ProviderKind::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture_observed(
             provider,
             self.provider_name(),
             requested_model,
@@ -75,6 +80,13 @@ where
 
     fn model(&self) -> &str {
         LlmClient::model(self)
+    }
+
+    fn wire_format(&self) -> Option<codewhale_config::provider::WireFormat> {
+        LlmClient::wire_format(self)
+    }
+    fn cache_route_receipt(&self) -> Option<crate::route_receipt::TurnRouteReceipt> {
+        LlmClient::cache_route_receipt(self)
     }
 
     fn billing_base_url(&self) -> Option<&str> {

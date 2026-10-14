@@ -18,21 +18,21 @@ The internal runtime type is `FleetRole` (formerly
 compatibility adapter during v0.9.x. New prompts and config should use fleet
 names.
 
-Architecturally, sub-agents should not be a second execution substrate. The
-durable primitive is the fleet-backed worker run described in
-[`AGENT_RUNTIME.md`](AGENT_RUNTIME.md): retries, terminal status, receipts,
-artifact refs, inspection, and restart behavior belong there. The
-model-facing launcher is the single `agent` tool and detached work should
-converge on the same lifecycle as Agent fleet.
+Child assignments run through the same `Engine::run_turn` planner, executor,
+Session and approval inbox as ordinary turns. The private captured ChildGrant
+narrows tool actions, shell, workspace, network and descendant depth at the final
+execution boundary. The existing SubAgentManager still owns launch slots,
+coordination, worker checkpoints and terminal delivery; it does not run another
+model/tool loop. Work and the single bounded reporting turn share that configured
+child Engine and its original deadline.
 
-The current `agent` implementation delegates to the durable sub-agent runtime
-while that cutover completes. It can still be useful for short in-session
-delegation. Transient provider header/stream/time-out failures are retried with
-backoff inside the child runtime before the worker is marked interrupted; if the
-retry budget is exhausted, Codewhale preserves a checkpoint and returns a
-continuation handle instead of leaving the parent to infer what happened. For
-work that must survive process restarts, sleep, or remote execution, prefer
-fleet or a Workflow-backed fleet run.
+Transient provider failures use Core's dispatch and retry boundaries. An exhausted
+budget or interrupted request preserves the recorded checkpoint and a continuation
+handle. Each actually dispatched attempt carries its original session, route and
+source identity: provider usage is billed once, then projected to the worker
+ledger. A successful response without usage and an unknown request outcome retain
+distinct coverage gaps; neither is priced as zero. For work that must survive
+process restarts, sleep or remote execution, use Fleet or a Workflow-backed run.
 
 Sub-agents inherit the parent's permitted tool registry, including `agent`
 coordination. Spawning obeys one absolute depth ceiling: the root is depth 0,
@@ -50,8 +50,8 @@ normal turn. Explicit interruption or cancellation remains authoritative.
 it does not remove child budgets or the headless host's deadline.
 
 This doc covers roles and individual worker controls. Use `workflow` to coordinate
-multiple assignments through the same worker runtime; see the sub-agent guidance in
-`crates/tui/src/prompts/text.rs` (`AGENT_MODE`) and the in-line
+multiple assignments through the same worker runtime; see the per-role prompts in
+`crates/tui/src/tools/subagent/mod.rs` (`*_AGENT_INTRO`) and the in-line
 tool description.
 
 ## Role taxonomy
@@ -76,9 +76,9 @@ stewardship.
 | Role          | Stance                                 | Writes? | Network? | Shell posture | Typical use                                  |
 |---------------|----------------------------------------|---------|----------|---------------|----------------------------------------------|
 | `general`     | flexible; do whatever the parent says  | yes     | yes      | yes           | the default; multi-step tasks                |
-| `explore`     | read-only; map the relevant code fast  | no      | yes      | read-only (net + bounded verify) | "find every call site of `Foo`; check the PR with gh" |
+| `explore`     | read-only; map the relevant code fast  | no      | yes      | bounded inspection | "find every call site of `Foo`; check the PR with gh" |
 | `planner`     | analyse and produce a strategy         | no      | yes      | read-only probes | "design the migration; don't execute"        |
-| `reviewer`    | read-and-grade with severity scores    | no      | yes      | read-only (net + bounded verify) | "audit this PR for bugs"                     |
+| `reviewer`    | read-and-grade with severity scores    | no      | yes      | bounded inspection | "audit this PR for bugs"                     |
 | `implement`   | land a specific change with min edit   | yes     | yes      | yes           | "rewrite `bar.rs::Foo::bar` to do X"         |
 | `test`        | run tests / validation, report outcome | no      | yes      | bounded verification (no writes) | "verify the diff with the bounded test checks; report PASS/FAIL" |
 | `advisor`     | short-lived, high-reasoning counsel     | no      | yes      | none          | "what are we missing in this design?"        |
@@ -123,8 +123,9 @@ floor and one-shot model guardian decide a worker's held calls (never a
 prompt; an unavailable guardian denies, fail closed); under Ask a held call
 the role cannot delegate is raised as an approval prompt in the parent's
 UI and the worker waits visibly (`waiting for user`), or is denied with the
-reason on hosts that cannot prompt; Full Access still fails closed on the
-non-bypassable safety floor. Each decision nobody was prompted for is a
+reason on hosts that cannot prompt; Full Access applies
+exactly as it does to the parent turn, so a call the person granted is not
+stranded by the Auto-Review floor. Each decision nobody was prompted for is a
 one-line note in that worker's transcript (visible when it is focused) and
 an audit-log record. See `docs/MODES.md`.
 
@@ -159,9 +160,9 @@ turn is included.
 
 **The list is shown once, at that spawn, and never re-sent.** No sub-agent
 request re-states a To-do list, and neither does a parent request. Each agent
-keeps its own private list (#4810); what it knows about that list comes from the
-tool results its own `todo_write` calls returned, which are ordinary messages in
-its own transcript. A worker therefore cannot read or write a parent's or a
+keeps its own private list (#4810); what it knows about that list comes from its
+own `todo_write` calls (each sends the whole list) and the short receipts they
+returned, which are ordinary messages in its own transcript. A worker therefore cannot read or write a parent's or a
 sibling's list, and a forked child cannot mutate the snapshot it was handed or
 keep reading later parent changes.
 
@@ -213,12 +214,23 @@ real isolated worktree may proceed in parallel. A `custom` role requires
 explicit write-capable authority to claim writes; otherwise it starts
 read-only.
 
+Read-only is not file-only. A normally write-capable agent narrowed with
+`write_authority: "read_only"` keeps the existing classifier-bounded inspection
+shell when its parent permits it: Git history/status, search, and allowed `gh`
+log reads, not arbitrary commands or test programs. Workflow read-only steps
+likewise use the effective role's tools instead of imposing a second File-only
+list; a `test` role retains its bounded verification interface. Explicit tool
+allowlists, `deny_all_tools`, parent denials, network limits, and mutation checks
+still apply. A parent without shell access cannot delegate it.
+
 Optional fields:
 
 - `worktree_branch`: exact branch to create.
 - `worktree_base`: git ref to branch from; defaults to `HEAD`.
-- `worktree_path`: exact checkout path. Relative paths stay under the default
-  sibling `.codewhale-worktrees/` root.
+- `worktree_path`: exact checkout path. Relative and absolute paths must stay
+  under the default sibling `.codewhale-worktrees/<repo>/` root (symlinks are
+  resolved before the check). Any worktree request keeps the approval card,
+  even for a read-only role.
 
 `cwd` may be combined with `worktree`: the requested directory becomes the
 discovery anchor the repo root (and the new checkout) is resolved from
@@ -262,6 +274,41 @@ bounded write receipt changed a file the child did not declare. A peer's
 change inside a worker's broad scope is not enough to attribute that write to
 the worker. `path:LINE` and `path:LINE-LINE` evidence citations, including
 sentence punctuation and Markdown links, never count as edit claims.
+
+### Read-only shell commands
+
+Scout, reviewer and planner agents, agents narrowed with
+`write_authority: "read_only"`, and durable Fleet workers with a read-only
+shell grant all judge `bash` calls by the same read-only grammar:
+
+- inspection programs: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `which`,
+  `stat`, `file`, `du`, `df`, `grep`, `rg`, `fd`, `find` without `-exec` or
+  `-delete`, and `sed -n <range>p`;
+- `git status`, `log`, `diff`, `show`, `ls-files`, `blame` and `grep`,
+  optionally after `-C <dir>` or `--no-pager`;
+- the text filters `sort`, `uniq`, `cut`, `tr` and `comm`, and literal
+  `echo`/`printf`;
+- with a network grant, `gh` issue/pr/release/repo/run/workflow view or list
+  reads.
+
+`npm view` is refused even with a network grant: npm configuration can select
+executable helpers, so package metadata reads are outside this bounded grammar.
+
+Admitted commands can be joined with `|`, `&&`, `||` and `;`, for example
+`git diff HEAD && echo '=== FILES ===' && ls -la`. A leading `cd <dir> &&`
+sets the working directory, and that directory must be inside the workspace.
+The only redirects are `2>/dev/null`, `>/dev/null` and `2>&1`. Quoted text is
+data, so `rg 'a && b' src` is one search. Other redirects, `$` or backtick
+expansion, subshells, backgrounding, inline environment assignments, and any
+other program (such as `python`, `awk`, `jq` or `cargo`) are refused. Options
+and path operands are still checked, and each `gh` or `npm` read needs the
+network grant wherever it appears in the command.
+
+A refused command comes back to the agent as an error result that names the
+rule, for example
+`[shell.readonly.command] program: `touch` is not a read-only inspection command`,
+followed by what the agent can do instead. The agent keeps working, and
+repeated refusals without progress end it as failed rather than completed.
 
 ### Reading beside a writer
 
@@ -322,9 +369,9 @@ checkpoints before scope expansion or after repeated failures.
 Good delegation prompt examples:
 
 ```text
-QUESTION: Does PR #3124 introduce release-risk behavior around provider routing?
-SCOPE: PR #3124 diff, linked issue, provider routing tests, docs/PROVIDERS.md.
-ALREADY_KNOWN: Branch is hunter/0.8.62-glm-subagents; workspace version stays 0.8.61.
+QUESTION: Does PR #N introduce release-risk behavior around provider routing?
+SCOPE: PR #N diff, linked issue, provider routing tests, docs/PROVIDERS.md.
+ALREADY_KNOWN: Branch is <release-branch>; workspace version is <live-version>.
 EFFORT: medium
 STOP_CONDITION: Return once you have either one BLOCKER/MAJOR issue or enough evidence for no MAJOR+ issues.
 OUTPUT: VERDICT, EVIDENCE with file:line refs or PR refs, GAPS, NEXT.
@@ -341,7 +388,7 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 
 ```text
 QUESTION: Is the focused prompt/subagent test filter valid, and what fails if not?
-SCOPE: cargo test -p codewhale-tui --bin codewhale-tui --locked prompt; subagent filter if needed.
+SCOPE: cargo test -p codewhale-tui --lib --locked prompt; subagent filter if needed.
 ALREADY_KNOWN: Do not fix failures; capture exact command, exit code, and first relevant assertion.
 EFFORT: medium
 STOP_CONDITION: Stop after one clean PASS or one reproducible failing assertion with command evidence.
@@ -421,7 +468,7 @@ request broad fan-out and let the manager drain it without creating an
 unbounded population.
 
 By default every admitted child may start immediately — there is no artificial
-throttle. Request the fan-out the work actually needs and let the runtime
+throttle beyond the rate-limit governor described below. Request the fan-out the work actually needs and let the runtime
 queue and drain it; the caps above are enforcement, not a reason to
 pre-refuse valid work. If you want gentler fan-out, lower `[subagents].launch_concurrency`
 (how many direct children start at once); children beyond that limit **queue**
@@ -435,6 +482,29 @@ counts both **running** and **queued** agents, while `launch_concurrency` keeps
 instantaneous execution bounded. Completed / failed / cancelled records persist
 for inspection but don't occupy an admission slot. Agents that lost their
 `task_handle` (e.g. across a process restart) also don't count against the cap.
+
+### Rate-limit governor
+
+The one automatic throttle is the rate-limit governor. It watches provider
+rate limits (HTTP 429) across a 60-second window. After repeated limits it
+shrinks the number of launch slots; under a sustained burst it pauses new
+launches entirely. Steady successes add slots back one at a time. It never
+interrupts an agent that is already running, and quota exhaustion is not
+treated as a throttle.
+
+While the governor is holding launches back, it says so in two places:
+
+- a queued agent's row gives the reason, for example
+  `launch slots throttled to 4/8 after 2 provider rate limit(s) in the last 60s`
+  or `launches paused after 4 provider rate limit(s) in the last 60s`, and the
+  time its wall budget ends;
+- `GET /v1/agent-runs` returns a `governor` object next to `runs`, with
+  `launch_slots`, `max_launch_slots`, `paused`, `recent_rate_limits`, and a
+  `status` line while launches are held back. It describes launches made by the
+  runtime serving the request (Fleet runs).
+
+Known limitation: the `/subagents` register header does not show the governor
+line yet; the TUI receives agent lists from the Engine without governor state.
 
 Provider profiles let one config stay aggressive for direct API routes while
 keeping subscription or aggregator routes gentle. Every key under
@@ -554,15 +624,32 @@ finite budget.
 
 `max_steps` and `wall_time_secs` are optional per-call limits.
 Each can only narrow the applicable role, operator, parent, and saved-run
-limits. Omission inherits those limits; explicit zero, null, negative, or
-out-of-range values are rejected by the tool parser.
+limits; the one exception is that `wall_time_secs` may raise the built-in
+1800-second default (see below). Omission inherits those limits; explicit zero, null, negative, or
+out-of-range values are rejected by the tool parser (schema minimum is 1).
+Fleet file task-specs use a different convention — there, omitted-or-zero
+means unbounded; see `docs/FLEET.md`.
 
 `max_steps` counts model turns and accepts 1 through 2000. All roles default
 to no model-turn cap unless an operator or ancestor supplies one; the internal
 zero representation for that default never cancels a finite inherited cap.
-`wall_time_secs` accepts 1 through 86400, with an operator-configurable
-1800-second default. It includes admission queue time, model requests, and
-tools. The effective absolute deadline is persisted.
+`wall_time_secs` accepts 1 through 86400. Omitted, it defaults to 1800
+seconds. An explicit value may go above that built-in default, for long
+unattended work; an operator-configured `default_wall_time_secs` is both the
+default and a ceiling, and role, parent, and saved-run deadlines still only
+narrow. It covers model requests and tools. The effective absolute deadline
+is persisted, and saved again when a queued agent launches, so a later
+continuation is bounded by the deadline the agent actually worked to.
+
+The work clock starts when the agent gets a launch slot. An agent that waits
+in the launch queue waits at most `wall_time_secs`; if no slot opens in that
+time it fails with a `never started` reason and zero steps, instead of being
+reported as a run that used up its budget. An agent that does get a slot
+after waiting receives its full `wall_time_secs` from that moment, still
+bounded by any parent, saved-run or source deadline. So a parent can wait up
+to about twice `wall_time_secs` for a queued agent. The queued row names the
+reason for the wait and the time the agent stops waiting. If agents often
+wait long, start fewer at once.
 
 For example, a focused review can request:
 
@@ -657,6 +744,26 @@ the same model or exact provider/model pair, but cannot change the pin with
 manual role pin. A type-only start also selects a unique saved role pin when
 there is no manual override; ambiguous saved roles fail instead of choosing one.
 Durable Fleet runs retain their selected member's frozen route.
+
+A structured role pin may list approved replacement routes:
+
+```toml
+[subagents.roles.reviewer]
+model = "xai/grok-4.6"
+replacements = ["deepseek/deepseek-v4-pro"]
+```
+
+When the pinned route refuses the agent's **first** request (exhausted quota,
+rejected credentials or authorization, or an unavailable model), the agent
+retries that same request on the next listed route, keeping its role,
+permissions, tools, scope and budgets. Listing a route authorizes sending the
+agent's task to that provider, so each entry must name `provider/model`; at
+most three are allowed and each is tried once. The route receipt records the
+effective route, `route_source = "role.replacement"`, and a note with the
+original route, the reason and the attempt. Replacement never happens after
+the agent has run a tool, never for content-policy, context-length or
+invalid-request errors, never for Codewhale's own permission denials, and never
+for exact Fleet members or task-level `model` choices, which stay exact.
 
 Structured role pins accept `provider/model`, preserving the configured provider's
 exact identity and the complete model suffix. Unknown providers, empty pairs,
@@ -959,11 +1066,11 @@ scout that discovers a project convention worth carrying across
 sessions, or a verifier that learns "this test is flaky".
 
 `remember` takes a `scope` of `global` or `workspace`
-(`crates/tui/src/tools/remember.rs:79-108`) and writes through
-`NativeMemoryStore` to `~/.codewhale/memory/global/MEMORY.md` or
-`~/.codewhale/memory/workspace/<id>/MEMORY.md`. Writes do not go through the
-standard write-approval flow. The legacy single-file `memory.md` path was
-removed in v0.9.4 (remember.rs:165); see `docs/MEMORY.md` for the full layout.
+(`crates/tui/src/tools/remember.rs`, schema enum plus scope handling) and
+writes through `NativeMemoryStore` to `~/.codewhale/memory/global/MEMORY.md`
+or `~/.codewhale/memory/workspace/<id>/MEMORY.md`. Writes do not go through
+the standard write-approval flow. The legacy single-file `memory.md` path was
+removed in v0.9.4; see `docs/MEMORY.md` for the full layout.
 
 ## Implementation notes
 

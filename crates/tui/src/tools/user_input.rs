@@ -116,6 +116,7 @@ pub struct UserInputRequest {
 impl UserInputRequest {
     /// Parse and validate against the built-in default limits. Call sites that
     /// hold a session's resolved config use [`Self::from_value_with_limits`].
+    #[cfg(test)]
     pub fn from_value(value: &Value) -> Result<Self, ToolError> {
         Self::from_value_with_limits(value, UserInputLimits::default())
     }
@@ -131,6 +132,7 @@ impl UserInputRequest {
         Ok(request)
     }
 
+    #[cfg(test)]
     pub fn validate(&self) -> Result<(), ToolError> {
         self.validate_with_limits(UserInputLimits::default())
     }
@@ -226,10 +228,10 @@ impl RequestUserInputTool {
         Self {
             description: format!(
                 "Ask the user 1-{} short questions with selectable options and return their \
-selections. Reach for this when a decision is genuinely the user's to make and guessing \
-would be costly or wrong: ambiguous scope, an irreversible or expensive choice, a missing \
-preference, or a fork the user should own. Do not use it for facts you can find in the \
-workspace — investigate those instead. The call blocks until the user answers.",
+selections. It is for decisions that are the user's to make, where a guess would be costly \
+or wrong: ambiguous scope, an irreversible or expensive choice, a missing preference, or a \
+fork the user should own. It returns the user's choices, not facts about the workspace. The \
+call blocks until the user answers.",
                 limits.max_questions
             ),
             limits,

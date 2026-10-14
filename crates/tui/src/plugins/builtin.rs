@@ -27,7 +27,10 @@
 //! * **Each build keeps its own complete tree.** A unique private stage is
 //!   published once under its embedded-content digest. Discovery receives
 //!   only that snapshot root, so another binary cannot replace a live bundle.
-//!   Neither old bundles nor their path-bound trust receipts are migrated.
+//!   Old bundles are not migrated. Their review is: when a new build's
+//!   bundle has the same capability hash, the prior review and enablement
+//!   carry to its new id; otherwise it reports `capabilities-changed`
+//!   ([`super::registry::PluginRegistry::carry_forward_builtin_trust`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -47,7 +50,7 @@ const SNAPSHOTS_DIR_NAME: &str = "snapshots";
 
 /// Publication marker, outside the plugin itself. It is checked along with
 /// every embedded byte and directory entry, never used as proof by itself.
-const STAMP_NAME: &str = ".stamp";
+pub(crate) const STAMP_NAME: &str = ".stamp";
 
 const COMPUTER_USE: &str = "computer-use";
 
@@ -77,6 +80,7 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
     bundle_file!("mcp.json"),
     bundle_file!("commands/computer.md"),
     bundle_file!("skills/computer-use/SKILL.md"),
+    bundle_file!("skills/computer-use/references/operating-details.md"),
     bundle_file!("skills/computer-use/references/quick-reference.md"),
     bundle_file!("skills/computer-use/references/refusal-codes.md"),
     bundle_file!("skills/recording/SKILL.md"),
@@ -87,14 +91,18 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
     bundle_file!("app/updates.mjs"),
     bundle_file!("mcp/server.mjs"),
     bundle_file!("src/app-handler.mjs"),
+    bundle_file!("src/app-script-policy.mjs"),
     bundle_file!("src/app-socket.mjs"),
     bundle_file!("src/browser-cdp.mjs"),
     bundle_file!("src/consent.mjs"),
     bundle_file!("src/spawn.mjs"),
     bundle_file!("src/exec.mjs"),
+    bundle_file!("src/lease.mjs"),
     bundle_file!("src/png-size.mjs"),
+    bundle_file!("src/recordings.mjs"),
     bundle_file!("src/registry.mjs"),
     bundle_file!("src/remote-runtime.mjs"),
+    bundle_file!("src/ssh-args.mjs"),
     bundle_file!("src/tools.mjs"),
     bundle_file!("src/trajectory.mjs"),
     bundle_file!("src/transport.mjs"),
@@ -114,7 +122,7 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
 
 /// Digest of one bundle's entire contents, including its file names, so a
 /// renamed or removed file is as much a change as an edited one.
-fn digest(files: &[(&str, &[u8])]) -> String {
+pub(crate) fn digest(files: &[(&str, &[u8])]) -> String {
     let mut hasher = Sha256::new();
     for (relative, contents) in files {
         hasher.update((relative.len() as u64).to_le_bytes());
@@ -123,6 +131,61 @@ fn digest(files: &[(&str, &[u8])]) -> String {
         hasher.update(contents);
     }
     super::manifest::hex_digest(hasher.finalize())
+}
+
+/// A bundle this build embeds, identified by the digest of its contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmbeddedBundle {
+    pub name: &'static str,
+    pub digest: String,
+}
+
+impl EmbeddedBundle {
+    /// Directory name of this build's snapshot under the snapshots root.
+    pub(crate) fn snapshot_dir_name(&self) -> String {
+        format!("{}-{}", self.name, self.digest)
+    }
+}
+
+/// The bundles this build would materialize. Garbage collection compares
+/// on-disk snapshots against this list to decide which belong to other builds.
+pub(crate) fn embedded_bundles() -> Vec<EmbeddedBundle> {
+    vec![EmbeddedBundle {
+        name: COMPUTER_USE,
+        digest: digest(COMPUTER_USE_FILES),
+    }]
+}
+
+/// `<home>/builtin-plugins/snapshots`, the only place snapshots are published.
+pub(crate) fn snapshots_dir(home: &Path) -> PathBuf {
+    home.join(BUILTIN_DIR_NAME).join(SNAPSHOTS_DIR_NAME)
+}
+
+/// Split `<bundle>-<64 hex>` into the embedded bundle name and its digest.
+/// Anything else in the snapshots root is not ours to classify.
+pub(crate) fn parse_snapshot_dir_name(
+    dir_name: &str,
+    bundles: &[EmbeddedBundle],
+) -> Option<(&'static str, String)> {
+    bundles.iter().find_map(|bundle| {
+        let digest = dir_name.strip_prefix(bundle.name)?.strip_prefix('-')?;
+        (digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| (bundle.name, digest.to_string()))
+    })
+}
+
+/// Record that this build started with `snapshot`, so garbage collection can
+/// tell a snapshot a recent binary still uses from one nobody has opened in
+/// weeks. Best effort and mtime only: the stamp's bytes are never touched.
+fn mark_snapshot_used(snapshot: &Path) {
+    if let Ok(Some(stamp)) =
+        super::registry::open_existing_regular_file(&snapshot.join(STAMP_NAME), true)
+    {
+        let _ = stamp.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// Discovery roots holding the built-in bundles, writing them out if what is
@@ -160,8 +223,24 @@ pub fn materialized_dirs() -> Vec<PathBuf> {
 /// into an existing home only keeps that promise, and costs nothing in
 /// practice — the home exists from the moment Codewhale is configured or run.
 fn materialize() -> io::Result<Option<PathBuf>> {
-    let home = codewhale_config::codewhale_home().map_err(io::Error::other)?;
+    let home = materialization_home()?;
     materialize_at_home(&home)
+}
+
+/// Startup materializes into any existing home, so an unsealed test would
+/// write the developer's real `~/.codewhale/builtin-plugins`; it gets a
+/// private home instead.
+#[cfg(test)]
+fn materialization_home() -> io::Result<PathBuf> {
+    match crate::test_support::unsealed_state_dir(".") {
+        Some(home) => Ok(home),
+        None => codewhale_config::codewhale_home().map_err(io::Error::other),
+    }
+}
+
+#[cfg(not(test))]
+fn materialization_home() -> io::Result<PathBuf> {
+    codewhale_config::codewhale_home().map_err(io::Error::other)
 }
 
 fn materialize_at_home(home: &Path) -> io::Result<Option<PathBuf>> {
@@ -202,7 +281,11 @@ fn materialize_at_home(home: &Path) -> io::Result<Option<PathBuf>> {
 /// never replaces an existing entry, including an empty or damaged directory.
 /// Concurrent publishers of identical bytes converge after verifying the winner;
 /// different builds retain different source paths and therefore trust identities.
-fn write_bundle(root: &Path, name: &str, files: &[(&str, &[u8])]) -> io::Result<PathBuf> {
+pub(crate) fn write_bundle(
+    root: &Path,
+    name: &str,
+    files: &[(&str, &[u8])],
+) -> io::Result<PathBuf> {
     reject_symlink(root)?;
     if !super::agent_plugin::is_standard_plugin_name(name) || files.is_empty() {
         return Err(invalid_bundle(
@@ -227,6 +310,7 @@ fn write_bundle(root: &Path, name: &str, files: &[(&str, &[u8])]) -> io::Result<
     }
     if snapshot_exists(&destination)? {
         verify_snapshot(&destination, &expected)?;
+        mark_snapshot_used(&destination);
         return Ok(destination);
     }
 
@@ -344,7 +428,7 @@ fn verify_snapshot(root: &Path, files: &BTreeMap<PathBuf, &[u8]>) -> io::Result<
 /// Atomic no-replace directory publication. A check followed by ordinary Unix
 /// rename is insufficient: rename is allowed to replace an existing empty dir.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
+pub(super) fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -375,7 +459,7 @@ fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
+pub(super) fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
     use windows::core::PCWSTR;
@@ -399,7 +483,7 @@ fn publish_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn publish_snapshot(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(super) fn publish_snapshot(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic built-in snapshot publication is unsupported on this platform",
@@ -658,6 +742,106 @@ mod tests {
         verify_plugin_authority(&old_authority).unwrap();
         next.revoke_trust("fixture").unwrap();
         assert!(verify_plugin_authority(&next_authority).is_err());
+    }
+
+    #[test]
+    fn an_upgrade_carries_builtin_review_unless_capabilities_change_or_trust_was_revoked() {
+        use crate::plugins::context::{HostEnvironment, PluginDiscoveryContext};
+        use crate::plugins::discovery::DiscoveryConfig;
+        use crate::plugins::registry::verify_plugin_authority;
+
+        const MANIFEST: &[u8] = br#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"fixture","version":"1.0.0"}"#;
+        const SKILL: &[u8] = b"---\nname: extra\ndescription: An added skill.\n---\nBody.\n";
+        let builds: [&[(&str, &[u8])]; 5] = [
+            &[("plugin.json", MANIFEST), ("body.txt", b"v1")],
+            &[("plugin.json", MANIFEST), ("body.txt", b"v2")],
+            &[
+                ("plugin.json", MANIFEST),
+                ("body.txt", b"v3"),
+                ("skills/extra/SKILL.md", SKILL),
+            ],
+            &[
+                ("plugin.json", MANIFEST),
+                ("body.txt", b"v4"),
+                ("skills/extra/SKILL.md", SKILL),
+            ],
+            &[
+                ("plugin.json", MANIFEST),
+                ("body.txt", b"v5"),
+                ("skills/extra/SKILL.md", SKILL),
+            ],
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&cache).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let registry_for = |files: &[(&str, &[u8])]| {
+            let config = DiscoveryConfig {
+                workspace: workspace.clone(),
+                user_plugins_dir: temp.path().join("plugins"),
+                workspace_plugins_dir: workspace.join(".codewhale/plugins"),
+                builtin_plugin_dirs: vec![write_bundle(&cache, "fixture", files).unwrap()],
+                state_path: temp.path().join("plugins/state.json"),
+            };
+            let context = PluginDiscoveryContext::from_config_and_environment(
+                &config,
+                HostEnvironment::default(),
+            );
+            (*context.registry_for_workspace(&workspace)).clone()
+        };
+
+        // A first install has nothing to carry: it waits for review.
+        let mut v1 = registry_for(builds[0]);
+        let plugin = v1.get("fixture").unwrap();
+        assert_eq!(plugin.trust_status, PluginTrustStatus::NeverReviewed);
+        assert!(!plugin.enabled);
+        v1.trust("fixture").unwrap();
+        v1.enable("fixture").unwrap();
+        let v1_id = v1.get("fixture").unwrap().id.clone();
+        let v1_authority = v1.authority_for("fixture").unwrap();
+
+        // New bytes, same capabilities: the review and enablement carry, the
+        // new build is live, and the older build keeps its own authority.
+        let v2 = registry_for(builds[1]);
+        let plugin = v2.get("fixture").unwrap();
+        assert_ne!(plugin.id, v1_id);
+        assert_eq!(plugin.trust_status, PluginTrustStatus::Trusted);
+        assert!(plugin.enabled);
+        assert!(plugin.active());
+        verify_plugin_authority(&v2.authority_for("fixture").unwrap()).unwrap();
+        verify_plugin_authority(&v1_authority).unwrap();
+        // Carrying is once per build: rediscovery changes nothing.
+        let state = fs::read(temp.path().join("plugins/state.json")).unwrap();
+        let again = registry_for(builds[1]);
+        assert!(again.get("fixture").unwrap().active());
+        assert_eq!(
+            fs::read(temp.path().join("plugins/state.json")).unwrap(),
+            state
+        );
+
+        // Changed capabilities never carry silently: review the changes.
+        let v3 = registry_for(builds[2]);
+        let plugin = v3.get("fixture").unwrap();
+        assert_eq!(plugin.trust_status, PluginTrustStatus::CapabilitiesChanged);
+        assert!(!plugin.enabled);
+
+        // A revocation anywhere in the line blocks carrying.
+        let mut v3 = v3;
+        v3.revoke_trust("fixture").unwrap();
+        let mut v4 = registry_for(builds[3]);
+        let plugin = v4.get("fixture").unwrap();
+        assert_eq!(plugin.trust_status, PluginTrustStatus::NeverReviewed);
+        assert!(!plugin.enabled);
+
+        // A revocation blocks only until the next review: once the user
+        // reviews and enables a later build, upgrades carry that review again.
+        v4.trust("fixture").unwrap();
+        v4.enable("fixture").unwrap();
+        let v5 = registry_for(builds[4]);
+        let plugin = v5.get("fixture").unwrap();
+        assert_eq!(plugin.trust_status, PluginTrustStatus::Trusted);
+        assert!(plugin.active());
     }
 
     #[test]

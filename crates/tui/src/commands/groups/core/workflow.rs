@@ -319,7 +319,7 @@ fn describe_run(line: &crate::tools::workflow::HostWorkflowRunLine, now_ms: u64)
         line.run_id,
         line.status,
         line.label,
-        crate::elapsed::format_elapsed_secs(elapsed),
+        codewhale_command_contract::elapsed::format_elapsed_secs(elapsed),
         line.child_count
     );
     if let Some(progress) = line.last_progress.as_deref() {
@@ -512,7 +512,7 @@ mod tests {
 
     fn test_app() -> App {
         let options = TuiOptions {
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &crate::config::Config::default())
     }
@@ -960,10 +960,12 @@ mod tests {
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let manager = new_shared_subagent_manager(dir.path().to_path_buf(), 2);
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = crate::client::CodewhaleClient::new(&crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            ..crate::config::Config::default()
-        })
+        let client = crate::client::CodewhaleClient::new(
+            &crate::config::Config {
+                ..crate::config::Config::default()
+            }
+            .with_legacy_root(Some("test-key".to_string()), None),
+        )
         .expect("stub client");
         let mut runtime = SubAgentRuntime::new(
             client,

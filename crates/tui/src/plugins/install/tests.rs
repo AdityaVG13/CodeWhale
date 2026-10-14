@@ -3,6 +3,9 @@ use super::*;
 // by the verbs, so it is not in `super`'s namespace.
 use super::tarball::scan_tarball;
 
+#[path = "tests/place_recovery.rs"]
+mod place_recovery;
+
 fn write_bundle(root: &Path, dir: &str, name: &str) -> PathBuf {
     let bundle = root.join(dir);
     fs::create_dir_all(&bundle).unwrap();
@@ -26,6 +29,44 @@ fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
     }
     let encoder = builder.into_inner().unwrap();
     encoder.finish().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_plugin_stage_preserves_only_owner_executable_intent() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    for (path, body, mode) in [
+        (
+            "repo/plugin.toml",
+            &b"schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n"[..],
+            0o644,
+        ),
+        ("repo/bin/server", &b"#!/bin/sh\nexit 0\n"[..], 0o6755),
+        ("repo/data.txt", &b"data"[..], 0o666),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, path, body).unwrap();
+    }
+    let bytes = builder.into_inner().unwrap().finish().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = stage_tarball(&bytes, tmp.path(), DEFAULT_MAX_SIZE_BYTES, None).unwrap();
+    for (path, expected) in [("bin/server", 0o700), ("data.txt", 0o600)] {
+        assert_eq!(
+            fs::metadata(staged.staged_path.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            expected,
+            "{path}"
+        );
+    }
 }
 
 fn symlink_tarball(link_path: &str, target: &str, manifest: &str) -> Vec<u8> {
@@ -719,26 +760,9 @@ async fn install_enforces_the_name_conflict_hook() {
 // ── update / uninstall ────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_refuses_local_installs_and_missing_markers() {
+async fn update_refuses_missing_markers() {
     let tmp = tempfile::tempdir().unwrap();
     let plugins = tmp.path().join("plugins");
-    let source = write_bundle(tmp.path(), "src/demo", "demo");
-    install(
-        PluginInstallSource::parse(source.to_str().unwrap()).unwrap(),
-        &plugins,
-        DEFAULT_MAX_SIZE_BYTES,
-        &allow_all(),
-        false,
-        &no_conflict(),
-    )
-    .await
-    .unwrap();
-
-    let err = update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
-        .await
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("local path"), "got: {err:#}");
-
     write_bundle(&plugins, "hand", "hand");
     let err = update("hand", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
         .await
@@ -749,6 +773,108 @@ async fn update_refuses_local_installs_and_missing_markers() {
             Some(PluginInstallError::NotInstalledHere(_))
         ),
         "got: {err:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_update_reuses_staging_and_preserves_the_installed_bundle_on_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    let source = write_bundle(tmp.path(), "src/demo", "demo");
+    fs::write(source.join("data.txt"), b"v1").unwrap();
+    install(
+        PluginInstallSource::LocalPath(source.clone()),
+        &plugins,
+        DEFAULT_MAX_SIZE_BYTES,
+        &allow_all(),
+        false,
+        &no_conflict(),
+    )
+    .await
+    .unwrap();
+    let target = plugins.join("demo");
+    let original_marker = fs::read(target.join(INSTALLED_FROM_MARKER)).unwrap();
+    assert!(matches!(
+        update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
+            .await
+            .unwrap(),
+        PluginUpdateResult::NoChange
+    ));
+    assert_eq!(
+        fs::read(target.join(INSTALLED_FROM_MARKER)).unwrap(),
+        original_marker
+    );
+
+    for altered in [Some(b"altered".as_slice()), None] {
+        if let Some(bytes) = altered {
+            fs::write(target.join("data.txt"), bytes).unwrap();
+        } else {
+            fs::remove_file(target.join("data.txt")).unwrap();
+        }
+        assert!(matches!(
+            update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
+                .await
+                .unwrap(),
+            PluginUpdateResult::Updated(_)
+        ));
+        assert_eq!(fs::read(target.join("data.txt")).unwrap(), b"v1");
+        assert_eq!(
+            fs::read(target.join(INSTALLED_FROM_MARKER)).unwrap(),
+            original_marker
+        );
+    }
+
+    fs::write(source.join("data.txt"), b"v2").unwrap();
+    let PluginUpdateResult::Updated(updated) =
+        update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
+            .await
+            .unwrap()
+    else {
+        panic!("changed local source must update through the existing installer");
+    };
+    assert_eq!(fs::read(updated.path.join("data.txt")).unwrap(), b"v2");
+    let updated_marker = fs::read(target.join(INSTALLED_FROM_MARKER)).unwrap();
+    assert_ne!(updated_marker, original_marker);
+    assert!(matches!(
+        update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
+            .await
+            .unwrap(),
+        PluginUpdateResult::NoChange
+    ));
+
+    let manifest = fs::read(source.join("plugin.toml")).unwrap();
+    fs::write(
+        source.join("plugin.toml"),
+        b"schema_version = 1\n[plugin]\nname = \"other\"\nversion = \"2.0.0\"\n",
+    )
+    .unwrap();
+    let error = update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<PluginNameConflict>().is_some());
+    assert!(!plugins.join("other").exists());
+    fs::write(source.join("plugin.toml"), b"malformed = [").unwrap();
+    assert!(
+        update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
+            .await
+            .is_err()
+    );
+    fs::write(source.join("plugin.toml"), manifest).unwrap();
+    fs::remove_dir_all(&source).unwrap();
+    assert!(
+        update("demo", &plugins, DEFAULT_MAX_SIZE_BYTES, &allow_all())
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(target.join("data.txt")).unwrap(), b"v2");
+    assert_eq!(
+        fs::read(target.join(INSTALLED_FROM_MARKER)).unwrap(),
+        updated_marker
+    );
+    assert_eq!(
+        fs::read_dir(&plugins).unwrap().count(),
+        1,
+        "no staging or backup residue"
     );
 }
 
@@ -825,6 +951,46 @@ fn parse_routes_remote_and_local_specs() {
     assert!(PluginInstallSource::parse("").is_err());
     assert!(PluginInstallSource::parse("   ").is_err());
     assert!(PluginInstallSource::parse("path:").is_err());
+    assert_eq!(
+        PluginInstallSource::parse("git:github.com/owner/repo").unwrap(),
+        PluginInstallSource::Remote(InstallSource::GitHubRepo("owner/repo".into()))
+    );
+    for (spec, url) in [
+        (
+            "git:github.com/owner/repo@v1.2.3",
+            "https://github.com/owner/repo/archive/v1.2.3.tar.gz",
+        ),
+        (
+            "npm:@owner/plugin@1.2.3",
+            "https://registry.npmjs.org/@owner/plugin/-/plugin-1.2.3.tgz",
+        ),
+        (
+            "npm:plugin@1.2.3-alpha.1",
+            "https://registry.npmjs.org/plugin/-/plugin-1.2.3-alpha.1.tgz",
+        ),
+    ] {
+        let source = PluginInstallSource::parse(spec).unwrap();
+        assert_eq!(
+            source,
+            PluginInstallSource::Remote(InstallSource::DirectUrl(url.into()))
+        );
+        assert_eq!(
+            PluginInstallSource::parse(&plugin_spec_string(&source, None)).unwrap(),
+            source
+        );
+    }
+    for spec in [
+        "git:gitlab.com/owner/repo",
+        "git:github.com/owner/repo@../x",
+        "git:github.com/owner/repo@",
+        "npm:plugin",
+        "npm:plugin@latest",
+        "npm:plugin@^1.2.3",
+        "npm:@owner/../plugin@1.2.3",
+        "npm:../plugin@1.2.3",
+    ] {
+        assert!(PluginInstallSource::parse(spec).is_err(), "{spec}");
+    }
 }
 
 // ── remote fetch against a loopback server ────────────────────────────

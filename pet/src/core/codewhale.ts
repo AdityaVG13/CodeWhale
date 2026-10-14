@@ -75,26 +75,6 @@ function classify(name: string): Category {
   if (/tool/.test(n)) return 'tool';
   return CATEGORIES.includes(n as Category) ? n as Category : 'other';
 }
-/** Presentation vocabulary beside the canonical category classifier. Only the
- * witnessed tool name is used; command contents are never inferred. */
-export function toolActivity(name: string): { kind: string; label: string } {
-  const n = name.toLowerCase().replace(/-/g, '_');
-  if (/search|grep|glob|find_file/.test(n)) return { kind: 'searching', label: 'Searching' };
-  if (/read_file|list_dir|read_text|open_file/.test(n)) return { kind: 'reading', label: 'Reading files' };
-  if (/apply_patch|write_file|edit_file|replace_text/.test(n)) return { kind: 'editing', label: 'Editing files' };
-  if (/run_test|pytest|test_suite/.test(n)) return { kind: 'testing', label: 'Running tests' };
-  const category = toolCategory(name);
-  return ({ browser: { kind: 'browsing', label: 'Using the browser' },
-    filesystem: { kind: 'files', label: 'Working with files' },
-    code: { kind: 'executing', label: 'Running a command' },
-    network: { kind: 'network', label: 'Calling a service' },
-    agent: { kind: 'delegating', label: 'Coordinating agents' },
-    memory: { kind: 'memory', label: 'Retrieving context' },
-    reasoning: { kind: 'thinking', label: 'Thinking' },
-    communication: { kind: 'communicating', label: 'Communicating' },
-  } as Record<string, {kind: string; label: string}>)[category] ?? { kind: 'tool', label: 'Using a tool' };
-}
-
 export function toolCategory(name: string): Category {
   const category = classify(name);
   return category === 'other' ? 'tool' : category;
@@ -167,6 +147,15 @@ export function fromCodewhaleSession(document: unknown, filename = 'Codewhale se
 
   const events: WhaleEvent[] = [];
   const pending = new Map<string, number>();
+  // One journal entry may hold any number of blocks, so bound every emitted
+  // event, not every entry. Identities stay unique like the generic importer:
+  // a repeated tool call id would otherwise replace the earlier call.
+  const identities = new Set<string>();
+  const push = (event: WhaleEvent): void => {
+    if (events.length >= maxEvents) throw new Error(`Import exceeds the ${maxEvents.toLocaleString()} event limit.`);
+    if (identities.has(event.id)) throw new Error(`Duplicate event identity (${sessionId}, ${event.id}). Import cancelled.`);
+    identities.add(event.id); pushEvent(events, event);
+  };
   let seq = 0;
   const originWall = orderOnly ? undefined : sourceEntries.map(e => parseTime(e.created_at)).find((n): n is number => n !== undefined);
   const agentId = 'parent';
@@ -181,7 +170,6 @@ export function fromCodewhaleSession(document: unknown, filename = 'Codewhale se
   };
 
   for (const entry of sourceEntries) {
-    if (events.length >= maxEvents) throw new Error(`Import exceeds the ${maxEvents.toLocaleString()} event limit.`);
     const entryId = str(entry.id) ?? `${sessionId}/entry/${seq}`;
     const message = obj(entry.message ?? (entry.kind === 'message' ? entry : {}));
     const role = str(message.role) ?? (str(entry.kind) === 'user' ? 'user' : str(entry.kind) === 'assistant' ? 'assistant' : undefined);
@@ -210,21 +198,23 @@ export function fromCodewhaleSession(document: unknown, filename = 'Codewhale se
           payload: { arguments: clip(block.input) }, raw,
         };
         pending.set(callId, events.length);
-        pushEvent(events, event);
+        push(event);
       } else if (type === 'tool_result') {
         const callId = str(block.tool_use_id);
         const isError = block.is_error === true;
         const target = callId !== undefined ? pending.get(callId) : undefined;
         if (target !== undefined) {
           const prior = events[target]!;
-          prior.endTime = t.start;
+          // Skewed or missing entry times never produce a negative duration.
+          if (t.start < prior.startTime) warnings.push(`Tool ${callId} result is timestamped before its call; its duration is recorded as zero.`);
+          prior.endTime = Math.max(prior.startTime, t.start);
           prior.openEnded = false;
           prior.status = statusOf('completed', isError);
           prior.payload = { ...(obj(prior.payload)), result: clip(block.content) };
           prior.attributes = { ...prior.attributes, 'codewhale.result_entry_id': entryId };
           pending.delete(callId as string);
         } else {
-          pushEvent(events, {
+          push({
             schemaVersion: 1, id: idBase, traceId: sessionId, parentId: callId ?? parentEventId,
             startTime: t.start, endTime: t.start, agentId,
             name: 'tool_result', category: 'tool', model, provider,
@@ -234,7 +224,7 @@ export function fromCodewhaleSession(document: unknown, filename = 'Codewhale se
           });
         }
       } else if (type === 'thinking') {
-        pushEvent(events, {
+        push({
           schemaVersion: 1, id: idBase, traceId: sessionId, parentId: parentEventId,
           startTime: t.start, endTime: t.start, agentId, name: 'thinking', category: 'reasoning',
           model, provider, status: 'success',
@@ -245,7 +235,7 @@ export function fromCodewhaleSession(document: unknown, filename = 'Codewhale se
         const text = str(block.text) ?? '';
         const operate = text.includes('codewhale:runtime_event');
         const user = role === 'user' || role === 'User';
-        pushEvent(events, {
+        push({
           schemaVersion: 1, id: idBase, traceId: sessionId, parentId: parentEventId,
           startTime: t.start, endTime: t.start, agentId,
           name: operate ? 'operate_contract' : user ? 'user_message' : 'assistant_message',
@@ -438,7 +428,9 @@ export class CodewhaleRuntimeTrace {
           payload: { input_summary: clip(turn.input_summary) }, raw: rec,
         };
         if (existing >= 0) {
-          const prior = events[existing]!; this.measure(prior, { ...next, startTime: prior.startTime });
+          // The kept start can follow a skewed completion time; never end before it.
+          const prior = events[existing]!;
+          this.measure(prior, { ...next, startTime: prior.startTime, endTime: Math.max(prior.startTime, next.endTime) });
         }
         else this.push(next);
         continue;

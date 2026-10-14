@@ -6,7 +6,7 @@ Thank you for your interest in contributing to codewhale! This document provides
 
 ### Prerequisites
 
-- Rust 1.88 or later (edition 2024)
+- Rust 1.89 or later (edition 2024)
 - Cargo package manager
 - Git
 
@@ -18,20 +18,42 @@ Thank you for your interest in contributing to codewhale! This document provides
    cd CodeWhale
    ```
 
-2. Build the project:
+2. Build the current engine and terminal:
    ```bash
-   cargo build
+   CODEWHALE_BUILD_SHA="$(git rev-parse HEAD)" cargo build --locked -p codewhale-cli
    ```
 
-3. Run tests:
+3. Run the tests near your change (see [Fast local loop](#fast-local-loop)):
    ```bash
-   cargo test --workspace --all-features
+   scripts/dev-test.sh tui your_test_filter
    ```
 
 4. Run with development settings:
    ```bash
-   cargo run --bin codewhale
+   ./target/debug/codewhale --version
+   ./target/debug/codewhale
    ```
+
+### Testing the latest source
+
+The canonical source is [`codewhale-hq/Codewhale`'s `main` branch](https://github.com/codewhale-hq/Codewhale/tree/main).
+Release candidates land there after their CI gates pass, so contributors can
+test and build on the same source. Tagged downloads remain the latest published
+release; their version can lag the development version on `main`.
+
+For a fresh checkout of the current source:
+
+```bash
+git clone --branch main https://github.com/codewhale-hq/Codewhale.git
+cd Codewhale
+CODEWHALE_BUILD_SHA="$(git rev-parse HEAD)" cargo build --release --locked -p codewhale-cli
+./target/release/codewhale --version
+./target/release/codewhale
+```
+
+Include the commit shown by `--version` when reporting a problem. If you work
+from a fork, add the canonical repository as `upstream` and fetch `upstream/main`
+before starting a change; preserve any local work when updating your branch.
 
 ## Development Workflow
 
@@ -45,7 +67,8 @@ Thank you for your interest in contributing to codewhale! This document provides
 ### Testing
 
 - Write tests for new functionality
-- Ensure all existing tests pass: `cargo test --workspace --all-features`
+- Run the tests near your change (see [Fast local loop](#fast-local-loop));
+  CI runs the whole suite on every pull request
 - Colocate unit tests beside the code they cover (standard Rust `#[cfg(test)]`
   modules), and add integration tests under the owning crate's `tests/`
   directory (for example `crates/tui/tests/` or `crates/state/tests/`). The
@@ -53,8 +76,10 @@ Thank you for your interest in contributing to codewhale! This document provides
 
 ### Pre-push verification
 
-Run these before every push. They match what CI enforces on pull
-requests, so passing locally means the PR lanes should pass too:
+These are the commands CI runs on every pull request. You do not need all
+of them before every push: run `cargo fmt`, then check and test the crates
+you touched (see [Fast local loop](#fast-local-loop)). Run the full set
+locally when a change spans many crates, or let CI run it for you:
 
 ```bash
 cargo fmt --all -- --check
@@ -69,10 +94,8 @@ cargo test --workspace --all-features --locked
 ```
 
 The release lane runs a stricter clippy that also lints test, bench, and
-example targets. The PR template checklist asks for this form, and it is
-the right command before requesting review or doing release-bound work,
-because `--all-features` alone skips lints that will fail the release
-lane later:
+example targets. Use this form for release-bound work, because
+`--all-features` alone skips lints that will fail the release lane later:
 
 ```bash
 cargo clippy --workspace --all-targets --all-features --locked -- \
@@ -97,7 +120,7 @@ scripts/dev-cargo.sh check -p codewhale-tui
 
 # 2. Run only the tests near your change (one crate, one filter).
 scripts/dev-test.sh tui fleet_setup
-# or: scripts/dev-test.sh crates/tui/src/elapsed.rs
+# or: scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 
 # 3. Run a whole crate's unit suite. scripts/dev-test.sh uses nextest when
 #    it is installed (one process per test, all cores busy, slow tests
@@ -106,7 +129,7 @@ cargo install cargo-nextest --locked      # once
 scripts/dev-test.sh tui
 scripts/dev-cargo.sh nextest run --workspace --all-features --locked
 
-# 4. Before pushing, run the authoritative gate exactly as CI does:
+# 4. The authoritative gate, exactly as CI runs it on your PR:
 cargo test --workspace --all-features --locked
 ```
 
@@ -195,6 +218,12 @@ manager writes one batched "receipts" commit per merge session, and
 `./scripts/sync-changelog.sh` keeps the packaged slice in sync. A PR that
 carries changelog hunks will be asked to strip them
 (`git checkout origin/main -- CHANGELOG.md crates/tui/CHANGELOG.md`).
+
+One exception is enforced by CI: a `feat:` commit whose message mentions an
+issue (`#N`) must add `#N` to `CHANGELOG.md` in the same PR
+(`scripts/release/check-feature-release-notes.sh`). To avoid touching the
+changelog, put issue numbers in the PR description instead of in `feat:`
+commit messages; the maintainer writes the entry at merge time.
 
 **AI-assistant co-author trailers are fine.** Using an assistant is welcome and
 needs no disclosure, and CI no longer rejects an auto-appended
@@ -474,8 +503,15 @@ verification.
 ## Pull Request Guidelines
 
 - Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md) when opening
-  a PR — it includes the Summary, Testing, and Checklist sections reviewers
-  expect
+  a PR — what and why, the issue line, and how you tested it
+- The PR description needs one issue line, checked by CI
+  (`.github/workflows/pr-issue-link.yml`): `Closes #N` (or `Fixes` /
+  `Resolves`) when the PR finishes the issue, `Refs #N` for related or partial
+  work, or `No-Issue: <one-line reason>`. Never write a negated closing
+  keyword such as "does not close #N": GitHub closes the issue anyway, so CI
+  rejects it
+- If you add a new layer, module, or abstraction, say which one it replaces
+  or deletes
 - Keep PRs focused on a single change
 - Update documentation if needed
 - Add tests for new functionality
@@ -507,19 +543,15 @@ Before submitting, run the commands in
 
 When reporting issues, please use one of the issue templates:
 
-- [Bug report](.github/ISSUE_TEMPLATE/bug_report.md) — for reproducible problems
+- [Bug report](.github/ISSUE_TEMPLATE/bug_report.yml) — for reproducible problems
   or regressions
-- [Feature request](.github/ISSUE_TEMPLATE/feature_request.md) — for ideas and
+- [Feature request](.github/ISSUE_TEMPLATE/feature_request.yml) — for ideas and
   improvements
 
-Issue reports should include:
-
-- Operating system and version
-- Rust version (`rustc --version`)
-- codewhale version (`codewhale --version`)
-- Steps to reproduce the issue
-- Expected vs actual behavior
-- Relevant error messages or logs
+The forms ask for what a report needs (`codewhale --version`, OS, how you got
+Codewhale, and steps to reproduce). Questions go to
+[Discussions](https://github.com/codewhale-hq/CodeWhale/discussions) or
+[Discord](https://discord.gg/37gfS3ksug).
 
 ## Security
 

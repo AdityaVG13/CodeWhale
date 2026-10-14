@@ -7,7 +7,7 @@ import type { ComputerUseDict } from "../types";
  * the app shows them; formal "Anda" address matches the rest of the site.
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Computer Use untuk Mac · Codewhale",
+  metaTitle: "Computer Use · Pratinjau · Codewhale",
   metaDescription: "Unduh dan siapkan Codewhale Computer Use untuk Mac. Kendali aplikasi di latar belakang, pengaturan izin, serta kontrol Pause dan Stop di tangan Anda.",
   title: "Computer Use",
   lead: "Biarkan Codewhale bekerja di aplikasi Anda sementara Anda tetap bekerja. Pembantu Mac ini menghadirkan pengaturan izin, kendali aplikasi di latar belakang, dan cara menjeda atau menghentikan input langsung dari bar menu.",
@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Jalankan pemeriksaan latar belakang", body: "Pembantu membuka jendela latihan sementara, mengetikkan teks, dan menangkap tampilan jendela tersebut. Ia memeriksa apakah penunjuk atau aplikasi aktif berubah selama proses berlangsung." },
     { title: "Hubungkan ke Codewhale", body: "Tinjau, percayai, dan aktifkan Computer Use di pasar plugin Codewhale. Gunakan plugin versi 0.3.1 atau lebih baru agar tindakan lokal berjalan melalui kontrol Pause dan Stop milik pembantu." },
   ],
-  controlsTitle: "Tetap bekerja. Tetap memegang kendali.",
+  controlsTitle: "Jeda atau hentikan kontrol aplikasi",
   controlsBody: "Tindakan yang didukung berjalan pada aplikasi terpilih di latar belakang. Aplikasi dan gestur yang membutuhkan kendali latar depan memerlukan persetujuan Anda. Menu menampilkan aplikasi target dan mode input; Pause menangguhkan input pembantu, dan Stop mengakhiri sesi pembantu yang sedang berjalan.",
   updateTitle: "Perbarui saat Anda mau",
   updateBody: "Pilih Check for updates di aplikasi. Sebelum memasang pembaruan, aplikasi memeriksa berkas unduhan, tanda tangan Codewhale, dan notarisasi Apple, serta menyimpan versi sebelumnya untuk pemulihan.",
@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Lihat pemeriksaan latar belakang",
   source: "Kode sumber dan platform lain",
   platforms: "Unduhan ini untuk Mac. Windows dan Linux saat ini menggunakan plugin dari kode sumber dan penyiapan di sisi host.",
-  installTitle: "Computer Use untuk Mac",
-  installLead: "Tambahkan kendali aplikasi di latar belakang dengan pembantu Computer Use. Siapkan izin Mac, jalankan pemeriksaan latar belakang, dan jeda atau hentikan input pembantu dari bar menu Anda.",
-  installLink: "Unduh dan siapkan Computer Use",
 };

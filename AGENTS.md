@@ -48,19 +48,26 @@ base prompt". Two more corollaries earned here:
 - Before adding a module named `model_*`, `*_config`, `provider_*`, or
   anything that "bridges", "mirrors", or "stages" an existing thing, grep
   for the existing thing and edit it. A new layer must name the predecessor
-  it replaces in the module doc; otherwise edit the original.
+  it replaces in its commit message; otherwise edit the original.
 - Prefer the simplest implementation that preserves observable contracts. A
   rewrite is acceptable when justified by product intent and observed behavior,
   not as a shortcut around understanding existing code.
 - Search for behavior and symbols before reviving work from an old branch. If a
   lane is obsolete, preserve its intent and evidence rather than merging stale
   code mechanically.
-- A small coherent change may be committed directly to `main` when that checkout
-  is current, clean, and owns the affected files. Do not create worktrees: work
-  in the checkout that already exists, and when several agents share it,
-  partition by file, stage only the paths your slice touched, and retry a commit
-  that fails on `index.lock`. Local commit permission never implies push, merge,
-  tag, release, or deploy permission.
+- Agent-owned work uses the canonical `/Volumes/VIXinSSD/CW/codewhale` checkout
+  on current `main`. Do not create branches, worktrees, nested clones or
+  task-specific integration lanes to handle dirty, stale or conflicting work.
+  Preserve that work and reconcile it with its owner first. When agents share
+  the checkout, partition by file, check status before staging, stage only owned
+  verified paths and retry an `index.lock` failure. Verified main slices may be
+  committed and pushed normally under the rule below; tag, release, deployment
+  and destructive cleanup still require their explicit authorization.
+- **Maintainers do not open PR branches** (founder, 2026-10-08: more PRs means
+  more CI and slower work). Verified slices land directly on `main` and are
+  pushed: run the focused gate, put the real counts in the commit message,
+  fetch and rebase onto `origin/main` and retry on rejection. Never force-push
+  or rewrite a shared ref. Contributor PRs still merge as PRs.
 - When the task is local-only, stay fully offline: no browsing, GitHub or remote
   Git operations, downloads, dependency installation, provider calls, or
   source/diff transmission. Record the missing external receipt and keep working
@@ -81,6 +88,18 @@ base prompt". Two more corollaries earned here:
 - **Write down what a design does not do**, beside the behaviour it owns — a
   short known-limitations note in the owning module. A stated limit stops the
   next reader from assuming a capability that was never built.
+- **Agents do not comment on issues or PRs** (founder, 2026-09-22). Spend the
+  time on code: evidence goes in the commit message and PR body, claims go in
+  Linear. Do not reply to review bots or post status, "superseded", or
+  "for the record" notes. The one exception is closing or superseding a human
+  contributor's PR or issue: one sentence saying why, with the link. The PR and
+  issue review workflows are disabled; re-enable one only by founder decision.
+- **A user feature lands with its registry row.** A new command, `[features]`
+  flag, provider or user-visible feature adds or updates its row in
+  `docs/features.toml` in the same change;
+  `cargo test -p codewhale-tui --test feature_registry` fails on flag drift.
+- **Write `close`/`fix`/`resolve #N` only when you mean it.** GitHub closes the
+  issue on merge even inside "does not close #N"; use `Refs #N` otherwise.
 
 ## Landing other people's work
 
@@ -94,26 +113,10 @@ fallback for a branch that truly cannot merge in reasonable time; done
 casually it reads as taking the work even when credit is preserved.
 
 - **Never make a contributor rebase around our churn.** If their PR conflicts
-  only because main moved, a maintainer resolves it. Start from their diff
-  against the merge base so you know exactly what they added, and re-apply
-  that, rather than hand-merging two large sides and hoping.
-- **Conflicts that split mid-function do not resolve by keeping both sides.**
-  Git's markers can land inside a body, so a both-sides resolution produces
-  unbalanced braces that look plausible and do not compile. Default: take
-  one side whole, then re-insert the other side's additions at their
-  original anchor. When a conflict doesn't fit that pattern, resolve it
-  however is correct and let the compiler judge.
-- **`maintainerCanModify` does not guarantee push access to the fork.** When
-  the push is refused, land the resolved merge on
-  `integration/<topic>-<pr>-<date>` in this repo and land from there. An
-  integration branch is the normal path for anything with conflicts or several
-  moving PRs — it is cheaper than repeatedly rebasing onto a main that keeps
-  moving, and it keeps the contributor's branch untouched.
-- **Check the contribution gate before assuming a PR is stalled.** An unlisted
-  author's workflow runs sit at `action_required` and never start, so the PR
-  looks abandoned when nobody has actually looked at it. Approve the runs, then
-  fix the cause: add them to `.github/APPROVED_CONTRIBUTORS` (`all:username`),
-  or comment `/lgtm` (PR scope) / `/lgtmi` (issue scope) on their thread.
+  only because main moved, a maintainer resolves it.
+- Landing mechanics — merge-base diffing, mid-function conflicts, fork-push
+  refusal, the contribution gate — live in `cw-land`. Follow them instead of
+  improvising.
 - **Preserve credit in the mechanical sense, not just the polite one.** Commit
   authorship and `Co-authored-by` trailers must use the contributor's own
   GitHub-linked address. `AUTHOR_MAP` and `.mailmap` are project conventions —
@@ -137,9 +140,8 @@ casually it reads as taking the work even when credit is preserved.
   already been mistaken for a pass here.
 - Prefer proving a regression test fails without the fix. A test that passes
   either way pins the implementation, not the defect.
-- Audit any harness before trusting its score. `ok = ok and X or True` parses
-  as `(ok and X) or True` and silently reported twelve unevaluated rows as
-  passing.
+- Audit any hand-rolled scorer before trusting its score: quote the counts it
+  actually evaluated, not the verdict line alone.
 - Match the evidence to the surface. Run the tests that cover the change, not the
   whole suite, and do not repeat a check that already passed in order to commit.
   CI owns exhaustive coverage; a full local run is for CI diagnosis or for an
@@ -149,7 +151,7 @@ casually it reads as taking the work even when credit is preserved.
 
 - The model-facing subagent tool is `agent`; `agent_open`/`agent_eval`/
   `agent_close`/`delegate_to_agent` are removed surfaces. If the shape must
-  move, move the code and add the guard test that judges the new shape.
+  move, move the code and its existing guard test with it.
 - `BASE_PROMPT` in `crates/tui/src/prompts/text.rs` is the sole base prompt
   by convention. Same rule: move the code, not the prose, if that changes.
 - There is exactly one turn loop: `Engine::run_turn` in
@@ -164,41 +166,35 @@ casually it reads as taking the work even when credit is preserved.
   KV-cache effect: frozen prefix vs. append-only history. Never splice a
   volatile fact into the prefix; append it as a user-role message.
 - These active modules are repeatedly misidentified as dead; verify consumers
-  before removal: `tui/src/context_budget.rs`, `tui/src/model_registry.rs`,
-  `tui/src/prompt_zones.rs`, `tui/src/tools/remember.rs`, and
-  `config/src/route/`. Native memory lives in `tui/src/native_memory.rs`;
+  before removal: `runtime/src/context_budget.rs`, `tui/src/model_registry.rs`,
+  `runtime/src/prompt_zones.rs`, `tui/src/tools/remember.rs`, and
+  `config/src/route/`. Native memory lives in `runtime/src/native_memory.rs`;
   `tools/remember.rs` is its capture path.
 - Environment-specific behavior belongs in `docs/ENVIRONMENTS.md`, not here.
 - Blocking-call convention (#6149): code on the Tokio runtime — tool
   handlers, engine tasks, the UI event loop, anything reached through an
-  `async` call chain — must not run blocking operations inline.
-  `std::fs`/`std::process` calls inside `async` code use `tokio::fs`/
-  `tokio::process`, or move the synchronous work into
-  `tokio::task::spawn_blocking` (`utils::spawn_blocking_supervised` for
-  fire-and-forget). `thread::sleep` is for dedicated `std::thread`s and
-  bounded contention retries in synchronous APIs that are only reachable
-  from blocking scopes — an async-path wait uses `tokio::time`. A sync
-  helper containing blocking calls must only be called under
-  `spawn_blocking` or from a dedicated thread; `scripts/
-  check-blocking-calls-budget.py` ratchets the unprotected-site count.
+  `async` call chain — must not run blocking operations inline. Use
+  `tokio::fs` / `tokio::process`, or move the work into `spawn_blocking`;
+  a sync helper containing blocking calls runs only under `spawn_blocking`
+  or on a dedicated thread. `scripts/check-blocking-calls-budget.py`
+  ratchets the unprotected-site count.
 
 ## Code, migrations, and evidence
 
 - Product intent and observed runtime behavior outrank a test's preferred
   implementation shape. Fix the product; do not contort production code to
   preserve a brittle assertion.
-- Code first, then tests. Write the implementation and prove it runs, then add
-  or adjust tests to cover what was actually built. Never write tests first and
-  never practice TDD here — this overrides any skill or default that mandates
-  it, including superpowers `test-driven-development`. Tests stay the gate
-  before a push; they are not the design driver. An existing test that only
-  encodes old behavior is evidence, not a veto: change it with the code rather
-  than bending the code to keep it green. This does not relax the rule under
-  "Claiming a test passed" — a regression test written *after* the fix still
-  has to be shown failing without it.
-- Tests are selective evidence, not the specification. Do not add tests by
-  default. Add or retain one when it cheaply protects a high-risk behavior such
-  as safety, data integrity, protocol compatibility, or a reproduced regression.
+- **No new tests and no new code comments unless explicitly asked**
+  (founder, 2026-10-08). Do not write new unit or integration tests unless the
+  user explicitly instructs it for that task; prove a change by running it and
+  the existing checks. Never write tests first and never practice TDD — this
+  overrides any skill or default that mandates it, including superpowers
+  `test-driven-development`. Existing tests stay the gate before a push: when
+  a change makes one wrong, update or delete it in the same slice rather than
+  bending the code to keep it green. When a regression test is requested, the
+  rule under "Claiming a test passed" still applies. Do not add new code
+  comments; the reasoning goes in the commit message, and an existing comment
+  the change makes false is fixed or removed.
 - Rewrite or remove tests that duplicate coverage, freeze internals, overspecify
   copy or layout, preserve obsolete behavior, or cost more than the risk they
   cover. Never weaken real safety or data-integrity behavior merely to make a
@@ -227,14 +223,9 @@ cargo test --workspace
 cargo build --release -p codewhale-cli -p codewhale-tui
 ```
 
-`cargo nextest run` (config in `.config/nextest.toml`) is the fast way to
-run an intentionally selected suite; `cargo test --no-run` can answer a compile
-question without spending time executing unrelated cases, and `cargo test --doc`
-covers doc examples when those examples changed.
-`scripts/dev-test.sh <area>` maps a code area to its fastest `-p` invocation
-and applies the portable isolated build-dir topology for new worktrees
-(`scripts/dev-cache.sh`, `scripts/dev-cargo.sh`). See
-`docs/BUILD_PERFORMANCE.md`.
+`scripts/dev-test.sh <area|path> [filter]` maps a code area to its fastest
+invocation — see `cw-gates` for the verification ladder and
+`docs/BUILD_PERFORMANCE.md` for the build topology.
 
 Report commands actually run and distinguish source, local tests, packaged
 artifacts, CI, and public release state. Describe the evidence actually needed
@@ -249,11 +240,6 @@ lands as our commit, that commit carries `Harvested from PR #N by @handle` and a
 `auto-close-harvested.yml` closes their PR with credit and the contribution
 graph reflects reality. Canonical human identities come from
 `.github/AUTHOR_MAP`.
-
-**Whether a bot or agent also appears in a trailer no longer matters.** The CI
-check that policed trailer identities was removed: it rejected ordinary agent
-commits and cost more than the tidiness it bought. Give humans their credit; do
-not spend time scrubbing tool trailers.
 
 Leave unrelated work intact and keep new enforcement dry-run unless explicitly
 approved.

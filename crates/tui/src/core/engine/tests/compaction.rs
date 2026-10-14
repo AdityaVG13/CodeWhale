@@ -6,13 +6,13 @@ async fn rejected_manual_compaction_route_closes_typed_lifecycle() {
     let _api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let route_config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some(String::new()),
         default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         Some(crate::config::DEFAULT_TEXT_MODEL),
     )
     .expect("structurally resolve route without credential");
@@ -61,13 +61,13 @@ async fn queued_manual_compaction_cancellation_is_idempotent_and_skips_route_act
     let _api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let route_config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some(String::new()),
         default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         Some(crate::config::DEFAULT_TEXT_MODEL),
     )
     .expect("structurally resolve route without credential");
@@ -210,10 +210,12 @@ async fn manual_compaction_accounts_accepted_and_rejected_responses_once() {
             .await;
         let route_config = Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("fixture-key".to_string()),
-            base_url: Some(format!("{}/v1", server.uri())),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(
+            Some("fixture-key".to_string()),
+            Some(format!("{}/v1", server.uri())),
+        );
         let (mut engine, handle) = Engine::new(
             EngineConfig {
                 workspace: workspace.path().to_path_buf(),
@@ -396,5 +398,96 @@ async fn emergency_compaction_cancellation_drops_provider_and_never_mutates_cont
             Event::CompactionCompleted { .. } | Event::CompactionFailed { .. }
         )),
         "a canceled emergency pass must have one canceled terminal event"
+    );
+}
+
+/// Experience mark 2: a one-message conversation has nothing to summarize.
+/// Emergency recovery must not start a pass (no spinner, no model call)
+/// before the failure the caller reports anyway.
+#[tokio::test]
+async fn emergency_recovery_skips_a_history_with_nothing_to_compact() {
+    use crate::llm_client::mock::MockLlmClient;
+    let _env_lock = lock_test_env();
+    let workspace = tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", workspace.path());
+    let (mut engine, handle) = Engine::new(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+    );
+    engine.session.messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    }]
+    .into();
+    let client = MockLlmClient::new(Vec::new());
+    let mut turn = TurnContext::new(1);
+    assert!(
+        !engine
+            .recover_context_overflow(&client, None, "preflight token budget", &mut turn)
+            .await
+    );
+    assert_eq!(client.call_count(), 0, "no summary request for one message");
+    assert_eq!(turn.stop_diagnostics.emergency_compaction_attempts, 0);
+    let mut events = handle.rx_event.write().await;
+    let drained = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !drained.iter().any(|event| matches!(
+            event,
+            Event::CompactionStarted { .. } | Event::CompactionFailed { .. }
+        )),
+        "{drained:?}"
+    );
+}
+
+#[test]
+fn recovery_failures_from_the_provider_are_told_apart_from_budget_failures() {
+    use super::super::compaction::is_provider_rejection;
+    use crate::llm_client::LlmError;
+    assert!(is_provider_rejection(&anyhow::Error::new(
+        LlmError::ModelError("\"nomic-embed-text:latest\" does not support chat".to_string())
+    )));
+    assert!(is_provider_rejection(&anyhow::anyhow!(
+        "connection refused while contacting http://localhost:11434"
+    )));
+    assert!(!is_provider_rejection(&anyhow::Error::new(
+        LlmError::ContextLengthError("prompt is too long".to_string())
+    )));
+    assert!(!is_provider_rejection(&anyhow::anyhow!(
+        "Making room did not shrink the context; the original conversation was preserved."
+    )));
+}
+
+#[test]
+fn a_request_that_cannot_fit_names_the_cause_and_one_next_step() {
+    use super::super::context::context_does_not_fit_message;
+    let embed =
+        context_does_not_fit_message(true, true, "nomic-embed-text:latest", 5_200, 1_500, 5_100);
+    assert_eq!(
+        embed,
+        "nomic-embed-text:latest can't chat. Pick a chat model: /model."
+    );
+    let window = context_does_not_fit_message(true, true, "qwen3:4b", 5_300, 3_000, 5_100);
+    assert!(
+        window.contains("qwen3:4b's context window (~3000 tokens usable)"),
+        "{window}"
+    );
+    assert!(
+        window.contains("working instructions (~5100 tokens)"),
+        "{window}"
+    );
+    assert!(window.ends_with("raise num_ctx: /model."), "{window}");
+    assert!(!window.contains("compaction"), "{window}");
+    let message = context_does_not_fit_message(false, false, "small-model", 9_000, 6_000, 2_000);
+    assert!(
+        message.contains("there is not enough earlier conversation to summarize"),
+        "{message}"
+    );
+    assert!(message.ends_with("choose a larger model."), "{message}");
+    assert!(
+        !message.contains("/model"),
+        "headless has no command layer: {message}"
     );
 }

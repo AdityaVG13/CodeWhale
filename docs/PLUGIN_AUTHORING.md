@@ -7,6 +7,9 @@ The [hello-codewhale example](examples/plugins/hello-codewhale/plugin.json)
 contains two files, declares no server or hook, and asks for no tool use.
 This walkthrough takes it from source files to a reviewed, enabled skill.
 
+For a custom AI provider with host-owned OAuth, see [Plugin providers](PLUGIN_PROVIDERS.md)
+and the [provider example](examples/plugins/oauth-provider/plugin.json).
+
 ## 1. Create the bundle
 
 Use the checked-in example, or create this directory outside an installed
@@ -144,13 +147,78 @@ All components use the same bundle review and existing Codewhale runtime:
 | Commands | Markdown command files; [command metadata](architecture/command-dispatch.md#user-commands). |
 | Agent profiles | Fleet TOML profiles; [Fleet authoring](FLEET.md#authoring-agent-profiles-fleet-setup). |
 | Hooks | `HooksConfig` TOML files; [events and process behavior](HOOKS.md). |
+| Native mods (experimental) | Reviewed ESM entries contributing tools, commands, pre-execute listeners, prompt sections and owner-local JSON state; [extension contract](EXTENSIONS.md). |
 
 Declare Commands, Agents, and Hooks paths under
 `extensions["net.codewhale"]` in `plugin.json`, as specified in
 [Plugin bundles](PLUGIN_BUNDLES.md#active-and-inactive-component-surfaces).
 Do not place MCP server fields or arbitrary runtime entrypoints at the manifest
-root. LSP and native extensions can be inventoried but are not executable
-plugin adapters.
+root. LSP can be inventoried but has no executable adapter. A `native`
+extension is inventory-only by default; with the experimental
+`[features] extension_host` flag on, it names one `.mjs`, `.js` or `.mts` ES module
+file that the TypeScript extension host runs, and `/plugin validate` rejects
+any other entry. Its tools always use `Required` approval, never a plugin's
+read-only hint. Full Access, Bypass, or an exact session grant for the
+reviewed build can satisfy that gate without a prompt
+([design](design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25)).
+For a tested typed example, lifecycle rules and per-plugin diagnostics, read
+[Writing an extension tool](EXTENSIONS.md). `.mts` supports Node's erasable
+types without a separate compiler; syntax needing transformation is not supported.
+
+## Write a scoped native mod
+
+The [mod-extension example](examples/plugins/mod-extension/README.md) is a
+runnable ESM bundle with no package installation or compiler step. It registers
+`mod_counter`, `/mod-count`, one prompt section, and a pre-execute listener
+limited to its own tool. The tool returns a structured JSON counter value;
+`ctx.storage` keeps that value in the owner directory Rust assigned. Its
+idempotent disposers remove registrations and wait for queued work. Disable
+withdraws the prompt section and listener while retaining the stored counter.
+
+Enable the experimental `extension_host` feature explicitly, install the
+example directory, validate and inspect its Native capability, then personally
+review and trust its exact content/capability hashes before enabling it. With
+the feature off, native code remains inventory-only. Source changes require
+another review; `/plugin reload` is explicit, not a hot-reload watcher.
+
+The available author services are `tools`, `commands`, `prompt`, `storage`, `skills`,
+`logger`, and Cordis lifecycle facilities. `ctx.on('tools/pre-execute', ...)`
+may abstain, deny, ask, revise object input or annotate context. Rust folds those
+proposals and repeats planning and admission checks for revised input. `allow`
+does not approve anything; `next()` abstains. Errors, malformed answers,
+timeouts and withdrawn owners fail closed. This is a pre-execute proposal
+contract, with no around-execution middleware or post-result rewriting.
+
+`ctx.prompt.registerSection({id, text})` proposes bounded, attributed
+instructions delivered through the existing Engine runtime-message path.
+`ctx.storage.get/set/delete` handles bounded owner-local JSON, including state
+across generations. Neither API replaces the system prompt, session store or
+credentials. Tool and command invocations expose optional frozen `sessionId`,
+`agentId` and `originTurnId` labels supplied for that call, not runtime handles.
+The public author SDK is not published; the example uses the documented shims.
+
+`ctx.skills.registerRoot({path: 'profiles/review-skills'})` contributes child
+`SKILL.md` packages from the reviewed bundle to the existing Rust skill
+catalog. Its disposer retires the root; disable, revoke and host exit do the
+same. Rust checks the Native receipt, file hashes and current registration
+when discovering or loading a skill, including queued user selections. A
+process or host restart invalidates a saved Native selection. Bundle-relative
+paths, parser rules and count/byte limits are documented in
+[the skill-root contract](EXTENSIONS.md#skill-roots). This API adds instructions;
+tool permissions remain with the shared engine.
+
+The DSH importer described below can prepare a reviewed Native composition
+from a closed package, as well as convert portable declarative components.
+Custom Ratatui/GPUI widgets, DSH browser UI slots and DSH's agent runtime
+are not provided.
+Compatible Claude bundles still use the existing declarative component adapters;
+this Native API does not load Claude's agent loop or automatically adapt Pi's
+extension API. Port executable mod behavior against the documented host contract.
+An extension tool can use `exec.core.call` only during its direct model
+invocation under the shared turn gate. Commands and activation have no core
+handle. Nested shell and network calls force a user prompt; a mode that cannot
+open one refuses them. See [the exact core-call contract](EXTENSIONS.md#asking-the-core-to-run-a-tool)
+for refused tools, cancellation and call limits.
 
 Plugin trust is **not an OS sandbox**. A local MCP server or hook can launch a
 process; review its code and authority before enabling it. Skills do not grant
@@ -232,26 +300,88 @@ python3 scripts/convert-plugin.py --format dsh \
 The DSH input may also be JSON, but must be the plain entry list, not a full
 profile or patch composition. Each row must name `@deepseek-ai/dsh-mcp-client`.
 
-A real dsh bundle package — an npm package whose `package.json` declares
-`dsh.bundle.patch` — converts directly with `--bundle`:
+A real DeepSeek Harness bundle package — an npm package whose `package.json`
+declares `dsh.bundle.patch` — is imported natively by Codewhale, not by this
+script (`--bundle` is retired):
 
-```sh
-python3 scripts/convert-plugin.py --format dsh \
-  --bundle ./node_modules/@demo/tools-dsh --name migrated-dsh --output ./migrated-dsh
+```text
+/plugin import dsh ./node_modules/@demo/tools-dsh
+/plugin import dsh approve <package-dir> <content-hash>
 ```
 
-The converter reads the package's `cordis.patch.yml`, applies its `insert` and
-keyed-override operations over an empty profile (matching `applyEntryPatches`),
-and converts each resulting row. Rows it cannot represent — runtime plugins,
-`dsh.client` UI code, `!!js` expressions outside the documented idioms,
-conditional `disabled` flags — are listed in `CONVERSION.md` rather than
-silently dropped. The `!!js` idioms it does lower: `process.execPath` (becomes
-`node`), `process.env.NAME` and `process.env.NAME || 'literal'` (resolved
-against this machine), and `` `${process.env.NAME}...` `` templates. An `args`
-entry that resolves to a host file is snapshotted: its containing directory is
-copied into `mcp/<server>` and the resolution is recorded in the receipt. Rows
-of `@deepseek-ai/dsh-skill-filesystem` contribute their `customSkillDirs`
-children as skills when those directories live inside the package.
+The first command converts the package into scratch and shows what converts,
+what is skipped, the network hosts and local processes the bundle will request,
+and its content hash; nothing is installed. `approve` installs exactly that
+converted bundle through the ordinary reviewed installer: it lands disabled and
+untrusted, and a package edited after review installs nothing. Installing the
+package directory as a plain `/plugin install <dir>` routes to the same importer.
+`/plugin update <name>` re-converts the recorded package; changed output
+replaces the bundle and invalidates its trust receipt. The Runtime API exposes
+the same review as `POST /v1/apps/plugins/import/dsh/preview`, whose
+`install_source` and `content_hash` go to `POST /v1/apps/plugins/install`.
+Those two are the only import surfaces today: the TUI slash command
+(`/plugin import dsh <dir>` and `approve`) and the Runtime API. There is no
+`codewhale plugin` CLI subcommand for DSH import. This bundle import is also
+not the external-launcher integration `codewhale integrations dsh`, which runs
+the user's installed `dsh` (see [INTEGRATIONS_DSH.md](INTEGRATIONS_DSH.md)).
+
+`dsh.bundle.patch` may name one patch file or an ordered list of files. The
+importer reads only contained, non-linked package files (at most 64 files and
+1 MiB of patch data combined), then applies `insert` and keyed overrides over
+one empty profile. As in upstream `applyEntryPatches`, an override replaces a
+whole field: `config` is **not** deep-merged. This is not a complete profile
+resolver: other bundles, user overlays and deployment configuration are absent.
+Plain YAML scalars follow the YAML 1.2 core schema, as DSH's own parser does.
+
+Packages containing supported local modules, contained ESM package exports or
+the supported DSH service bridges can produce a Native composition. The importer
+seals the contained source files and module hashes, then generates the Native
+entry or entries. A Native graph with an unresolved or unsupported row is
+refused as a whole. It does not silently install the parts that happened to
+resolve. Reviewed agent-preset packages can produce separate Native entries;
+the selected default or child preset scopes their contributions.
+
+Import and review never execute plugin code. A generated Native composition
+remains inactive until `extension_host` is explicitly enabled and the installed
+bundle is reviewed, trusted and enabled. The host verifies its source closure
+before loading it, and Rust retains tool approval and session authority. The
+supported services, runtime limits and teardown behavior are documented in
+[EXTENSIONS.md](EXTENSIONS.md). DSH UI code and the upstream agent loop are
+outside this contract.
+
+For portable declarative conversion, disabled groups propagate their state to
+descendants. Disabled MCP declarations
+stay disabled. Disabled skills are omitted with an explicit receipt because the
+native skill format has no disabled state. A conditional/non-boolean `disabled`
+value on a group or portable row refuses the import rather than assuming it is
+enabled. Unsupported entry policy/dependency fields, including `inject`,
+`intercept` and `isolate`, also refuse the import on those rows or their groups.
+Preserve their activation and authority rules in a manual port.
+
+Unrepresentable portable components are reported in the bundle's `CONVERSION.md` and
+structured `CONVERSION.json`, with source package/version, manifest and
+ordered-layer SHA-256 hashes, converter version, per-row outcomes and required
+manual ports. Unapplied patch operations also appear in the structured
+manual-port list, with their source layer and one-based operation index.
+
+In portable conversion, the only lowered `!!js` expressions are
+`process.execPath` (becomes `node`) and
+simple quoted/template literals without escapes or interpolation. Environment
+expressions—including fallbacks—are never resolved against this machine.
+Packaged Node MCP converts only when its relative entry resolves inside the
+package (and its declared relative working directory); a server outside the
+package is skipped, and host paths are never copied. Rows of
+`@deepseek-ai/dsh-skill-filesystem` contribute their literal `customSkillDirs`
+children only when those directories live inside the package. Default user and
+project skill roots, watchers and foreign service dependencies are not imported.
+DSH modules run through the experimental TypeScript extension host
+(`[features] extension_host`, off by default), using either an explicitly
+authored Native entry or a generated reviewed composition. Tools, commands,
+prompt sections, skills, hooks and owner-local storage use Codewhale's existing
+consumers and approval rules. This is a supported compatibility subset; a
+successful import is not evidence that every upstream DSH service is available.
+See [EXTENSIONS.md](EXTENSIONS.md) and
+[design/TS_EXTENSION_HOST.md](design/TS_EXTENSION_HOST.md).
 
 ### Local Node MCP servers
 
@@ -337,7 +467,7 @@ YAML aliases/tags, `__jsExpr`, and unsupported skill runtime fields (including
 `user-invocable: false`) require a manual port. Conversion does not reproduce
 another client's runtime or bypass Codewhale's credential and sandbox rules.
 
-Read the generated `CONVERSION.md`, `plugin.json`, `mcp.json` when present, and
+Read the generated `CONVERSION.md`, `CONVERSION.json` for bundles, `plugin.json`, `mcp.json` when present, and
 all selected skill and MCP source files. Then use `/plugin install ./migrated-opencode` (or the
 DSH output path), `/plugin validate <name>`, and the same hash-bound trust and
 enable flow above. Conversion alone proves neither connectivity nor runtime
@@ -346,11 +476,21 @@ compatibility; the output is not installed, trusted, or enabled.
 Source audit, 2026-09-08: OpenCode's [v1 MCP documentation](https://github.com/anomalyco/opencode/blob/d6855b6b47a8433462ac6aeeba882ccf734cb7f1/packages/web/src/content/docs/mcp-servers.mdx)
 and [v2 MCP schema](https://github.com/anomalyco/opencode/blob/d6855b6b47a8433462ac6aeeba882ccf734cb7f1/packages/core/src/config/mcp.ts)
 at `d6855b6b47`, and DSH's [MCP client reference](https://github.com/deepseek-ai/deepseek-harness/blob/c389f96bf3a9b6807cb71ed6bdad5849be0df6d8/packages/mcp/mcp-client/README.md)
-at `c389f96bf3`. Upstream supports more than this deliberately bounded converter.
+at `c389f96bf3`. Bundle patch semantics were rechecked against DSH
+[`00102833df`](https://github.com/deepseek-ai/deepseek-harness/tree/00102833dfaee1da9f48a3a8eae9d34005a75218)
+(`0.1.7-alpha.2`); `scripts/fixtures/dsh-web-app` retains its real five-file package
+as pinned test data, not as an importable native plugin. The Rust tests in
+`crates/tui/src/plugins/install/dsh_tests.rs` load that package through the native
+importer and assert that no row is promoted to a converted component; they run in
+the workspace `Test` job. The CI `Plugin conversion` job runs only
+`scripts/test_convert_plugin.py` (the OpenCode and static DSH MCP-entry converter)
+with Python/PyYAML and synthetic Node fixtures, and the script's `--bundle` path
+refuses and points to `/plugin import dsh`. Upstream supports more than this
+deliberately bounded converter.
 
 ## Community context
 
 This guide responds to [giancarlocp's request for plugin authoring guidance
-and OpenCode conversion in discussion #5827](https://github.com/Hmbown/Codewhale/discussions/5827).
+and OpenCode conversion in discussion #5827](https://github.com/codewhale-hq/Codewhale/discussions/5827).
 The Chinese companion follows the documentation work requested by
-[SparkofSpike in issue #5482](https://github.com/Hmbown/Codewhale/issues/5482).
+[SparkofSpike in issue #5482](https://github.com/codewhale-hq/Codewhale/issues/5482).

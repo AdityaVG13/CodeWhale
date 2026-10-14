@@ -11,7 +11,7 @@ use super::qa_harness::{
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn launch(workspace: &SealedWorkspace) -> Harness {
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -28,7 +28,7 @@ fn launch(workspace: &SealedWorkspace) -> Harness {
         .size(32, 100)
         .spawn()
         .unwrap();
-    tui.wait_for_text("Type a message", TIMEOUT).unwrap();
+    tui.wait_for_composer(TIMEOUT).unwrap();
     tui
 }
 
@@ -93,7 +93,7 @@ fn contextual_tips_opt_out_survives_restart_and_preserves_caps() {
     // The existing Settings row supports pointer activation as well as the
     // command route. One click selects; the second activates the same row.
     tui.send(keys::key::f2()).unwrap();
-    tui.wait_for_text("Config", TIMEOUT).unwrap();
+    tui.wait_for_text("Settings", TIMEOUT).unwrap();
     for ch in "tips".chars() {
         tui.send(ch.to_string()).unwrap();
     }

@@ -8,7 +8,7 @@ import type { ComputerUseDict } from "../types";
  * Japanese system UI (アクセシビリティ / 画面収録 / アプリケーション).
  */
 export const computerUse: ComputerUseDict = {
-  metaTitle: "Mac 版 Computer Use · Codewhale",
+  metaTitle: "Computer Use · プレビュー · Codewhale",
   metaDescription: "Mac 版 Codewhale Computer Use をダウンロードして設定します。アプリのバックグラウンド操作、権限の設定、そして人が操作する Pause と Stop のコントロールを備えています。",
   title: "Computer Use",
   lead: "あなたが作業を続けている間に、Codewhale がアプリの中で仕事を進めます。Mac 用ヘルパーは、権限の設定、アプリのバックグラウンド操作、入力の一時停止や停止をメニューバーにまとめます。",
@@ -30,7 +30,7 @@ export const computerUse: ComputerUseDict = {
     { title: "バックグラウンドチェックを実行する", body: "ヘルパーが使い捨ての練習用ウインドウを開き、テキストを入力して、そのウインドウをキャプチャします。実行中にポインタや前面のアプリが変わらなかったかを確認します。" },
     { title: "Codewhale に接続する", body: "Codewhale のプラグインマーケットプレイスで Computer Use を確認し、信頼して有効にします。ローカル操作がヘルパーの Pause と Stop のコントロールを通るように、プラグインは 0.3.1 以降を使用してください。" },
   ],
-  controlsTitle: "作業を続けながら、主導権はあなたに。",
+  controlsTitle: "アプリ操作を一時停止または停止する",
   controlsBody: "対応している操作は、選択したアプリのバックグラウンドで実行されます。前面での操作が必要なアプリやジェスチャには、あなたの承認が必要です。メニューには対象アプリと入力モードが表示され、Pause（一時停止）はヘルパーの入力を保留し、Stop（停止）は進行中のセッションを終了します。",
   updateTitle: "アップデートはあなたのタイミングで",
   updateBody: "アプリから Check for updates（アップデートを確認）を選択します。インストール前にダウンロードしたファイル、Codewhale の署名、Apple の公証を検証し、復旧用に以前のアプリを保持します。",
@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "バックグラウンドチェックを見る",
   source: "ソースコードとその他のプラットフォーム",
   platforms: "このダウンロードは Mac 用です。Windows と Linux では現在、ソースプラグインとホスト側のセットアップを使用します。",
-  installTitle: "Mac 版 Computer Use",
-  installLead: "Computer Use ヘルパーでアプリのバックグラウンド操作を追加します。Mac の権限を設定し、バックグラウンドチェックを実行して、メニューバーからヘルパーの入力を一時停止または停止できます。",
-  installLink: "Computer Use のダウンロードと設定",
 };

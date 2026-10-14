@@ -560,6 +560,7 @@ pub fn parse_kimi_plugin_json(text: &str, root: &Path) -> Result<PluginManifest,
         hooks: None,
         lsp: None,
         native: None,
+        providers: BTreeMap::new(),
         mcp_servers: (!mcp_servers.is_empty()).then_some(mcp_servers),
         capabilities: PluginCapabilities {
             network_hosts,
@@ -647,6 +648,8 @@ pub struct CodewhalePluginExtension {
     pub lsp: Option<PluginPathSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<PluginPathSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, super::providers::PluginProviderDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<PluginCapabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -664,6 +667,7 @@ impl CodewhalePluginExtension {
             && self.hooks.is_none()
             && self.lsp.is_none()
             && self.native.is_none()
+            && self.providers.is_empty()
             && self.capabilities.is_none()
             && self.when.is_none()
     }
@@ -847,6 +851,7 @@ fn standard_server_to_config(
         disabled: extension.disabled.unwrap_or(false),
         enabled: extension.enabled.unwrap_or(true),
         required: extension.required.unwrap_or(false),
+        lazy: false,
         enabled_tools: extension.enabled_tools,
         disabled_tools: extension.disabled_tools,
         headers: server.headers.into_iter().collect(),
@@ -943,6 +948,7 @@ pub fn standard_to_manifest(
         hooks: extension.hooks,
         lsp: extension.lsp,
         native: extension.native,
+        providers: extension.providers,
         mcp_servers,
         capabilities: extension.capabilities.unwrap_or_default(),
         when: extension.when,
@@ -1031,6 +1037,7 @@ pub fn manifest_to_standard(
         hooks: manifest.hooks.clone(),
         lsp: manifest.lsp.clone(),
         native: manifest.native.clone(),
+        providers: manifest.providers.clone(),
         capabilities: (!capabilities_are_default(&manifest.capabilities))
             .then(|| manifest.capabilities.clone()),
         when: manifest.when.clone(),
@@ -1328,16 +1335,14 @@ fn validate_mcp_server_json(id: &str, server: &serde_json::Value) -> Result<(), 
     for key in ["command", "cwd", "url"] {
         optional_string(object, key).map_err(|error| format!("mcp.json server `{id}`: {error}"))?;
     }
-    for key in ["args"] {
-        if let Some(values) = object.get(key) {
-            let values = values.as_array().ok_or_else(|| {
-                format!("mcp.json server `{id}` {key} must be an array of strings")
-            })?;
-            if values.iter().any(|value| !value.is_string()) {
-                return Err(format!(
-                    "mcp.json server `{id}` {key} must be an array of strings"
-                ));
-            }
+    if let Some(values) = object.get("args") {
+        let values = values
+            .as_array()
+            .ok_or_else(|| format!("mcp.json server `{id}` args must be an array of strings"))?;
+        if values.iter().any(|value| !value.is_string()) {
+            return Err(format!(
+                "mcp.json server `{id}` args must be an array of strings"
+            ));
         }
     }
     for key in ["env", "headers"] {

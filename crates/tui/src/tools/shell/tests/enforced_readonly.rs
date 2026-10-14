@@ -37,7 +37,10 @@ async fn enforced_readonly_rejects_incompatible_shapes_before_running_anything()
     ] {
         let mut input = json!({"command": "touch should-not-exist", "read_only": true});
         input[key] = value;
-        assert!(!exec_shell_input_agent_readonly(&input), "{input}");
+        assert!(
+            exec_shell_input_agent_readonly_verdict(&input).is_err(),
+            "{input}"
+        );
         let error = BashTool::new("Bash")
             .execute(input, &context)
             .await
@@ -142,7 +145,9 @@ fn python(script: &str) -> String {
 #[tokio::test]
 #[allow(clippy::print_stderr)] // Native enforcement receipt, outside the TUI runtime.
 async fn enforced_readonly_native_python_reads_sqlite_and_cannot_write() {
-    let tmp = tempdir().unwrap();
+    // #6305: the sandbox replaces /tmp with a fresh tmpfs, so a fixture
+    // rooted there vanishes before --chdir reaches it.
+    let tmp = crate::test_support::sandbox_visible_tempdir();
     let Some(context) = native_context(tmp.path()) else {
         return;
     };
@@ -192,7 +197,9 @@ async fn enforced_readonly_native_python_reads_sqlite_and_cannot_write() {
 #[tokio::test]
 #[allow(clippy::print_stderr)] // Native enforcement receipt, outside the TUI runtime.
 async fn enforced_readonly_native_python_cannot_reach_a_loopback_listener() {
-    let tmp = tempdir().unwrap();
+    // #6305: the sandbox replaces /tmp with a fresh tmpfs, so a fixture
+    // rooted there vanishes before --chdir reaches it.
+    let tmp = crate::test_support::sandbox_visible_tempdir();
     let Some(context) = native_context(tmp.path()) else {
         return;
     };
@@ -209,7 +216,15 @@ async fn enforced_readonly_native_python_cannot_reach_a_loopback_listener() {
         )
         .await
         .unwrap_err();
-    assert!(!refused.to_string().contains("connected"), "{refused}");
+    // Python includes the submitted source line in its traceback. Only an
+    // actual output line means the script reached the print after connect.
+    assert!(
+        !refused
+            .to_string()
+            .lines()
+            .any(|line| line.trim() == "connected"),
+        "{refused}"
+    );
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

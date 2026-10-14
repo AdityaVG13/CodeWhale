@@ -2,12 +2,15 @@ export const STREAM_EVENT_NAMES = [
   "thread.started",
   "thread.updated",
   "thread.forked",
+  "thread.permissions_changed",
   "turn.started",
   "turn.lifecycle",
   "turn.usage",
   "turn.steered",
   "turn.steer_dropped",
   "turn.interrupt_requested",
+  "turn.artifacts",
+  "turn.workspace_snapshot",
   "turn.completed",
   "item.started",
   "item.delta",
@@ -18,6 +21,8 @@ export const STREAM_EVENT_NAMES = [
   "approval.required",
   "approval.decided",
   "approval.timeout",
+  "approval.grant_added",
+  "approval.grant_revoked",
   "user_input.required",
   "user_input.answered",
   "user_input.canceled",
@@ -117,6 +122,15 @@ export function applyRuntimeEvent(state, envelope) {
     const turnId = envelope.turn_id;
     const turn = turnId ? state.turns.get(turnId) : null;
     if (turn) state.turns.set(turnId, { ...turn, status: "in_progress" });
+  } else if (eventName === "turn.workspace_snapshot") {
+    // The payload is one restore-point receipt; the turn record keeps them
+    // in the order the engine took them (`workspace_snapshots`).
+    const turnId = envelope.turn_id;
+    const turn = turnId ? state.turns.get(turnId) : null;
+    if (turn && payload.kind && payload.tree_id) {
+      const receipts = Array.isArray(turn.workspace_snapshots) ? turn.workspace_snapshots : [];
+      state.turns.set(turnId, { ...turn, workspace_snapshots: [...receipts, payload] });
+    }
   } else if (
     eventName === "item.started"
     || eventName === "item.completed"
@@ -476,8 +490,140 @@ export function workflowReceiptPresentation(item, detail, raw) {
   };
 }
 
-export function eventStreamUrl(threadId, latestSeq) {
-  return `/v1/threads/${encodeURIComponent(threadId)}/events?since_seq=${normalizedSequence(latestSeq)}`;
+export function eventStreamUrl(threadId, latestSeq, ticket = "") {
+  const url = `/v1/threads/${encodeURIComponent(threadId)}/events?since_seq=${normalizedSequence(latestSeq)}`;
+  return ticket ? `${url}&web_stream_ticket=${encodeURIComponent(ticket)}` : url;
+}
+
+export function createWebSessionFetch({ location, history, storage, fetch, pageProof = "" }) {
+  const key = "codewhale_web_request_proof";
+  const fragmentProof = new URLSearchParams(location.hash.slice(1)).get("p");
+  if (fragmentProof) history.replaceState(null, "", location.pathname + location.search);
+  let proof = pageProof || fragmentProof || "";
+  if (proof) {
+    try { storage().setItem(key, proof); } catch (_) { /* Memory-only session. */ }
+  } else {
+    try { proof = storage().getItem(key) || ""; } catch (_) { /* Storage unavailable. */ }
+  }
+  return (path, options = {}) => {
+    const headers = new Headers(options.headers || {});
+    headers.set("x-codewhale-web-request", proof);
+    if (options.body != null && !headers.has("content-type")) {
+      headers.set("content-type", "application/json");
+    }
+    return fetch(path, { ...options, headers, credentials: "same-origin", cache: "no-store" });
+  };
+}
+
+// One owner for pending ticket requests, EventSources, and reconnect timers.
+// Ticket HTTP 401/403 ends retries; EventSource hides HTTP status, so its
+// errors retry through a fresh ticket request. Snapshot recovery owns its
+// own retry when it requests an open handshake.
+export function createStreamConnector({
+  app, api, EventSource, receive, setConnection, showStatus,
+  setTimeout = globalThis.setTimeout, clearTimeout = globalThis.clearTimeout,
+}) {
+  let attempt = 0;
+  let retryDelay = 900;
+  function stopStream() {
+    attempt += 1;
+    if (app.streamOpenCancel) app.streamOpenCancel();
+    app.streamOpenCancel = null;
+    if (app.stream) app.stream.close();
+    app.stream = null;
+    if (app.reconnectTimer) clearTimeout(app.reconnectTimer);
+    app.reconnectTimer = null;
+  }
+
+  async function connectStream(threadId, sequence, generation, waitForOpen = false) {
+    if (generation !== app.generation || threadId !== app.selectedThreadId) return;
+    stopStream();
+    const currentAttempt = attempt;
+    const isCurrent = () => currentAttempt === attempt
+      && generation === app.generation && threadId === app.selectedThreadId;
+    const reconnect = () => {
+      if (!isCurrent() || app.stream !== null) return;
+      setConnection("", "Reconnecting to local runtime…");
+      app.reconnectTimer = setTimeout(() => {
+        app.reconnectTimer = null;
+        if (!isCurrent() || app.stream !== null) return;
+        void connectStream(threadId, app.threadState.latestSeq, generation).catch(() => {});
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 30_000);
+    };
+    let ticket;
+    try {
+      ({ stream_ticket: ticket } = await api("/__codewhale/web/stream-ticket", { method: "POST" }));
+    } catch (error) {
+      if (!isCurrent()) return;
+      showStatus(error.message);
+      setConnection("error", "Runtime connection failed");
+      if (!waitForOpen && error.status !== 401 && error.status !== 403) reconnect();
+      throw error;
+    }
+    if (!isCurrent() || app.stream !== null) return;
+    const stream = new EventSource(eventStreamUrl(threadId, sequence, ticket), { withCredentials: true });
+    app.stream = stream;
+    let opened = false;
+    let resolveOpen;
+    let rejectOpen;
+    const openHandshake = waitForOpen
+      ? new Promise((resolve, reject) => {
+          resolveOpen = resolve;
+          rejectOpen = reject;
+        })
+      : undefined;
+    const cancelOpen = () => {
+      if (!rejectOpen) return;
+      const reject = rejectOpen;
+      resolveOpen = null;
+      rejectOpen = null;
+      reject(new Error("Runtime event stream open was cancelled"));
+    };
+    if (waitForOpen) app.streamOpenCancel = cancelOpen;
+    const clearOpenHandshake = () => {
+      if (app.streamOpenCancel === cancelOpen) app.streamOpenCancel = null;
+    };
+    stream.onopen = () => {
+      if (!isCurrent() || app.stream !== stream) {
+        stream.close();
+        return;
+      }
+      retryDelay = 900;
+      opened = true;
+      setConnection("ready", "Local runtime connected");
+      clearOpenHandshake();
+      if (resolveOpen) resolveOpen();
+      resolveOpen = null;
+      rejectOpen = null;
+    };
+    for (const name of STREAM_EVENT_NAMES) {
+      stream.addEventListener(name, (message) => {
+        if (isCurrent() && app.stream === stream) receive(stream, message, threadId, generation);
+      });
+    }
+    stream.onerror = () => {
+      if (app.stream !== stream) {
+        stream.close();
+        return;
+      }
+      stream.close();
+      app.stream = null;
+      if (generation !== app.generation || threadId !== app.selectedThreadId) return;
+      if (waitForOpen && !opened) {
+        clearOpenHandshake();
+        const reject = rejectOpen;
+        resolveOpen = null;
+        rejectOpen = null;
+        reject?.(new Error("Runtime event stream did not reopen"));
+        return;
+      }
+      reconnect();
+    };
+    return openHandshake;
+  }
+
+  return { connectStream, stopStream };
 }
 
 export function saveDraft(drafts, threadId, value) {
@@ -931,17 +1077,16 @@ function startBrowserClient() {
     dom.status.hidden = !message;
   }
 
+  const sessionFetch = createWebSessionFetch({
+    location: window.location,
+    history: window.history,
+    storage: () => window.sessionStorage,
+    pageProof: document.querySelector('meta[name="codewhale-web-request"]')?.content,
+    fetch: (...args) => fetch(...args),
+  });
+
   async function api(path, options = {}) {
-    const headers = new Headers(options.headers || {});
-    if (options.body != null && !headers.has("content-type")) {
-      headers.set("content-type", "application/json");
-    }
-    const response = await fetch(path, {
-      ...options,
-      headers,
-      credentials: "same-origin",
-      cache: "no-store",
-    });
+    const response = await sessionFetch(path, options);
     if (!response.ok) {
       let message = `${response.status} ${response.statusText}`.trim();
       try {
@@ -953,7 +1098,7 @@ function startBrowserClient() {
       if (response.status === 401) {
         message = "This browser session is not authenticated. Restart `codewhale web` to open a fresh one-time session.";
       }
-      throw new Error(message);
+      throw Object.assign(new Error(message), { status: response.status });
     }
     if (response.status === 204) return null;
     const contentType = response.headers.get("content-type") || "";
@@ -1166,14 +1311,37 @@ function startBrowserClient() {
     dom.peek.append(resume);
   }
 
-  function stopStream() {
-    if (app.streamOpenCancel) app.streamOpenCancel();
-    app.streamOpenCancel = null;
-    if (app.stream) app.stream.close();
-    app.stream = null;
-    if (app.reconnectTimer) clearTimeout(app.reconnectTimer);
-    app.reconnectTimer = null;
-  }
+  const { connectStream, stopStream } = createStreamConnector({
+    app, api, EventSource, setConnection, showStatus,
+    receive: (stream, message, threadId, generation) => {
+      try {
+        const envelope = JSON.parse(message.data);
+        if (runtimeEventContinuity(app.threadState, envelope) === "gap") {
+          app.streamGap = true;
+          renderStreamCursor();
+          showStatus("Runtime event continuity changed; refreshing the thread snapshot…");
+          void recoverProjection(threadId, generation, stream);
+          return;
+        }
+        if (!applyRuntimeEvent(app.threadState, envelope)) return;
+        renderAll(true);
+        if (
+          envelope.event === "turn.completed"
+          || envelope.event === "thread.updated"
+          || envelope.event === "approval.required"
+          || envelope.event === "approval.decided"
+          || envelope.event === "approval.timeout"
+          || envelope.event === "user_input.required"
+          || envelope.event === "user_input.answered"
+          || envelope.event === "user_input.canceled"
+        ) {
+          loadThreads().catch((error) => showStatus(error.message));
+        }
+      } catch (error) {
+        showStatus(`Could not read a Runtime event: ${error.message}`);
+      }
+    },
+  });
 
   async function selectThread(threadId) {
     if (!threadId) return;
@@ -1203,7 +1371,7 @@ function startBrowserClient() {
         threadId,
         loadSnapshot: (id) => api(`/v1/threads/${encodeURIComponent(id)}`),
         subscribe: (id, sequence) => {
-          connectStream(id, sequence, generation);
+          return connectStream(id, sequence, generation);
         },
         isCurrent: () => generation === app.generation && threadId === app.selectedThreadId,
       });
@@ -1217,100 +1385,6 @@ function startBrowserClient() {
     }
   }
 
-  function connectStream(threadId, sequence, generation, waitForOpen = false) {
-    if (generation !== app.generation || threadId !== app.selectedThreadId) return;
-    if (app.streamOpenCancel) app.streamOpenCancel();
-    app.streamOpenCancel = null;
-    if (app.stream) app.stream.close();
-    const stream = new EventSource(eventStreamUrl(threadId, sequence), { withCredentials: true });
-    app.stream = stream;
-    let opened = false;
-    let resolveOpen;
-    let rejectOpen;
-    const openHandshake = waitForOpen
-      ? new Promise((resolve, reject) => {
-          resolveOpen = resolve;
-          rejectOpen = reject;
-        })
-      : undefined;
-    const cancelOpen = () => {
-      if (!rejectOpen) return;
-      const reject = rejectOpen;
-      resolveOpen = null;
-      rejectOpen = null;
-      reject(new Error("Runtime event stream open was cancelled"));
-    };
-    if (waitForOpen) app.streamOpenCancel = cancelOpen;
-    const clearOpenHandshake = () => {
-      if (app.streamOpenCancel === cancelOpen) app.streamOpenCancel = null;
-    };
-    stream.onopen = () => {
-      opened = true;
-      setConnection("ready", "Local runtime connected");
-      clearOpenHandshake();
-      if (resolveOpen) resolveOpen();
-      resolveOpen = null;
-      rejectOpen = null;
-    };
-    const receive = (message) => {
-      if (
-        app.stream !== stream
-        || generation !== app.generation
-        || threadId !== app.selectedThreadId
-      ) return;
-      try {
-        const envelope = JSON.parse(message.data);
-        if (runtimeEventContinuity(app.threadState, envelope) === "gap") {
-          app.streamGap = true;
-          renderStreamCursor();
-          showStatus("Runtime event continuity changed; refreshing the thread snapshot…");
-          void recoverProjection(threadId, generation, stream);
-          return;
-        }
-        if (!applyRuntimeEvent(app.threadState, envelope)) return;
-        renderAll(true);
-        if (
-          envelope.event === "turn.completed"
-          || envelope.event === "thread.updated"
-          || envelope.event === "approval.required"
-          || envelope.event === "approval.decided"
-          || envelope.event === "approval.timeout"
-          || envelope.event === "user_input.required"
-          || envelope.event === "user_input.answered"
-          || envelope.event === "user_input.canceled"
-        ) {
-          loadThreads().catch((error) => showStatus(error.message));
-        }
-      } catch (error) {
-        showStatus(`Could not read a Runtime event: ${error.message}`);
-      }
-    };
-    for (const name of STREAM_EVENT_NAMES) stream.addEventListener(name, receive);
-    stream.onerror = () => {
-      if (app.stream !== stream) {
-        stream.close();
-        return;
-      }
-      stream.close();
-      app.stream = null;
-      if (generation !== app.generation || threadId !== app.selectedThreadId) return;
-      if (waitForOpen && !opened) {
-        clearOpenHandshake();
-        const reject = rejectOpen;
-        resolveOpen = null;
-        rejectOpen = null;
-        reject?.(new Error("Runtime event stream did not reopen"));
-        return;
-      }
-      setConnection("", "Reconnecting to local runtime…");
-      app.reconnectTimer = setTimeout(
-        () => connectStream(threadId, app.threadState.latestSeq, generation),
-        900,
-      );
-    };
-    return openHandshake;
-  }
-
   async function recoverProjection(threadId, generation, sourceStream = null) {
     if (
       generation !== app.generation
@@ -1318,10 +1392,7 @@ function startBrowserClient() {
       || (sourceStream && app.stream !== sourceStream)
     ) return;
 
-    if (app.stream) app.stream.close();
-    app.stream = null;
-    if (app.reconnectTimer) clearTimeout(app.reconnectTimer);
-    app.reconnectTimer = null;
+    stopStream();
     setConnection("", "Refreshing thread snapshot…");
 
     try {
@@ -1344,10 +1415,12 @@ function startBrowserClient() {
       if (generation !== app.generation || threadId !== app.selectedThreadId) return;
       showStatus(`Could not refresh the thread snapshot: ${error.message}`);
       setConnection("error", "Runtime recovery failed");
-      app.reconnectTimer = setTimeout(
-        () => recoverProjection(threadId, generation),
-        900,
-      );
+      if (error.status !== 401 && error.status !== 403) {
+        app.reconnectTimer = setTimeout(
+          () => recoverProjection(threadId, generation),
+          900,
+        );
+      }
     }
   }
 

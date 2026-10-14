@@ -167,11 +167,20 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn tool_media_publication_is_immutable_and_replay_preserves_manifest() {
+    #[test]
+    fn tool_media_publication_is_immutable_and_replay_preserves_manifest() {
+        // Serialize the shared disk fixture before entering the async runtime.
         let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
             .lock()
             .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(check_tool_media_publication_is_immutable_and_replay_preserves_manifest());
+    }
+
+    async fn check_tool_media_publication_is_immutable_and_replay_preserves_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let _root = ArtifactRoot(crate::artifacts::set_test_artifact_sessions_root(Some(
             temp.path().to_owned(),
@@ -279,11 +288,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn tool_media_rejects_spoofed_mime_bytes_and_plugin_descriptors() {
+    #[test]
+    fn tool_media_rejects_spoofed_mime_bytes_and_plugin_descriptors() {
+        // Serialize the shared disk fixture before entering the async runtime.
         let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
             .lock()
             .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(check_tool_media_rejects_spoofed_mime_bytes_and_plugin_descriptors());
+    }
+
+    async fn check_tool_media_rejects_spoofed_mime_bytes_and_plugin_descriptors() {
         let temp = tempfile::tempdir().unwrap();
         let _root = ArtifactRoot(crate::artifacts::set_test_artifact_sessions_root(Some(
             temp.path().to_owned(),

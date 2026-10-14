@@ -182,7 +182,7 @@ pub(super) fn apply_subagent_terminal_projection(
     true
 }
 
-fn worker_status_for_terminal_projection(status: &SubAgentStatus) -> AgentWorkerStatus {
+pub(crate) fn worker_status_for_terminal_projection(status: &SubAgentStatus) -> AgentWorkerStatus {
     match status {
         SubAgentStatus::Running => AgentWorkerStatus::Running,
         SubAgentStatus::Completed => AgentWorkerStatus::Completed,
@@ -588,13 +588,23 @@ pub(super) fn handle_subagent_mailbox_for_turn(
     let is_fanout = matches!(dispatch_kind, Some("rlm_open" | "rlm_eval" | "rlm"));
 
     if is_fanout {
+        // A completion-first delivery opens the slot settled, as the delegate
+        // path does; recording it as running would leave a finished worker
+        // counted as running with nothing left to settle it (U05-04).
+        let first_status = match &display_message {
+            MailboxMessage::Completed { .. } => AgentLifecycle::Completed,
+            MailboxMessage::Failed { .. } => AgentLifecycle::Failed,
+            MailboxMessage::Interrupted { .. } => AgentLifecycle::Interrupted,
+            MailboxMessage::Cancelled { .. } => AgentLifecycle::Cancelled,
+            _ => AgentLifecycle::Running,
+        };
         // Reuse the active fanout card for sibling spawns; otherwise create
         // one anchored at this position so subsequent siblings join it.
         if let Some(idx) = app.last_fanout_card_index
             && let Some(HistoryCell::SubAgent(SubAgentCell::Fanout(card))) =
                 app.history.get_mut(idx)
         {
-            let updated = card.claim_pending_worker(&agent_id, AgentLifecycle::Running);
+            let updated = card.claim_pending_worker(&agent_id, first_status);
             app.subagent_card_index.insert(agent_id, idx);
             if updated {
                 app.bump_history_cell(idx);
@@ -602,7 +612,7 @@ pub(super) fn handle_subagent_mailbox_for_turn(
             updated
         } else {
             let mut card = FanoutCard::new(dispatch_kind.unwrap_or("rlm_eval").to_string());
-            card.upsert_worker(&agent_id, AgentLifecycle::Running);
+            card.upsert_worker(&agent_id, first_status);
             app.add_message(HistoryCell::SubAgent(SubAgentCell::Fanout(card)));
             let idx = app.history.len().saturating_sub(1);
             app.last_fanout_card_index = Some(idx);
@@ -693,6 +703,7 @@ fn bounded_mailbox_message(message: &MailboxMessage) -> MailboxMessage {
 fn record_agent_current_activity(app: &mut App, message: &MailboxMessage) {
     let agent_id = message.agent_id().to_string();
     let meta = app.agent_progress_meta.entry(agent_id).or_default();
+    meta.last_progress_at = Some(Instant::now());
     if let MailboxMessage::TokenUsage { route, usage, .. } = message {
         // The child's own used-token tally (input + output), matching the
         // worker budget's `usage_total_tokens`. Counting only completions made
@@ -818,13 +829,31 @@ fn record_agent_current_activity(app: &mut App, message: &MailboxMessage) {
         MailboxMessage::WorkState { .. } => unreachable!("work state handled above"),
     };
 
-    meta.current_activity = Some(AgentCurrentActivity::bounded(
-        status,
-        detail,
-        current_tool.clone(),
-        step,
-    ));
-    meta.current_tool = current_tool;
+    // A settled agent is final, as on its transcript card (U05-04): mailbox
+    // producers are concurrent, so a Started/Progress/tool envelope can land
+    // after the terminal one. It must not move the Work row back to active.
+    // Only settlements whose continuation is a *new* agent latch; `Waiting`
+    // (a question) resumes this same agent. The manager snapshot
+    // (`reconcile_subagent_activity_state`) stays the authority either way.
+    let settled = previous.as_ref().is_some_and(|activity| {
+        matches!(
+            activity.status,
+            AgentCurrentActivityStatus::Done
+                | AgentCurrentActivityStatus::Failed
+                | AgentCurrentActivityStatus::Canceled
+                | AgentCurrentActivityStatus::Interrupted
+                | AgentCurrentActivityStatus::Parked
+        )
+    });
+    if !settled {
+        meta.current_activity = Some(AgentCurrentActivity::bounded(
+            status,
+            detail,
+            current_tool.clone(),
+            step,
+        ));
+        meta.current_tool = current_tool;
+    }
     if let MailboxMessage::ToolCallCompleted {
         tool_name,
         ok: true,
@@ -849,6 +878,7 @@ pub(super) fn task_mode_label(mode: AppMode) -> &'static str {
 
 pub(super) fn task_summary_to_panel_entry(summary: TaskSummary) -> TaskPanelEntry {
     TaskPanelEntry {
+        exit_code: None,
         id: summary.id,
         status: task_status_label(summary.status).to_string(),
         prompt_summary: summary.prompt_summary,
@@ -898,7 +928,7 @@ pub(super) fn format_task_list(tasks: &[TaskSummary]) -> String {
     for task in tasks {
         let duration = task
             .duration_ms
-            .map(crate::elapsed::format_elapsed_ms)
+            .map(codewhale_command_contract::elapsed::format_elapsed_ms)
             .unwrap_or_else(|| "-".to_string());
         let owner_session = task.owner_session_id.as_deref().unwrap_or("-");
         let owner_session = if owner_session.chars().count() > 12 {
@@ -975,7 +1005,7 @@ fn format_task_detail(task: &TaskRecord) -> String {
     if let Some(duration) = task.duration_ms {
         lines.push(format!(
             "Duration: {}",
-            crate::elapsed::format_elapsed_ms(duration)
+            codewhale_command_contract::elapsed::format_elapsed_ms(duration)
         ));
     }
     lines.push(String::new());
@@ -1064,12 +1094,12 @@ mod tests {
             start_in_agent_mode: true,
             initial_input: None::<InitialInput>,
             startup_notice: None,
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         }
     }
 
     fn test_route(
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
         model: &str,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
         crate::cost_status::EffectiveRouteEnvelope::capture(
@@ -1077,7 +1107,7 @@ mod tests {
             provider,
             provider.as_str(),
             model,
-            Some(provider.default_base_url()),
+            Some(provider.provider().default_base_url()),
             Utc::now(),
         )
     }
@@ -1118,6 +1148,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Worker,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: format!("objective-{id}"),
                 role: Some("worker".to_string()),
             },
@@ -1136,6 +1167,8 @@ mod tests {
             duration_ms: 0,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -1320,7 +1353,7 @@ mod tests {
                 agent_id: "agent_route".to_string(),
                 source_id: "response-route".to_string(),
                 route: Box::new(test_route(
-                    crate::config::ApiProvider::Openrouter,
+                    crate::config::ProviderKind::Openrouter,
                     "vendor/model-real",
                 )),
                 usage: codewhale_models::Usage::default(),
@@ -1337,7 +1370,7 @@ mod tests {
     #[test]
     fn token_usage_accumulates_input_plus_output_across_child_turns() {
         let mut app = App::new(test_options(), &Config::default());
-        let route = test_route(crate::config::ApiProvider::Deepseek, "deepseek-v4-flash");
+        let route = test_route(crate::config::ProviderKind::Deepseek, "deepseek-v4-flash");
         handle_subagent_mailbox(
             &mut app,
             1,

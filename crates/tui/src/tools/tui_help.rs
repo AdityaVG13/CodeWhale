@@ -1,8 +1,8 @@
 //! On-demand command and keybinding reference: `tui_help`.
 //!
 //! Every field is read back out of the registries the human-facing help
-//! renders from — `commands::command_infos()`, the user-command registry, and
-//! `tui::keybindings::KEYBINDINGS` — so the model-facing reference cannot
+//! renders from — `command_catalog::CommandCatalog`, the user-command registry, and
+//! `keybinding_table::KEYBINDINGS` — so the model-facing reference cannot
 //! drift from `/help` and the help overlay.
 
 use std::path::Path;
@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::commands::{self, user_registry};
-use crate::tui::keybindings::KEYBINDINGS;
+use crate::command_catalog::{BuiltinCommand, CommandCatalog};
+use crate::keybinding_table::KEYBINDINGS;
 use codewhale_localization::{Locale, tr};
 
 use super::spec::{
@@ -108,7 +108,18 @@ impl ToolSpec for TuiHelpTool {
             Some(_) => return Err(ToolError::invalid_input("`query` must be a string")),
         };
 
-        let help = build_help(ui_locale(), &context.workspace, query.as_deref());
+        let catalog = crate::command_catalog::installed()
+            .ok_or_else(|| ToolError::execution_failed("command catalog is not installed"))?;
+        let workspace = context.workspace.clone();
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
+        let help = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
+            build_help(catalog.as_ref(), ui_locale(), &workspace, query.as_deref())
+        })
+        .await
+        .map_err(|error| ToolError::execution_failed(error.to_string()))?;
         ToolResult::json(&help).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
@@ -127,13 +138,18 @@ fn ui_locale() -> Locale {
     )
 }
 
-fn build_help(locale: Locale, workspace: &Path, query: Option<&str>) -> HelpOutput {
+fn build_help(
+    catalog: &dyn CommandCatalog,
+    locale: Locale,
+    workspace: &Path,
+    query: Option<&str>,
+) -> HelpOutput {
     let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
-        return cheatsheet(locale, workspace);
+        return cheatsheet(catalog, locale, workspace);
     };
     let needle = query.to_lowercase();
 
-    let mut commands: Vec<(u8, CommandEntry)> = all_commands(locale, workspace)
+    let mut commands: Vec<(u8, CommandEntry)> = all_commands(catalog, locale, workspace)
         .into_iter()
         .filter_map(|entry| entry.rank(&needle).map(|rank| (rank, entry)))
         .collect();
@@ -165,15 +181,16 @@ fn build_help(locale: Locale, workspace: &Path, query: Option<&str>) -> HelpOutp
 
 /// Unscoped answer: the commands the help overlay shows at its root, capped
 /// like every other answer.
-fn cheatsheet(locale: Locale, workspace: &Path) -> HelpOutput {
+fn cheatsheet(catalog: &dyn CommandCatalog, locale: Locale, workspace: &Path) -> HelpOutput {
     // User commands lead: they are workspace-specific and unguessable, where a
     // built-in is stable enough to be worth querying by name.
-    let mut entries = user_commands(workspace);
+    let mut entries = user_commands(catalog, workspace);
     entries.extend(
-        commands::command_infos()
+        catalog
+            .builtins()
             .into_iter()
-            .filter(|info| info.show_in_empty_discovery())
-            .map(|info| builtin_entry(info, locale)),
+            .filter(|info| info.show_in_empty_discovery)
+            .map(|info| builtin_entry(&info, locale)),
     );
     let keybindings = all_keybindings(locale);
 
@@ -195,45 +212,49 @@ fn take_entries<T>(ranked: Vec<(u8, T)>, limit: usize) -> Vec<T> {
         .collect()
 }
 
-fn builtin_entry(info: &'static commands::traits::CommandInfo, locale: Locale) -> CommandEntry {
+fn builtin_entry(info: &BuiltinCommand, locale: Locale) -> CommandEntry {
     let command = format!("/{}", info.name);
     CommandEntry {
         usage: Some(info.usage.trim().to_string()).filter(|usage| *usage != command),
         command,
-        description: info.description_for(locale).into_owned(),
+        description: tr(locale, info.description_id).into_owned(),
         aliases: info.aliases.iter().map(|alias| alias.to_string()).collect(),
         source: "builtin".to_string(),
     }
 }
 
-fn all_commands(locale: Locale, workspace: &Path) -> Vec<CommandEntry> {
-    let mut entries: Vec<CommandEntry> = commands::command_infos()
+fn all_commands(
+    catalog: &dyn CommandCatalog,
+    locale: Locale,
+    workspace: &Path,
+) -> Vec<CommandEntry> {
+    let mut entries: Vec<CommandEntry> = catalog
+        .builtins()
         .into_iter()
         // Unlisted commands still run when typed; help does not teach them.
-        .filter(|info| !info.is_unlisted())
-        .map(|info| builtin_entry(info, locale))
+        .filter(|info| !info.unlisted)
+        .map(|info| builtin_entry(&info, locale))
         .collect();
-    entries.extend(user_commands(workspace));
+    entries.extend(user_commands(catalog, workspace));
     entries
 }
 
 /// The user registry is keyed by a hash map, so sort for a stable answer.
-fn user_commands(workspace: &Path) -> Vec<CommandEntry> {
-    user_registry::with_registry_for_workspace(Some(workspace), |registry| {
-        let mut entries: Vec<CommandEntry> = registry
-            .iter()
-            .filter(|metadata| !metadata.hidden)
-            .map(|metadata| CommandEntry {
-                command: format!("/{}", metadata.name),
-                usage: metadata.display_usage().map(str::to_string),
-                description: metadata.description.clone().unwrap_or_default(),
-                aliases: metadata.aliases.clone(),
-                source: "user".to_string(),
-            })
-            .collect();
-        entries.sort_by(|a, b| a.command.cmp(&b.command));
-        entries
-    })
+fn user_commands(catalog: &dyn CommandCatalog, workspace: &Path) -> Vec<CommandEntry> {
+    let mut entries: Vec<CommandEntry> = catalog
+        .user_commands(workspace)
+        .into_iter()
+        .filter(|metadata| !metadata.hidden)
+        .map(|metadata| CommandEntry {
+            command: format!("/{}", metadata.name),
+            usage: metadata.usage,
+            description: metadata.description.unwrap_or_default(),
+            aliases: metadata.aliases,
+            source: "user".to_string(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.command.cmp(&b.command));
+    entries
 }
 
 fn all_keybindings(locale: Locale) -> Vec<KeybindingEntry> {
@@ -296,19 +317,55 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    struct Catalog;
+    impl CommandCatalog for Catalog {
+        fn answers_to(&self, _: &str) -> bool {
+            false
+        }
+        fn builtins(&self) -> Vec<BuiltinCommand> {
+            ["mode".to_string(), "compact".to_string()]
+                .into_iter()
+                .chain((0..13).map(|index| format!("edge{index}")))
+                .map(|name| BuiltinCommand {
+                    usage: format!("/{name} [value]"),
+                    name,
+                    aliases: Vec::new(),
+                    description_id: codewhale_localization::MessageId::CmdModeDescription,
+                    subcommands: Vec::new(),
+                    takes_arguments: true,
+                    requires_argument: true,
+                    requires_required_argument: false,
+                    composer_wants_trailing_space: true,
+                    palette_runs_directly: false,
+                    show_in_empty_discovery: true,
+                    discovery: codewhale_command_contract::CommandDiscovery::Primary,
+                    unlisted: false,
+                })
+                .collect()
+        }
+        fn user_commands(&self, _: &Path) -> Vec<crate::command_catalog::UserCommand> {
+            Vec::new()
+        }
+    }
+
     #[test]
     fn scoped_query_answers_from_the_command_and_keybinding_registries() {
         let tmp = tempdir().expect("tempdir");
-        let help = build_help(Locale::En, tmp.path(), Some("mode"));
+        let help = build_help(&Catalog, Locale::En, tmp.path(), Some("mode"));
 
         let mode = help
             .commands
             .iter()
             .find(|entry| entry.command == "/mode")
             .unwrap_or_else(|| panic!("no /mode in {:?}", help.commands));
-        let info = commands::get_command_info("mode").expect("registered /mode");
-        assert_eq!(mode.usage.as_deref(), Some(info.usage));
-        assert_eq!(mode.description, info.description_for(Locale::En));
+        assert_eq!(mode.usage.as_deref(), Some("/mode [value]"));
+        assert_eq!(
+            mode.description,
+            tr(
+                Locale::En,
+                codewhale_localization::MessageId::CmdModeDescription
+            )
+        );
 
         assert!(
             help.keybindings
@@ -326,7 +383,7 @@ mod tests {
     #[test]
     fn exact_command_name_outranks_incidental_mentions() {
         let tmp = tempdir().expect("tempdir");
-        let help = build_help(Locale::En, tmp.path(), Some("compact"));
+        let help = build_help(&Catalog, Locale::En, tmp.path(), Some("compact"));
 
         assert_eq!(
             help.commands.first().map(|entry| entry.command.as_str()),
@@ -337,7 +394,7 @@ mod tests {
     #[test]
     fn unmatched_query_returns_nothing_rather_than_everything() {
         let tmp = tempdir().expect("tempdir");
-        let help = build_help(Locale::En, tmp.path(), Some("zzzz-no-such-topic"));
+        let help = build_help(&Catalog, Locale::En, tmp.path(), Some("zzzz-no-such-topic"));
 
         assert!(help.commands.is_empty());
         assert!(help.keybindings.is_empty());
@@ -350,12 +407,12 @@ mod tests {
         // A query every entry matches on the description axis would otherwise
         // dump the whole catalog.
         for query in [None, Some("e")] {
-            let help = build_help(Locale::En, tmp.path(), query);
+            let help = build_help(&Catalog, Locale::En, tmp.path(), query);
             assert!(help.commands.len() <= MAX_COMMANDS, "{query:?}");
             assert!(help.keybindings.len() <= MAX_KEYBINDINGS, "{query:?}");
         }
 
-        let broad = build_help(Locale::En, tmp.path(), Some("e"));
+        let broad = build_help(&Catalog, Locale::En, tmp.path(), Some("e"));
         assert!(
             broad.omitted_commands > 0,
             "a catalog-wide query must report the dropped matches"
@@ -365,7 +422,7 @@ mod tests {
     #[test]
     fn blank_query_falls_back_to_the_cheatsheet() {
         let tmp = tempdir().expect("tempdir");
-        let help = build_help(Locale::En, tmp.path(), Some("   "));
+        let help = build_help(&Catalog, Locale::En, tmp.path(), Some("   "));
 
         assert!(help.query.is_none());
         assert!(!help.commands.is_empty());
@@ -375,6 +432,7 @@ mod tests {
     async fn execute_returns_json_and_rejects_non_string_queries() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path());
+        let _catalog = crate::command_catalog::CatalogGuard::install(std::sync::Arc::new(Catalog));
 
         let result = TuiHelpTool
             .execute(json!({ "query": "mode" }), &ctx)

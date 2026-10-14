@@ -570,10 +570,8 @@ mod tests {
         // `new_with_sessions`, so both sides still see one store snapshot.
         let tmp = TempDir::new().expect("tempdir");
         let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
-        let workspace = tmp.path().join("workspace");
-        let other = tmp.path().join("other");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        std::fs::create_dir_all(&other).expect("other");
+        let workspace = PathBuf::from("/repo");
+        let other = PathBuf::from("/other");
 
         for (id, title, ws) in [
             ("alpha", "Alpha work", &workspace),
@@ -904,7 +902,7 @@ mod tests {
             for forbidden in [
                 "reqwest",
                 "llm_client",
-                "ApiProvider",
+                "ProviderKind",
                 "http://",
                 "https://",
             ] {

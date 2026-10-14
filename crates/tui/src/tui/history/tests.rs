@@ -18,18 +18,16 @@
 //! * One test per property, with its cases in a table — not one test per case.
 //! * Never assert `a || b` where `b` is trivially true of any English string.
 
-use super::constants::{
-    TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_LINE_LIMIT, TOOL_OUTPUT_TAIL_LINES,
-    TOOL_SUCCESS_OUTPUT_PREVIEW_LINES,
-};
+use super::constants::{TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_LINE_LIMIT, TOOL_OUTPUT_TAIL_LINES};
 use super::thinking::cached_color_depth;
 use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
     REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, RenderMode, ToolCell, ToolStatus,
-    TranscriptRenderOptions, WebSearchCell, assistant_label_style_for, extract_reasoning_summary,
-    render_spillover_annotation, render_thinking, render_thinking_with_analysis,
-    running_status_label_with_elapsed,
+    TranscriptFold, TranscriptRenderOptions, WebSearchCell, assistant_label_style_for,
+    extract_reasoning_summary, render_spillover_annotation, render_thinking,
+    render_thinking_with_analysis, running_status_label_with_elapsed,
 };
+use crate::session_manager::{SessionManager, create_saved_session};
 use crate::tools::plan::{PlanSnapshot, StepStatus};
 use crate::tui::motion::MotionMode;
 use crate::tui::ui_text::{
@@ -38,6 +36,36 @@ use crate::tui::ui_text::{
 use codewhale_models::{ContentBlock, Message, Role};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tempfile::tempdir;
+
+#[test]
+fn extension_prompt_snapshots_and_withdrawal_show_the_complete_model_input() {
+    let instructions = format!("{}\nLast instruction.", "x".repeat(12_000));
+    for block in [Some(instructions.as_str()), None] {
+        let message = crate::runtime_handoff::extension_prompt_contributions_runtime_message(block);
+        let cells = super::history_cells_from_message(&message);
+        let [HistoryCell::System { content }] = cells.as_slice() else {
+            panic!("runtime instructions must be shown as a system receipt");
+        };
+        match block {
+            Some(text) => assert!(
+                content.contains(text),
+                "the full model-visible text stays auditable"
+            ),
+            None => assert!(content.contains("withdrawn")),
+        }
+    }
+    let message = crate::runtime_handoff::mcp_server_instructions_runtime_message(&[(
+        "guided".into(),
+        "Search before fetching.".into(),
+    )]);
+    let cells = super::history_cells_from_message(&message);
+    assert!(
+        matches!(cells.as_slice(), [HistoryCell::System { content }]
+            if content.contains("Search before fetching.")),
+        "the transcript shows what the model saw"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -80,6 +108,7 @@ fn exec_tool(command: &str, status: ToolStatus) -> ExecCell {
         duration_ms: None,
         stale_elapsed_since_output_ms: None,
         source: ExecSource::Assistant,
+        description: None,
         interaction: None,
         output_summary: None,
     }
@@ -96,6 +125,87 @@ fn calm_options() -> TranscriptRenderOptions {
     TranscriptRenderOptions {
         low_motion: true,
         ..TranscriptRenderOptions::default()
+    }
+}
+
+#[test]
+fn ordinary_cell_fold_preserves_body_metadata_and_full_exports() {
+    let content = format!(
+        "[reference](https://example.com/reference)\n\n{}",
+        (1..=12)
+            .map(|line| format!("paragraph {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    let mut tool = exec_tool("example", ToolStatus::Failed);
+    tool.output = Some(content.clone());
+    let cells = [
+        HistoryCell::User {
+            content: content.clone(),
+        },
+        HistoryCell::Assistant {
+            content: content.clone(),
+            streaming: false,
+        },
+        HistoryCell::Assistant {
+            content: content.clone(),
+            streaming: true,
+        },
+        HistoryCell::System {
+            content: content.clone(),
+        },
+        HistoryCell::Error {
+            message: content.clone(),
+            severity: crate::error_taxonomy::ErrorSeverity::Error,
+        },
+        HistoryCell::Tool(ToolCell::Exec(tool)),
+    ];
+    for cell in cells {
+        let options = calm_options();
+        let full = cell.lines_with_copy_metadata(80, options);
+        let (preview, action) =
+            cell.lines_with_copy_metadata_folded(80, options, Some(TranscriptFold::Collapsed));
+        assert!(
+            preview.len() < full.len(),
+            "a folded long body stays bounded"
+        );
+        assert_eq!(action, Some(super::CellFoldAction::Expand));
+        assert_eq!(preview[0].copy_prefix_width, preview[0].line.width());
+        assert!(preview[0].links.is_empty());
+        let body = &preview[1..];
+        for (index, line) in body.iter().enumerate() {
+            assert_eq!(line.line, full[index].line);
+            assert_eq!(line.links, full[index].links);
+            assert_eq!(line.copy_prefix_width, full[index].copy_prefix_width);
+            if index + 1 < body.len() {
+                assert_eq!(line.copy_separator_after, full[index].copy_separator_after);
+            }
+        }
+        assert_eq!(
+            body.last().unwrap().copy_separator_after,
+            crate::tui::ui_text::CopyLineSeparator::Newline
+        );
+        let (plain, plain_action) =
+            cell.lines_with_options_folded(80, options, Some(TranscriptFold::Collapsed));
+        assert_eq!(plain_action, action);
+        assert_eq!(
+            plain,
+            preview
+                .iter()
+                .map(|line| line.line.clone())
+                .collect::<Vec<_>>()
+        );
+        let (restored, action) =
+            cell.lines_with_copy_metadata_folded(80, options, Some(TranscriptFold::Expanded));
+        assert!(action.is_none());
+        assert_eq!(restored.len(), full.len());
+        for (restored, original) in restored.iter().zip(&full) {
+            assert_eq!(restored.line, original.line);
+            assert_eq!(restored.links, original.links);
+            assert_eq!(restored.copy_prefix_width, original.copy_prefix_width);
+            assert_eq!(restored.copy_separator_after, original.copy_separator_after);
+        }
+        assert!(lines_text(&cell.transcript_lines(80)).contains("paragraph 12"));
     }
 }
 
@@ -304,14 +414,10 @@ fn a_live_card_spends_the_whole_output_budget_it_advertises() {
     }
 }
 
-/// Failure output is the one thing worth the vertical space. Whatever the
-/// display settings say about density, a failed tool's body stays expanded and
-/// is never traded for an omission marker or a "see details" affordance — the
-/// user should not have to press a key to learn why something broke.
-///
-/// Replaces four tests that differed only in which option flag they set.
+/// Failure keeps the invocation plus head/tail evidence visible under every
+/// density setting; the full record remains in the details view.
 #[test]
-fn failed_tool_output_is_never_traded_for_an_affordance() {
+fn calm1_failed_tool_keeps_context_and_result_under_every_density_setting() {
     let total = 30usize;
     let last = format!("row {:02} plain content", total - 1);
 
@@ -341,8 +447,8 @@ fn failed_tool_output_is_never_traded_for_an_affordance() {
 
         let text = lines_text(&cell.lines_with_options(80, options));
         assert!(
-            !text.contains("lines omitted"),
-            "[{label}] failed output must not be hidden behind an omission marker: {text}"
+            text.contains("lines omitted"),
+            "[{label}] a bounded failure must advertise omitted output: {text}"
         );
         assert!(
             text.contains(&last),
@@ -412,15 +518,27 @@ fn whatever_live_truncates_the_transcript_still_holds() {
         .filter(|i| live_text.contains(&format!("row {i:02} plain content")))
         .count();
     assert_eq!(
-        previewed, TOOL_SUCCESS_OUTPUT_PREVIEW_LINES,
-        "a successful exec previews exactly {TOOL_SUCCESS_OUTPUT_PREVIEW_LINES} \
-         rows: {live_text}"
+        previewed, 3,
+        "a successful exec previews only the opening and final result rows: {live_text}"
     );
     assert!(
-        live_text.contains(first) && !live_text.contains(&last),
-        "the preview reads from the top and stops: {live_text}"
+        live_text.contains(first) && live_text.contains(&last),
+        "the bounded preview retains context and the final result: {live_text}"
+    );
+    let output_hint = crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output");
+    assert!(
+        live_text.contains(&output_hint),
+        "a shortened success must point to its full output: {live_text}"
+    );
+    assert!(
+        !live_text.contains("row 15 plain content"),
+        "the live preview should leave routine middle output for details: {live_text}"
     );
     assert!(transcript_text.contains(first) && transcript_text.contains(&last));
+    assert!(
+        transcript_text.contains("row 15 plain content"),
+        "the full transcript must retain output omitted from the live card: {transcript_text}"
+    );
 
     // Successful generic tool: output collapses entirely live, and does so
     // without spending a row telling the user it collapsed.
@@ -438,6 +556,102 @@ fn whatever_live_truncates_the_transcript_still_holds() {
     );
     assert!(transcript_text.contains(first));
     assert!(transcript_text.contains("row 23 plain content"));
+}
+
+/// A successful run shows three rows of output. They used to be the first two
+/// and the very last, so `npm test` showed a blank row, the script banner and
+/// a timing line, and hid whether the tests passed. The rows that say how the
+/// run went must be among the three, blank rows must not take a slot, and
+/// every hidden row must be announced, including rows after the last one shown.
+#[test]
+fn a_successful_run_preview_shows_how_the_run_ended() {
+    let node_test = "\n> trip-timer@1.0.0 test\n> node --test\n\n\
+                     ✔ formats minutes (0.5ms)\n\
+                     ✔ trips over an hour show remainder minutes (0.1ms)\n\
+                     ℹ tests 2\nℹ suites 0\nℹ pass 2\nℹ fail 0\nℹ cancelled 0\n\
+                     ℹ skipped 0\nℹ todo 0\nℹ duration_ms 57.924542";
+    let cargo_test = "   Compiling demo v0.1.0\n     Running unittests src/lib.rs\n\n\
+                      running 2 tests\ntest a ... ok\ntest b ... ok\n\n\
+                      test result: ok. 2 passed; 0 failed; finished in 0.00s\n\n";
+    let plain = numbered_output(30);
+
+    // (case, output, rows that must be shown, omission markers in order)
+    let cases: [(&str, &str, &[&str], &[&str]); 3] = [
+        (
+            "totals followed by other lines",
+            node_test,
+            &["> trip-timer@1.0.0 test", "ℹ pass 2", "ℹ fail 0"],
+            &["5 lines omitted", "4 lines omitted"],
+        ),
+        (
+            "result followed by blank lines",
+            cargo_test,
+            &[
+                "Compiling demo v0.1.0",
+                "test b ... ok",
+                "test result: ok. 2 passed; 0 failed",
+            ],
+            &["3 lines omitted"],
+        ),
+        (
+            "nothing states an outcome",
+            &plain,
+            &[
+                "row 00 plain content",
+                "row 28 plain content",
+                "row 29 plain content",
+            ],
+            &["27 lines omitted"],
+        ),
+    ];
+
+    for (case, output, shown, markers) in cases {
+        let cell = {
+            let mut exec = exec_tool("npm test", ToolStatus::Success);
+            exec.output = Some(output.to_string());
+            exec.duration_ms = Some(120);
+            HistoryCell::Tool(ToolCell::Exec(exec))
+        };
+        let live = cell.lines_with_options(80, calm_options());
+        let live_text = lines_text(&live);
+
+        for row in shown {
+            assert!(
+                live_text.contains(row),
+                "[{case}] `{row}` hidden: {live_text}"
+            );
+        }
+        let source_rows_shown = output
+            .lines()
+            .filter(|line| !line.trim().is_empty() && live_text.contains(line.trim()))
+            .count();
+        assert_eq!(
+            source_rows_shown,
+            shown.len(),
+            "[{case}] the preview keeps its three-row budget: {live_text}"
+        );
+        let announced: Vec<String> = live
+            .iter()
+            .map(line_text)
+            .filter(|line| line.contains("lines omitted"))
+            .collect();
+        assert_eq!(
+            announced.len(),
+            markers.len(),
+            "[{case}] every gap is announced once: {live_text}"
+        );
+        for (line, marker) in announced.iter().zip(markers) {
+            assert!(line.contains(marker), "[{case}] `{marker}`: {live_text}");
+        }
+
+        let transcript_text = lines_text(&cell.transcript_lines(80));
+        for line in output.lines() {
+            assert!(
+                transcript_text.contains(line.trim()),
+                "[{case}] the transcript keeps `{line}`: {transcript_text}"
+            );
+        }
+    }
 }
 
 /// Repro for #80: a `git diff --stat`-shaped result must keep its newlines on
@@ -506,17 +720,17 @@ fn reasoning_folds_in_live_and_the_fold_is_reversible() {
             low_motion: true,
             ..TranscriptRenderOptions::default()
         };
-        // `folded` is the Space toggle *relative to* the configured default,
-        // so the expanded state is whichever call disagrees with it. Running
-        // both defaults proves the toggle survives the inversion.
+        // An explicit intent says expanded or collapsed outright, so the same
+        // two calls answer for either configured default. Running both proves
+        // the intent is not re-read through the preference.
         let expanded = lines_text(
             &cell
-                .lines_with_options_folded(80, options, !default_expanded)
+                .lines_with_options_folded(80, options, Some(TranscriptFold::Expanded))
                 .0,
         );
         let collapsed = lines_text(
             &cell
-                .lines_with_options_folded(80, options, default_expanded)
+                .lines_with_options_folded(80, options, Some(TranscriptFold::Collapsed))
                 .0,
         );
 
@@ -544,12 +758,14 @@ fn reasoning_folds_in_live_and_the_fold_is_reversible() {
     }
 }
 
-/// The fold toggle is relative to the expanded baseline (verbose session or
-/// expanded default): Space inverts the baseline, never the other flag.
-/// In particular verbose plus an expanded default renders expanded — the
-/// old triple-XOR collapsed exactly that cell.
+/// The preference baseline (verbose session or expanded default) decides only
+/// the cells nobody has touched; an explicit intent decides its own cell in
+/// both directions. Verbose plus an expanded default renders expanded — the
+/// old triple-XOR collapsed exactly that cell — and an explicit expand stays
+/// expanded under every preference combination, which the later relative bit
+/// still got wrong (#5847).
 #[test]
-fn thinking_fold_toggle_is_relative_to_the_expanded_baseline() {
+fn explicit_thinking_fold_outranks_every_preference_baseline() {
     let body = (1..=20)
         .map(|i| format!("step {i:02}: baseline check"))
         .collect::<Vec<_>>()
@@ -559,16 +775,23 @@ fn thinking_fold_toggle_is_relative_to_the_expanded_baseline() {
         streaming: false,
         duration_secs: Some(1.0),
     };
-    // (folded, verbose, default_expanded, expect_expanded)
-    for (folded, verbose, default_expanded, expect_expanded) in [
-        (false, false, false, false),
-        (false, false, true, true),
-        (false, true, false, true),
-        (false, true, true, true),
-        (true, false, false, true),
-        (true, false, true, false),
-        (true, true, false, false),
-        (true, true, true, false),
+    // (fold, verbose, default_expanded, expect_expanded)
+    for (fold, verbose, default_expanded, expect_expanded) in [
+        // No explicit intent: the preference baseline decides.
+        (None, false, false, false),
+        (None, false, true, true),
+        (None, true, false, true),
+        (None, true, true, true),
+        // An explicit expand renders expanded whatever the preferences say.
+        (Some(TranscriptFold::Expanded), false, false, true),
+        (Some(TranscriptFold::Expanded), false, true, true),
+        (Some(TranscriptFold::Expanded), true, false, true),
+        (Some(TranscriptFold::Expanded), true, true, true),
+        // And an explicit collapse renders collapsed whatever they say.
+        (Some(TranscriptFold::Collapsed), false, false, false),
+        (Some(TranscriptFold::Collapsed), false, true, false),
+        (Some(TranscriptFold::Collapsed), true, false, false),
+        (Some(TranscriptFold::Collapsed), true, true, false),
     ] {
         let options = TranscriptRenderOptions {
             verbose,
@@ -576,11 +799,11 @@ fn thinking_fold_toggle_is_relative_to_the_expanded_baseline() {
             low_motion: true,
             ..TranscriptRenderOptions::default()
         };
-        let text = lines_text(&cell.lines_with_options_folded(80, options, folded).0);
+        let text = lines_text(&cell.lines_with_options_folded(80, options, fold).0);
         let expanded = text.contains("step 20: baseline check");
         assert_eq!(
             expanded, expect_expanded,
-            "[folded={folded} verbose={verbose} default_expanded={default_expanded}]"
+            "[fold={fold:?} verbose={verbose} default_expanded={default_expanded}]"
         );
     }
 }
@@ -656,7 +879,7 @@ fn streaming_reasoning_shows_its_newest_line_not_a_placeholder() {
 ///
 /// Replaces three tests.
 #[test]
-fn a_foreground_shell_wait_offers_the_escape_hatch_not_the_command_echo() {
+fn a_foreground_shell_wait_names_its_command_without_a_key_hint() {
     let command = "cargo test --workspace --all-features";
     let running = {
         let mut exec = exec_tool(command, ToolStatus::Running);
@@ -673,17 +896,16 @@ fn a_foreground_shell_wait_offers_the_escape_hatch_not_the_command_echo() {
         ),
     ] {
         assert!(
-            text.contains("Ctrl+B"),
-            "[{label}] the backgrounding chord is the point of the card: {text}"
+            text.contains(command),
+            "[{label}] the card names what is running: {text}"
+        );
+        assert!(
+            !text.contains("Ctrl+B"),
+            "[{label}] a long wait moves itself to the background: {text}"
         );
         assert!(
             !text.contains("running line 1"),
             "[{label}] the live tail belongs to the sidebar and /jobs: {text}"
-        );
-        assert!(
-            !text.contains(command),
-            "[{label}] the header already carries the summary; do not echo the \
-             command target: {text}"
         );
         assert!(!text.contains("command:"), "[{label}] {text}");
     }
@@ -1215,6 +1437,7 @@ fn a_card_verb_agrees_with_its_own_label_in_every_locale() {
             entries: vec![super::ExploringEntry {
                 label: label.to_string(),
                 status: ToolStatus::Success,
+                error: None,
             }],
         };
 
@@ -1238,7 +1461,7 @@ fn a_card_verb_agrees_with_its_own_label_in_every_locale() {
             "{label:?} should read {expected_zh:?} in zh-Hans: {header_zh:?}"
         );
         assert!(
-            !header_zh.contains("done"),
+            !header_zh.to_lowercase().contains("done"),
             "zh-Hans must not leak the English status word: {header_zh:?}"
         );
         assert!(
@@ -1411,7 +1634,7 @@ fn agent_cards_stay_one_line_and_spawn_cards_yield_to_the_delegate_card() {
                 "{summary:?} should read as {expected:?}: {text:?}"
             );
             assert!(
-                !text.contains("delegate done"),
+                !text.to_lowercase().contains("delegate done"),
                 "an inspection must not read as a finished delegation: {text:?}"
             );
         }
@@ -1521,6 +1744,30 @@ fn error_severity_ranks_stay_visually_distinguishable() {
     assert_eq!(body_fg, error_fg);
 }
 
+#[test]
+fn error_guidance_keeps_recovery_commands_on_their_own_line() {
+    let cell = HistoryCell::Error {
+        message: "DeepSeek API key not found.\nSave it:\n  codewhale auth set --provider deepseek"
+            .to_string(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    };
+    for width in [80, 140] {
+        let lines = cell.lines(width);
+        let command_line = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("codewhale auth set --provider deepseek"))
+            .expect("recovery command stays intact");
+        assert!(!command_line.contains('\n'), "{command_line:?}");
+        assert!(!command_line.contains("Save it:"), "{command_line:?}");
+    }
+}
+
 /// A multiline failure can run past the bottom of the terminal while its full
 /// text stays in history. The live cell advertises the pager; the pager and the
 /// transcript must carry the recovery instruction verbatim and must not
@@ -1581,10 +1828,11 @@ fn a_web_search_receipt_names_its_source_and_any_degradation() {
     }
 }
 
-/// A workflow card stands in for a whole fan-out the user cannot see. The run
-/// card reports lifecycle, child count, phases and failures without repeating
-/// the header in the body; the expanded card adds the goal, the child labels,
-/// the final result and the error; the status card lists the runs it found.
+/// A workflow's transcript is one row per run; live progress is the
+/// workbar's. A foreground `run` card that returned its settled record says
+/// only the finish — the final state replaces `started` — without repeating the header
+/// in a body; the expanded card adds the goal, the child labels, the final
+/// result and the error; the status card lists the runs it found.
 ///
 /// Replaces three tests, and drops assertions of the form
 /// `contains('s') || contains('m')` — true of essentially any English string.
@@ -1612,9 +1860,17 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     run.input_summary = Some("action: run".to_string());
     run.output = Some(run_output);
     let text = lines_text(&run.lines_with_mode(120, true, RenderMode::Live));
-    assert!(text.contains("children"), "child count: {text:?}");
-    assert!(text.contains("phase"), "phase count: {text:?}");
-    assert!(text.contains("fail"), "failure count: {text:?}");
+    assert!(
+        !text.contains("started"),
+        "the settled record replaces the start line: {text:?}"
+    );
+    assert!(
+        text.contains("finished") && text.contains("/3 done"),
+        "the finish line with done/total agents: {text:?}"
+    );
+    assert_eq!(text.lines().count(), 1, "one row for the run: {text:?}");
+    // #6503: a run with no failures does not announce `0 fail`.
+    assert!(!text.contains("fail"), "no zero failure count: {text:?}");
     assert!(
         !text.contains("status:"),
         "the body must not repeat the header lifecycle: {text:?}"
@@ -1680,6 +1936,76 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     }
 }
 
+/// The founder's transcript (2026-09-28): a refused `start` echoed
+/// `action: start` and hid its reason; the settled run's reason was cut
+/// mid-word. Each is one row that says why.
+#[test]
+fn workflow_rows_say_why_without_raw_action_or_mid_word_cuts() {
+    let mut refused = generic_tool("workflow", ToolStatus::Failed);
+    refused.input_summary = Some("action: start".to_string());
+    refused.output = Some(
+        "Error: Invalid input for tool 'workflow': Workflow leaf 'engine-readiness': \
+         task(): cwd entries must be bounded repo-relative paths\n\
+         Tool validation feedback: {\"category\":\"invalid_input\"}"
+            .to_string(),
+    );
+    let text = lines_text(&refused.lines_with_mode(100, true, RenderMode::Live));
+    assert!(!text.contains("action: start"), "{text}");
+    assert!(
+        text.contains("cwd entries must be bounded repo-relative paths"),
+        "{text}"
+    );
+    assert!(!text.contains("Invalid input for tool"), "{text}");
+
+    let reason = "[auth] Authorization failed: You have run out of credits or need a Grok \
+                  subscription. Add credits at https://grok.com/?_s=usage.";
+    let failed = serde_json::json!({
+        "run_id": "workflow_6409ebe6",
+        "status": "failed",
+        "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers.",
+        "started_at_ms": 1_000,
+        "completed_at_ms": 1_355,
+        "error": "no task produced a result: all 2 task(s) failed and 1 fan-out(s) lost every slot (no work survived them); the recorded result reflects no completed work",
+        "transcript_line": "finished",
+        "events": [
+            {"type": "run_started", "at_ms": 1_000, "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers."},
+            {"type": "task_started", "at_ms": 1_080, "task_id": "a", "workflow_task_label": "engine-readiness"},
+            {"type": "task_started", "at_ms": 1_117, "task_id": "b", "workflow_task_label": "desktop-readiness"},
+            {"type": "task_completed", "at_ms": 1_329, "task_id": "a", "status": "failed", "reason": reason},
+            {"type": "task_completed", "at_ms": 1_338, "task_id": "b", "status": "failed", "reason": reason},
+            {"type": "run_completed", "at_ms": 1_355, "status": "failed"},
+        ],
+    })
+    .to_string();
+    let mut finish = generic_tool("workflow", ToolStatus::Failed);
+    finish.output = Some(failed);
+    let text = lines_text(&finish.lines_with_mode(60, true, RenderMode::Live));
+    assert!(!text.contains("started"), "{text}");
+    assert!(text.contains("0/2 done · 2 failed"), "{text}");
+    assert!(text.contains("355ms"), "{text}");
+    // The whole first sentence, wrapped, never cut.
+    let flat = text
+        .split_whitespace()
+        .filter(|word| {
+            !word
+                .chars()
+                .all(|ch| ('\u{2500}'..='\u{259F}').contains(&ch))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains(
+            "Authorization failed: You have run out of credits or need a Grok subscription"
+        ),
+        "{text}"
+    );
+    assert!(
+        !flat.contains("grok.com"),
+        "only the first sentence: {text}"
+    );
+    assert!(!text.contains("..."), "{text}");
+}
+
 #[test]
 fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
     let output = serde_json::json!({
@@ -1701,9 +2027,12 @@ fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
 
     let lines = run.lines_with_mode(120, false, RenderMode::Live);
     let text = lines_text(&lines);
-    assert!(text.contains("issue"), "warning receipt missing: {text:?}");
     assert!(
-        !text.contains(" done"),
+        text.contains("finished with gaps"),
+        "warning receipt missing: {text:?}"
+    );
+    assert!(
+        !text.to_lowercase().contains(" done"),
         "must not read as success: {text:?}"
     );
     assert!(
@@ -1714,7 +2043,7 @@ fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
     let warning = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "issue")
+        .find(|span| span.content.as_ref() == "finished with gaps")
         .expect("terminal warning status span");
     assert_eq!(
         warning.style.fg,
@@ -1768,11 +2097,12 @@ fn a_checklist_update_shows_only_the_item_that_changed() {
         },
         80,
         true,
+        codewhale_localization::Locale::En,
     );
     assert!(lines.len() >= 3, "header, change, summary: {}", lines.len());
 
     let change = line_text(&lines[1]);
-    for needle in ["#2", "Write the test", "in_progress"] {
+    for needle in ["#2", "Write the test", "in progress"] {
         assert!(change.contains(needle), "missing {needle:?}: {change:?}");
     }
     for other in ["Land the PR", "Read the spec"] {
@@ -1808,6 +2138,7 @@ fn a_checklist_update_shows_only_the_item_that_changed() {
         },
         80,
         true,
+        codewhale_localization::Locale::En,
     );
     let change = line_text(&lines[1]);
     assert!(change.contains("#99") && change.contains("(missing title)"));
@@ -1879,7 +2210,7 @@ fn fan_out_prompts_replace_the_inline_argument_summary() {
     );
 
     let mut plain = generic_tool("file_search", ToolStatus::Running);
-    plain.input_summary = Some("query: foo".to_string());
+    plain.input_summary = Some("query: foo, path: src".to_string());
     let text = lines_text(&HistoryCell::Tool(ToolCell::Generic(plain)).lines(80));
     assert!(
         text.contains("query: foo"),
@@ -1897,7 +2228,7 @@ fn an_activity_group_renders_as_a_single_metadata_line() {
     let lines = cell.lines_with_mode(120, true, RenderMode::Live);
 
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines_text(&lines), "Explored 2 files, 1 search");
+    assert_eq!(lines_text(&lines), "Explored 2 files, 1 search ›");
     assert!(!lines_text(&lines).contains("activity_group"));
 }
 
@@ -1996,6 +2327,7 @@ fn replay_routes_repair_receipts_and_plan_calls_to_typed_cells() {
     let plan = Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "plan-1".to_string(),
             name: "update_plan".to_string(),
             input: serde_json::json!({
@@ -2247,7 +2579,7 @@ fn a_collapsed_run_summary_names_what_actually_happened() {
                 ..Default::default()
             }
         )),
-        "Explored 4 files, 1 search: read_file, list_dir"
+        "Explored 4 files, 1 search: read file, list dir"
     );
 
     assert_eq!(
@@ -2259,7 +2591,7 @@ fn a_collapsed_run_summary_names_what_actually_happened() {
                 ..Default::default()
             }
         )),
-        "Explored 2 files: read_file, ran 2 commands: run_tests, validate_data",
+        "Explored 2 files: read file, ran 2 commands: run tests, validate data",
         "each clause lists only its own families"
     );
 
@@ -2288,7 +2620,7 @@ fn a_collapsed_run_summary_names_what_actually_happened() {
     assert_eq!(commands[0].activity.commands, 3);
     assert_eq!(
         super::tool_run_summary(&commands[0]),
-        "Ran 3 commands: run_tests, run_verifiers, validate_data"
+        "Ran 3 commands: run tests, run verifiers, validate data"
     );
 
     let git = super::detect_tool_runs(
@@ -2302,7 +2634,7 @@ fn a_collapsed_run_summary_names_what_actually_happened() {
     assert_eq!(git[0].activity.files, 3);
     assert_eq!(
         super::tool_run_summary(&git[0]),
-        "Explored 3 files: git_log, git_show, git_blame"
+        "Explored 3 files: git log, git show, git blame"
     );
 }
 
@@ -2422,18 +2754,10 @@ fn card_rail_carries_the_cell_status() {
             .style
             .fg
             .expect("header status glyph must be styled");
-        if status == ToolStatus::Success {
-            // A settled card dims its border but keeps an identifying glyph.
-            assert_ne!(
-                rail_color, glyph_color,
-                "a settled card must not dim its glyph along with its rail"
-            );
-        } else {
-            assert_eq!(
-                rail_color, glyph_color,
-                "{status:?} must read the same on the rail and the glyph"
-            );
-        }
+        assert_eq!(
+            rail_color, glyph_color,
+            "{status:?} must read the same on the rail and the glyph"
+        );
 
         rails.push((status, rail_color));
     }
@@ -2448,32 +2772,30 @@ fn card_rail_carries_the_cell_status() {
     }
 }
 
-/// The header glyph reports identity, not just lifecycle: a passed `verify`
-/// card keeps its green tick where a finished `read` keeps the family accent
-/// the mockup draws as a blue magnifier. Relationship, not token — the two must
-/// simply not collapse into one another.
+/// Finished work shares quiet ink while its glyph shape preserves identity:
+/// a passed verify and a completed read must still be distinguishable.
 #[test]
 fn a_settled_verify_glyph_does_not_read_as_a_settled_read() {
     let verify = generic_tool("run_tests", ToolStatus::Success);
     let read = generic_tool("read_file", ToolStatus::Success);
 
-    let glyph_color = |cell: &GenericToolCell| {
+    let glyph = |cell: &GenericToolCell| {
         cell.lines_with_mode_and_locale(
             80,
             /*low_motion*/ true,
             RenderMode::Live,
             codewhale_localization::Locale::En,
         )[0]
-        .spans[1]
-            .style
-            .fg
-            .expect("header status glyph must be styled")
+        // Rail, shared status mark, then the tool-family identity glyph.
+        .spans[2]
+            .clone()
     };
-
-    assert_ne!(
-        glyph_color(&verify),
-        glyph_color(&read),
-        "a passed verify and a finished read must not share a glyph colour"
+    let verify = glyph(&verify);
+    let read = glyph(&read);
+    assert_ne!(verify.content, read.content, "tool identity stays visible");
+    assert_eq!(
+        verify.style.fg, read.style.fg,
+        "settled work shares quiet ink"
     );
 }
 
@@ -2491,6 +2813,7 @@ fn exploring_cell_status_keeps_the_loudest_terminal_state() {
             .map(|status| ExploringEntry {
                 label: "Reading src/foo.rs".to_string(),
                 status: *status,
+                error: None,
             })
             .collect(),
     };
@@ -2567,41 +2890,38 @@ fn tool_rail_is_distinct_for_every_status() {
     }
 }
 
-/// The rail reports lifecycle, the glyph reports identity, and each half of
-/// that split is load-bearing: a settled card must dim its border while
-/// keeping an identifying glyph, a passed verify must not share a glyph with a
-/// finished read, and the two must never disagree about trouble.
+/// Finished rows recede while failures and warnings retain attention ink.
 #[test]
-fn rail_and_glyph_split_only_where_the_card_has_settled() {
+fn calm1_settled_headers_are_muted_without_hiding_failures() {
     use crate::tui::widgets::tool_card::ToolFamily;
+    use ratatui::style::Modifier;
     for family in [ToolFamily::Read, ToolFamily::Verify] {
-        for status in [ToolStatus::Running, ToolStatus::Warning, ToolStatus::Failed] {
+        for status in [
+            ToolStatus::Running,
+            ToolStatus::Success,
+            ToolStatus::Hydrated,
+            ToolStatus::Warning,
+            ToolStatus::Failed,
+        ] {
             assert_eq!(
                 super::tool_rail_color(status),
-                super::tool_glyph_color(status, family),
-                "{status:?} must read the same on the rail and the glyph"
+                super::tool_glyph_color(status, family)
             );
         }
         assert_ne!(
-            super::tool_rail_color(ToolStatus::Success),
             super::tool_glyph_color(ToolStatus::Success, family),
-            "a settled {family:?} card must dim its border without dimming its glyph"
-        );
-        assert_eq!(
-            super::tool_glyph_color(ToolStatus::Hydrated, family),
-            super::tool_rail_color(ToolStatus::Hydrated),
-            "a hydrated {family:?} card has not succeeded at anything and must not borrow an accent"
+            super::tool_glyph_color(ToolStatus::Failed, family)
         );
     }
-    assert_ne!(
-        super::tool_glyph_color(ToolStatus::Success, ToolFamily::Verify),
-        super::tool_glyph_color(ToolStatus::Success, ToolFamily::Read),
-        "a passed verify and a finished read must not share a glyph colour"
+    assert!(
+        !super::tool_title_style(ToolStatus::Success)
+            .add_modifier
+            .contains(Modifier::BOLD)
     );
-    assert_eq!(
-        super::tool_glyph_color(ToolStatus::Success, ToolFamily::Read),
-        super::tool_glyph_color(ToolStatus::Running, ToolFamily::Read),
-        "a finished read keeps the accent it wore while running"
+    assert!(
+        super::tool_title_style(ToolStatus::Failed)
+            .add_modifier
+            .contains(Modifier::BOLD)
     );
 }
 
@@ -2676,6 +2996,148 @@ fn first_file_line_reference_returns_one_match_and_resolves_it() {
     assert_eq!(line, 12);
 }
 
+/// The forms tools and models print: rustc's `-->` locator with a column,
+/// a backticked reference, and one inside a sentence with punctuation.
+#[test]
+fn file_line_reference_reads_common_forms_on_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/a.rs"), "fn a() {}\n").unwrap();
+    let expected = Some((workspace.join("src/a.rs"), 12));
+
+    for line in [
+        "  --> src/a.rs:12:5",
+        "see `src/a.rs:12` for the loop",
+        "the bug is in (src/a.rs:12), again.",
+        "src/a.rs:12: error: mismatched types",
+        "./src/a.rs:12",
+    ] {
+        assert_eq!(
+            super::file_line_reference(line, workspace),
+            expected,
+            "{line:?}"
+        );
+    }
+    assert_eq!(super::file_line_reference("src/a.rs:0", workspace), None);
+}
+
+/// Model output is not trusted to name a file: an absolute path outside the
+/// workspace and a `../` escape both used to open in `$EDITOR`.
+#[test]
+fn file_line_reference_refuses_paths_outside_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/in.rs"), "fn a() {}\n").unwrap();
+    let outside = root.path().join("outside.rs");
+    std::fs::write(&outside, "secret\n").unwrap();
+
+    let absolute_outside = format!("{}:3", outside.display());
+    assert_eq!(
+        super::file_line_reference(&absolute_outside, &workspace),
+        None
+    );
+    assert_eq!(
+        super::file_line_reference("../outside.rs:3", &workspace),
+        None
+    );
+    assert_eq!(
+        super::first_file_line_reference(
+            &format!("{absolute_outside}\n../outside.rs:1\n"),
+            &workspace
+        ),
+        None
+    );
+
+    let absolute_inside = format!("{}:4", workspace.join("src/in.rs").display());
+    assert_eq!(
+        super::file_line_reference(&absolute_inside, &workspace),
+        Some((workspace.join("src/in.rs"), 4)),
+        "an absolute path inside the workspace still opens"
+    );
+}
+
+/// A link inside the workspace passed the text-only check and `is_file()`
+/// followed it, so `vendor -> <outside>` or `notes.md -> <outside file>` in
+/// model output offered "Open in editor" on a file outside the workspace.
+#[cfg(unix)]
+#[test]
+fn file_line_reference_refuses_links_out_of_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.rs"), "secret\n").unwrap();
+    std::fs::write(workspace.join("src/in.rs"), "fn a() {}\n").unwrap();
+    std::os::unix::fs::symlink(&outside, workspace.join("vendor")).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.rs"), workspace.join("notes.rs")).unwrap();
+    // A link that stays inside is still a link: refused, not followed.
+    std::os::unix::fs::symlink(workspace.join("src"), workspace.join("alias")).unwrap();
+
+    for line in ["vendor/secret.rs:1", "notes.rs:1", "alias/in.rs:1"] {
+        assert_eq!(
+            super::file_line_reference(line, &workspace),
+            None,
+            "{line:?}"
+        );
+    }
+    assert_eq!(
+        super::workspace_file(&workspace, "src"),
+        None,
+        "a directory"
+    );
+    assert_eq!(
+        super::file_line_reference("src/in.rs:2", &workspace),
+        Some((workspace.join("src/in.rs"), 2))
+    );
+}
+
+/// The two escapes the review named: a directory link to `/` and links into
+/// an `.ssh` directory. The `.ssh` here is one the test creates outside the
+/// workspace with real files in it, so a follow-the-link check would find
+/// them and resolve; the test does not depend on the host's own keys.
+#[cfg(unix)]
+#[test]
+fn file_line_reference_refuses_links_to_root_and_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = &dir.path().join("ws");
+    std::fs::create_dir_all(workspace).unwrap();
+    std::os::unix::fs::symlink("/", workspace.join("rootfs")).unwrap();
+    let ssh = dir.path().join("home/.ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(ssh.join("id_ed25519"), "PRIVATE KEY\n").unwrap();
+    std::fs::write(ssh.join("config"), "Host *\n").unwrap();
+    std::os::unix::fs::symlink(ssh.join("id_ed25519"), workspace.join("key.rs")).unwrap();
+    std::os::unix::fs::symlink(&ssh, workspace.join("ssh")).unwrap();
+    assert!(workspace.join("key.rs").is_file(), "the file link resolves");
+    assert!(
+        workspace.join("ssh/config").is_file(),
+        "the dir link resolves"
+    );
+
+    for line in [
+        "rootfs/etc/hosts:1",
+        "./rootfs/etc/hosts:1",
+        "key.rs:1",
+        "ssh/config:1",
+        "ssh/id_ed25519:1",
+    ] {
+        assert_eq!(
+            super::file_line_reference(line, workspace),
+            None,
+            "{line:?}"
+        );
+    }
+    let absolute = workspace.join("rootfs/etc/hosts");
+    assert_eq!(
+        super::workspace_file(workspace, absolute.to_str().unwrap()),
+        None,
+        "an absolute path through the link"
+    );
+}
+
 #[test]
 fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -2701,4 +3163,276 @@ fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
         super::first_file_line_reference("no references here\n", workspace).is_none(),
         "a cell with nothing to open must report nothing, not a default"
     );
+}
+
+/// #6601: the project-trust warning is a runtime-owned internal message; the
+/// model reads it, the transcript never shows it as the user's words.
+#[test]
+fn workspace_trust_warning_renders_no_transcript_cell() {
+    for warning in [Some("untrusted project skills were skipped"), None] {
+        let message = crate::runtime_handoff::workspace_trust_runtime_message(warning);
+        assert!(crate::runtime_handoff::is_internal_runtime_handoff(
+            &message
+        ));
+        assert!(
+            super::history_cells_from_message(&message).is_empty(),
+            "{warning:?}"
+        );
+    }
+}
+
+#[test]
+fn calm1_failed_tool_preview_matrix_preserves_full_details_and_mcp_identity() {
+    for width in [40, 60, 80, 140] {
+        for status in [ToolStatus::Running, ToolStatus::Success, ToolStatus::Failed] {
+            let output = (0..30)
+                .map(|i| format!("row {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mcp = HistoryCell::Tool(ToolCell::Mcp(super::McpToolCell {
+                tool: "linear_get_issue".into(),
+                status,
+                content: Some(output.clone()),
+                is_image: false,
+            }));
+            let mut generic = generic_tool("read_file", status);
+            generic.output = Some(output);
+            for (cell, is_mcp) in [
+                (mcp, true),
+                (HistoryCell::Tool(ToolCell::Generic(generic)), false),
+            ] {
+                let options = TranscriptRenderOptions {
+                    calm_mode: true,
+                    show_tool_details: false,
+                    low_motion: true,
+                    ..Default::default()
+                };
+                let live = cell.lines_with_options(width, options);
+                let text = lines_text(&live);
+                let full = lines_text(&cell.transcript_lines(width));
+                assert!(
+                    full.contains("row 15"),
+                    "full details must preserve omitted content"
+                );
+                if is_mcp {
+                    assert_eq!(text.matches("linear_get_issue").count(), 1, "{text}");
+                }
+                if status == ToolStatus::Failed {
+                    assert!(text.contains("row 00") && text.contains("row 29"), "{text}");
+                    assert!(!text.contains("row 15"), "{text}");
+                    assert!(text.contains("lines omitted"), "{text}");
+                    assert_eq!(
+                        (0..30)
+                            .filter(|i| text.contains(&format!("row {i:02}")))
+                            .count(),
+                        6
+                    );
+                    if is_mcp {
+                        assert!(live.len() <= 8, "{text}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn calm1_settled_reasoning_is_one_localized_row_and_stays_expandable() {
+    for (locale, expected) in [
+        (codewhale_localization::Locale::En, "Thought for 12s"),
+        (codewhale_localization::Locale::ZhHans, "思考用时 12s"),
+    ] {
+        let cell = HistoryCell::Thinking {
+            content: "private reasoning body\nlast step".into(),
+            streaming: false,
+            duration_secs: Some(12.0),
+        };
+        let options = TranscriptRenderOptions {
+            calm_mode: true,
+            locale,
+            ..Default::default()
+        };
+        let (lines, action) = cell.lines_with_options_folded(80, options, None);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines_text(&lines).contains(expected),
+            "{}",
+            lines_text(&lines)
+        );
+        assert_eq!(action, Some(super::CellFoldAction::Expand));
+        let expanded = cell
+            .lines_with_options_folded(80, options, Some(TranscriptFold::Expanded))
+            .0;
+        assert!(lines_text(&expanded).contains("private reasoning body"));
+    }
+}
+
+#[test]
+fn calm1_calm_and_hidden_details_share_one_card_budget() {
+    let mut exec = exec_tool("command", ToolStatus::Success);
+    exec.output = Some(numbered_output(40));
+    let cell = HistoryCell::Tool(ToolCell::Exec(exec));
+    let mut rendered = Vec::new();
+    for (calm_mode, show_tool_details) in [(true, false), (true, true), (false, false)] {
+        let options = TranscriptRenderOptions {
+            calm_mode,
+            show_tool_details,
+            low_motion: true,
+            ..Default::default()
+        };
+        let lines = cell.lines_with_options(80, options);
+        assert!(lines.len() <= super::constants::TOOL_SUMMARY_CARD_LINES);
+        rendered.push(lines_text(&lines));
+    }
+    assert!(rendered.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+/// #4681: reopening a session must not surface `<turn_meta>` machine
+/// blocks in the transcript. Covers the current trailing shape and the
+/// legacy leading shape (sessions saved before the turn-meta tail move),
+/// while the loaded API history keeps both envelopes intact for replay.
+#[test]
+fn rehydrated_turn_meta_blocks_never_render_in_history_cells() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+
+    let turn_meta = "<turn_meta>\nCurrent local date: 2026-08-01\n</turn_meta>";
+    let trailing_shape = Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::Text {
+                text: "Fix the flaky test".to_string(),
+                cache_control: None,
+            },
+            ContentBlock::Text {
+                text: turn_meta.to_string(),
+                cache_control: None,
+            },
+        ],
+    };
+    let legacy_leading_shape = Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::Text {
+                text: turn_meta.to_string(),
+                cache_control: None,
+            },
+            ContentBlock::Text {
+                text: "Now add the docs".to_string(),
+                cache_control: None,
+            },
+        ],
+    };
+    let messages = vec![
+        trailing_shape,
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "Done.".to_string(),
+                cache_control: None,
+            }],
+        },
+        legacy_leading_shape,
+    ];
+    let session = create_saved_session(&messages, "test-model", tmp.path(), 100, None);
+    let session_id = session.metadata.id.clone();
+    manager.save_session(&session).expect("save");
+
+    let loaded = manager.load_session(&session_id).expect("load");
+
+    // Display path: no rendered cell may carry turn_meta markup.
+    let rendered: Vec<HistoryCell> = loaded
+        .messages
+        .iter()
+        .flat_map(super::history_cells_from_message)
+        .collect();
+    let user_texts: Vec<&str> = rendered
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::User { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_texts, vec!["Fix the flaky test", "Now add the docs"]);
+    assert!(
+        !user_texts.iter().any(|text| text.contains("<turn_meta")),
+        "rendered cells must not contain turn_meta markup: {user_texts:?}"
+    );
+
+    // Model-facing replay: the persisted envelopes survive the round trip.
+    let replayed_envelopes = loaded
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| {
+            matches!(block, ContentBlock::Text { text, .. } if text.contains("<turn_meta>"))
+        })
+        .count();
+    assert_eq!(replayed_envelopes, 2);
+}
+
+#[test]
+fn save_and_load_session_preserves_rich_update_plan_tool_payload() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "plan this carefully".to_string(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                execution_id: None,
+                id: "plan-1".to_string(),
+                name: "update_plan".to_string(),
+                input: serde_json::json!({
+                    "objective": "Make Plan mode reviewable",
+                    "sources_used": ["gh issue view 2691"],
+                    "critical_files": ["crates/tui/src/tools/plan.rs"],
+                    "constraints": ["Preserve legacy update_plan payloads"],
+                    "verification_plan": "Run focused plan tests",
+                    "handoff_packet": "Next agent should inspect replay",
+                    "plan": [
+                        { "step": "render replay card", "status": "completed" }
+                    ]
+                }),
+                caller: None,
+                thought_signature: None,
+            }],
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                execution_id: None,
+                tool_use_id: "plan-1".to_string(),
+                content: "Plan updated".to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+    ];
+    let session = create_saved_session(&messages, "deepseek-v4-flash", tmp.path(), 42, None);
+    let session_id = session.metadata.id.clone();
+
+    manager.save_session(&session).expect("save");
+    let loaded = manager.load_session(&session_id).expect("load");
+
+    assert_eq!(loaded.messages.len(), 3);
+    let cells = super::history_cells_from_message(&loaded.messages[1]);
+    let Some(HistoryCell::Tool(ToolCell::PlanUpdate(cell))) = cells.first() else {
+        panic!("expected loaded update_plan to replay as a PlanUpdate cell");
+    };
+    assert_eq!(
+        cell.snapshot.objective.as_deref(),
+        Some("Make Plan mode reviewable")
+    );
+    assert_eq!(
+        cell.snapshot.critical_files,
+        vec!["crates/tui/src/tools/plan.rs"]
+    );
+    assert_eq!(cell.snapshot.items[0].status, StepStatus::Completed);
 }

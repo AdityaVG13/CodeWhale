@@ -48,9 +48,10 @@ fn bundled_integration_skills_use_current_codewhale_commands_and_paths() {
     assert!(SKILL_CREATOR_BODY.contains("<workspace>/.codewhale/skills"));
     assert!(SKILL_CREATOR_BODY.contains("~/.codewhale/skills"));
     assert!(SKILL_INSTALLER_BODY.contains("~/.codewhale/skills"));
-    // Bundled skills must name live tools. `read_file` is retired and cannot
-    // dispatch (crates/tui/src/tools/registry.rs:2067).
-    assert!(PDF_BODY.contains("built-in `File` tool (`action: \"read\"`)"));
+    // Bundled skills must name model-visible tools. `read_file` is retired and
+    // `File`/`Bash` are hidden compatibility names absent from new catalogs.
+    assert!(PDF_BODY.contains("through `bash`"));
+    assert!(HELP_BODY.contains("the `read` tool"));
     for (name, body) in [
         ("pdf", PDF_BODY),
         ("help", HELP_BODY),
@@ -60,6 +61,10 @@ fn bundled_integration_skills_use_current_codewhale_commands_and_paths() {
         assert!(
             !body.contains("read_file") && !body.contains("exec_shell"),
             "{name} must not teach a retired tool name"
+        );
+        assert!(
+            !body.contains("`File`") && !body.contains("`Bash`"),
+            "{name} must not teach the hidden File/Bash tools"
         );
     }
 }
@@ -544,6 +549,7 @@ fn upgrade_preserves_user_modified_bundled_skill_body() {
         body.contains("customized"),
         "user edit must not be overwritten by name alone"
     );
+    assert_eq!(unrecognized_system_skills(tmp.path()), vec!["debug"]);
 }
 
 /// A generation-10 install carries the Registry-first `mcp-discovery` body.
@@ -662,6 +668,12 @@ fn procedural_skill_homes_remain_bundled_and_lazy() {
 
 #[test]
 fn generation_14_refreshes_known_bodies_and_preserves_customizations_and_deletions() {
+    for line in SHIPPED_BODY_HASHES.lines() {
+        let (name, digest) = line.split_once(' ').expect("name and digest");
+        assert!(is_bundled_skill_name(name), "{name} is not bundled");
+        assert_eq!(digest.len(), 64, "{name}");
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+    }
     for (name, old) in SUPERSEDED_BODIES
         .iter()
         .filter(|(name, _)| *name != "mcp-discovery")
@@ -671,6 +683,12 @@ fn generation_14_refreshes_known_bodies_and_preserves_customizations_and_deletio
             .find(|skill| skill.name == *name)
             .unwrap();
         assert_ne!(*old, skill.body);
+        assert!(hash_is_listed(SHIPPED_BODY_HASHES, name, old), "{name}");
+        assert!(!hash_is_listed(
+            SHIPPED_BODY_HASHES,
+            name,
+            &format!("{old}\nMy instructions.\n")
+        ));
         for customized in [false, true] {
             let tmp = TempDir::new().unwrap();
             let file = skill_file(&tmp, name);
@@ -697,5 +715,77 @@ fn generation_14_refreshes_known_bodies_and_preserves_customizations_and_deletio
         fs::write(marker_file(&tmp), "13").unwrap();
         install_system_skills(tmp.path()).unwrap();
         assert!(!skill_file(&tmp, name).exists(), "{name} must stay deleted");
+    }
+}
+
+#[test]
+fn generation_15_refreshes_help_and_pdf_from_generation_14() {
+    for name in ["help", "pdf"] {
+        let old = SUPERSEDED_BODIES
+            .iter()
+            .find(|(entry, _)| *entry == name)
+            .map(|(_, body)| *body)
+            .expect("generation-14 body retained");
+        assert!(
+            old.contains("`File`"),
+            "{name} retained body is the old one"
+        );
+        let skill = BUNDLED_SKILLS
+            .iter()
+            .find(|skill| skill.name == name)
+            .unwrap();
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(skill_dir(&tmp, name)).unwrap();
+        fs::write(skill_file(&tmp, name), old).unwrap();
+        fs::write(marker_file(&tmp), "14").unwrap();
+        install_system_skills(tmp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(skill_file(&tmp, name)).unwrap(),
+            skill.body,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn generation_17_refreshes_previous_plugin_creator_bodies() {
+    let skill = BUNDLED_SKILLS
+        .iter()
+        .find(|skill| skill.name == "plugin-creator")
+        .unwrap();
+    assert!(skill.body.contains("Create `plugin.json`"));
+    assert!(skill.body.contains("## Experimental host code"));
+    for (generation, old) in [
+        (
+            "15",
+            include_str!("../../../assets/skills/plugin-creator/SKILL.generation-15.md"),
+        ),
+        (
+            "16",
+            include_str!("../../../assets/skills/plugin-creator/SKILL.generation-16.md"),
+        ),
+    ] {
+        assert!(is_superseded_shipped_body("plugin-creator", old));
+        assert!(!old.contains("## Experimental host code"));
+        for customized in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            fs::create_dir_all(skill_dir(&tmp, "plugin-creator")).unwrap();
+            let body = if customized {
+                format!("{old}\nMy instructions.\n")
+            } else {
+                old.to_string()
+            };
+            fs::write(skill_file(&tmp, "plugin-creator"), &body).unwrap();
+            fs::write(marker_file(&tmp), generation).unwrap();
+            install_system_skills(tmp.path()).unwrap();
+            assert_eq!(
+                fs::read_to_string(skill_file(&tmp, "plugin-creator")).unwrap(),
+                if customized {
+                    body
+                } else {
+                    skill.body.to_string()
+                },
+            );
+        }
     }
 }

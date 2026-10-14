@@ -286,25 +286,26 @@ fn diff_with(
                 if !commit_id(base) {
                     bail!("The pinned PR commits do not have one available merge base");
                 }
-                let diff = run(
-                    Program::Git,
-                    &[
-                        "diff".into(),
-                        "--no-ext-diff".into(),
-                        "--no-textconv".into(),
-                        "--no-color".into(),
-                        "--no-relative".into(),
-                        "--full-index".into(),
-                        "--find-renames=50%".into(),
-                        "--src-prefix=a/".into(),
-                        "--dst-prefix=b/".into(),
-                        "--ignore-submodules=none".into(),
-                        "--submodule=short".into(),
-                        base.into(),
-                        view.head_sha.clone(),
-                        "--".into(),
-                    ],
-                )?;
+                let mut diff_args = vec!["diff".to_string()];
+                diff_args.extend(Git::REVIEW_DIFF_ARGS.map(String::from));
+                diff_args.extend(
+                    [
+                        "--no-color",
+                        "--no-relative",
+                        "--full-index",
+                        "--find-renames=50%",
+                        "--src-prefix=a/",
+                        "--dst-prefix=b/",
+                        // Commit-to-commit: no worktree is read, so every
+                        // submodule pointer change belongs in the file set.
+                        "--ignore-submodules=none",
+                        base,
+                        view.head_sha.as_str(),
+                        "--",
+                    ]
+                    .map(String::from),
+                );
+                let diff = run(Program::Git, &diff_args)?;
                 complete_file_set(&diff, view)?;
                 Ok(diff)
             })();
@@ -463,12 +464,13 @@ fn run_command(workspace: &Path, program: Program, args: &[String]) -> Result<St
         Program::Gh => Gh::command().context("PR review requires GitHub CLI on PATH")?,
         Program::Git => Git::review_command(workspace)?,
     };
+    // `gh` shells out to git; give it the same no-prompt environment.
+    crate::dependencies::apply_git_noninteractive_env(&mut command);
     command
         .args(args)
         .current_dir(workspace)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

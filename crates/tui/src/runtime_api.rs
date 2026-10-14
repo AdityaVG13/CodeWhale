@@ -1,6 +1,6 @@
 //! Runtime HTTP/SSE API for local Codewhale automation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -43,6 +43,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
+mod constitution;
 mod notification_delivery;
 
 #[cfg(test)]
@@ -54,7 +55,7 @@ use crate::automation_manager::{
 };
 #[cfg(test)]
 use crate::config::DEFAULT_TEXT_MODEL;
-use crate::config::{ApiProvider, Config, normalize_model_name_for_provider, validate_route};
+use crate::config::{Config, ProviderKind, normalize_model_name_for_provider, validate_route};
 use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
 use crate::fleet::ledger::{
     FleetEventReplayError, FleetLedgerState, FleetTaskLedgerStatus, fleet_ledger_path,
@@ -72,10 +73,12 @@ use crate::runtime_threads::{
     CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision,
     MAX_RUNTIME_EVENT_REPLAY_TAIL, RuntimeThreadManager, RuntimeThreadManagerConfig,
     SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest, ThreadDetail, ThreadListFilter,
-    ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest, UsageGroupBy, UsageTotals,
+    ThreadRecord, TurnRecord, UpdateThreadRequest, UsageGroupBy, UsageTotals,
 };
+// `TurnItemKind` is read only by the summary tests now that the route builds
+// its rows from `ThreadListFacts` instead of walking item records here.
 #[cfg(test)]
-pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemLifecycleStatus};
+pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemKind, TurnItemLifecycleStatus};
 use crate::session_manager::default_sessions_dir;
 #[cfg(test)]
 pub(super) use crate::session_manager::{SavedSession, SessionMetadata};
@@ -84,7 +87,7 @@ use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskRecord, TaskSummary,
 };
 use crate::tools::subagent::{
-    AgentWorkerRecord, SharedSubAgentManager, load_persisted_agent_worker_records,
+    AgentWorkerRecord, AgentWorkerStatus, SharedSubAgentManager, SubAgentStatus,
     new_shared_subagent_manager_with_timeout,
 };
 #[cfg(test)]
@@ -96,18 +99,24 @@ use codewhale_protocol::fleet::{
 };
 
 mod auth;
+mod avatars;
+mod computer_display;
 mod context;
 mod diagnostics;
 mod git;
 mod jobs;
 mod lsp;
+mod mcp_import;
 mod memory_lens;
 mod mobile;
 mod plans;
 mod plugins;
 mod secrets;
-mod sessions;
+pub(crate) mod sessions;
 mod targets;
+mod terminal;
+pub(crate) mod thread_history;
+mod turn_artifacts;
 mod voice;
 mod web;
 mod workspace;
@@ -118,17 +127,18 @@ use self::auth::{
     runtime_request_is_authorized,
 };
 use self::sessions::{
-    create_session_from_thread, delete_session, get_session, list_session_artifacts, list_sessions,
-    list_sessions_summary, patch_session, read_session_artifact, resume_session_thread,
-    save_current_session,
+    create_session_from_thread, delete_session, get_session, get_session_repair,
+    list_session_artifacts, list_sessions, list_sessions_summary, patch_session,
+    read_session_artifact, resume_session_thread, save_current_session,
 };
 #[cfg(test)]
 use self::sessions::{messages_from_thread_detail, session_to_detail};
 #[cfg(test)]
 use self::workspace::collect_workspace_status;
 use self::workspace::{
-    collect_workspace_git_metadata, workspace_file_read, workspace_file_search,
-    workspace_file_write, workspace_files_list, workspace_instructions, workspace_status,
+    WorkspaceGitMetadata, collect_workspace_git_metadata, update_workspace_trust,
+    workspace_file_read, workspace_file_search, workspace_file_write, workspace_files_list,
+    workspace_instructions, workspace_status,
 };
 
 const RUNTIME_TOKEN_ENV: &str = "CODEWHALE_RUNTIME_TOKEN";
@@ -200,19 +210,720 @@ pub struct RuntimeApiState {
     /// Executable used by Runtime API-owned Fleet manager loops. Stored on
     /// state so tests and embedded callers can provide a hermetic worker.
     fleet_codewhale_binary: String,
-    /// Shared McpPool reused for explicit live MCP discovery. Passive API
-    /// calls do not initialize this pool so dashboards cannot accidentally
-    /// become a second stdio-process owner. The outer mutex guards only the
-    /// lazily-initialized slot; slow per-pool work (connect_all) runs under
-    /// the inner handle so it cannot block slot reads.
-    mcp_pool: Arc<Mutex<Option<Arc<Mutex<McpPool>>>>>,
-    /// Workspace-level LSP client for the HTTP surface (APPS-93): diagnostics
-    /// and semantic queries on files a client views. Engines keep their own
-    /// per-thread managers; this one serves the file view and is built lazily
-    /// so a server without LSP use never spawns a language server.
-    lsp_manager: Arc<std::sync::OnceLock<Arc<crate::lsp::LspManager>>>,
+    /// Held by the actual owner, shared by all matching listener scopes.
+    workspace_scopes: Arc<RuntimeWorkspaceScopes>,
+    workspace_scope: Arc<RuntimeWorkspaceScope>,
+    /// The computer this Engine runs on: display socket, human control
+    /// lease, device client tokens and `computer.*` events (§3.3).
+    computer: computer_display::ComputerState,
+    /// Fires when the server stops on purpose, so open thread event streams
+    /// end with a typed `stream.end` rather than a bare EOF.
+    shutdown: RuntimeServerShutdown,
+    /// Serializes this runtime's git writes (stage/unstage/discard/commit/
+    /// branch) so a precondition check and its write are atomic with respect
+    /// to other windows on the same server (#6647).
+    git_writes: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes provider switches: each one saves, applies and, when the
+    /// apply is refused, takes back its own save before the next one starts.
+    provider_switches: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
+}
+
+// This is a cache bound inside the existing owner, matching the daemon's
+// maximum of 64 live frontend connections. Scopes remain retained until owner
+// retirement; opening another listener never creates a parallel cache.
+const MAX_RUNTIME_WORKSPACE_SCOPES: usize = 64;
+
+struct RuntimeWorkspaceScope {
+    lexical: PathBuf,
+    canonical: PathBuf,
+    directory: Arc<std::fs::File>,
+    mcp: Mutex<Option<(u64, Arc<Mutex<McpPool>>)>>,
+    lsp: std::sync::OnceLock<Arc<crate::lsp::LspManager>>,
+    owner: SharedRuntimeThreadManager,
+    cleanup_runtime: tokio::runtime::Handle,
+    /// The workspace drive lease held for this scope's lifetime: at most one
+    /// driving engine per workspace, across stores and clients
+    /// (`workspace_lease`). Watch-only observers never reach scope admission.
+    /// Underscored because it is held for its `Drop` side effect, never read.
+    _drive_lease: Option<crate::workspace_lease::SharedWorkspaceDriveLease>,
+}
+
+pub(crate) fn open_workspace_directory(workspace: &FsPath) -> Result<(PathBuf, std::fs::File)> {
+    let canonical = workspace
+        .canonicalize()
+        .context("workspace is unavailable")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0200_0000 | 0x0020_0000); // BACKUP_SEMANTICS, OPEN_REPARSE_POINT
+    }
+    let directory = options.open(&canonical)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && !crate::plugins::metadata_is_link_or_reparse(&metadata),
+        "workspace is not an ordinary directory"
+    );
+    anyhow::ensure!(
+        workspace.canonicalize()? == canonical,
+        "selected workspace changed"
+    );
+    Ok((canonical, directory))
+}
+
+impl RuntimeWorkspaceScope {
+    fn validate_sync(&self) -> Result<()> {
+        let (canonical, directory) = open_workspace_directory(&self.lexical)?;
+        anyhow::ensure!(
+            canonical == self.canonical
+                && crate::fleet::files::same_file(&self.directory, &directory)?,
+            "selected workspace identity changed"
+        );
+        Ok(())
+    }
+    async fn validate(self: &Arc<Self>) -> Result<()> {
+        let scope = self.clone();
+        codewhale_app_server::daemon_socket::owner_work(move || scope.validate_sync()).await
+    }
+}
+
+impl Drop for RuntimeWorkspaceScope {
+    fn drop(&mut self) {
+        let mcp = self.mcp.get_mut().take().map(|(_, pool)| pool);
+        let lsp = self.lsp.take();
+        let drive_lease = self._drive_lease.take();
+        // The canonical writer lease and held directory survive the actual
+        // transport cleanup, including waiter cancellation and guest detach.
+        let owner = self.owner.clone();
+        let directory = self.directory.clone();
+        self.cleanup_runtime.spawn(async move {
+            let _owner = owner;
+            let _directory = directory;
+            let _drive_lease = drive_lease;
+            if let Some(pool) = mcp {
+                pool.lock().await.shutdown_all().await;
+            }
+            if let Some(manager) = lsp {
+                manager.shutdown_all().await;
+            }
+        });
+    }
+}
+
+struct RuntimeWorkspaceScopes {
+    scopes: parking_lot::Mutex<BTreeMap<PathBuf, Arc<RuntimeWorkspaceScope>>>,
+    mcp_generation: std::sync::atomic::AtomicU64,
+    dynamic_servers: Arc<parking_lot::RwLock<HashMap<String, crate::mcp::McpServerConfig>>>,
+    owner: SharedRuntimeThreadManager,
+    workers: SharedSubAgentManager,
+    cleanup_runtime: tokio::runtime::Handle,
+}
+
+/// A legible refusal when the workspace drive lease is held elsewhere: it
+/// names the recorded holder so the second client can offer a real choice
+/// (stay watch-only, or take the lease over) instead of an opaque conflict.
+#[derive(Debug)]
+struct WorkspaceDriveLeaseRefusal {
+    message: String,
+}
+
+impl WorkspaceDriveLeaseRefusal {
+    fn named_holder(workspace: &FsPath) -> Option<Self> {
+        let holder = crate::workspace_lease::WorkspaceDriveLease::read_holder(workspace)
+            .ok()
+            .flatten()?;
+        let held_for = holder.held_for();
+        Some(Self {
+            message: format!(
+                "another client is already driving this workspace: pid={} client={} store={} held_for={held_for:?}; \
+                 close it first or attach watch-only to its existing owner",
+                holder.pid,
+                holder.client.as_deref().unwrap_or("unknown"),
+                holder
+                    .store_root
+                    .as_ref()
+                    .map_or_else(|| "unknown".to_string(), |root| root.display().to_string()),
+            ),
+        })
+    }
+
+    fn unreadable() -> Self {
+        Self {
+            message:
+                "another client is already driving this workspace (holder record unreadable); \
+                      close it first or attach watch-only to its existing owner"
+                    .to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceDriveLeaseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WorkspaceDriveLeaseRefusal {}
+
+impl RuntimeWorkspaceScopes {
+    fn new(owner: SharedRuntimeThreadManager, workers: SharedSubAgentManager) -> Arc<Self> {
+        Arc::new(Self {
+            scopes: parking_lot::Mutex::new(BTreeMap::new()),
+            mcp_generation: std::sync::atomic::AtomicU64::new(0),
+            dynamic_servers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            owner,
+            workers,
+            cleanup_runtime: tokio::runtime::Handle::current(),
+        })
+    }
+
+    async fn admit(self: &Arc<Self>, lexical: PathBuf) -> Result<Arc<RuntimeWorkspaceScope>> {
+        let owner = self.clone();
+        codewhale_app_server::daemon_socket::owner_work(move || {
+            let (canonical, directory) = open_workspace_directory(&lexical)?;
+            let directory = Arc::new(directory);
+            let mut scopes = owner.scopes.lock();
+            if let Some(scope) = scopes.get(&lexical) {
+                anyhow::ensure!(
+                    canonical == scope.canonical
+                        && crate::fleet::files::same_file(&scope.directory, &directory)?,
+                    "selected workspace identity changed"
+                );
+                return Ok(scope.clone());
+            }
+            anyhow::ensure!(
+                scopes.len() < MAX_RUNTIME_WORKSPACE_SCOPES,
+                "Runtime workspace scope limit reached; restart the owner to retire unused scopes"
+            );
+            // One driving engine per workspace, process-wide. The lease is held
+            // for as long as this engine drives the workspace and releases when
+            // the scope (and its engine) goes away. A contending client gets the
+            // recorded holder's facts in the refusal instead of an opaque
+            // conflict. Watch-only observers attach to the owner that holds the
+            // lease, so they never reach this point.
+            let client = std::env::var("CODEWHALE_CLIENT_LABEL")
+                .ok()
+                .filter(|label| !label.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("TERM_PROGRAM")
+                        .ok()
+                        .filter(|program| program.to_ascii_lowercase().contains("vscode"))
+                })
+                .map(|label| label.replace(['\n', '='], " "));
+            let store_root = owner.owner.session_store_binding().data_dir;
+            let drive_lease = crate::workspace_lease::SharedWorkspaceDriveLease::acquire(
+                &lexical,
+                client.as_deref(),
+                Some(&store_root),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "workspace drive lease check failed for {}: {error:#}",
+                    lexical.display()
+                )
+            })?;
+            let Some(drive_lease) = drive_lease else {
+                let refusal = WorkspaceDriveLeaseRefusal::named_holder(&lexical)
+                    .unwrap_or_else(WorkspaceDriveLeaseRefusal::unreadable);
+                return Err(anyhow::Error::new(refusal));
+            };
+            owner
+                .workers
+                .blocking_write()
+                .admit_coordination_workspace(lexical.clone(), canonical.clone(), directory.clone())
+                .map_err(anyhow::Error::msg)?;
+            let scope = Arc::new(RuntimeWorkspaceScope {
+                lexical: lexical.clone(),
+                canonical,
+                directory,
+                mcp: Mutex::new(None),
+                lsp: std::sync::OnceLock::new(),
+                owner: owner.owner.clone(),
+                cleanup_runtime: owner.cleanup_runtime.clone(),
+                _drive_lease: Some(drive_lease),
+            });
+            scopes.insert(lexical, scope.clone());
+            Ok(scope)
+        })
+        .await
+    }
+}
+
+async fn require_workspace_scope(
+    State(state): State<RuntimeApiState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    if state.workspace_scope.validate().await.is_err() {
+        return ApiError::conflict("selected workspace identity changed").into_response();
+    }
+    next.run(request).await
+}
+
+/// How the Runtime API server stops on purpose.
+///
+/// `requested` fires once the server decides to stop: the listener stops
+/// accepting, idle connections close, and every open thread event stream sends
+/// `stream.end {reason: "runtime_shutdown"}` and finishes. `stopped` fires once
+/// `serve_runtime_api` has drained every connection.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeServerShutdown {
+    requested: CancellationToken,
+    stopped: CancellationToken,
+}
+
+impl RuntimeServerShutdown {
+    /// Ask the server to stop and wait at most `deadline` for it to drain.
+    /// Returns whether it drained in time; a long-lived response that does not
+    /// watch `requested` (a turn or Fleet stream) can hold it to the deadline.
+    pub(crate) async fn drain(&self, deadline: Duration) -> bool {
+        self.requested.cancel();
+        tokio::time::timeout(deadline, self.stopped.cancelled())
+            .await
+            .is_ok()
+    }
+}
+
+/// Serve `app` until `shutdown` is requested, then drain gracefully so the
+/// final frames of open streams reach their clients before connections close.
+async fn serve_runtime_api(
+    listener: TcpListener,
+    app: Router,
+    shutdown: RuntimeServerShutdown,
+) -> std::io::Result<()> {
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.requested.clone().cancelled_owned())
+    .await;
+    shutdown.stopped.cancel();
+    result
+}
+
+/// Listener state is local to the selected authenticated frontend. All service
+/// handles remain the original owner's captured handles.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeFrontendReady {
+    endpoint: SocketAddr,
+    auth_required: bool,
+    generated_auth: bool,
+    reused_owner_listener: bool,
+    mobile_bootstrap_url: Option<String>,
+    web_bootstrap_url: Option<String>,
+}
+fn canonical_runtime_config_source(source: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        source.as_os_str().len() <= 32768,
+        "operator config source exceeds its bounds"
+    );
+    let source = std::path::absolute(source)?;
+    if source.try_exists()? {
+        anyhow::ensure!(
+            source.is_file(),
+            "operator config source is not a regular file"
+        );
+        return Ok(Some(source.canonicalize()?));
+    }
+    // The captured loader permits a missing config document and missing
+    // parents. Anchor its exact uncreated suffix under the nearest existing
+    // directory without resolving another default or creating those paths.
+    let mut ancestor = source.as_path();
+    while !ancestor.try_exists()? {
+        ancestor = ancestor
+            .parent()
+            .context("operator config source has no existing ancestor")?;
+    }
+    anyhow::ensure!(
+        ancestor.is_dir(),
+        "operator config source ancestor is not a directory"
+    );
+    let suffix = source.strip_prefix(ancestor)?;
+    Ok(Some(ancestor.canonicalize()?.join(suffix)))
+}
+
+struct CapturedRuntimeFrontend {
+    worker_setting: usize,
+    generated_auth: bool,
+    config_source: Option<PathBuf>,
+    state: RuntimeApiState,
+    default_model: String,
+}
+impl CapturedRuntimeFrontend {
+    async fn capture(
+        state: RuntimeApiState,
+        model: String,
+        worker_setting: usize,
+        generated_auth: bool,
+    ) -> Result<Arc<Self>> {
+        let source = state
+            .config
+            .read()
+            .loaded_config_path
+            .clone()
+            .or_else(|| state.config_path.clone());
+        let config_source = codewhale_app_server::daemon_socket::owner_work(move || {
+            canonical_runtime_config_source(source)
+        })
+        .await?;
+        Ok(Arc::new(Self {
+            state,
+            default_model: model,
+            worker_setting,
+            generated_auth,
+            config_source,
+        }))
+    }
+    async fn validate_scope(
+        &self,
+        scope: &codewhale_app_server::RuntimeFrontendScope,
+    ) -> Result<()> {
+        scope.validate_bounds()?;
+        anyhow::ensure!(
+            scope.workers == self.worker_setting,
+            "selected worker setting differs from the held scheduler"
+        );
+        anyhow::ensure!(
+            scope.config_profile == self.state.config_profile,
+            "selected config profile differs from the captured owner scope"
+        );
+        if let Some(source) = scope.config_source.clone() {
+            let source = codewhale_app_server::daemon_socket::owner_work(move || {
+                canonical_runtime_config_source(Some(source))
+            })
+            .await?;
+            anyhow::ensure!(
+                source == self.config_source,
+                "selected operator config differs from the captured owner source"
+            );
+        }
+        Ok(())
+    }
+}
+impl codewhale_app_server::RuntimeOwnerFrontend for CapturedRuntimeFrontend {
+    fn validate_selection<'a>(
+        &'a self,
+        selection: &'a codewhale_app_server::RuntimeOwnerFrontendSelection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match selection {
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Control(scope) => {
+                    self.validate_scope(scope).await?;
+                    anyhow::ensure!(
+                        !self.state.runtime_threads.is_acp_host(),
+                        "immutable ACP-base owner cannot admit ordinary control turns"
+                    );
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Acp { scope, model } => {
+                    if let Some(scope) = scope {
+                        self.validate_scope(scope).await?;
+                    }
+                    anyhow::ensure!(
+                        model
+                            .as_ref()
+                            .is_none_or(|model| !model.trim().is_empty() && model.len() <= 1024),
+                        "invalid selected ACP model"
+                    );
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Listener(selection) => {
+                    selection.validate_bounds()?;
+                    self.validate_scope(&codewhale_app_server::RuntimeFrontendScope {
+                        workers: selection.workers,
+                        workspace: selection.workspace.clone(),
+                        config_profile: selection.config_profile.clone(),
+                        config_source: selection.config_source.clone(),
+                    })
+                    .await?;
+                    anyhow::ensure!(
+                        !self.state.runtime_threads.is_acp_host(),
+                        "immutable ACP-base owner cannot admit ordinary listener turns"
+                    );
+                    validate_runtime_listener_security(&RuntimeApiOptions {
+                        host: selection.host.clone(),
+                        port: selection.port,
+                        cors_origins: selection.cors_origins.clone(),
+                        auth_token: selection.auth_token.clone(),
+                        insecure_no_auth: selection.insecure_no_auth,
+                        mobile: selection.mobile,
+                        web: selection.web,
+                        control_frontend: Some(
+                            codewhale_app_server::RuntimeControlFrontend::LegacyHttp,
+                        ),
+                        ..Default::default()
+                    })?;
+                }
+            }
+            Ok(())
+        })
+    }
+    fn serve(
+        &self,
+        selection: codewhale_app_server::RuntimeOwnerFrontendSelection,
+        compatibility: codewhale_app_server::AppState,
+        input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+        mut output: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.validate_selection(&selection).await?;
+            let selection = match selection {
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Control(scope) => {
+                    self.validate_scope(&scope).await?;
+                    anyhow::ensure!(
+                        !self.state.runtime_threads.is_acp_host(),
+                        "immutable ACP-base owner cannot admit ordinary control turns"
+                    );
+                    return codewhale_app_server::run_guest_control(
+                        compatibility,
+                        scope.workspace,
+                        input,
+                        output,
+                    )
+                    .await;
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Acp { scope, model } => {
+                    let workspace = if let Some(scope) = scope {
+                        self.validate_scope(&scope).await?;
+                        scope.workspace
+                    } else {
+                        self.state.workspace.clone()
+                    };
+                    let config = self.state.config.read().clone();
+                    let acp = crate::acp_server::capture_frontend(
+                        config,
+                        model.unwrap_or_else(|| self.default_model.clone()),
+                        workspace,
+                        self.state.runtime_threads.clone(),
+                        self.state.sessions_dir.clone(),
+                        self.state.config_path.clone(),
+                        self.state.config_profile.clone(),
+                    )?;
+                    return acp.serve(input, output).await;
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Listener(selection) => {
+                    selection
+                }
+            };
+            selection.validate_bounds()?;
+            anyhow::ensure!(
+                selection.workers == self.worker_setting,
+                "selected worker setting differs from the held scheduler"
+            );
+            anyhow::ensure!(
+                selection.config_profile == self.state.config_profile,
+                "selected config profile differs from the captured owner scope"
+            );
+            anyhow::ensure!(
+                !self.state.runtime_threads.is_acp_host(),
+                "immutable ACP-base owner cannot admit ordinary listener turns"
+            );
+            let workspace = selection.workspace;
+            let options = RuntimeApiOptions {
+                host: selection.host,
+                port: selection.port,
+                cors_origins: selection.cors_origins,
+                auth_token: selection.auth_token,
+                insecure_no_auth: selection.insecure_no_auth,
+                mobile: selection.mobile,
+                web: selection.web,
+                control_frontend: Some(codewhale_app_server::RuntimeControlFrontend::LegacyHttp),
+                ..Default::default()
+            };
+            validate_runtime_listener_security(&options)?;
+            let selected_addr = runtime_bind_address(&options.host, options.port)?;
+            let original_addr = runtime_bind_address(&self.state.bind_host, self.state.bind_port)?;
+            let same_auth = match (
+                options
+                    .auth_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty()),
+                self.state.runtime_token.as_deref(),
+            ) {
+                (Some(selected), Some(original)) => codewhale_core::secret_eq::constant_time_eq(
+                    selected.as_bytes(),
+                    original.as_bytes(),
+                ),
+                (None, Some(_)) => self.generated_auth && !options.insecure_no_auth,
+                (None, None) => options.insecure_no_auth,
+                _ => false,
+            };
+            if selected_addr == original_addr
+                && !options.web
+                && !options.mobile
+                && self.state.web.is_none()
+                && self.state.mobile.is_none()
+                && options.cors_origins == self.state.cors_origins
+                && workspace == self.state.workspace
+                && same_auth
+            {
+                let ready = RuntimeFrontendReady {
+                    endpoint: original_addr,
+                    auth_required: self.state.auth_required,
+                    generated_auth: self.generated_auth,
+                    reused_owner_listener: true,
+                    mobile_bootstrap_url: None,
+                    web_bootstrap_url: None,
+                };
+                write_frontend_ready(&mut output, ready).await?;
+                return tokio::select! {
+                    result = wait_frontend_input_close(input) => result,
+                    _ = self.state.shutdown.requested.cancelled() => Ok(()),
+                };
+            }
+            let resolved =
+                resolve_runtime_auth(options.auth_token.clone(), None, options.insecure_no_auth);
+            let listener =
+                TcpListener::bind(runtime_bind_address(&options.host, options.port)?).await?;
+            let endpoint = listener.local_addr()?;
+            let workspace_scope = self.state.workspace_scopes.admit(workspace.clone()).await?;
+            let mut state = self.state.clone();
+            state.workspace = workspace.clone();
+            state.workspace_scope = workspace_scope;
+            state.runtime_token = resolved.token.clone();
+            state.auth_required = resolved.token.is_some();
+            state.bind_host = options.host;
+            state.bind_port = endpoint.port();
+            state.cors_origins = options.cors_origins.clone();
+            state.mobile_enabled = options.mobile;
+            let (web, web_bootstrap_url) = if options.web {
+                anyhow::ensure!(
+                    state.auth_required,
+                    "Codewhale web requires Runtime authentication"
+                );
+                let (web, nonce) = web::RuntimeWebState::new();
+                (Some(web), Some(web::bootstrap_url(endpoint, &nonce)))
+            } else {
+                (None, None)
+            };
+            let (mobile, mobile_bootstrap_url) = if options.mobile && state.auth_required {
+                let (mobile, nonce) = mobile::RuntimeMobileState::new();
+                (Some(mobile), Some(mobile::bootstrap_url(endpoint, &nonce)))
+            } else {
+                (None, None)
+            };
+            state.web = web;
+            state.mobile = mobile;
+            // The guest may drain its own streams/listener. It cannot replace
+            // the global signal registration or stop shared schedulers/managers.
+            let shutdown = RuntimeServerShutdown::default();
+            state.shutdown = shutdown.clone();
+            let app =
+                build_router(state).merge(codewhale_app_server::runtime_compatibility_router(
+                    compatibility,
+                    &options.cors_origins,
+                    resolved.token.clone(),
+                    Some(workspace),
+                ));
+            let ready = RuntimeFrontendReady {
+                endpoint,
+                auth_required: resolved.token.is_some(),
+                generated_auth: resolved.generated,
+                reused_owner_listener: false,
+                mobile_bootstrap_url,
+                web_bootstrap_url,
+            };
+            write_frontend_ready(&mut output, ready).await?;
+            let serving = serve_runtime_api(listener, app, shutdown.clone());
+            tokio::pin!(serving);
+            let input_result = tokio::select! {
+                result = &mut serving => { result?; return Ok(()); }
+                _ = self.state.shutdown.requested.cancelled() => Ok(()),
+                result = wait_frontend_input_close(input) => result,
+            };
+            shutdown.requested.cancel();
+            // Accepted turns live in the held manager, independently of this
+            // response or listener drain. Never retry their uncertain writes.
+            tokio::time::timeout(Duration::from_secs(5), &mut serving)
+                .await
+                .context("selected listener drain deadline expired")??;
+            input_result
+        })
+    }
+}
+
+async fn write_frontend_ready(
+    output: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    ready: RuntimeFrontendReady,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let frame = serde_json::to_vec(
+        &json!({"jsonrpc":"2.0","method":"daemon/frontend_ready","params":ready}),
+    )?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        output.write_all(&frame).await?;
+        output.write_all(b"\n").await?;
+        output.flush().await
+    })
+    .await
+    .context("selected listener readiness write timed out; outcome uncertain")??;
+    Ok(())
+}
+async fn wait_frontend_input_close(
+    input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+) -> Result<()> {
+    let mut input = codewhale_app_server::BoundedLines::new(input);
+    if let Some(line) = input.next_line().await? {
+        let value: Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            codewhale_app_server::is_control_input_closed(&value),
+            "selected listener accepts only its logical input close"
+        );
+    }
+    Ok(())
+}
+
+/// The serving Runtime API, for the process signal handler (`lib.rs`), which
+/// exits the process on a terminating signal. Without this it would cut every
+/// open stream mid-connection, indistinguishable from a network drop.
+static SIGNAL_SHUTDOWN: std::sync::Mutex<Option<RuntimeServerShutdown>> =
+    std::sync::Mutex::new(None);
+
+/// How long a terminating signal waits for open streams to say goodbye. A
+/// second signal skips the wait.
+const SIGNAL_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+
+/// Clears `SIGNAL_SHUTDOWN` when the server that registered it returns.
+struct SignalShutdownRegistration;
+
+impl SignalShutdownRegistration {
+    fn register(shutdown: &RuntimeServerShutdown) -> Self {
+        if let Ok(mut slot) = SIGNAL_SHUTDOWN.lock() {
+            *slot = Some(shutdown.clone());
+        }
+        Self
+    }
+}
+
+impl Drop for SignalShutdownRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = SIGNAL_SHUTDOWN.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// Called by the process signal handler before it exits: stop the serving
+/// Runtime API (if any) and give its open streams a bounded window to send
+/// their final `stream.end` frame.
+pub(crate) async fn drain_for_signal_exit() {
+    let shutdown = SIGNAL_SHUTDOWN.lock().ok().and_then(|slot| slot.clone());
+    if let Some(shutdown) = shutdown
+        && !shutdown.drain(SIGNAL_SHUTDOWN_DRAIN).await
+    {
+        tracing::warn!("Runtime API did not drain within the signal shutdown window");
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +976,9 @@ pub struct RuntimeApiOptions {
     pub config_path: Option<PathBuf>,
     /// Effective profile used to load the server's initial Config.
     pub config_profile: Option<String>,
+    pub control_frontend: Option<codewhale_app_server::RuntimeControlFrontend>,
+    pub runtime_event_tap:
+        Option<fn(tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>)>,
 }
 
 impl Default for RuntimeApiOptions {
@@ -281,6 +995,8 @@ impl Default for RuntimeApiOptions {
             show_qr: false,
             config_path: None,
             config_profile: None,
+            control_frontend: None,
+            runtime_event_tap: None,
         }
     }
 }
@@ -334,6 +1050,9 @@ struct ThreadSummaryQuery {
     limit: Option<usize>,
     search: Option<String>,
     include_archived: Option<bool>,
+    /// Comma-separated exact IDs let callers filter before applying the result
+    /// limit. One parameter, because axum's `Query` cannot collect repeated keys.
+    thread_ids: Option<String>,
     /// When `true`, returns archived threads only (overrides `include_archived`).
     /// Whalescale#260 / #563.
     archived_only: Option<bool>,
@@ -373,6 +1092,10 @@ struct ThreadSummary {
     pending_attention_count: usize,
 }
 
+/// `GET /v1/skills` row. Routing metadata (`invocation`, `aliases`,
+/// `bundled_tier`) rides along so a client can build a picker or autocomplete
+/// without a second request per row; the body itself stays behind
+/// `GET /v1/skills/{name}`.
 #[derive(Debug, Serialize)]
 struct SkillEntry {
     name: String,
@@ -386,6 +1109,12 @@ struct SkillEntry {
     plugin_content_hash: Option<String>,
     enabled: bool,
     is_bundled: bool,
+    /// `model+user` | `explicit-only` | `model-only` | `disabled`.
+    invocation: &'static str,
+    /// Alternate lookup names for the same body; never separate entries.
+    aliases: Vec<String>,
+    /// `core` | `tools` for bundled skills, absent for custom ones.
+    bundled_tier: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -396,9 +1125,40 @@ struct SkillsResponse {
     skills: Vec<SkillEntry>,
 }
 
+/// `GET /v1/skills/{name}` — one skill's body plus the routing metadata a
+/// client needs to offer activation: the `/v1/skills` row, plus the full
+/// SKILL.md body. Flattened rather than repeated field-by-field so the two
+/// shapes cannot drift apart.
+#[derive(Debug, Serialize)]
+struct SkillDetailResponse {
+    #[serde(flatten)]
+    skill: SkillEntry,
+    /// Full SKILL.md body (frontmatter stripped) for client-side activation.
+    body: String,
+}
+
 #[derive(Debug, Serialize)]
 struct AgentRunsResponse {
     runs: Vec<AgentWorkerRecord>,
+    /// Live launch-governor state for agents this runtime launches (Fleet
+    /// runs), so a client can say why a queued run waits (addendum F5).
+    governor: AgentRunsGovernor,
+}
+
+/// The rate-limit governor behind agent launches, as of this response.
+#[derive(Debug, Serialize)]
+struct AgentRunsGovernor {
+    /// Launch slots currently granted, after any rate-limit shrink.
+    launch_slots: usize,
+    /// Configured launch concurrency.
+    max_launch_slots: usize,
+    /// New launches are held entirely after sustained provider rate limits.
+    paused: bool,
+    /// Provider rate limits seen inside the governor's sliding window.
+    recent_rate_limits: usize,
+    /// One human line while launches are held back; absent at full speed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -563,13 +1323,18 @@ struct RuntimeInfoResponse {
 
 fn default_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
+        client_token_intents: true,
         account_session: true,
+        account_model_owner: true,
         threads: true,
+        thread_shell_consent: true,
         turns: true,
         turn_operation_idempotency: true,
         turn_operation_lookup: true,
+        automation_mutation_preconditions: true,
         turn_image_inputs: true,
         turn_output_token_limit: true,
+        profile_constitution: true,
         turn_steer: true,
         turn_interrupt: true,
         event_replay: true,
@@ -585,8 +1350,20 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         memory: true,
         mcp_server_management: true,
         skill_lifecycle: true,
+        skill_detail: true,
         plugin_management: true,
         agent_mail: true,
+        // SSE journal frames carry their durable `seq` as the event id, and the
+        // thread event stream resumes from `Last-Event-ID`.
+        event_stream_resume: true,
+        // The terminal family follows the routes' own gate: the owner is
+        // `#[cfg(unix)]` end to end, and the Windows and OpenHarmony builds
+        // answer 501. A client must be able to feature-detect that before it
+        // offers a pane, so the flag must never outrun the handler.
+        terminal_stream: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_input: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_resize: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_kill: cfg!(all(unix, not(target_env = "ohos"))),
     }
 }
 
@@ -809,6 +1586,10 @@ struct McpServerActionReceipt {
 #[derive(Debug, Deserialize)]
 struct AutomationRunsQuery {
     limit: Option<usize>,
+    /// Serve the terminal-run archive kept for deleted automations instead of
+    /// the live run history.
+    #[serde(default)]
+    archived: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -870,6 +1651,16 @@ struct FleetEventsQuery {
 struct StartTurnResponse {
     thread: ThreadRecord,
     turn: TurnRecord,
+    /// Present only when the durable `operation_key` made this submission a
+    /// replay of one already accepted: the turn is the original and nothing
+    /// new was admitted. Omitted otherwise so every existing response stays
+    /// byte-identical — a client that never sends a key sees no change.
+    #[serde(skip_serializing_if = "replay_flag_is_absent")]
+    idempotent_replay: bool,
+}
+
+fn replay_flag_is_absent(replayed: &bool) -> bool {
+    !*replayed
 }
 
 fn install_runtime_server_workshop_budgets(
@@ -878,6 +1669,7 @@ fn install_runtime_server_workshop_budgets(
     crate::tools::large_output_router::WorkshopConfig::install_active(config.workshop.as_ref())
 }
 
+#[cfg(test)]
 fn open_runtime_threads_for_server(
     config: &Config,
     workspace: PathBuf,
@@ -887,23 +1679,135 @@ fn open_runtime_threads_for_server(
     SharedRuntimeThreadManager,
     crate::tools::large_output_router::WorkshopConfig,
 )> {
+    open_runtime_threads_for_host(
+        config,
+        workspace,
+        manager_config,
+        plugin_registry,
+        false,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn open_runtime_threads_for_host(
+    config: &Config,
+    workspace: PathBuf,
+    manager_config: RuntimeThreadManagerConfig,
+    plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    acp: bool,
+    preheld_lock: Option<crate::runtime_threads::RuntimeProcessOwnerLock>,
+    binding: Option<&crate::runtime_threads::RuntimeStoreBinding>,
+) -> Result<(
+    SharedRuntimeThreadManager,
+    crate::tools::large_output_router::WorkshopConfig,
+)> {
     // The Runtime API lazily creates engines after the HTTP/Web server starts.
     // Install the resolved process-wide read/tool byte limits before the
     // thread manager can spawn any of those engines, matching interactive and
     // headless exec startup.
     let workshop_activation = install_runtime_server_workshop_budgets(config);
-    let manager = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
+    let profile = if acp {
+        crate::core::engine::EngineHostProfile::Acp
+    } else {
+        crate::core::engine::EngineHostProfile::Normal
+    };
+    let manager = Arc::new(RuntimeThreadManager::open_host(
         config.clone(),
         workspace,
         manager_config,
         plugin_registry,
+        profile,
+        preheld_lock,
+        binding,
     )?);
+    if let Some(skills_dir) = config.bundled_skills_install_dir()
+        && let Err(error) = crate::skills::install_system_skills(&skills_dir)
+    {
+        crate::logging::warn(format!("Failed to install system skills: {error}"));
+    }
     // Publish the same exact endpoint-scoped catalog as interactive startup
     // before the server admits turns. A cached model list alone does not make
     // its capabilities available to route resolution.
     crate::provider_catalog_live::maybe_load_persisted_cache_for_config(config);
     Ok((manager, workshop_activation))
 }
+
+#[cfg(any(unix, windows))]
+enum RuntimeHostAdmission {
+    Attached(Box<codewhale_app_server::daemon_client::OwnerClient>),
+    Bootstrap {
+        lock: crate::runtime_threads::RuntimeProcessOwnerLock,
+        binding: Option<crate::runtime_threads::RuntimeStoreBinding>,
+        recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
+    },
+}
+
+/// Observe first, then hold the existing store lease through all recovery.
+/// Only pre-write publication changes or lease contention can re-observe.
+#[cfg(any(unix, windows))]
+async fn admit_runtime_host(
+    config_path: Option<PathBuf>,
+    selected_socket: Option<PathBuf>,
+    selected_store: PathBuf,
+) -> Result<RuntimeHostAdmission> {
+    use codewhale_app_server::daemon_client::{HostOwnerProbe, PublicationChangedBeforeAttach};
+    use codewhale_app_server::daemon_socket::owner_work;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let probe = match codewhale_app_server::daemon_client::probe_owner_for_host_startup(
+                config_path.clone(), selected_socket.clone(),
+            ).await {
+                Err(error) if error.is::<PublicationChangedBeforeAttach>() => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                result => result?,
+            };
+            let (binding, recovery) = match probe {
+                HostOwnerProbe::Attached(client) => return Ok(RuntimeHostAdmission::Attached(client)),
+                HostOwnerProbe::Absent => (None, None),
+                HostOwnerProbe::Unavailable(publication) => {
+                    let binding = validate_selected_owner_receipt(publication.receipt().clone(), selected_store.clone()).await?;
+                    (Some(binding), Some(publication))
+                }
+            };
+            let store = selected_store.clone();
+            let existing = binding.clone();
+            let create = recovery.is_none();
+            let lock = owner_work(move || {
+                if let Some(binding) = existing.as_ref() { binding.validate_existing_store()?; }
+                crate::runtime_threads::RuntimeProcessOwnerLock::try_acquire_for_host(&store, create)
+            }).await?;
+            let Some(lock) = lock else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            let store = selected_store.clone();
+            let existing = binding.clone();
+            let lock = owner_work(move || {
+                lock.validate_at_root(&store)?;
+                if let Some(binding) = existing.as_ref() { binding.validate_existing_store()?; }
+                Ok(lock)
+            }).await?;
+            let current = match recovery.as_ref() {
+                Some(publication) => publication.revalidate().await?,
+                None => codewhale_app_server::daemon_client::publication_is_absent(
+                    config_path.clone(), selected_socket.clone(),
+                ).await?,
+            };
+            if !current {
+                drop(lock);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            return Ok(RuntimeHostAdmission::Bootstrap { lock, binding, recovery });
+        }
+    }).await.context("Runtime host admission deadline expired; attachment outcome may be uncertain and is not replayed")?
+}
+
+/// Prefix of the first line the Runtime prints once it holds its listener.
+pub const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
 
 /// Start the runtime API server.
 pub async fn run_http_server(
@@ -913,22 +1817,161 @@ pub async fn run_http_server(
     options: RuntimeApiOptions,
 ) -> Result<()> {
     validate_runtime_listener_security(&options)?;
+    let acp_selected = matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::Acp { .. })
+    );
 
-    // Keep the server usable before a local catalog arrives. Omitted API
-    // requests are checked at admission; background tasks keep the auto sentinel.
     let task_default_model = runtime_request_model(&config, None).unwrap_or_else(|_| "auto".into());
     let task_cfg = TaskManagerConfig::from_runtime(
         &config,
         workspace.clone(),
-        Some(task_default_model),
+        Some(task_default_model.clone()),
         Some(options.workers),
     );
-    let (runtime_threads, _workshop_activation) = open_runtime_threads_for_server(
+    #[cfg(any(unix, windows))]
+    let selected_store =
+        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()).data_dir;
+    #[cfg(unix)]
+    let control_socket = Some(
+        store_selected_control_socket(selected_control_socket(&options), &selected_store).await?,
+    );
+    #[cfg(windows)]
+    let control_socket = selected_control_socket(&options);
+    #[cfg(any(unix, windows))]
+    let admission = admit_runtime_host(
+        options.config_path.clone(),
+        control_socket.clone(),
+        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()).data_dir,
+    )
+    .await?;
+    #[cfg(any(unix, windows))]
+    let (published, preheld_lock, existing_binding, recovery) = match admission {
+        RuntimeHostAdmission::Attached(client) => (Some(*client), None, None, None),
+        RuntimeHostAdmission::Bootstrap {
+            lock,
+            binding,
+            recovery,
+        } => (None, Some(lock), binding, recovery),
+    };
+    #[cfg(not(any(unix, windows)))]
+    let preheld_lock = None;
+    #[cfg(not(any(unix, windows)))]
+    let existing_binding: Option<crate::runtime_threads::RuntimeStoreBinding> = None;
+    #[cfg(any(unix, windows))]
+    if let Some(control) = published {
+        validate_selected_owner(&control, selected_store.clone()).await?;
+        let observed_owner = control.receipt().clone();
+        let client = match options.control_frontend.as_ref() {
+            Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }) => {
+                drop(control);
+                let client =
+                    codewhale_app_server::daemon_client::connect_selected_acp_if_published(
+                        options.config_path.clone(),
+                        control_socket.clone(),
+                        codewhale_app_server::RuntimeFrontendScope {
+                            workers: options.workers,
+                            workspace: workspace.clone(),
+                            config_profile: options.config_profile.clone(),
+                            config_source: config
+                                .loaded_config_path
+                                .clone()
+                                .or_else(|| options.config_path.clone()),
+                        },
+                        model.clone(),
+                        observed_owner.clone(),
+                    )
+                    .await?
+                    .context("authenticated owner disappeared before ACP attachment")?;
+                anyhow::ensure!(
+                    client.receipt() == &observed_owner,
+                    "selected owner changed before ACP attachment"
+                );
+                client
+            }
+            Some(
+                codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Socket { .. },
+            ) => {
+                drop(control);
+                codewhale_app_server::daemon_client::connect_scoped_control_if_published(
+                    options.config_path.clone(),
+                    control_socket.clone(),
+                    codewhale_app_server::RuntimeFrontendScope {
+                        workers: options.workers,
+                        workspace: workspace.clone(),
+                        config_profile: options.config_profile.clone(),
+                        config_source: config
+                            .loaded_config_path
+                            .clone()
+                            .or_else(|| options.config_path.clone()),
+                    },
+                    observed_owner,
+                )
+                .await?
+                .context("authenticated owner disappeared before control attachment")?
+            }
+            _ => {
+                let environment = runtime_token_environment(&|name| std::env::var(name).ok());
+                let selection = codewhale_app_server::RuntimeListenerSelection {
+                    workers: options.workers,
+                    workspace: workspace.clone(),
+                    config_profile: options.config_profile.clone(),
+                    config_source: config
+                        .loaded_config_path
+                        .clone()
+                        .or_else(|| options.config_path.clone()),
+                    host: options.host.clone(),
+                    port: options.port,
+                    cors_origins: options.cors_origins.clone(),
+                    auth_token: options
+                        .auth_token
+                        .clone()
+                        .filter(|token| !token.trim().is_empty())
+                        .or(environment.token),
+                    insecure_no_auth: options.insecure_no_auth,
+                    mobile: options.mobile,
+                    web: options.web,
+                };
+                drop(control);
+                codewhale_app_server::daemon_client::connect_listener_if_published(
+                    options.config_path.clone(),
+                    control_socket.clone(),
+                    selection,
+                    observed_owner,
+                )
+                .await?
+                .context("authenticated owner disappeared before listener attachment")?
+            }
+        };
+        return run_attached_frontend(client, &options).await;
+    }
+    // No publication permits guessing an owner or bypassing its lease. The
+    // real manager open below is still the exclusive bootstrap authority.
+    let addr = runtime_bind_address(&options.host, options.port)?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind {addr}"))?;
+    let bound_addr = listener
+        .local_addr()
+        .context("Failed to read Runtime API listener address")?;
+    let sessions_dir = default_sessions_dir().unwrap_or_else(|_| fallback_sessions_dir());
+    let mut manager_config =
+        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone());
+    manager_config.sessions_dir = Some(sessions_dir.clone());
+    let (runtime_threads, _workshop_activation) = open_runtime_threads_for_host(
         &config,
         workspace.clone(),
-        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()),
+        manager_config,
         plugin_discovery.registry_for_workspace(&workspace),
+        acp_selected,
+        preheld_lock,
+        existing_binding.as_ref(),
     )?;
+    let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
+    if let Some(tap) = options.runtime_event_tap {
+        tap(runtime_threads.subscribe_events());
+    }
     let task_manager =
         TaskManager::start_with_runtime_manager(task_cfg, config.clone(), runtime_threads.clone())
             .await?;
@@ -945,7 +1988,9 @@ pub async fn run_http_server(
         AutomationSchedulerConfig::default(),
     );
 
-    let sessions_dir = default_sessions_dir().unwrap_or_else(|_| fallback_sessions_dir());
+    // Repair the saved-session store once per server start (#6144); this
+    // server's own store is open by now, so it reads as in use.
+    crate::session_reconcile::spawn_background_reconcile(None);
     let runtime_token_env = runtime_token_environment(&|name| std::env::var(name).ok());
     let runtime_token_alias_warning =
         runtime_token_alias_warning(options.auth_token.as_deref(), &runtime_token_env);
@@ -974,6 +2019,21 @@ pub async fn run_http_server(
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
+    let shutdown = RuntimeServerShutdown::default();
+    // Opening a thread is every client's first read, and the store can only
+    // answer it after one pass over the whole items directory (an item's
+    // filename names the item, not its turn). Every open used to pay that pass;
+    // here it is paid once, while the server is starting and nobody is waiting
+    // for it. See [`RuntimeThreadStore::ensure_item_index`].
+    let warm_threads = runtime_threads.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = warm_threads.warm_item_index() {
+            tracing::warn!(%error, "thread item index warm-up failed");
+        }
+    });
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -990,90 +2050,419 @@ pub async fn run_http_server(
         skill_state: Arc::new(Mutex::new(skill_state)),
         auth_required: auth_enabled,
         bind_host: options.host.clone(),
-        bind_port: options.port,
+        bind_port: bound_addr.port(),
         mobile_enabled: options.mobile,
         mobile,
         web,
         fleet_codewhale_binary: configured_codewhale_binary(),
-        mcp_pool: Arc::new(Mutex::new(None)),
-        lsp_manager: Arc::new(std::sync::OnceLock::new()),
+        workspace_scopes,
+        workspace_scope,
+        computer: computer_display::ComputerState::from_env(),
+        shutdown: shutdown.clone(),
+        git_writes: Arc::new(tokio::sync::Mutex::new(())),
+        provider_switches: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
+    #[cfg(any(unix, windows))]
+    let (owner_frontend, control_state) = bind_captured_runtime_frontends(
+        &state,
+        control_socket.clone(),
+        match options.control_frontend.as_ref() {
+            Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }) => model.clone(),
+            _ => task_default_model.clone(),
+        },
+        options.workers,
+        resolved_auth.generated,
+        recovery,
+    )
+    .await?;
+    let listener_workspace = state.workspace.clone();
     let app = build_router(state);
+    #[cfg(any(unix, windows))]
+    let app = app.merge(codewhale_app_server::runtime_compatibility_router(
+        control_state.clone(),
+        &options.cors_origins,
+        runtime_token.clone(),
+        Some(listener_workspace),
+    ));
+    let owned_stdio = matches!(
+        options.control_frontend.as_ref(),
+        Some(
+            codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+        )
+    );
 
-    let addr = runtime_bind_address(&options.host, options.port)?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind {addr}"))?;
-
-    let bound_addr = listener
-        .local_addr()
-        .context("Failed to read Runtime API listener address")?;
-    println!("Runtime API listening on http://{bound_addr}");
-    for line in runtime_auth_status_lines(&resolved_auth) {
-        println!("{line}");
-    }
-    if let Some(warning) = runtime_token_alias_warning {
-        println!("{warning}");
-    }
-    if options.mobile {
-        print_mobile_urls(
-            bound_addr,
-            auth_enabled,
-            resolved_auth.generated,
-            options.show_qr,
-            mobile_bootstrap.as_deref(),
-        );
-    }
-    if let Some(bootstrap) = web_bootstrap {
-        println!("Codewhale web enabled at http://{bound_addr}/");
-        let bootstrap_url = web::bootstrap_url(bound_addr, &bootstrap);
-        println!(
-            "Codewhale web bootstrap (single-use, expires in {} min): {bootstrap_url}",
-            web::BOOTSTRAP_TTL.as_secs() / 60
-        );
-        if let Some(warning) = web_launcher_warning(crate::utils::open_url(&bootstrap_url)) {
+    if !owned_stdio {
+        // First stdout line, flushed: a supervising parent reads the endpoint
+        // from here instead of guessing a port (stdout is block-buffered on a pipe).
+        println!("{RUNTIME_LISTENING_PREFIX}{bound_addr}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        for line in runtime_auth_status_lines(&resolved_auth) {
+            println!("{line}");
+        }
+        if let Some(warning) = runtime_token_alias_warning {
             println!("{warning}");
         }
-    }
-    let is_loopback = is_loopback_bind_host(&options.host);
-    if is_loopback {
-        println!("Security: this server is local-first. Do not expose it to untrusted networks.");
-    } else {
-        println!(
-            "Security: bound to {host}; reachable from any peer that can route to this address.",
-            host = options.host
-        );
-        if !auth_enabled {
-            println!(
-                "  WARNING: auth is disabled. Anyone on the network can call /v1/* without authentication."
+        if options.mobile {
+            print_mobile_urls(
+                bound_addr,
+                auth_enabled,
+                resolved_auth.generated,
+                options.show_qr,
+                mobile_bootstrap.as_deref(),
             );
         }
-        println!(
-            "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
-            host = options.host,
-            port = options.port,
-            auth = auth_enabled,
-        );
+        if let Some(bootstrap) = web_bootstrap {
+            println!("Codewhale web enabled at http://{bound_addr}/");
+            let bootstrap_url = web::bootstrap_url(bound_addr, &bootstrap);
+            println!(
+                "Codewhale web bootstrap (single-use, expires in {} min): {bootstrap_url}",
+                web::BOOTSTRAP_TTL.as_secs() / 60
+            );
+            if let Some(warning) = web_launcher_warning(crate::utils::open_url(&bootstrap_url)) {
+                println!("{warning}");
+            }
+        }
+        let is_loopback = is_loopback_bind_host(&options.host);
+        if is_loopback {
+            println!(
+                "Security: this server is local-first. Do not expose it to untrusted networks."
+            );
+        } else {
+            println!(
+                "Security: bound to {host}; reachable from any peer that can route to this address.",
+                host = options.host
+            );
+            if !auth_enabled {
+                println!(
+                    "  WARNING: auth is disabled. Anyone on the network can call /v1/* without authentication."
+                );
+            }
+            println!(
+                "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
+                host = options.host,
+                port = bound_addr.port(),
+                auth = auth_enabled,
+            );
+        }
     }
-    let serve_result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    let signal_registration = SignalShutdownRegistration::register(&shutdown);
+    #[cfg(any(unix, windows))]
+    let (serve_result, owner_result) = {
+        let owner_handle = owner_frontend.shutdown_handle();
+        let mut owner_task = tokio::spawn(owner_frontend.serve());
+        let stdio = async {
+            if acp_selected {
+                codewhale_app_server::run_owned_acp(control_state).await
+            } else if owned_stdio {
+                codewhale_app_server::run_owned_stdio(control_state).await
+            } else {
+                std::future::pending::<Result<()>>().await
+            }
+        };
+        tokio::pin!(stdio);
+        let serve = serve_runtime_api(listener, app, shutdown.clone());
+        tokio::pin!(serve);
+        tokio::select! {
+            result = &mut serve => {
+                owner_handle.trigger();
+                let owner = owner_task.await.context("owner control frontend task failed")
+                    .and_then(|result| result.map_err(Into::into));
+                (result.map_err(|e| anyhow!("Runtime API server error: {e}")), owner)
+            }
+            result = &mut stdio => {
+                shutdown.requested.cancel();
+                let served = serve.await.map_err(|error|anyhow!("Runtime API server error: {error}"));
+                owner_handle.trigger();
+                let owner=owner_task.await.context("owner control frontend task failed").and_then(|result|result.map_err(Into::into));
+                (result.and(served),owner)
+            }
+            owner = &mut owner_task => {
+                shutdown.requested.cancel();
+                let result = serve.await.map_err(|e| anyhow!("Runtime API server error: {e}"));
+                let owner = owner.context("owner control frontend task failed")
+                    .and_then(|result| result.map_err(Into::into));
+                (result, owner.and_then(|()| Err(anyhow!("owner control frontend stopped before its Runtime host"))))
+            }
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let serve_result = serve_runtime_api(listener, app, shutdown)
+        .await
+        .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    drop(signal_registration);
     scheduler_cancel.cancel();
     scheduler_handle.abort();
     task_manager.shutdown_and_wait().await?;
+    #[cfg(any(unix, windows))]
+    owner_result?;
     serve_result
+}
+
+fn selected_control_socket(options: &RuntimeApiOptions) -> Option<PathBuf> {
+    match options.control_frontend.as_ref() {
+        Some(codewhale_app_server::RuntimeControlFrontend::Socket { path }) => path.clone(),
+        _ => None,
+    }
+}
+
+/// The control endpoint this `serve` run uses: an explicit `Socket { path }`
+/// selection, else the socket derived from the selected runtime store.
+///
+/// One endpoint per store, as a pure function of the store selection. The
+/// default store keeps the well-known socket (discovery and single-engine
+/// setups unchanged), while a non-default store — a client-scoped
+/// `CODEWHALE_RUNTIME_DIR`, like the VS Code extension's per-workspace store —
+/// derives its own private sibling socket. A store-scoped engine then elects
+/// its own owner instead of colliding with the default store's owner, and the
+/// cross-store attach refusal drops out of the topology.
+///
+/// `selected_store` is the store root this run resolved, the same value the
+/// thread manager will open.
+///
+/// Unix only, with `daemon_socket::store_selected_socket_path`: a Windows
+/// owner endpoint is a named pipe whose derived-name form is follow-up work,
+/// so Windows keeps the well-known endpoint and the explicit selection.
+#[cfg(unix)]
+async fn store_selected_control_socket(
+    explicit: Option<PathBuf>,
+    selected_store: &FsPath,
+) -> Result<PathBuf> {
+    let selected_store = selected_store.to_path_buf();
+    codewhale_app_server::daemon_socket::owner_work(move || {
+        let store_override = crate::runtime_threads::canonical_runtime_dir_override()?;
+        let inputs = codewhale_app_server::daemon_socket::SocketPathInputs::from_environment(None)?;
+        store_selected_control_socket_with(
+            explicit,
+            &selected_store,
+            store_override.as_deref(),
+            &inputs,
+        )
+    })
+    .await
+}
+
+/// The environment-free core of [`store_selected_control_socket`].
+///
+/// The environment reads stay in the caller so this decision — the part the
+/// endpoint depends on — can be proven without a test mutating process-wide
+/// environment, which would race every other test in this binary.
+#[cfg(unix)]
+fn store_selected_control_socket_with(
+    explicit: Option<PathBuf>,
+    selected_store: &FsPath,
+    store_override: Option<&FsPath>,
+    inputs: &codewhale_app_server::daemon_socket::SocketPathInputs,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    // Canonicalize the store root before comparing: the override is canonical
+    // (`canonical_runtime_dir_override`), and the store selection is whatever
+    // the store chain resolved. Comparing them in different forms would let a
+    // symlinked or relative override silently keep the default endpoint.
+    let selected =
+        crate::runtime_threads::checked_runtime_store_root(selected_store.to_path_buf())?;
+    let derived_from = store_override.filter(|dir| *dir == selected);
+    codewhale_app_server::daemon_socket::store_selected_socket_path(derived_from, inputs)
+        .map_err(Into::into)
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) async fn validate_selected_owner(
+    client: &codewhale_app_server::daemon_client::OwnerClient,
+    selected_store: PathBuf,
+) -> Result<()> {
+    validate_selected_owner_receipt(client.receipt().clone(), selected_store)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(any(unix, windows))]
+async fn validate_selected_owner_receipt(
+    receipt: codewhale_protocol::RuntimeOwnerReceipt,
+    selected_store: PathBuf,
+) -> Result<crate::runtime_threads::RuntimeStoreBinding> {
+    codewhale_app_server::daemon_socket::owner_work(move || {
+        let selected = crate::runtime_threads::RuntimeStoreBinding::for_store_dir(&selected_store)?;
+        selected.validate_existing_store()?;
+        anyhow::ensure!(
+            selected.data_dir == receipt.data_dir
+                && !selected.execution_scope.is_empty()
+                && selected.execution_scope == receipt.execution_scope,
+            "authenticated Runtime owner belongs to another selected store; refusing attachment"
+        );
+        Ok(selected)
+    })
+    .await
+}
+
+#[cfg(any(unix, windows))]
+async fn bind_captured_runtime_frontends(
+    state: &RuntimeApiState,
+    selected_socket: Option<PathBuf>,
+    model: String,
+    worker_setting: usize,
+    generated_auth: bool,
+    recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
+) -> Result<(
+    codewhale_app_server::daemon_socket::DaemonSocket,
+    codewhale_app_server::AppState,
+)> {
+    let captured_manager = state.runtime_threads.clone();
+    let (binding, generation) = codewhale_app_server::daemon_socket::owner_work(move || {
+        captured_manager.capture_control_owner()
+    })
+    .await?;
+    let config_path = state.config_path.clone();
+    let socket_path =
+        codewhale_app_server::daemon_socket::owner_work(move || match selected_socket {
+            Some(path) => Ok(path),
+            None => codewhale_app_server::daemon_socket::default_socket_path().map_err(Into::into),
+        })
+        .await?;
+    let process_start =
+        codewhale_app_server::daemon_socket::capture_process_start(std::process::id()).await?;
+    #[cfg(unix)]
+    let principal =
+        codewhale_config::private_directory::PrivateDirectory::current_user_id().to_string();
+    #[cfg(windows)]
+    let principal = codewhale_app_server::daemon_socket::owner_work(|| {
+        codewhale_config::windows_identity::CurrentWindowsUser::open()?.sid_string()
+    })
+    .await?;
+    let owner = codewhale_protocol::RuntimeOwnerReceipt {
+        version: 1,
+        data_dir: binding.data_dir,
+        execution_scope: binding.execution_scope,
+        lease_generation: generation,
+        pid: std::process::id(),
+        process_start,
+        principal,
+        socket_path,
+        config_path: config_path.clone(),
+    };
+    codewhale_app_server::bind_runtime_frontends(
+        config_path,
+        state.runtime_token.clone(),
+        owner,
+        codewhale_app_server::RuntimeOwnerRouting {
+            workers: Some(worker_setting),
+            workspace: Some(state.workspace.clone()),
+            endpoint: runtime_bind_address(&state.bind_host, state.bind_port)?,
+            mobile: state.mobile.is_some(),
+            web: state.web.is_some(),
+            acp: true,
+            acp_only: state.runtime_threads.is_acp_host(),
+        },
+        Some(
+            CapturedRuntimeFrontend::capture(state.clone(), model, worker_setting, generated_auth)
+                .await?,
+        ),
+        recovery,
+    )
+    .await
+}
+
+#[cfg(any(unix, windows))]
+async fn run_attached_frontend(
+    mut client: codewhale_app_server::daemon_client::OwnerClient,
+    options: &RuntimeApiOptions,
+) -> Result<()> {
+    let routing = client
+        .routing()
+        .context("authenticated owner has no selected frontend facts")?;
+    let acp_selected = matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::Acp { .. })
+    );
+    anyhow::ensure!(
+        (!acp_selected || routing.acp) && (acp_selected || !routing.acp_only),
+        "selected owner cannot admit this frontend within its captured base profile"
+    );
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(
+            codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+        )
+    ) {
+        return client
+            .forward(tokio::io::stdin(), tokio::io::stdout())
+            .await;
+    }
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::Socket { .. })
+    ) {
+        println!(
+            "Attached to the authenticated Runtime control owner at {}.",
+            routing.endpoint
+        );
+    } else {
+        let frame = tokio::time::timeout(Duration::from_secs(10), client.recv())
+            .await
+            .context("selected listener readiness deadline expired; attachment outcome uncertain")??
+            .context("owner closed before selected listener readiness")?;
+        anyhow::ensure!(
+            frame["jsonrpc"] == "2.0"
+                && frame["method"] == "daemon/frontend_ready"
+                && frame.get("id").is_none(),
+            "invalid selected listener readiness response"
+        );
+        let ready: RuntimeFrontendReady = serde_json::from_value(frame["params"].clone())?;
+        println!("{RUNTIME_LISTENING_PREFIX}{}", ready.endpoint);
+        if ready.generated_auth {
+            println!("Runtime authentication enabled; generated bearer is not printed.");
+        }
+        if let Some(url) = ready.web_bootstrap_url {
+            println!("Codewhale web: {url}");
+        }
+        if let Some(url) = ready.mobile_bootstrap_url {
+            println!("Codewhale mobile: {url}");
+        }
+    }
+
+    // This local guest owns its connection only. A signal detaches; it never
+    // sends the host shutdown request or replays an uncertain operation.
+    tokio::select! {
+        result=async {while client.recv().await?.is_some() {} Ok::<(), anyhow::Error>(())}=>result,
+        result=tokio::signal::ctrl_c()=>result.map_err(Into::into),
+    }
 }
 
 /// Mobile control uses plain HTTP only on loopback. It has no TLS or verified
 /// overlay transport, so a non-loopback listener would expose the Runtime API
 /// to peers that can observe or replay browser traffic.
 fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()> {
-    if options.port == 0 {
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::LegacyHttp)
+    ) && !is_loopback_bind_host(&options.host)
+        && options
+            .auth_token
+            .as_ref()
+            .is_none_or(|token| token.trim().is_empty())
+    {
+        bail!("refusing non-loopback compatibility bind without explicit auth token");
+    }
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(
+            codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Socket { .. }
+                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+        )
+    ) && !is_loopback_bind_host(&options.host)
+    {
+        bail!("owned local control requires a loopback private Runtime listener");
+    }
+    // Port 0 asks the kernel for an ephemeral port. Only a plain loopback
+    // Runtime may use it: web and mobile clients are given a fixed endpoint.
+    if options.port == 0 && (options.web || options.mobile || !is_loopback_bind_host(&options.host))
+    {
         bail!("Port must be > 0");
     }
     if options.web && options.host != "127.0.0.1" {
@@ -1137,6 +2526,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .put(save_current_session),
         )
         .route("/v1/sessions/summary", get(list_sessions_summary))
+        .route("/v1/sessions/repair", get(get_session_repair))
         .route(
             "/v1/sessions/{id}",
             get(get_session).patch(patch_session).delete(delete_session),
@@ -1151,6 +2541,18 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(read_session_artifact),
         )
         .route("/v1/workspace/status", get(workspace_status))
+        // The only writer a GUI has for workspace trust. The engine owns
+        // `config.toml`; a client asks here instead of editing the file.
+        .route("/v1/workspace/trust", post(update_workspace_trust))
+        // The Engine's terminal byte stream (#34). Auth is the route layer's,
+        // not this module's; these never create a session — see terminal.rs.
+        .route("/v1/terminal/{name}/output", get(terminal::terminal_output))
+        .route("/v1/terminal/{name}/input", post(terminal::terminal_input))
+        .route(
+            "/v1/terminal/{name}/resize",
+            post(terminal::terminal_resize),
+        )
+        .route("/v1/terminal/{name}/kill", post(terminal::terminal_kill))
         .route("/v1/workspace/files/search", get(workspace_file_search))
         .route(
             "/v1/workspace/files",
@@ -1164,6 +2566,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/workspace/instructions", get(workspace_instructions))
         .route("/v1/agent-runs", get(list_agent_runs))
         .route("/v1/agent-runs/{run_id}", get(get_agent_run))
+        .route("/v1/agent-runs/{run_id}/cancel", post(cancel_agent_run))
         .route("/v1/fleet/profiles", get(list_fleet_profiles))
         .route(
             "/v1/fleet/runs",
@@ -1239,6 +2642,26 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route(
+            "/v1/threads/{id}/history",
+            get(thread_history::snapshot_thread_history),
+        )
+        .route(
+            "/v1/thread-history/operations/lookup",
+            post(thread_history::lookup_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/operations/recover",
+            post(thread_history::recover_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/mutate",
+            post(thread_history::mutate_thread_history),
+        )
+        .route(
+            "/v1/thread-history/import",
+            post(thread_history::import_thread_history),
+        )
+        .route(
             "/v1/threads/{id}/jobs",
             get(jobs::list_thread_jobs).post(jobs::create_thread_job),
         )
@@ -1295,6 +2718,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
+        .route("/v1/threads/{id}/fork-at-turn", post(fork_thread_at_turn))
         .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
         .route("/v1/threads/{id}/file-revert", post(revert_thread_file))
         .route("/v1/threads/{id}/retry", post(retry_thread_turn))
@@ -1313,6 +2737,21 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(steer_thread_turn),
         )
         .route(
+            "/v1/threads/{id}/turns/{turn_id}/artifacts",
+            get(turn_artifacts::list_turn_artifacts),
+        )
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}",
+            get(turn_artifacts::read_turn_artifact),
+        )
+        // What one tool call changed, from the workspace restore points the
+        // engine recorded around it. A shell command's writes belong to the
+        // command here, not only to the turn (see `turn_artifacts`).
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/calls/{tool_call_id}/changes",
+            get(turn_artifacts::list_call_changes),
+        )
+        .route(
             "/v1/threads/{id}/turns/{turn_id}/interrupt",
             post(interrupt_thread_turn),
         )
@@ -1322,6 +2761,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/compact", post(compact_thread))
         .route("/v1/threads/{id}/usage", get(get_thread_usage))
+        .route("/v1/threads/{id}/receipt", get(get_thread_receipt))
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/receipt",
+            get(get_turn_receipt),
+        )
         .route("/v1/threads/{id}/events", get(stream_thread_events))
         .route("/v1/agent-mail", post(send_agent_mail))
         .route("/v1/threads/{id}/agent-mail", get(list_agent_mail))
@@ -1345,8 +2789,13 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/goal/complete", post(complete_thread_goal))
         .route("/v1/threads/{id}/goal/block", post(block_thread_goal))
+        .route("/v1/goals", get(list_goals))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{approval_id}", post(decide_approval))
+        .route(
+            "/v1/threads/{id}/approval-grants/{grant_id}",
+            delete(revoke_approval_grant),
+        )
         .route(
             "/v1/user-input/{thread_id}/{input_id}",
             post(submit_user_input),
@@ -1356,9 +2805,16 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/skills", get(list_skills))
         .route("/v1/commands", get(list_commands))
+        .route("/v1/hooks", get(list_hooks))
         .route(
             "/v1/skills/{name}",
-            post(set_skill_enabled).delete(uninstall_skill_api),
+            post(set_skill_enabled)
+                .get(get_skill_detail)
+                .delete(uninstall_skill_api),
+        )
+        .route(
+            "/v1/apps/mcp/imports",
+            get(mcp_import::preview).post(mcp_import::apply),
         )
         .route(
             "/v1/apps/mcp/servers",
@@ -1388,9 +2844,18 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/skills/{name}/audit", get(audit_skill_api))
         .route("/v1/apps/mcp/tools", get(list_mcp_tools))
         .route("/v1/apps/plugins", get(plugins::list_plugins))
+        .route("/v1/apps/avatars", get(avatars::list_avatars))
+        .route(
+            "/v1/apps/avatars/{handle}/atlases/{page}",
+            get(avatars::get_atlas),
+        )
         .route(
             "/v1/apps/plugins/install",
             post(plugins::install_plugin_api),
+        )
+        .route(
+            "/v1/apps/plugins/import/dsh/preview",
+            post(plugins::preview_dsh_plugin_api),
         )
         .route(
             "/v1/apps/plugins/{selector}",
@@ -1483,6 +2948,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
+        .route("/v1/constitution", get(constitution::get_constitution))
+        .route(
+            "/v1/constitution/preview",
+            post(constitution::preview_constitution).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .route("/v1/settings/schema", get(get_settings_schema))
         .route(
             "/v1/threads/{id}/notifications/prepare",
@@ -1498,6 +2968,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .merge(memory_lens::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
+            require_workspace_scope,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
             require_runtime_token,
         ));
 
@@ -1511,6 +2985,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(web::exchange_bootstrap),
         )
         .route(
+            "/__codewhale/web/stream-ticket",
+            post(web::refresh_stream_ticket),
+        )
+        .route(
             "/__codewhale/mobile/bootstrap/{nonce}",
             get(exchange_mobile_bootstrap),
         )
@@ -1522,24 +3000,37 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/health", get(health))
         .route("/mobile", get(mobile_page))
         .route("/mobile/", get(mobile_page))
+        // Intentionally unauthenticated: loopback clients discover the
+        // listener here. The response already redacts account detail for
+        // unauthorized requests; it never mutates state.
         .route("/v1/runtime/info", get(runtime_info))
+        // Authenticates per handler: the display WS also takes a single-use
+        // ticket, and client-token minting is master-token only.
+        .merge(computer_display::router(
+            state.computer.clone(),
+            state.runtime_token.clone(),
+        ))
         .merge(api_routes)
         .layer(cors_layer(&state.cors_origins))
         .with_state(state)
 }
 
-async fn mobile_page(State(state): State<RuntimeApiState>, req: Request) -> Response {
+async fn mobile_page(State(state): State<RuntimeApiState>) -> Result<Response, ApiError> {
     if !state.mobile_enabled {
-        return (
+        return Ok((
             StatusCode::NOT_FOUND,
             "mobile control is disabled; start with `codewhale serve --mobile`",
         )
-            .into_response();
+            .into_response());
     }
-    let _ = req;
-    let mut response = Html(MOBILE_HTML).into_response();
+    let settings = tokio::task::spawn_blocking(crate::settings::Settings::load_read_only)
+        .await
+        .map_err(|err| ApiError::internal(format!("mobile settings task failed: {err}")))?
+        .map_err(|err| ApiError::internal(format!("mobile settings unavailable: {err}")))?;
+    let locale = codewhale_localization::resolve_locale(&settings.locale);
+    let mut response = Html(mobile_html(locale)).into_response();
     secure_mobile_response(&mut response);
-    response
+    Ok(response)
 }
 
 #[derive(Serialize)]
@@ -1739,8 +3230,10 @@ fn runtime_request_model(config: &Config, requested: Option<&str>) -> Result<Str
     if let Some(model) = requested {
         return Ok(model.to_string());
     }
-    let provider = config.api_provider();
-    let model = provider_default_model_for_api(config, provider, provider);
+    let identity = config
+        .active_provider_identity()
+        .map_err(ApiError::bad_request)?;
+    let model = provider_default_model_for_api(config, &identity);
     if model.is_empty() {
         return Err(ApiError::bad_request(
             "The active provider has no available default model; refresh its catalog or select an explicit model.",
@@ -1783,7 +3276,11 @@ async fn create_thread(
 
     let thread = state
         .runtime_threads
-        .create_thread(req)
+        .create_thread_with_shell_policy(
+            req,
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok((StatusCode::CREATED, Json(thread)))
@@ -1849,34 +3346,78 @@ async fn ack_thread_notice(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// First-appearance dedupe that preserves the order paths were seen in.
+///
+/// The thread summary resolves git metadata per distinct workspace rather than
+/// per row. One resolution runs up to five blocking `git` processes, and rows
+/// overwhelmingly share a single workspace, so resolving per row multiplied a
+/// listing's process count by its row count.
+fn distinct_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut distinct: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !distinct.contains(&path) {
+            distinct.push(path);
+        }
+    }
+    distinct
+}
+
 async fn list_threads_summary(
     State(state): State<RuntimeApiState>,
     Query(query): Query<ThreadSummaryQuery>,
 ) -> Result<Json<Vec<ThreadSummary>>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let search = query.search.as_deref().map(str::to_ascii_lowercase);
+    let thread_ids = query
+        .thread_ids
+        .map(|ids| {
+            let ids = ids.split(',').map(str::to_owned).collect::<Vec<_>>();
+            if ids.is_empty()
+                || ids.len() > 200
+                || ids.iter().any(|id| {
+                    id.is_empty()
+                        || id.trim() != id
+                        || id.len() > 128
+                        || id.chars().any(char::is_control)
+                })
+            {
+                return Err(ApiError::bad_request(
+                    "thread_ids must be at most 200 comma-separated nonempty IDs of at most 128 bytes",
+                ));
+            }
+            Ok(ids.into_iter().collect::<BTreeSet<_>>())
+        })
+        .transpose()?;
     let filter = resolve_thread_filter(query.include_archived, query.archived_only);
     // `limit` bounds the rows this route returns, not how far a search looks.
     // Passing it to the store read as well matched only inside the newest
     // `limit` threads, so any older match — the row the caller typed the query
     // to find — was invisible. Unsearched listings keep the cheap bounded read;
-    // a search scans in newest-first order and stops at `limit` matches.
+    // a search or exact-ID filter scans in newest-first order and stops at
+    // `limit` matches.
     //
-    // Match on the thread record *before* `get_thread_detail`. Detail is a
-    // whole-store turns+items walk, so loading it for every thread made a
-    // non-matching dashboard keystroke O(threads × (all_turns + all_items))
-    // JSON reads. Preview is filled only for matches; it is not a search key.
-    let scan_limit = if search.is_some() { None } else { Some(limit) };
+    // Match on the thread record *before* harvesting row facts. Preview is
+    // filled only for rows that are returned; it is not a search key.
+    let scan_limit = if search.is_some() || thread_ids.is_some() {
+        None
+    } else {
+        Some(limit)
+    };
     let threads = state
         .runtime_threads
         .list_threads(filter, scan_limit)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let mut summaries = Vec::new();
+    let mut rows = Vec::new();
     for thread in threads {
-        if summaries.len() >= limit {
+        if rows.len() >= limit {
             break;
+        }
+        if let Some(thread_ids) = &thread_ids
+            && !thread_ids.contains(&thread.id)
+        {
+            continue;
         }
         if let Some(search) = &search
             && !state
@@ -1885,18 +3426,60 @@ async fn list_threads_summary(
         {
             continue;
         }
-        let detail = state
-            .runtime_threads
-            .get_thread_detail(&thread.id)
-            .await
-            .map_err(map_thread_err)?;
-        let latest_turn = detail.turns.last();
-        let latest_status =
-            latest_turn.map(|turn| format!("{:?}", turn.status).to_ascii_lowercase());
-        let pending_attention_count = detail
-            .pending_approvals
-            .len()
-            .saturating_add(detail.pending_user_inputs.len());
+        rows.push(thread);
+    }
+
+    // Harvest every returned row's facts in ONE pass over the store. Reading a
+    // whole thread detail per row made this route `rows x (all_turns +
+    // all_items)` JSON reads and parses — seconds-per-thread, so the rail timed
+    // out and went blank on a store of a few dozen threads. Preview and turn
+    // status now come from that same scan; attention comes from live state.
+    let row_ids: Vec<String> = rows.iter().map(|thread| thread.id.clone()).collect();
+
+    // Settle queued recovery receipts before reading the rows, exactly as the
+    // per-row detail read did. The flush cancels a recovered turn's pending
+    // requests, and this page's attention count reads that state, so it has to
+    // precede the scan.
+    state
+        .runtime_threads
+        .flush_recovery_receipts(&row_ids)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let facts = state
+        .runtime_threads
+        .thread_list_facts(&row_ids)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Resolve git metadata once per workspace, not once per row. Each
+    // resolution spawns up to five blocking `git` processes — `rev-parse
+    // --is-inside-work-tree` twice, `--abbrev-ref HEAD`, `--short HEAD` and
+    // `status --porcelain` — and rows overwhelmingly share one workspace, so a
+    // per-row resolve turned a 72-thread listing into roughly 360 process
+    // spawns, every one of them blocking whichever runtime thread ran it.
+    // One blocking task now covers every distinct workspace on the page.
+    let workspaces = distinct_paths(rows.iter().map(|thread| thread.workspace.clone()));
+    let git_by_workspace: Vec<(PathBuf, WorkspaceGitMetadata)> =
+        tokio::task::spawn_blocking(move || {
+            workspaces
+                .into_iter()
+                .map(|workspace| {
+                    let metadata = collect_workspace_git_metadata(&workspace);
+                    (workspace, metadata)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Workspace git metadata task failed: {e}")))?;
+
+    let mut summaries = Vec::with_capacity(rows.len());
+    for thread in rows {
+        let facts = facts.get(&thread.id);
+        let latest_status = facts.and_then(|facts| facts.latest_turn_status.clone());
+        let pending_attention_count = facts.map_or(0, |facts| facts.pending_attention_count);
+        let latest_input_summary =
+            facts.and_then(|facts| facts.latest_turn_input_summary.as_deref());
 
         let title = thread
             .title
@@ -1905,44 +3488,35 @@ async fn list_threads_summary(
             .filter(|t| !t.is_empty())
             .map(|t| truncate_text(t, 72))
             .unwrap_or_else(|| {
-                latest_turn
-                    .map(|turn| {
-                        if turn.input_summary.trim().is_empty() {
+                latest_input_summary
+                    .map(|summary| {
+                        if summary.trim().is_empty() {
                             "New Thread".to_string()
                         } else {
-                            truncate_text(&turn.input_summary, 72)
+                            truncate_text(summary, 72)
                         }
                     })
                     .unwrap_or_else(|| "New Thread".to_string())
             });
 
-        let preview = detail
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match item.kind {
-                TurnItemKind::AgentMessage | TurnItemKind::UserMessage => {
-                    let text = item.detail.clone().unwrap_or_else(|| item.summary.clone());
-                    if text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(truncate_text(&text, 140))
-                    }
-                }
-                _ => None,
-            })
+        let preview = facts
+            .and_then(|facts| facts.preview.as_deref())
+            .map(|text| truncate_text(text, 140))
             .unwrap_or_else(|| title.clone());
 
-        let workspace_git = collect_workspace_git_metadata(&thread.workspace);
+        let workspace_git = git_by_workspace
+            .iter()
+            .find(|(workspace, _)| workspace == &thread.workspace)
+            .map(|(_, metadata)| metadata);
         summaries.push(ThreadSummary {
             id: thread.id,
             title,
             preview,
             model: thread.model,
             mode: thread.mode,
-            branch: workspace_git.branch,
-            head: workspace_git.head,
-            dirty: workspace_git.dirty,
+            branch: workspace_git.and_then(|git| git.branch.clone()),
+            head: workspace_git.and_then(|git| git.head.clone()),
+            dirty: workspace_git.is_some_and(|git| git.dirty),
             workspace: thread.workspace,
             archived: thread.archived,
             updated_at: thread.updated_at,
@@ -1955,34 +3529,281 @@ async fn list_threads_summary(
     Ok(Json(summaries))
 }
 
+fn same_agent_worker_launch(current: &AgentWorkerRecord, expected: &AgentWorkerRecord) -> bool {
+    current.spec.worker_id == expected.spec.worker_id
+        && current.owner_session_id == expected.owner_session_id
+        && current.spec.run_id == expected.spec.run_id
+        && current.created_at_ms == expected.created_at_ms
+        && current
+            .spec
+            .launch_manifest
+            .as_ref()
+            .map(|manifest| manifest.generation)
+            == expected
+                .spec
+                .launch_manifest
+                .as_ref()
+                .map(|manifest| manifest.generation)
+}
+
+fn fleet_worker_has_selected_lease(
+    record: &AgentWorkerRecord,
+    fleet: &crate::fleet::ledger::FleetLedgerState,
+) -> bool {
+    fleet.tasks.values().any(|task| {
+        task.entry.run_id.0 == record.spec.run_id
+            && task.leased_to.as_deref() == Some(record.spec.worker_id.as_str())
+    })
+}
+
+async fn workspace_agent_runs(state: &RuntimeApiState) -> Result<Vec<AgentWorkerRecord>, ApiError> {
+    let manager = state.sub_agent_manager.clone().read_owned().await;
+    let selected_state = state.clone();
+    codewhale_app_server::daemon_socket::owner_work(move || {
+        let projected = manager
+            .worker_records_for_workspace(&selected_state.workspace)
+            .map_err(anyhow::Error::msg)?;
+        let fleet = if projected.iter().any(|(_, fleet)| *fleet) {
+            Some(
+                open_fleet_manager(&selected_state)
+                    .map_err(|error| anyhow::anyhow!(error.message))?
+                    .rebuild_state()?,
+            )
+        } else {
+            None
+        };
+        Ok(projected
+            .into_iter()
+            .filter_map(|(record, needs_lease)| {
+                if needs_lease
+                    && !fleet
+                        .as_ref()
+                        .is_some_and(|fleet| fleet_worker_has_selected_lease(&record, fleet))
+                {
+                    return None;
+                }
+                Some(record)
+            })
+            .collect())
+    })
+    .await
+    .map_err(|error| ApiError::conflict(format!("agent run origin could not be verified: {error}")))
+}
+
 async fn list_agent_runs(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<AgentRunsResponse>, ApiError> {
-    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
-        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
-    })?;
-    Ok(Json(AgentRunsResponse { runs }))
+    let runs = workspace_agent_runs(&state).await?;
+    let snapshot = state
+        .sub_agent_manager
+        .read()
+        .await
+        .rate_limit_governor()
+        .snapshot(std::time::Instant::now());
+    Ok(Json(AgentRunsResponse {
+        runs,
+        governor: AgentRunsGovernor {
+            launch_slots: snapshot.launch_capacity,
+            max_launch_slots: snapshot.max_capacity,
+            paused: snapshot.paused,
+            recent_rate_limits: snapshot.window_limited,
+            status: snapshot.status_line(),
+        },
+    }))
 }
 
 async fn get_agent_run(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<AgentWorkerRecord>, ApiError> {
-    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
-        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
-    })?;
+    let runs = workspace_agent_runs(&state).await?;
     let run = runs
         .into_iter()
-        .find(|record| {
-            let effective_run_id = if record.spec.run_id.is_empty() {
-                record.spec.worker_id.as_str()
-            } else {
-                record.spec.run_id.as_str()
-            };
-            effective_run_id == run_id || record.spec.worker_id == run_id
-        })
+        .find(|record| agent_run_matches(record, &run_id))
         .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
     Ok(Json(run))
+}
+
+/// A run is addressed by its run id, or by its worker id for records that
+/// predate run ids.
+fn agent_run_matches(record: &AgentWorkerRecord, run_id: &str) -> bool {
+    let effective_run_id = if record.spec.run_id.is_empty() {
+        record.spec.worker_id.as_str()
+    } else {
+        record.spec.run_id.as_str()
+    };
+    effective_run_id == run_id || record.spec.worker_id == run_id
+}
+
+/// How long a stop request waits for the owning engine to record the
+/// terminal receipt before answering `202 Accepted` with the live record.
+const AGENT_RUN_CANCEL_SETTLE: Duration = Duration::from_secs(3);
+
+/// `POST /v1/agent-runs/{run_id}/cancel`: stop a delegated agent run and
+/// answer with its receipt (addendum F2).
+///
+/// The stop goes through the same session-scoped path as the TUI's `X` and
+/// the `agent/cancel` tool, so descendants stop with it and a write-scoped
+/// child's work is inventoried rather than dropped. The answer is:
+/// - `200` with the terminal record once the run is stopped (or was already
+///   finished — stopping is idempotent);
+/// - `202` with the current record when the owning engine accepted the stop
+///   but has not recorded the terminal receipt yet;
+/// - `404` for an unknown run;
+/// - `409` when the run belongs to a session this runtime does not host, so
+///   nothing here can reach it.
+async fn cancel_agent_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<(StatusCode, Json<AgentWorkerRecord>), ApiError> {
+    let selected_record = workspace_agent_runs(&state)
+        .await?
+        .into_iter()
+        .find(|record| agent_run_matches(record, &run_id))
+        .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
+    // Runs this runtime is executing itself (Fleet-launched children) stop
+    // in place. Only a running child in this process qualifies for mutation;
+    // a terminal receipt can be returned without mutating or consulting disk.
+    // Other persisted runs still go through their owning session below.
+    let owned = {
+        let manager = state.sub_agent_manager.clone().read_owned().await;
+        let selected_workspace = state.workspace.clone();
+        let expected = selected_record.clone();
+        codewhale_app_server::daemon_socket::owner_work(move || {
+            Ok(manager
+                .worker_records_for_workspace(&selected_workspace)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .map(|(record, _)| record)
+                .find(|record| same_agent_worker_launch(record, &expected))
+                .filter(|record| {
+                    manager
+                        .get_result(&record.spec.worker_id)
+                        .is_ok_and(|agent| {
+                            agent.status == SubAgentStatus::Running || record.status.is_terminal()
+                        })
+                }))
+        })
+        .await
+        .map_err(|error| ApiError::conflict(error.to_string()))?
+    };
+    if let Some(record) = owned {
+        // Persistence is asynchronous. A repeated stop must answer from the
+        // owning manager's terminal receipt, not race the disk projection and
+        // incorrectly report a run we just stopped as missing or still live.
+        if record.status.is_terminal() {
+            return Ok((StatusCode::OK, Json(record)));
+        }
+        let mut manager = state.sub_agent_manager.clone().write_owned().await;
+        let selected_workspace = state.workspace.clone();
+        let selected_state = state.clone();
+        let expected_record = record.clone();
+        let cancelled = codewhale_app_server::daemon_socket::owner_work(move || {
+            let (current, needs_lease) = manager
+                .worker_records_for_workspace(&selected_workspace)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .find(|(record, _)| same_agent_worker_launch(record, &expected_record))
+                .ok_or_else(|| anyhow::anyhow!("worker origin changed before cancellation"))?;
+            if needs_lease {
+                let fleet = open_fleet_manager(&selected_state)
+                    .map_err(|error| anyhow::anyhow!(error.message))?
+                    .rebuild_state()?;
+                anyhow::ensure!(
+                    fleet_worker_has_selected_lease(&current, &fleet),
+                    "selected Fleet lease changed before cancellation"
+                );
+                // Revalidate the held root after the bounded ledger read, before
+                // the actor mutation. No awaited operation follows this check.
+                anyhow::ensure!(
+                    manager
+                        .worker_records_for_workspace(&selected_workspace)
+                        .map_err(anyhow::Error::msg)?
+                        .iter()
+                        .any(|(record, _)| same_agent_worker_launch(record, &current)),
+                    "worker origin changed during selected Fleet lease validation"
+                );
+            }
+            if current.owner_session_id.is_empty() {
+                manager.cancel_agent(&current.spec.worker_id)
+            } else {
+                manager.cancel_agent_for_session(&current.owner_session_id, &current.spec.worker_id)
+            }
+        })
+        .await
+        .map_err(|err| {
+            ApiError::conflict(format!("agent run '{run_id}' could not be stopped: {err}"))
+        })?;
+        let cancelled =
+            crate::tools::subagent::settle_requested_child(&state.sub_agent_manager, cancelled)
+                .await;
+        crate::tools::subagent::preserve_cancelled_work(&state.sub_agent_manager, cancelled).await;
+        let manager = state.sub_agent_manager.read().await;
+        let record = manager
+            .list_worker_records()
+            .into_iter()
+            .find(|current| same_agent_worker_launch(current, &record))
+            .ok_or_else(|| {
+                ApiError::conflict("worker launch changed while cancellation settled")
+            })?;
+        let status = if record.status.is_terminal() {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        };
+        return Ok((status, Json(record)));
+    }
+
+    let record = selected_record;
+
+    // A runtime thread's session id is its thread id: its live engine owns
+    // the child and stops it through the session-scoped cancel path. The
+    // on-disk projection cannot tell a live child from an orphan (loading it
+    // marks every in-flight record interrupted), so a hosted thread is always
+    // asked, and only its own write settles the answer.
+    let engine = if record.owner_session_id.is_empty() {
+        None
+    } else {
+        state
+            .runtime_threads
+            .loaded_engine(&record.owner_session_id)
+            .await
+    };
+    let Some(engine) = engine else {
+        if record.status.is_terminal() {
+            return Ok((StatusCode::OK, Json(record)));
+        }
+        return Err(ApiError::conflict(format!(
+            "agent run '{run_id}' belongs to a session this runtime is not hosting; stop it from that session"
+        )));
+    };
+    engine
+        .send(crate::core::ops::Op::CancelSubAgent {
+            agent_id: record.spec.worker_id.clone(),
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("Failed to reach the run's engine: {err}")))?;
+
+    let settled = |current: &AgentWorkerRecord| {
+        current.status.is_terminal()
+            && (current.status != AgentWorkerStatus::Interrupted
+                || current.latest_message != record.latest_message)
+    };
+    let deadline = tokio::time::Instant::now() + AGENT_RUN_CANCEL_SETTLE;
+    loop {
+        let current = workspace_agent_runs(&state)
+            .await?
+            .into_iter()
+            .find(|current| same_agent_worker_launch(current, &record))
+            .unwrap_or_else(|| record.clone());
+        if settled(&current) {
+            return Ok((StatusCode::OK, Json(current)));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok((StatusCode::ACCEPTED, Json(current)));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn list_fleet_profiles(
@@ -2279,7 +4100,9 @@ async fn start_fleet_run(
     let codewhale_binary = state.fleet_codewhale_binary.clone();
     let sessions_dir = state.sessions_dir.clone();
     let execution_run_id = run_id.clone();
+    let workspace_scope = state.workspace_scope.clone();
     tokio::spawn(async move {
+        let _workspace_scope = workspace_scope;
         let mut executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
         if let Err(error) = manager
             .run_to_completion(
@@ -2608,7 +4431,9 @@ async fn restart_fleet_worker(
     let workspace = state.workspace.clone();
     let codewhale_binary = state.fleet_codewhale_binary.clone();
     let sessions_dir = state.sessions_dir.clone();
+    let workspace_scope = state.workspace_scope.clone();
     tokio::spawn(async move {
+        let _workspace_scope = workspace_scope;
         let mut executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
         if let Err(err) = manager
             .run_to_completion(
@@ -3112,6 +4937,18 @@ struct CommandCatalogEntry {
     /// Literal verbs declared by the usage line (`/goal <block|complete|…>`).
     subcommands: Vec<String>,
     takes_arguments: bool,
+    /// Composer argument shape, computed the way the TUI composer computes
+    /// it so clients do not re-derive it from the usage string.
+    /// Usage mentions any argument, required or optional.
+    requires_argument: bool,
+    /// Usage has a `<required>` argument outside every `[optional]` group.
+    requires_required_argument: bool,
+    /// Accepting the command leaves a trailing space for its arguments.
+    composer_wants_trailing_space: bool,
+    /// The palette runs the command on selection instead of pasting it.
+    palette_runs_directly: bool,
+    /// Listed when the slash menu opens with no filter text.
+    show_in_empty_discovery: bool,
     /// `builtin` is registered code; `user` expands a stored template.
     kind: &'static str,
     /// `host` runs locally and never reaches the model; `prompt` expands into
@@ -3136,58 +4973,69 @@ struct CommandsResponse {
 }
 
 fn command_catalog(
-    user_commands: &crate::commands::user_registry::UserCommandRegistry,
+    builtins: &[crate::command_catalog::BuiltinCommand],
+    users: &[crate::command_catalog::UserCommand],
 ) -> Vec<CommandCatalogEntry> {
     let mut commands = Vec::new();
-    for info in crate::commands::command_infos() {
-        let shadowed_by = user_commands
-            .get(info.name)
-            .map(|command| command.name.clone());
+    for info in builtins {
+        let shadowed_by = users
+            .iter()
+            .find(|user| {
+                user.builtin_bindings
+                    .iter()
+                    .any(|spelling| spelling == &info.name)
+            })
+            .map(|user| user.name.clone());
         let shadowed_aliases = info
             .aliases
             .iter()
-            .filter(|alias| user_commands.get(alias).is_some())
-            .map(|alias| (*alias).to_string())
+            .filter(|alias| {
+                users
+                    .iter()
+                    .any(|user| user.builtin_bindings.contains(alias))
+            })
+            .cloned()
             .collect();
         commands.push(CommandCatalogEntry {
-            name: info.name.to_string(),
-            aliases: info
-                .aliases
-                .iter()
-                .map(|alias| (*alias).to_string())
-                .collect(),
+            name: info.name.clone(),
+            aliases: info.aliases.clone(),
             summary: Some(
-                info.description_for(codewhale_localization::Locale::En)
+                codewhale_localization::tr(codewhale_localization::Locale::En, info.description_id)
                     .into_owned(),
             ),
-            usage: Some(info.usage.to_string()),
-            subcommands: crate::commands::traits::usage_subcommands(info.usage)
-                .iter()
-                .map(|token| (*token).to_string())
-                .collect(),
-            takes_arguments: crate::commands::user_registry::usage_describes_arguments(
-                info.name, info.usage,
-            ),
+            usage: Some(info.usage.clone()),
+            subcommands: info.subcommands.clone(),
+            takes_arguments: info.takes_arguments,
+            requires_argument: info.requires_argument,
+            requires_required_argument: info.requires_required_argument,
+            composer_wants_trailing_space: info.composer_wants_trailing_space,
+            palette_runs_directly: info.palette_runs_directly,
+            show_in_empty_discovery: info.show_in_empty_discovery,
             kind: "builtin",
             binding: "host",
-            discovery: Some(match info.discovery() {
-                crate::commands::traits::CommandDiscovery::Primary => "primary",
-                crate::commands::traits::CommandDiscovery::Advanced => "advanced",
-                crate::commands::traits::CommandDiscovery::Compatibility => "compatibility",
+            discovery: Some(match info.discovery {
+                codewhale_command_contract::CommandDiscovery::Primary => "primary",
+                codewhale_command_contract::CommandDiscovery::Advanced => "advanced",
+                codewhale_command_contract::CommandDiscovery::Compatibility => "compatibility",
             }),
-            hidden: crate::commands::traits::UNLISTED_COMMANDS.contains(&info.name),
+            hidden: info.unlisted,
             shadowed_by,
             shadowed_aliases,
         });
     }
-    for command in user_commands.iter() {
+    for command in users.iter().filter(|command| !command.extension) {
         commands.push(CommandCatalogEntry {
             name: command.name.clone(),
             aliases: command.aliases.clone(),
             summary: command.description.clone(),
-            usage: command.display_usage().map(str::to_string),
+            usage: command.usage.clone(),
             subcommands: Vec::new(),
-            takes_arguments: command.takes_arguments(),
+            takes_arguments: command.takes_arguments,
+            requires_argument: command.takes_arguments,
+            requires_required_argument: false,
+            composer_wants_trailing_space: command.takes_arguments,
+            palette_runs_directly: !command.takes_arguments,
+            show_in_empty_discovery: !command.hidden,
             kind: "user",
             binding: "prompt",
             discovery: None,
@@ -3202,11 +5050,143 @@ fn command_catalog(
 async fn list_commands(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<CommandsResponse>, ApiError> {
-    let commands = crate::commands::user_registry::with_registry_for_workspace(
-        Some(state.workspace.as_path()),
-        command_catalog,
-    );
+    let catalog = crate::command_catalog::installed()
+        .ok_or_else(|| ApiError::internal("command catalog is not installed"))?;
+    let workspace = state.workspace.clone();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    let commands = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        command_catalog(
+            &catalog.builtins(),
+            &catalog.user_commands(workspace.as_path()),
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(CommandsResponse { commands }))
+}
+
+#[derive(Debug, Deserialize)]
+struct HooksQuery {
+    /// Report the hooks a thread's engine runs (its workspace); defaults to
+    /// the server workspace.
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HooksResponse {
+    workspace: String,
+    enabled: bool,
+    hooks: Vec<HookEntry>,
+    /// Hooks rejected or warned about at load, one redaction-safe line each.
+    problems: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HookEntry {
+    name: Option<String>,
+    event: &'static str,
+    /// The shell command, with credential-shaped values masked.
+    command: String,
+    background: bool,
+    timeout_secs: u64,
+    /// `global` (user config), `plugin` (reviewed plugin) or `project`
+    /// (trusted, approved `.codewhale/hooks.toml`).
+    source: &'static str,
+}
+
+/// Mask a hook command for `GET /v1/hooks`. Keyed and credential-shaped
+/// values go through the shared redactor; every URL additionally keeps only
+/// its scheme and host, because webhook secrets live in the path
+/// (`https://hooks.slack.com/services/T…/B…/<secret>`) where no key names
+/// them.
+fn redact_hook_command_for_listing(command: &str) -> String {
+    let masked = codewhale_config::persistence::redact_secrets(command);
+    masked
+        .split(' ')
+        .map(|word| match word.find("://") {
+            Some(scheme_end) => {
+                let rest = &word[scheme_end + 3..];
+                let host_end = rest.find(['/', '?', '#', '"', '\'']).unwrap_or(rest.len());
+                let host = &rest[..host_end];
+                // Userinfo (`user:pass@host`) is a credential too.
+                let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+                let tail = &rest[host_end..];
+                let quote = tail
+                    .chars()
+                    .last()
+                    .filter(|c| matches!(c, '"' | '\''))
+                    .map(String::from)
+                    .unwrap_or_default();
+                let path = if tail.len() > quote.len() {
+                    "/[redacted]"
+                } else {
+                    ""
+                };
+                format!("{}{host}{path}{quote}", &word[..scheme_end + 3])
+            }
+            None => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `GET /v1/hooks` (B4): the hook set Runtime API threads run, from the same
+/// loader their engines use, so clients show one truth instead of keeping a
+/// hook table of their own.
+async fn list_hooks(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<HooksQuery>,
+) -> Result<Json<HooksResponse>, ApiError> {
+    let workspace = match query.thread_id.as_deref() {
+        Some(id) => {
+            state
+                .runtime_threads
+                .get_thread(id)
+                .await
+                .map_err(map_thread_err)?
+                .workspace
+        }
+        None => state.workspace.clone(),
+    };
+    let config = state.config.read().clone();
+    let plugins = state.plugin_discovery.registry_for_workspace(&workspace);
+    let executor = state.runtime_threads.hook_executor_for_workspace(
+        &config,
+        &workspace,
+        Some(plugins.as_ref()),
+    );
+    let hooks_config = executor.config();
+    let hooks = hooks_config
+        .hooks
+        .iter()
+        .map(|hook| HookEntry {
+            name: hook.name.clone(),
+            event: hook.event.as_str(),
+            command: redact_hook_command_for_listing(&hook.command),
+            background: hook.background,
+            timeout_secs: hook.timeout_secs,
+            source: if hook.project_authority.is_some() {
+                "project"
+            } else if hook.plugin_authority.is_some() {
+                "plugin"
+            } else {
+                "global"
+            },
+        })
+        .collect();
+    Ok(Json(HooksResponse {
+        workspace: workspace.display().to_string(),
+        enabled: hooks_config.enabled,
+        hooks,
+        problems: hooks_config
+            .problems
+            .iter()
+            .map(crate::hooks::HookConfigProblem::summary)
+            .collect(),
+    }))
 }
 
 async fn list_skills(
@@ -3215,9 +5195,7 @@ async fn list_skills(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -3237,38 +5215,9 @@ async fn list_skills(
         .list()
         .iter()
         .map(|skill| {
-            let (path, source, plugin_id, plugin_generation, plugin_content_hash) =
-                match &skill.source {
-                    crate::skills::SkillSource::Native => (
-                        Some(skill.path.clone()),
-                        "native".to_string(),
-                        None,
-                        None,
-                        None,
-                    ),
-                    crate::skills::SkillSource::Plugin {
-                        plugin_id,
-                        plugin_name,
-                        authority,
-                    } => (
-                        None,
-                        format!("reviewed-plugin-snapshot:{plugin_name}"),
-                        Some(plugin_id.clone()),
-                        Some(authority.state_generation),
-                        Some(authority.content_hash.clone()),
-                    ),
-                };
-            SkillEntry {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                path,
-                source,
-                plugin_id,
-                plugin_generation,
-                plugin_content_hash,
-                enabled: skill_state.is_enabled(&skill.name),
-                is_bundled: skill_entry_is_bundled(skill, &skills_dir),
-            }
+            let enabled = skill_state
+                .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
+            skill_entry_for(skill, enabled, &skills_dir)
         })
         .collect();
     Ok(Json(SkillsResponse {
@@ -3287,9 +5236,7 @@ async fn set_skill_enabled(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -3317,6 +5264,100 @@ async fn set_skill_enabled(
         name,
         enabled: req.enabled,
     }))
+}
+
+/// `GET /v1/skills/{name}` — one skill's full routing metadata plus its body.
+///
+/// Clients that activate a skill client-side (TUI's `/skill`, the VS Code GUI)
+/// need the SKILL.md body to compose the next turn's instruction. `load_skill`
+/// serves the model inside a turn; this endpoint serves the *client* before
+/// one. The same discovery walk backs both, so a name the listing shows is a
+/// name this resolves. Plugin bodies are already content-bound in the
+/// in-memory registry snapshot; native bodies are re-checked against disk so
+/// a deleted SKILL.md fails loudly instead of serving a stale body.
+async fn get_skill_detail(
+    State(state): State<RuntimeApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<SkillDetailResponse>, ApiError> {
+    // Discovery, plugin tree hashing/state locks, and skill-state refresh
+    // all read disk; keep this new route's work off the async server worker.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let (skills_dir, mode) = {
+            let config = state.config.read();
+            let skills_dir = resolve_skills_dir(&config, &state.workspace);
+            let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
+            (skills_dir, mode)
+        };
+        let plugin_registry = state
+            .plugin_discovery
+            .registry_for_workspace(&state.workspace);
+        let (registry, directories) = discover_skills_for_runtime_api(
+            &state.workspace,
+            &skills_dir,
+            mode,
+            Some(plugin_registry.as_ref()),
+        );
+        let Some(skill) = registry.get(&name) else {
+            return Err(ApiError::not_found(format!(
+                "skill '{name}' not found in searched directories: {}",
+                format_skill_search_paths(&directories)
+            )));
+        };
+
+        // Only the checks the listing does not need: this route hands the body to
+        // a client, so a native skill whose file has gone must fail rather than
+        // serve the cached instructions, and a plugin must still hold the
+        // authority its snapshot was reviewed under. Field derivation itself is
+        // `skill_entry_for`'s, shared with the listing.
+        match &skill.source {
+            crate::skills::SkillSource::Native if !skill.path.is_file() => {
+                return Err(ApiError::not_found(format!(
+                    "skill '{}' is registered at {} but that file no longer exists on disk",
+                    skill.name,
+                    skill.path.display()
+                )));
+            }
+            crate::skills::SkillSource::Plugin { authority, .. } => {
+                // The same gate the TUI's own activation path runs: a plugin whose
+                // trust or enablement changed since discovery must not hand its
+                // body to a client.
+                crate::plugins::registry::verify_plugin_component_authority(
+                    authority,
+                    crate::plugins::activation::PluginActivationCapability::Skills,
+                )
+                .map_err(|reason| {
+                    ApiError::forbidden(format!(
+                        "plugin skill '{}' is no longer active: {reason}",
+                        skill.name
+                    ))
+                })?;
+                if authority.workspace != state.workspace {
+                    return Err(ApiError::forbidden(format!(
+                        "plugin skill '{}' belongs to a different workspace",
+                        skill.name
+                    )));
+                }
+            }
+            crate::skills::SkillSource::Native => {}
+        }
+
+        let mut skill_state = state.skill_state.blocking_lock();
+        skill_state
+            .refresh()
+            .map_err(|error| ApiError::internal(format!("refresh skill state: {error}")))?;
+        let enabled = skill_state
+            .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref());
+        Ok(Json(SkillDetailResponse {
+            skill: skill_entry_for(skill, enabled, &skills_dir),
+            body: skill.body.clone(),
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("skill detail read task failed: {error}")))?
 }
 
 // ─── Skill lifecycle helpers ────────────────────────────────────────────────
@@ -3740,9 +5781,37 @@ struct ApprovalsQuery {
 struct ApprovalHistoryRow {
     approval_id: String,
     tool_name: String,
+    /// Redacted host or workspace-relative path the ask was about. Absent on
+    /// records written before targets were kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    /// Redacted one-line description of what was asked, at most 120
+    /// characters. Absent on records written before summaries were kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
     outcome: String,
+    /// `allow` or `deny` when a standing session rule or grant answered the
+    /// ask rather than a person; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standing_rule: Option<&'static str>,
+    /// Who resolved it: `user`, `session_rule`, `posture`, or `host`.
+    /// Absent while pending and on records written before deciders were kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decided_by: Option<crate::approval_log::ApprovalDecider>,
     asked_at: chrono::DateTime<Utc>,
     decided_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn approval_row_standing_rule(
+    outcome: &crate::approval_log::ApprovalOutcome,
+    decided_by: Option<crate::approval_log::ApprovalDecider>,
+) -> Option<&'static str> {
+    use crate::approval_log::{ApprovalDecider, ApprovalOutcome};
+    match (outcome, decided_by) {
+        (ApprovalOutcome::ApprovedOnce, Some(ApprovalDecider::SessionRule)) => Some("allow"),
+        (ApprovalOutcome::Denied, Some(ApprovalDecider::SessionRule)) => Some("deny"),
+        _ => None,
+    }
 }
 
 fn approval_outcome_label(outcome: &crate::approval_log::ApprovalOutcome) -> &'static str {
@@ -3769,7 +5838,11 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
             ApprovalHistoryRow {
                 approval_id: completed.ask.approval_id().to_string(),
                 tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
+                target: completed.ask.target().map(str::to_string),
+                summary: completed.ask.summary().map(str::to_string),
                 outcome: approval_outcome_label(&completed.outcome).to_string(),
+                standing_rule: approval_row_standing_rule(&completed.outcome, completed.decided_by),
+                decided_by: completed.decided_by,
                 asked_at,
                 decided_at: Some(completed.decided_at),
             }
@@ -3777,7 +5850,11 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
         .chain(replay.unmatched_asks.iter().map(|ask| ApprovalHistoryRow {
             approval_id: ask.approval_id().to_string(),
             tool_name: ask.tool_name().unwrap_or("unknown").to_string(),
+            target: ask.target().map(str::to_string),
+            summary: ask.summary().map(str::to_string),
             outcome: "pending".to_string(),
+            standing_rule: None,
+            decided_by: None,
             asked_at: ask.created_at(),
             decided_at: None,
         }))
@@ -3852,6 +5929,27 @@ async fn decide_approval(
         decision: req.decision,
         delivered,
     }))
+}
+
+/// `DELETE /v1/threads/{id}/approval-grants/{grant_id}` — revoke one
+/// "allow for this conversation" grant. The next matching call prompts again.
+async fn revoke_approval_grant(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, grant_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let revoked = state
+        .runtime_threads
+        .revoke_approval_grant(&thread_id, &grant_id)
+        .await
+        .map_err(map_thread_err)?;
+    if !revoked {
+        return Err(ApiError::not_found(format!(
+            "no approval grant with id '{grant_id}' on thread '{thread_id}'"
+        )));
+    }
+    Ok(Json(
+        json!({ "ok": true, "grant_id": grant_id, "revoked": true }),
+    ))
 }
 
 async fn submit_user_input(
@@ -3944,7 +6042,7 @@ fn runtime_account_info_for_request(
     }
 }
 
-fn runtime_account_api_base() -> String {
+pub(crate) fn runtime_account_api_base() -> String {
     std::env::var(ACCOUNT_API_BASE_ENV)
         .ok()
         .and_then(|value| normalize_runtime_account_api_base(&value))
@@ -4045,6 +6143,7 @@ fn mcp_mutation_error(error: anyhow::Error) -> ApiError {
         ApiError {
             status: StatusCode::PRECONDITION_FAILED,
             message: error.to_string(),
+            code: None,
         }
     } else if let Some(error) = error.downcast_ref::<McpManagementFailure>() {
         error.0.clone()
@@ -4060,6 +6159,7 @@ fn mcp_expected_revision(headers: &axum::http::HeaderMap) -> Result<String, ApiE
             status: StatusCode::PRECONDITION_REQUIRED,
             message: "Read the MCP configuration and send its revision in If-Match before saving"
                 .into(),
+            code: None,
         })?
         .to_str()
         .map_err(|_| ApiError::bad_request("Invalid MCP revision"))?
@@ -4095,11 +6195,20 @@ async fn mutate_mcp_management<T: Send + 'static>(
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
+        state
+            .workspace_scope
+            .validate_sync()
+            .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
         let path = state.config.read().mcp_config_path();
-        crate::mcp::mutate_config(&path, Some(&expected), |config| {
+        let result = crate::mcp::mutate_config(&path, Some(&expected), |config| {
             mutate(&state, config).map_err(|error| anyhow::Error::new(McpManagementFailure(error)))
         })
-        .map_err(mcp_mutation_error)
+        .map_err(mcp_mutation_error)?;
+        state
+            .workspace_scopes
+            .mcp_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(result)
     })
     .await
     .map_err(|_| ApiError::internal("MCP configuration write failed"))?
@@ -4143,6 +6252,7 @@ fn require_writable_mcp_server(state: &RuntimeApiState, name: &str) -> Result<()
             message: format!(
                 "MCP server '{name}' is owned by {origin} configuration; manage it at its source"
             ),
+            code: None,
         }),
         None => Err(ApiError::not_found(format!(
             "MCP server '{name}' not found"
@@ -4154,18 +6264,75 @@ async fn mcp_pool_handle(
     state: &RuntimeApiState,
     create: bool,
 ) -> Result<Option<Arc<Mutex<McpPool>>>, ApiError> {
-    let mut slot = state.mcp_pool.lock().await;
-    if slot.is_none() && create {
-        let path = state.config.read().mcp_config_path();
-        let plugins = state
-            .plugin_discovery
-            .registry_for_workspace(&state.workspace);
-        let pool =
-            McpPool::from_config_path_with_workspace_and_plugins(&path, &state.workspace, plugins)
-                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-        *slot = Some(Arc::new(Mutex::new(pool)));
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
+    let mut slot = state.workspace_scope.mcp.lock().await;
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
+    loop {
+        let generation = state
+            .workspace_scopes
+            .mcp_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((admitted, pool)) = slot.as_ref() {
+            if *admitted == generation {
+                return Ok(Some(pool.clone()));
+            }
+            let mut held = pool.clone().lock_owned().await;
+            let current = state.clone();
+            #[cfg(test)]
+            let env_ticket = crate::test_support::env_scope_ticket();
+            codewhale_app_server::daemon_socket::owner_work(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(env_ticket);
+                // Keep the exact scope/owner alive through synchronous disk
+                // reload even if this request is cancelled after admission.
+                current.workspace_scope.validate_sync()?;
+                let path = current.config.read().mcp_config_path();
+                let plugins = current
+                    .plugin_discovery
+                    .registry_for_workspace(&current.workspace);
+                held.switch_workspace_config_source(&path, &current.workspace, plugins)
+            })
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+            slot.as_mut().expect("retained pool").0 = generation;
+        } else if create {
+            let current = state.clone();
+            #[cfg(test)]
+            let env_ticket = crate::test_support::env_scope_ticket();
+            let pool = codewhale_app_server::daemon_socket::owner_work(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(env_ticket);
+                current.workspace_scope.validate_sync()?;
+                let path = current.config.read().mcp_config_path();
+                let plugins = current
+                    .plugin_discovery
+                    .registry_for_workspace(&current.workspace);
+                let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
+                    &path,
+                    &current.workspace,
+                    plugins,
+                )?
+                .with_backend(crate::mcp::McpBackend::from_config(&current.config.read()));
+                pool.dynamic_servers = current.workspace_scopes.dynamic_servers.clone();
+                Ok(pool)
+            })
+            .await
+            .map_err(|error| ApiError::internal(format!("Failed to load MCP config: {error}")))?;
+            *slot = Some((generation, Arc::new(Mutex::new(pool))));
+        } else {
+            return Ok(None);
+        }
+        // A concurrent global mutation may have settled during disk work.
+        // Repeat validation under the same pool; no second connection owner.
     }
-    Ok(slot.clone())
 }
 
 fn mcp_connection_outcome(
@@ -4191,6 +6358,11 @@ async fn list_mcp_servers(
         Some(handle) => Some(handle.lock().await),
         None => None,
     };
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     let mut servers = Vec::new();
     for (name, server_cfg) in config.servers {
         let origin = origins.get(&name).copied().unwrap_or("unknown");
@@ -4234,6 +6406,11 @@ async fn list_mcp_tools(
         }));
     };
     let mut pool = pool_handle.lock().await;
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     if fresh_config
         .as_ref()
         .is_some_and(|config| !pool.config_matches(config))
@@ -4331,6 +6508,11 @@ async fn get_mcp_server(
         Some(handle) => Some(handle.lock().await),
         None => None,
     };
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     let connected = pool
         .as_ref()
         .is_some_and(|pool| pool.connected_servers().contains(&name.as_str()));
@@ -4392,6 +6574,7 @@ async fn create_mcp_server(
                     message: format!(
                         "MCP server '{target_name}' already exists in the effective configuration"
                     ),
+                    code: None,
                 });
             }
             config.servers.insert(target_name, new_cfg.clone());
@@ -4400,10 +6583,6 @@ async fn create_mcp_server(
         .await?;
 
     // Invalidate the in-memory pool so the next tool call reloads from disk.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok((
         StatusCode::CREATED,
@@ -4451,6 +6630,7 @@ async fn update_mcp_server(
             return Err(ApiError {
                 status: StatusCode::CONFLICT,
                 message: "Clear this connector's credential configuration before changing its command, arguments, URL, or transport; retained credentials cannot be forwarded to a different target".to_owned(),
+                code: None,
             });
         }
         if existing.command.is_none() && existing.url.is_none() {
@@ -4462,10 +6642,6 @@ async fn update_mcp_server(
     }).await?;
 
     // Invalidate the in-memory pool.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerDetail::from_config(
         &name,
@@ -4492,10 +6668,6 @@ async fn delete_mcp_server(
     .await?;
 
     // Invalidate the in-memory pool.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerActionReceipt {
         revision: Some(revision),
@@ -4526,10 +6698,6 @@ async fn enable_mcp_server(
     .await?;
 
     // Invalidate the in-memory pool so the enabled server participates next time.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerActionReceipt {
         revision: Some(revision),
@@ -4560,10 +6728,6 @@ async fn disable_mcp_server(
     .await?;
 
     // Invalidate the in-memory pool so the disabled server is excluded next time.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerActionReceipt {
         revision: Some(revision),
@@ -4590,6 +6754,11 @@ async fn reconnect_mcp_server(
         .await?
         .ok_or_else(|| ApiError::internal("MCP pool unavailable"))?;
     let mut pool = handle.lock().await;
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     let error = if !config.servers[&name].is_enabled() {
         Some(anyhow::anyhow!("MCP server '{name}' is disabled"))
     } else if !pool.config_matches(&config) {
@@ -4632,6 +6801,7 @@ fn mcp_server_config_from_write_request(
         disabled: !enabled,
         enabled,
         required: req.required.unwrap_or(false),
+        lazy: false,
         enabled_tools: req.enabled_tools.unwrap_or_default(),
         disabled_tools: req.disabled_tools.unwrap_or_default(),
         headers: std::collections::HashMap::new(),
@@ -4724,15 +6894,174 @@ async fn list_automations(
     Ok(Json(automations))
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AutomationPreconditionQuery {
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+static AUTOMATION_IDEMPOTENCY_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn lock_automation_idempotency_key(scoped_key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let gate = {
+        let mut gates = AUTOMATION_IDEMPOTENCY_GATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates.retain(|_, gate| std::sync::Arc::strong_count(gate) > 1);
+        gates.entry(scoped_key.to_string()).or_default().clone()
+    };
+    gate.lock_owned().await
+}
+
+fn automation_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Idempotency-Key must be visible ASCII"))?
+        .trim();
+    if key.is_empty() || key.len() > 255 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ApiError::bad_request(
+            "Idempotency-Key must be 1-255 visible ASCII characters",
+        ));
+    }
+    Ok(Some(key.to_string()))
+}
+
+async fn automation_mutation<T, Fut>(
+    state: &RuntimeApiState,
+    headers: &HeaderMap,
+    operation: &str,
+    request: &impl Serialize,
+    ok_status: StatusCode,
+    map_err: fn(anyhow::Error) -> ApiError,
+    run: Fut,
+) -> Result<Response, ApiError>
+where
+    T: Serialize,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let run = async {
+        match run.await {
+            Ok(value) => Ok(Ok(value)),
+            Err(err) => match err.downcast_ref::<crate::automation_manager::RevisionConflict>() {
+                Some(conflict) => Ok(Err(conflict.current)),
+                None => Err(map_err(err)),
+            },
+        }
+    };
+    let conflict_response = |current: u64| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": {
+                    "message": format!(
+                        "Automation revision conflict: current revision is {current}"
+                    ),
+                    "status": 409,
+                    "code": "revision_conflict",
+                    "current_revision": current,
+                }
+            })),
+        )
+            .into_response()
+    };
+    let respond = |status: StatusCode, body: serde_json::Value, replayed: bool| {
+        let mut response = (status, Json(body)).into_response();
+        if replayed {
+            response
+                .headers_mut()
+                .insert("idempotency-replayed", HeaderValue::from_static("true"));
+        }
+        response
+    };
+    let Some(key) = automation_idempotency_key(headers)? else {
+        let value = match run.await? {
+            Ok(value) => value,
+            Err(current) => return Ok(conflict_response(current)),
+        };
+        let body = serde_json::to_value(value)
+            .map_err(|e| ApiError::internal(format!("Failed to encode response: {e}")))?;
+        return Ok(respond(ok_status, body, false));
+    };
+    let fingerprint = {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(operation.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(request).unwrap_or_default());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let key = format!("{operation}\n{key}");
+    let _gate = lock_automation_idempotency_key(&key).await;
+    let lookup = state
+        .automations
+        .lock()
+        .await
+        .idempotency_lookup(&key, &fingerprint)
+        .map_err(|e| ApiError::internal(format!("Idempotency store unavailable: {e}")))?;
+    match lookup {
+        crate::automation_manager::IdempotencyLookup::Replay { status, body } => {
+            let status = StatusCode::from_u16(status).unwrap_or(ok_status);
+            return Ok(respond(status, body, true));
+        }
+        crate::automation_manager::IdempotencyLookup::KeyReused => {
+            return Err(ApiError::unprocessable(
+                "Idempotency-Key was already used for a different request",
+            )
+            .with_code("idempotency_key_reuse"));
+        }
+        crate::automation_manager::IdempotencyLookup::Miss => {}
+    }
+    let value = match run.await? {
+        Ok(value) => value,
+        Err(current) => return Ok(conflict_response(current)),
+    };
+    let body = serde_json::to_value(value)
+        .map_err(|e| ApiError::internal(format!("Failed to encode response: {e}")))?;
+    if let Err(error) = state.automations.lock().await.idempotency_store(
+        &key,
+        &fingerprint,
+        ok_status.as_u16(),
+        body.clone(),
+    ) {
+        tracing::error!(
+            %error,
+            operation,
+            "automation mutation committed but its idempotency record could not be stored"
+        );
+    }
+    Ok(respond(ok_status, body, false))
+}
+
 async fn create_automation(
     State(state): State<RuntimeApiState>,
+    headers: HeaderMap,
     Json(req): Json<CreateAutomationRequest>,
-) -> Result<(StatusCode, Json<AutomationRecord>), ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager
-        .create_automation(req)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(automation)))
+) -> Result<Response, ApiError> {
+    automation_mutation(
+        &state,
+        &headers,
+        "POST /v1/automations",
+        &req,
+        StatusCode::CREATED,
+        |e| ApiError::bad_request(e.to_string()),
+        async {
+            state
+                .automations
+                .lock()
+                .await
+                .create_automation(req.clone())
+        },
+    )
+    .await
 }
 
 async fn get_automation(
@@ -4747,13 +7076,27 @@ async fn get_automation(
 async fn update_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateAutomationRequest>,
-) -> Result<Json<AutomationRecord>, ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager
-        .update_automation(&id, req)
-        .map_err(map_automation_err)?;
-    Ok(Json(automation))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+    Json(mut req): Json<UpdateAutomationRequest>,
+) -> Result<Response, ApiError> {
+    req.expected_revision = req.expected_revision.or(query.expected_revision);
+    automation_mutation(
+        &state,
+        &headers,
+        &format!("PATCH /v1/automations/{id}"),
+        &req,
+        StatusCode::OK,
+        map_automation_err,
+        async {
+            state
+                .automations
+                .lock()
+                .await
+                .update_automation(&id, req.clone())
+        },
+    )
+    .await
 }
 
 async fn delete_automation(
@@ -4768,32 +7111,83 @@ async fn delete_automation(
 async fn run_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<AutomationRunRecord>, ApiError> {
-    // run_now_shared drops the manager mutex across the task-manager await so
-    // other automation endpoints stay responsive behind a slow enqueue.
-    let run =
-        crate::automation_manager::run_now_shared(&state.automations, &id, &state.task_manager)
-            .await
-            .map_err(map_automation_err)?;
-    Ok(Json(run))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    automation_mutation(
+        &state,
+        &headers,
+        &format!("POST /v1/automations/{id}/run"),
+        &query.expected_revision,
+        StatusCode::OK,
+        map_automation_err,
+        crate::automation_manager::run_now_shared_if(
+            &state.automations,
+            &id,
+            query.expected_revision,
+            &state.task_manager,
+        ),
+    )
+    .await
+}
+
+async fn set_automation_status(
+    state: RuntimeApiState,
+    id: String,
+    query: AutomationPreconditionQuery,
+    headers: HeaderMap,
+    action: &str,
+    status: crate::automation_manager::AutomationStatus,
+) -> Result<Response, ApiError> {
+    let req = UpdateAutomationRequest {
+        status: Some(status),
+        expected_revision: query.expected_revision,
+        ..UpdateAutomationRequest::default()
+    };
+    automation_mutation(
+        &state,
+        &headers,
+        &format!("POST /v1/automations/{id}/{action}"),
+        &query.expected_revision,
+        StatusCode::OK,
+        map_automation_err,
+        async { state.automations.lock().await.update_automation(&id, req) },
+    )
+    .await
 }
 
 async fn pause_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<AutomationRecord>, ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager.pause_automation(&id).map_err(map_automation_err)?;
-    Ok(Json(automation))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    set_automation_status(
+        state,
+        id,
+        query,
+        headers,
+        "pause",
+        crate::automation_manager::AutomationStatus::Paused,
+    )
+    .await
 }
 
 async fn resume_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<AutomationRecord>, ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager.resume_automation(&id).map_err(map_automation_err)?;
-    Ok(Json(automation))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    set_automation_status(
+        state,
+        id,
+        query,
+        headers,
+        "resume",
+        crate::automation_manager::AutomationStatus::Active,
+    )
+    .await
 }
 
 async fn list_automation_runs(
@@ -4802,9 +7196,19 @@ async fn list_automation_runs(
     Query(query): Query<AutomationRunsQuery>,
 ) -> Result<Json<Vec<AutomationRunRecord>>, ApiError> {
     let manager = state.automations.lock().await;
-    let runs = manager
-        .list_runs(&id, query.limit)
-        .map_err(map_automation_err)?;
+    let runs = if query.archived {
+        let mut runs = manager
+            .list_archived_runs(&id)
+            .map_err(map_automation_err)?;
+        if let Some(limit) = query.limit {
+            runs.truncate(limit);
+        }
+        runs
+    } else {
+        manager
+            .list_runs(&id, query.limit)
+            .map_err(map_automation_err)?
+    };
     Ok(Json(runs))
 }
 
@@ -5041,6 +7445,12 @@ async fn check_operate_auto_merge(
     State(state): State<RuntimeApiState>,
     Json(req): Json<OperateAutoMergeCheckRequest>,
 ) -> Result<Json<OperateAutoMergeCheckView>, ApiError> {
+    crate::operate::validate_auto_merge_request(&crate::operate::AutoMergeRequest {
+        repo: &req.repo,
+        pr: &req.pr,
+        role: &req.agent,
+    })
+    .map_err(ApiError::bad_request)?;
     let checker = crate::operate::discover_auto_merge_checker(&state.workspace);
     let repo = req.repo.clone();
     let pr = req.pr.clone();
@@ -5113,6 +7523,44 @@ async fn get_thread_usage(
     }))
 }
 
+/// `GET /v1/threads/{id}/receipt` — what the thread did, built by the one
+/// receipt builder from the thread snapshot and its `approval.*` events
+/// (`docs/RECEIPTS.md`). Read-only.
+async fn get_thread_receipt(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+    thread_receipt(&state, &id, None).await.map(Json)
+}
+
+/// `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same receipt scoped
+/// to one turn.
+async fn get_turn_receipt(
+    State(state): State<RuntimeApiState>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+    thread_receipt(&state, &id, Some(&turn_id)).await.map(Json)
+}
+
+async fn thread_receipt(
+    state: &RuntimeApiState,
+    id: &str,
+    turn: Option<&str>,
+) -> Result<crate::receipts::Receipt, ApiError> {
+    let detail = state
+        .runtime_threads
+        .get_thread_detail(id)
+        .await
+        .map_err(map_thread_err)?;
+    let events = state
+        .runtime_threads
+        .events_since_async(id, None)
+        .await
+        .map_err(map_thread_err)?;
+    crate::receipts::thread_receipt(&detail.thread, &detail.turns, &detail.items, &events, turn)
+        .map_err(|error| ApiError::not_found(error.to_string()))
+}
+
 async fn update_thread(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -5120,7 +7568,12 @@ async fn update_thread(
 ) -> Result<Json<ThreadRecord>, ApiError> {
     let thread = state
         .runtime_threads
-        .update_thread(&id, req)
+        .update_thread_with_shell_policy(
+            &id,
+            req,
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
         .await
         .map_err(map_thread_err)?;
     Ok(Json(thread))
@@ -5144,7 +7597,7 @@ async fn fork_thread(
 ) -> Result<(StatusCode, Json<ThreadRecord>), ApiError> {
     let thread = state
         .runtime_threads
-        .fork_thread(&id)
+        .fork_thread_in_sessions_dir(&id, &state.sessions_dir)
         .await
         .map_err(map_thread_err)?;
     Ok((StatusCode::CREATED, Json(thread)))
@@ -5176,7 +7629,45 @@ async fn undo_thread_turn(
     let depth = req.depth.unwrap_or(0);
     let (forked_thread, original_user_text, original_user_images, _) = state
         .runtime_threads
-        .fork_at_user_message(&id, depth)
+        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(UndoTurnResponse {
+            thread: forked_thread,
+            original_user_text,
+            original_user_images,
+        }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ForkAtTurnRequest {
+    /// The user turn to fork at, as `GET /v1/threads/{id}` reports it. The
+    /// fork keeps that turn and every turn before it, and drops the rest.
+    turn_id: String,
+}
+
+/// Fork a thread at one named user turn — the client-side "continue from this
+/// turn" affordance, which carries on in the new thread.
+///
+/// The fork keeps the named turn and everything before it, so the branch point
+/// is the answer a person is looking at rather than the question above it;
+/// naming the last turn keeps the whole conversation. The receipt is
+/// deliberately the undo receipt: the first dropped turn's prompt comes back
+/// with the new thread, so a client can put what was asked next into the
+/// composer and let the person edit or replace it. The source thread, its
+/// session document and the workspace are untouched — no file rollback happens
+/// here, because the branch that was left behind shares the workspace.
+async fn fork_thread_at_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForkAtTurnRequest>,
+) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
+    let (forked_thread, original_user_text, original_user_images, _) = state
+        .runtime_threads
+        .fork_at_user_turn_in_sessions_dir(&id, &req.turn_id, &state.sessions_dir)
         .await
         .map_err(map_thread_err)?;
     Ok((
@@ -5195,9 +7686,11 @@ async fn undo_thread_turn(
 struct PatchUndoResult {
     /// Whether files were restored from a snapshot.
     files_restored: bool,
-    /// Human-readable summary of what was restored (diff stat).
+    /// Human-readable summary: one `<action> <path>` line per restored file,
+    /// or why nothing needed restoring.
     summary: Option<String>,
-    /// The label of the restored snapshot (e.g. "tool:apply_patch" or "pre-turn:3").
+    /// Label of the pre-turn snapshot the files went back to (e.g.
+    /// "pre-turn:3: fix the parser").
     snapshot_label: Option<String>,
 }
 
@@ -5233,13 +7726,15 @@ async fn patch_undo_thread_turn(
     // Once admitted, own the operation even when the HTTP caller disconnects:
     // the reservation must outlive both the file mutation and the fork
     // publication, so a dropped connection cannot release it mid-Git.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     tokio::spawn(async move {
         let reservation = reservation;
         // Validate depth/history before touching any file, so an invalid
         // undo request cannot leave a half-applied workspace.
         let prepared = state
             .runtime_threads
-            .prepare_fork_at_user_message(&id, depth)
+            .prepare_fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
             .await
             .map_err(map_thread_err)?;
         // File rollback is a workspace mutation, so it needs the trust the
@@ -5247,12 +7742,17 @@ async fn patch_undo_thread_turn(
         // client does not get to assert it.
         let trusted = thread.trust_mode || thread.auto_approve;
         let workspace = thread.workspace.clone();
-        let session_id = thread.session_id.clone();
+        // The restore points come from the dropped turns' own records, not
+        // from the thread's saved-session binding or a scan of the shared
+        // snapshot store: those are the snapshots this thread owns.
+        let dropped_turns = prepared.dropped_turns().to_vec();
         // Step 1: snapshot-based file rollback. The `?` is deliberate: a
         // refusal or a failed restore aborts *before* the conversation is
         // forked, so the turn never disappears while its file changes stay.
         let patch_result = tokio::task::spawn_blocking(move || {
-            patch_undo_workspace_files(&workspace, session_id.as_deref(), trusted)
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
+            patch_undo_workspace_files(&workspace, &dropped_turns, trusted)
         })
         .await
         .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))??;
@@ -5289,125 +7789,541 @@ async fn patch_undo_thread_turn(
     .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))?
 }
 
-/// Restore the newest `tool:` or `pre-turn:` snapshot that differs from the
-/// current workspace — same target selection as the TUI's `patch_undo`.
+/// Error codes a patch-undo refusal carries in `error.code`. A client offers a
+/// conversation-only `POST /v1/threads/{id}/undo` for the first four.
+const PATCH_UNDO_NO_RESTORE_POINT: &str = "restore_point_unavailable";
+const PATCH_UNDO_RESTORE_POINT_PRUNED: &str = "restore_point_pruned";
+const PATCH_UNDO_PATH_NOT_SNAPSHOTTED: &str = "path_not_snapshotted";
+const PATCH_UNDO_WORKSPACE_CHANGED: &str = "workspace_changed_since_turn";
+const PATCH_UNDO_UNTRUSTED: &str = "restore_requires_trust";
+const PATCH_UNDO_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
+
+/// One pre-turn → post-turn window of a dropped turn, resolved to the trees
+/// the snapshot store still holds.
+struct UndoSegment {
+    turn_id: String,
+    pre: crate::snapshot::SnapshotId,
+    post: crate::snapshot::SnapshotId,
+    pre_label: String,
+    /// Paths that changed in the window only while one of the turn's own
+    /// tool calls was running: the turn's changes.
+    owned: std::collections::BTreeSet<PathBuf>,
+    /// Paths that changed in the window while none of the turn's tools could
+    /// have written them: someone else's changes.
+    foreign: std::collections::BTreeSet<PathBuf>,
+}
+
+/// Pair each `pre_turn` receipt of a turn with the `post_turn` receipt that
+/// closes it, in recorded order, as index ranges into `snapshots` (the
+/// `tool`/`post_tool` receipts between them are the window's inner spans). A
+/// turn can hold more than one window (a shell turn and a model turn under
+/// one runtime turn); a `post_turn` with no open window cannot belong to this
+/// turn and is skipped. `None` means a window the engine never closed (the
+/// turn died before its post-turn snapshot) or no window at all.
+fn turn_snapshot_windows(
+    snapshots: &[crate::snapshot::WorkspaceSnapshotRef],
+) -> Option<Vec<std::ops::RangeInclusive<usize>>> {
+    use crate::snapshot::WorkspaceSnapshotKind;
+    let mut windows = Vec::new();
+    let mut open = None;
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        match snapshot.kind {
+            WorkspaceSnapshotKind::PreTurn => {
+                if open.is_some() {
+                    return None;
+                }
+                open = Some(index);
+            }
+            WorkspaceSnapshotKind::PostTurn => {
+                if let Some(pre) = open.take() {
+                    windows.push(pre..=index);
+                }
+            }
+            WorkspaceSnapshotKind::Tool | WorkspaceSnapshotKind::PostTool => {}
+        }
+    }
+    (open.is_none() && !windows.is_empty()).then_some(windows)
+}
+
+/// A path a file tool declared it writes, as a workspace-relative path the
+/// snapshots would hold, or `None` when it is outside the workspace.
+fn declared_write_path(workspace: &FsPath, raw: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let candidate = FsPath::new(raw);
+    let rel = if candidate.is_absolute() {
+        let canonical_workspace = workspace.canonicalize().ok();
+        let canonical_candidate = candidate
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(candidate.file_name())
+            .map(|(parent, name)| parent.join(name));
+        [Some(workspace), canonical_workspace.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|root| {
+                candidate
+                    .strip_prefix(root)
+                    .ok()
+                    .or_else(|| canonical_candidate.as_deref()?.strip_prefix(root).ok())
+                    .map(FsPath::to_path_buf)
+            })?
+    } else {
+        candidate.to_path_buf()
+    };
+    let rel: PathBuf = rel
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    crate::snapshot::workspace_relative_path(workspace, rel.to_str()?)
+}
+
+/// Who could have changed the workspace in the span after one receipt.
+enum SpanWriter {
+    /// None of the turn's tool calls was running.
+    Nobody,
+    /// A call whose writes are not declared (a shell command, a program).
+    Undeclared,
+    /// A file tool that declared exactly these paths.
+    Declared(std::collections::BTreeSet<PathBuf>),
+}
+
+/// Split a window's changes into the turn's own and everyone else's, from
+/// the spans its receipts bound: a path belongs to the turn only if it
+/// changed while one of the turn's tool calls was running and, for a file
+/// tool, is one the call declared. A span whose changes were not recorded
+/// (a snapshot in it failed) cannot be attributed and fails closed.
+fn attribute_window(
+    workspace: &FsPath,
+    turn_id: &str,
+    receipts: &[crate::snapshot::WorkspaceSnapshotRef],
+) -> Result<
+    (
+        std::collections::BTreeSet<PathBuf>,
+        std::collections::BTreeSet<PathBuf>,
+    ),
+    ApiError,
+> {
+    use crate::snapshot::WorkspaceSnapshotKind;
+    let mut owned = std::collections::BTreeSet::new();
+    let mut foreign = std::collections::BTreeSet::new();
+    // Undeclared calls whose `post_tool` receipt is still ahead: everything
+    // up to it (a program's nested calls included) is theirs.
+    let mut open_undeclared: Vec<&str> = Vec::new();
+    let mut writer = SpanWriter::Nobody;
+    for (index, receipt) in receipts.iter().enumerate() {
+        if index > 0 {
+            let Some(changed) = receipt.changed_paths.as_ref() else {
+                return Err(no_restore_point(
+                    turn_id,
+                    "has an incomplete record of what changed while it ran (a snapshot during the turn failed), so its changes cannot be told apart from anyone else's",
+                ));
+            };
+            for path in changed {
+                let path = PathBuf::from(path);
+                match &writer {
+                    SpanWriter::Undeclared => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(declared) if declared.contains(&path) => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(_) | SpanWriter::Nobody => {
+                        foreign.insert(path);
+                    }
+                }
+            }
+        }
+        match receipt.kind {
+            WorkspaceSnapshotKind::Tool => {
+                if receipt.write_paths.is_none()
+                    && let Some(call) = receipt.tool_call_id.as_deref()
+                    && receipts[index + 1..].iter().any(|later| {
+                        later.kind == WorkspaceSnapshotKind::PostTool
+                            && later.tool_call_id.as_deref() == Some(call)
+                    })
+                {
+                    open_undeclared.push(call);
+                }
+            }
+            WorkspaceSnapshotKind::PostTool => {
+                if let Some(call) = receipt.tool_call_id.as_deref() {
+                    open_undeclared.retain(|open| *open != call);
+                }
+            }
+            WorkspaceSnapshotKind::PreTurn | WorkspaceSnapshotKind::PostTurn => {}
+        }
+        writer = if !open_undeclared.is_empty() {
+            SpanWriter::Undeclared
+        } else {
+            match receipt.kind {
+                // A shell turn: its command runs from the pre-turn snapshot.
+                WorkspaceSnapshotKind::PreTurn if receipt.tool_call_id.is_some() => {
+                    SpanWriter::Undeclared
+                }
+                WorkspaceSnapshotKind::Tool => match receipt.write_paths.as_ref() {
+                    Some(paths) => SpanWriter::Declared(
+                        paths
+                            .iter()
+                            .filter_map(|raw| declared_write_path(workspace, raw))
+                            .collect(),
+                    ),
+                    None => SpanWriter::Undeclared,
+                },
+                _ => SpanWriter::Nobody,
+            }
+        };
+    }
+    Ok((owned, foreign))
+}
+
+fn no_restore_point(turn_id: &str, why: &str) -> ApiError {
+    ApiError::conflict(format!(
+        "Turn {turn_id} {why}, so its workspace changes cannot be restored; nothing was changed. \
+         Use POST /v1/threads/{{id}}/undo for a conversation-only undo."
+    ))
+    .with_code(PATCH_UNDO_NO_RESTORE_POINT)
+}
+
+/// Roll the workspace files back to where they were before the first dropped
+/// turn — only the files the dropped turns changed, and only when nothing
+/// else changed them since.
+///
+/// # Ownership
+///
+/// The restore points are the `pre_turn`/`post_turn` receipts recorded on the
+/// dropped turns themselves (`TurnRecord::workspace_snapshots`), resolved by
+/// tree and session tag against the snapshot store. Nothing is selected by
+/// scanning the shared store, so another thread's (or the TUI's) snapshots in
+/// the same workspace are never candidates, and a fork restores the turns it
+/// inherited because it carries their records.
+///
+/// # What is restored
+///
+/// For each dropped turn's window, the paths that differ between its
+/// pre-turn and post-turn snapshots are candidates, and each must be the
+/// turn's own: it changed only while one of the turn's tool calls was running
+/// (the engine bounds every call that may write with a `tool` and a
+/// `post_tool` snapshot and records what changed in each span), and, for a
+/// file tool, it is a path the call declared. A path that changed while none
+/// of the turn's tools could have written it — another thread, an editor, a
+/// background process — is someone else's change: the undo is refused rather
+/// than revert it. Each of the turn's paths goes back to its content before
+/// the first dropped turn that changed it, and nothing outside that set is
+/// touched, so later work survives. The whole turn goes, not just its last
+/// write.
+///
+/// A path a file tool declared that the snapshots cannot hold (ignored by
+/// `.gitignore` or the built-in exclusions, or outside the workspace) is
+/// refused too: no snapshot can put it back, so "nothing to restore" would
+/// be a lie.
 ///
 /// # The rollback contract
 ///
 /// `Ok` is a decision the conversation fork may proceed on: either the files
-/// were restored, or there was *provably* nothing to restore. `Err` aborts the
-/// whole undo, and the caller must not fork either — dropping the turn while
-/// leaving its file changes on disk hands the user a workspace the transcript
-/// can no longer account for, which is worse than refusing outright.
+/// were restored, or there was *provably* nothing to restore (the dropped
+/// turns ran here without tools, changed no files, or the files are back at
+/// their pre-turn state). `Err` aborts the whole undo, and the caller must not
+/// fork either: a turn that has no recorded restore point, a pruned restore
+/// point, or a path changed since the turn is a `409` with a stable
+/// `error.code`, never a `201` that forks while the files stay changed.
 ///
 /// `trusted` mirrors the gate the TUI's `patch_undo()` applies
-/// (`yolo || trust_mode`). It is evaluated *after* a real target is found, so
-/// that "there was nothing to revert" still undoes the conversation, while
-/// "there is something to revert but you are not trusted" aborts.
+/// (`yolo || trust_mode`), evaluated once a real change is known.
 fn patch_undo_workspace_files(
     workspace: &FsPath,
-    current_session_id: Option<&str>,
+    dropped_turns: &[crate::runtime_threads::DroppedTurnSnapshots],
     trusted: bool,
 ) -> Result<PatchUndoResult, ApiError> {
     // An unreadable workspace directory (unmounted volume, disconnected
     // share, permissions) proves nothing about the files a turn changed, so
-    // the conversation is not forked away from them. Every repository
-    // failure is operational and aborts for the same reason: "no snapshots"
-    // cannot be proven while Git is unavailable.
+    // the conversation is not forked away from them.
     if !workspace.is_dir() {
         return Err(ApiError::conflict(format!(
             "Workspace directory {} is not available; mount or restore it before undoing files, or use /undo for a conversation-only undo.",
             workspace.display()
-        )));
+        ))
+        .with_code(PATCH_UNDO_WORKSPACE_UNAVAILABLE));
     }
+
+    // Which windows matter. A turn that ran no tool changed no file; a turn
+    // that did must have recorded where it started and ended.
+    let mut windows = Vec::new();
+    for turn in dropped_turns {
+        if !turn.may_change_files {
+            continue;
+        }
+        if turn.snapshots.is_empty() {
+            return Err(no_restore_point(
+                &turn.turn_id,
+                "has no recorded workspace restore point (it predates restore-point receipts, was imported from a saved session, or ran with snapshots off or unavailable)",
+            ));
+        }
+        let Some(turn_windows) = turn_snapshot_windows(&turn.snapshots) else {
+            return Err(no_restore_point(
+                &turn.turn_id,
+                "has no complete pre-turn/post-turn restore point (its snapshot failed or the turn stopped before it was taken)",
+            ));
+        };
+        windows.extend(
+            turn_windows
+                .into_iter()
+                .map(|range| (turn, &turn.snapshots[range])),
+        );
+    }
+    if windows.is_empty() {
+        return Ok(PatchUndoResult {
+            files_restored: false,
+            summary: Some(
+                "The undone turn(s) ran no tools, so they changed no workspace files; nothing to restore."
+                    .to_string(),
+            ),
+            snapshot_label: None,
+        });
+    }
+
+    // Every repository failure is operational and aborts: "nothing to
+    // restore" cannot be proven while Git is unavailable.
     let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace).map_err(|e| {
         ApiError::internal(format!(
             "Snapshot repo unavailable; conversation preserved: {e}"
         ))
     })?;
-    let Some(current_session_id) = current_session_id else {
-        return Ok(PatchUndoResult {
-            files_restored: false,
-            summary: Some(
-                "No current session is bound to this thread; workspace files were not changed."
-                    .to_string(),
-            ),
-            snapshot_label: None,
-        });
-    };
-    let snapshots = repo
-        .list(100)
+    // Resolve by id against the whole store — no listing cap, so an old but
+    // retained restore point is never mistaken for a pruned one.
+    let listed = repo
+        .list(usize::MAX)
         .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
-    let mut target = None;
-    for snapshot in snapshots
-        .iter()
-        .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
-        .filter(|s| s.session_id.as_deref() == Some(current_session_id))
-    {
-        if !repo.work_tree_matches_snapshot(&snapshot.id).map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to compare snapshot; conversation preserved: {e}"
-            ))
-        })? {
-            target = Some(snapshot);
-            break;
-        }
-    }
-    let Some(target) = target else {
-        return Ok(PatchUndoResult {
-            files_restored: false,
-            summary: Some(
-                "No current-session tool or pre-turn snapshots differ from the current workspace."
-                    .to_string(),
-            ),
-            snapshot_label: None,
-        });
+    let resolve = |turn_id: &str,
+                   receipt: &crate::snapshot::WorkspaceSnapshotRef|
+     -> Result<(crate::snapshot::SnapshotId, String), ApiError> {
+        listed
+            .iter()
+            .find(|snapshot| receipt.matches(snapshot))
+            .map(|snapshot| (snapshot.tree.clone(), snapshot.label.clone()))
+            .ok_or_else(|| {
+                ApiError::conflict(format!(
+                    "The {} restore point of turn {turn_id} is no longer in the snapshot store (pruned, or its session tag changed), so its workspace changes cannot be restored; nothing was changed. Use POST /v1/threads/{{id}}/undo for a conversation-only undo.",
+                    receipt.kind.label_prefix().trim_end_matches(':')
+                ))
+                .with_code(PATCH_UNDO_RESTORE_POINT_PRUNED)
+            })
     };
 
+    // Every path a dropped file-tool call declared must be one the snapshots
+    // hold; otherwise its change is invisible to them and cannot be undone.
+    let mut not_snapshotted = std::collections::BTreeSet::new();
+    for turn in dropped_turns.iter().filter(|turn| turn.may_change_files) {
+        let receipt_writes = turn
+            .snapshots
+            .iter()
+            .filter(|receipt| {
+                receipt
+                    .tool_call_id
+                    .as_ref()
+                    .is_none_or(|call| !turn.unrun_tool_calls.contains(call))
+            })
+            .filter_map(|receipt| receipt.write_paths.as_ref())
+            .flatten();
+        for raw in turn.declared_writes.iter().chain(receipt_writes) {
+            let covered = match declared_write_path(workspace, raw) {
+                Some(rel) => !repo.path_is_excluded(&rel).map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to check snapshot coverage; conversation preserved: {e}"
+                    ))
+                })?,
+                None => false,
+            };
+            if !covered {
+                not_snapshotted.insert(raw.clone());
+            }
+        }
+    }
+    if !not_snapshotted.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "The undone turn(s) wrote {}, which workspace snapshots do not hold (ignored by .gitignore or the built-in snapshot exclusions, or outside the workspace), so those changes cannot be restored; nothing was changed. Use POST /v1/threads/{{id}}/undo for a conversation-only undo and restore those files yourself.",
+            not_snapshotted.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+        .with_code(PATCH_UNDO_PATH_NOT_SNAPSHOTTED));
+    }
+
+    let mut segments = Vec::with_capacity(windows.len());
+    for (turn, receipts) in windows {
+        let (pre, pre_label) = resolve(&turn.turn_id, &receipts[0])?;
+        let (post, _) = resolve(&turn.turn_id, &receipts[receipts.len() - 1])?;
+        let (owned, foreign) = attribute_window(workspace, &turn.turn_id, receipts)?;
+        segments.push(UndoSegment {
+            turn_id: turn.turn_id.clone(),
+            pre,
+            post,
+            pre_label,
+            owned,
+            foreign,
+        });
+    }
+
+    let compare_err = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            ApiError::conflict(format!(
+                "A path the undone turn(s) changed cannot be restored file by file: {e}. Nothing was changed; use /restore for a whole-workspace rollback."
+            ))
+            .with_code(PATCH_UNDO_WORKSPACE_CHANGED)
+        } else {
+            ApiError::internal(format!(
+                "Failed to compare snapshots; conversation preserved: {e}"
+            ))
+        }
+    };
+
+    // path -> (content to restore, content the dropped turns left)
+    let mut plan: std::collections::BTreeMap<
+        PathBuf,
+        (crate::snapshot::SnapshotId, crate::snapshot::SnapshotId),
+    > = std::collections::BTreeMap::new();
+    for segment in &segments {
+        let changed = repo
+            .changed_paths_between(&segment.pre, &segment.post)
+            .map_err(compare_err)?;
+        // A path someone else changed while the turn ran cannot be told
+        // apart from the turn's own change to it, and reverting it would
+        // erase their work: refuse instead of guessing.
+        let not_owned: Vec<String> = changed
+            .iter()
+            .filter(|path| segment.foreign.contains(*path) || !segment.owned.contains(*path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if !not_owned.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "{} changed while turn {} ran but outside its own tool calls (another thread, an editor or a background process), so undoing the turn would revert changes it did not make; nothing was changed. Revert the turn's files individually with file-revert, or use /undo for a conversation-only undo.",
+                not_owned.join(", "),
+                segment.turn_id
+            ))
+            .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+        }
+        for path in changed {
+            match plan.get_mut(&path) {
+                None => {
+                    plan.insert(path, (segment.pre.clone(), segment.post.clone()));
+                }
+                Some((_, left)) => {
+                    // Between two dropped turns that both changed this path,
+                    // something else changed it too; restoring the earlier
+                    // content would erase that change.
+                    if !repo
+                        .path_same_in_snapshots(left, &segment.pre, &path)
+                        .map_err(compare_err)?
+                    {
+                        return Err(ApiError::conflict(format!(
+                            "'{}' was changed outside turn {} between the undone turns; undoing would erase that change. Nothing was changed.",
+                            path.display(),
+                            segment.turn_id
+                        ))
+                        .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+                    }
+                    *left = segment.post.clone();
+                }
+            }
+        }
+    }
+
+    // Compare each changed path with the workspace now: already back at its
+    // pre-turn content (skip), still as the turns left it (restore), or
+    // changed since by someone else (refuse — never clobber later work).
+    let mut to_restore = Vec::new();
+    let mut changed_since = Vec::new();
+    for (path, (before, after)) in &plan {
+        if repo
+            .path_matches_snapshot(before, path)
+            .map_err(compare_err)?
+        {
+            continue;
+        }
+        if repo
+            .path_matches_snapshot(after, path)
+            .map_err(compare_err)?
+        {
+            to_restore.push((path.clone(), before.clone(), after.clone()));
+        } else {
+            changed_since.push(path.display().to_string());
+        }
+    }
+    if !changed_since.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "These files changed after the undone turn(s): {}. Undoing would overwrite those changes; nothing was changed. Revert individual files with file-revert, or use /undo for a conversation-only undo.",
+            changed_since.join(", ")
+        ))
+        .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+    }
+    let first = &segments[0];
+    if to_restore.is_empty() {
+        return Ok(PatchUndoResult {
+            files_restored: false,
+            summary: Some(if plan.is_empty() {
+                "The undone turn(s) left workspace files unchanged; nothing to restore.".to_string()
+            } else {
+                format!(
+                    "The files the undone turn(s) changed are already at their state before turn {}; nothing to restore.",
+                    first.turn_id
+                )
+            }),
+            snapshot_label: None,
+        });
+    }
+
     // Restoring is a workspace mutation. Gate it exactly where the TUI gates
-    // it — after a real, current-session target is known — so the two surfaces
-    // cannot drift into "one refuses, the other half-undoes".
+    // it — after a real, owned change is known — so the two surfaces cannot
+    // drift into "one refuses, the other half-undoes".
     if !trusted {
         return Err(ApiError::conflict(
             "Refusing to undo workspace files outside trusted mode. \
              Turn on /trust or switch this thread to Full Access, then undo again.",
-        ));
+        )
+        .with_code(PATCH_UNDO_UNTRUSTED));
     }
 
-    // Capture what this restore is about to change *before* it runs: after the
-    // checkout the work tree matches the snapshot, so a post-restore stat would
-    // always be empty. Runs against the side repo, not the user's — the user's
-    // `git diff --stat` reports their own uncommitted work, which is not what
-    // the undo changed.
-    let diff_stat = match repo.snapshot_diff_stat(&target.id) {
-        Ok(stat) => stat,
-        Err(e) => {
-            tracing::warn!(
-                target: "snapshot",
-                "diff stat for the patch-undo summary failed: {e}"
-            );
-            None
-        }
-    };
+    let restore_plan: Vec<(PathBuf, crate::snapshot::SnapshotId)> = to_restore
+        .iter()
+        .map(|(path, before, _)| (path.clone(), before.clone()))
+        .collect();
+    let short = &first.pre.as_str()[..first.pre.as_str().len().min(12)];
+    let outcomes = repo
+        .restore_path_plan(&restore_plan, &format!("pre-restore:{short}"), true, || {
+            // Re-verify immediately before the first mutation, after the
+            // safety snapshot: a write that landed meanwhile is refused.
+            for (path, _, after) in &to_restore {
+                if !repo.path_matches_snapshot(after, path)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "'{}' changed while the undo was being prepared; nothing was changed.",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                ApiError::conflict(e.to_string()).with_code(PATCH_UNDO_WORKSPACE_CHANGED)
+            }
+            std::io::ErrorKind::InvalidInput => compare_err(e),
+            _ => ApiError::internal(format!("Restore failed: {e}")),
+        })?;
 
-    repo.restore(&target.id)
-        .map_err(|e| ApiError::internal(format!("Restore failed: {e}")))?;
-
-    let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
-    let summary = match diff_stat {
-        Some(ref stat) => format!(
-            "Restored snapshot '{}' ({}). Files affected:\n{stat}",
-            target.label, short
-        ),
-        None => format!(
-            "Restored snapshot '{}' ({}). No diff stat available.",
-            target.label, short
-        ),
-    };
+    let lines: Vec<String> = outcomes
+        .iter()
+        .map(|outcome| format!("{} {}", outcome.action.as_str(), outcome.path.display()))
+        .collect();
     Ok(PatchUndoResult {
         files_restored: true,
-        summary: Some(summary),
-        snapshot_label: Some(target.label.clone()),
+        summary: Some(format!(
+            "Restored {} file(s) to their state before turn {} (snapshot '{}'):\n{}",
+            outcomes.len(),
+            first.turn_id,
+            first.pre_label,
+            lines.join("\n")
+        )),
+        snapshot_label: Some(first.pre_label.clone()),
     })
 }
 
@@ -5416,7 +8332,9 @@ struct RevertThreadFileRequest {
     /// The single file to restore, relative to the thread's workspace.
     /// Absolute paths inside the workspace are accepted and normalized.
     path: String,
-    /// Exact pre-tool/pre-turn snapshot from the change the user selected.
+    /// Exact pre-tool/pre-turn restore point from the change the user
+    /// selected: a commit id from `GET /v1/snapshots`, or the `snapshot_id` /
+    /// `tree_id` of a receipt in the thread's `workspace_snapshots`.
     snapshot_id: String,
     /// SHA-256 of the bytes reviewed by the client, or `absent` for deletion.
     expected_hash: String,
@@ -5443,9 +8361,10 @@ struct RevertThreadFileResponse {
 /// hash of the bytes it reviewed; the server never guesses a "newest differing"
 /// snapshot, because an unrelated newer snapshot can erase later user edits.
 ///
-/// Ownership follows the rule the TUI's `/undo` applies: only snapshots tagged
-/// with this thread's own session are candidates, and the thread must be in
-/// trusted mode or Full Access. Nothing to revert is a `409`, not a silent
+/// Ownership: only the `tool:`/`pre-turn:` restore points recorded on this
+/// thread's own turns (`TurnRecord::workspace_snapshots`, fork-inherited turns
+/// included) are candidates, never another thread's or the TUI's snapshots in
+/// the same workspace, and the thread must be in trusted mode or Full Access. Nothing to revert is a `409`, not a silent
 /// success, so the GUI can tell the user why the button did nothing.
 async fn revert_thread_file(
     State(state): State<RuntimeApiState>,
@@ -5474,18 +8393,24 @@ async fn revert_thread_file(
             "Refusing to restore workspace files outside trusted mode. Turn on /trust or switch this thread to Full Access, then retry.",
         ));
     }
-    let Some(session_id) = thread.session_id else {
-        return Err(ApiError::conflict(
-            "Thread has no bound session, so no snapshot can be proven to own this file.",
-        ));
-    };
+    // The restore points this thread owns: the receipts on its own turns
+    // (including turns a fork cloned). Read under the restore reservation, so
+    // no turn is recording one meanwhile.
+    let owned = state
+        .runtime_threads
+        .thread_workspace_snapshots(&thread.id)
+        .map_err(map_thread_err)?;
     let workspace = thread.workspace;
     // The worker owns the reservation: a client disconnect cannot release it
     // while Git is still changing files. Snapshot listing, diffing and
     // checkout all shell out to git; keep that off the async workers.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     let response = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
         let _reservation = reservation;
-        revert_file_from_snapshot(&workspace, &session_id, &req)
+        revert_file_from_snapshot(&workspace, &owned, &req)
     })
     .await
     .map_err(|e| ApiError::internal(format!("file restore task failed: {e}")))??;
@@ -5493,7 +8418,7 @@ async fn revert_thread_file(
 }
 
 fn snapshot_id_is_well_formed(id: &str) -> bool {
-    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+    crate::snapshot::SnapshotId::is_well_formed(id)
 }
 
 fn expected_hash_is_well_formed(hash: &str) -> bool {
@@ -5508,7 +8433,7 @@ fn expected_hash_is_well_formed(hash: &str) -> bool {
 
 fn revert_file_from_snapshot(
     workspace: &FsPath,
-    session_id: &str,
+    owned: &[crate::snapshot::WorkspaceSnapshotRef],
     req: &RevertThreadFileRequest,
 ) -> Result<RevertThreadFileResponse, ApiError> {
     // Every caller-supplied path passes through this one gate. It accepts a
@@ -5536,22 +8461,43 @@ fn revert_file_from_snapshot(
     let snapshots = repo
         .list(usize::MAX)
         .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
-    // Exact identity only: the snapshot must exist, be owned by this thread's
-    // session and be a tool/pre-turn restore point. A stale or foreign id is
-    // a conflict the client resolves by refreshing its change record.
-    let target = snapshots
+    // Exact identity only: the snapshot must still exist, be a tool/pre-turn
+    // restore point recorded on one of this thread's turns, and still carry
+    // the session tag it was recorded with. The client may name it by the
+    // commit id `GET /v1/snapshots` lists now, or by the `snapshot_id` or
+    // `tree_id` its turn record holds (a prune rewrites commit ids but keeps
+    // trees). A foreign, unrecorded or pruned id is a conflict the client
+    // resolves by refreshing its change record.
+    let restore_points: Vec<&crate::snapshot::WorkspaceSnapshotRef> = owned
         .iter()
-        .find(|snapshot| {
-            snapshot.id.as_str() == req.snapshot_id
-                && snapshot.session_id.as_deref() == Some(session_id)
-                && (snapshot.label.starts_with("tool:")
-                    || snapshot.label.starts_with("pre-turn:"))
-        })
-        .ok_or_else(|| {
-            ApiError::conflict(
-                "Selected restore point is unavailable or belongs to another session; refresh the change record and select the change again.",
+        .filter(|receipt| {
+            matches!(
+                receipt.kind,
+                crate::snapshot::WorkspaceSnapshotKind::Tool
+                    | crate::snapshot::WorkspaceSnapshotKind::PreTurn
             )
-        })?;
+        })
+        .collect();
+    let target = match snapshots
+        .iter()
+        .find(|snapshot| snapshot.id.as_str() == req.snapshot_id)
+    {
+        Some(listed) => restore_points
+            .iter()
+            .any(|receipt| receipt.matches(listed))
+            .then_some(listed),
+        None => restore_points
+            .iter()
+            .find(|receipt| {
+                receipt.snapshot_id == req.snapshot_id || receipt.tree_id == req.snapshot_id
+            })
+            .and_then(|receipt| snapshots.iter().find(|listed| receipt.matches(listed))),
+    }
+    .ok_or_else(|| {
+        ApiError::conflict(
+            "Selected restore point is unavailable or belongs to another thread; refresh the change record and select the change again.",
+        )
+    })?;
 
     if !repo
         .path_differs_from_snapshot(&target.id, &rel)
@@ -5597,6 +8543,12 @@ struct RetryTurnRequest {
     /// from the dropped turn is re-used.
     #[serde(default)]
     prompt: Option<String>,
+    /// Client-executed tools the retried turn offers, as on a fresh turn.
+    /// Dynamic tools are per-turn and answered by the client that sent
+    /// them, so a retry the client starts must re-send them; without it the
+    /// retried turn silently lost tools such as the desktop's `open_in_app`.
+    #[serde(default)]
+    dynamic_tools: Vec<codewhale_protocol::runtime::DynamicToolSpec>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5615,7 +8567,7 @@ async fn retry_thread_turn(
     let depth = req.depth.unwrap_or(0);
     let (forked_thread, original_user_text, original_user_images, max_output_tokens) = state
         .runtime_threads
-        .fork_at_user_message(&id, depth)
+        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
         .await
         .map_err(map_thread_err)?;
 
@@ -5631,6 +8583,9 @@ async fn retry_thread_turn(
         .start_turn_from_stored_images(
             &forked_thread.id,
             StartTurnRequest {
+                account_model_owner: None,
+                profile_constitution: None,
+                expected_workspace: None,
                 max_output_tokens,
                 prompt: retry_prompt,
                 images: original_user_images,
@@ -5644,8 +8599,10 @@ async fn retry_thread_turn(
                 allow_shell: None,
                 trust_mode: None,
                 auto_approve: None,
-                dynamic_tools: Vec::new(),
+                dynamic_tools: req.dynamic_tools,
                 environment_id: None,
+                model_provider: None,
+                model_provider_id: None,
             },
         )
         .await
@@ -5665,9 +8622,9 @@ async fn start_thread_turn(
     Path(id): Path<String>,
     Json(req): Json<StartTurnRequest>,
 ) -> Result<(StatusCode, Json<StartTurnResponse>), ApiError> {
-    let turn = state
+    let (turn, replayed) = state
         .runtime_threads
-        .start_turn(&id, req)
+        .start_turn_reporting_replay(&id, req)
         .await
         .map_err(map_thread_err)?;
     let thread = state
@@ -5675,9 +8632,22 @@ async fn start_thread_turn(
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+    // A replay acknowledges work already accepted rather than admitting new
+    // work: 200 tells the client "this is the turn I already started", which
+    // is what lets an ambiguous submit resolve without duplicate messages or
+    // tools. A fresh admission stays 201.
+    let status = if replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     Ok((
-        StatusCode::CREATED,
-        Json(StartTurnResponse { thread, turn }),
+        status,
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: replayed,
+        }),
     ))
 }
 
@@ -5860,13 +8830,104 @@ async fn compact_thread(
         .map_err(map_thread_err)?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(StartTurnResponse { thread, turn }),
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: false,
+        }),
     ))
 }
 
 // ---------------------------------------------------------------------------
 // Thread goal endpoints
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct GoalsQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GoalsPage {
+    goals: Vec<codewhale_protocol::ThreadGoal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+/// `GET /v1/goals?limit=50&cursor=<opaque>&status=<status>` — read-only index
+/// of the per-thread goal records, newest update first. Pages are keyset
+/// cursors over `(updated_at, thread_id)`.
+async fn list_goals(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<GoalsQuery>,
+) -> Result<Json<GoalsPage>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let status = match query.status.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            serde_json::from_value::<codewhale_protocol::ThreadGoalStatus>(
+                serde_json::Value::String(raw.to_string()),
+            )
+            .map_err(|_| ApiError::bad_request(format!("unknown goal status '{raw}'")))?,
+        ),
+    };
+    let status_key = query.status.as_deref().unwrap_or("-");
+    let after = match query.cursor.as_deref() {
+        None => None,
+        Some(raw) => {
+            let mut parts = raw.splitn(3, ':');
+            let (cursor_status, updated_at, thread_id) = match (
+                parts.next(),
+                parts.next().and_then(|at| at.parse::<i64>().ok()),
+                parts.next(),
+            ) {
+                (Some(cursor_status), Some(at), Some(id)) => (cursor_status, at, id.to_string()),
+                _ => return Err(ApiError::bad_request("invalid cursor")),
+            };
+            if cursor_status != status_key {
+                return Err(ApiError::bad_request(
+                    "cursor does not match the status filter",
+                ));
+            }
+            Some((updated_at, thread_id))
+        }
+    };
+    let mut goals = state
+        .runtime_threads
+        .list_goals()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    goals.retain(|goal| status.as_ref().is_none_or(|s| &goal.status == s));
+    goals.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.thread_id.cmp(&b.thread_id))
+    });
+    if let Some((updated_at, thread_id)) = after {
+        goals.retain(|goal| {
+            goal.updated_at < updated_at
+                || (goal.updated_at == updated_at && goal.thread_id > thread_id)
+        });
+    }
+    let mut page = Vec::with_capacity(limit.min(goals.len()) + 1);
+    for goal in goals {
+        if state.runtime_threads.thread_exists(&goal.thread_id).await {
+            page.push(goal);
+            if page.len() > limit {
+                break;
+            }
+        }
+    }
+    let next_cursor = (page.len() > limit).then(|| {
+        let last = &page[limit - 1];
+        format!("{status_key}:{}:{}", last.updated_at, last.thread_id)
+    });
+    page.truncate(limit);
+    let goals = page;
+    Ok(Json(GoalsPage { goals, next_cursor }))
+}
 
 /// `GET /v1/threads/{id}/goal` — return the persistent goal for a thread, or
 /// 404 if the thread has no goal.
@@ -5982,8 +9043,9 @@ async fn delete_thread_goal(
     let _ = state.runtime_threads.emit_goal_cleared_event(&id).await;
     state
         .runtime_threads
-        .sync_engine_goal_status(&id, crate::tools::goal::GoalStatus::Active, true)
-        .await;
+        .sync_engine_goal_status(&id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6009,6 +9071,7 @@ async fn complete_thread_goal(
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' is already complete"),
+            code: None,
         });
     }
     let updated = state
@@ -6016,6 +9079,7 @@ async fn complete_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await
@@ -6023,6 +9087,7 @@ async fn complete_thread_goal(
         .ok_or_else(|| ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' changed concurrently; retry"),
+            code: None,
         })?;
     let _ = state
         .runtime_threads
@@ -6030,8 +9095,9 @@ async fn complete_thread_goal(
         .await;
     state
         .runtime_threads
-        .sync_engine_goal_status(&id, crate::tools::goal::GoalStatus::Complete, false)
-        .await;
+        .sync_engine_goal_status(&id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(updated))
 }
 
@@ -6058,6 +9124,7 @@ async fn block_thread_goal(
             message: format!(
                 "goal for thread '{id}' is already complete; cannot transition to blocked"
             ),
+            code: None,
         });
     }
     let updated = state
@@ -6065,6 +9132,7 @@ async fn block_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await
@@ -6072,6 +9140,7 @@ async fn block_thread_goal(
         .ok_or_else(|| ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' changed concurrently; retry"),
+            code: None,
         })?;
     let _ = state
         .runtime_threads
@@ -6079,8 +9148,9 @@ async fn block_thread_goal(
         .await;
     state
         .runtime_threads
-        .sync_engine_goal_status(&id, crate::tools::goal::GoalStatus::Blocked, false)
-        .await;
+        .sync_engine_goal_status(&id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(updated))
 }
 
@@ -6141,12 +9211,21 @@ async fn stream_thread_events(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let _ = state
         .runtime_threads
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+
+    // Two clients, two cursors. A browser `EventSource` can only replay through
+    // the `Last-Event-ID` header it sets on reconnect (the ids now ride the
+    // journal frames below); every other client passes `since_seq`. An explicit
+    // query cursor wins over the header, so a deliberate replay-from-zero is
+    // never silently overridden by a stale header — the header is the fallback
+    // when no cursor was asked for.
+    let since_seq = query.since_seq.or_else(|| last_event_id(&headers));
 
     // Subscribe before reading durable history. An event emitted while replay
     // is loaded is then present in both places (and deduped below) or queued
@@ -6162,7 +9241,7 @@ async fn stream_thread_events(
     }
     let replay = state
         .runtime_threads
-        .replay_events(&id, query.since_seq, query.replay_limit)
+        .replay_events(&id, since_seq, query.replay_limit)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
@@ -6173,6 +9252,7 @@ async fn stream_thread_events(
         replay.batches,
         live,
         query.progress,
+        state.shutdown.requested.clone(),
     );
 
     let mut response = Sse::new(stream)
@@ -6182,6 +9262,12 @@ async fn stream_thread_events(
                 .text("keepalive"),
         )
         .into_response();
+    // Every server-initiated end of this stream is a `stream.end` frame. The
+    // header lets a client tell that EOF without one is transport loss, which
+    // an older Runtime cannot promise.
+    response
+        .headers_mut()
+        .insert("x-codewhale-stream-end", HeaderValue::from_static("1"));
     if query.progress {
         response
             .headers_mut()
@@ -6190,52 +9276,156 @@ async fn stream_thread_events(
     Ok(response)
 }
 
+/// Opt-in transport frame at the existing journal cursor. It carries the same
+/// envelope identity (`schema_version`, `event`, `kind`, `thread_id`) as the
+/// journal and `stream.end`, but never a journal `seq` of its own.
 fn thread_stream_progress(thread_id: &str, seq: u64, live: bool) -> SseEvent {
     sse_json(
         "stream.progress",
         json!({
-            "event": "stream.progress", "thread_id": thread_id, "seq": seq,
+            "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+            "event": "stream.progress", "kind": "stream.progress",
+            "thread_id": thread_id, "seq": seq,
             "state": if live { "live" } else { "replaying" },
         }),
     )
+}
+
+/// Why the server ended a thread event stream it had already opened. Every
+/// server-initiated end is one of these, sent as the final `stream.end` frame;
+/// an EOF without that frame is the transport or the process dying, never the
+/// server choosing to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadStreamEnd {
+    /// The durable history read that feeds the opening replay failed.
+    ReplayFailed,
+    /// The durable re-read after broadcast lag could not be opened or failed.
+    CatchUpFailed,
+    /// The Runtime API server is stopping (a terminating signal).
+    RuntimeShutdown,
+}
+
+impl ThreadStreamEnd {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ReplayFailed => "replay_failed",
+            Self::CatchUpFailed => "catch_up_failed",
+            Self::RuntimeShutdown => "runtime_shutdown",
+        }
+    }
+
+    /// Every current end is resumable from `last_seq`. The flag exists so the
+    /// client rule keys on it rather than on the reason list: a future
+    /// non-resumable end stops clients without a client change.
+    const fn retryable(self) -> bool {
+        match self {
+            Self::ReplayFailed | Self::CatchUpFailed | Self::RuntimeShutdown => true,
+        }
+    }
+}
+
+/// The final frame of a server-ended thread stream. It has no `seq` and no SSE
+/// `id:` because it is not a journal event: seq-keyed consumers skip it, and a
+/// browser `EventSource` keeps `Last-Event-ID` on the last real event.
+/// `last_seq` is exactly the `since_seq` that resumes without loss or repeats.
+/// The underlying error stays in the server log; it can carry store paths.
+fn thread_stream_end(thread_id: &str, end: ThreadStreamEnd, last_seq: u64) -> SseEvent {
+    sse_json(
+        "stream.end",
+        json!({
+            "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+            "event": "stream.end", "kind": "stream.end",
+            "thread_id": thread_id, "reason": end.reason(),
+            "last_seq": last_seq, "retryable": end.retryable(),
+        }),
+    )
+}
+
+/// The journal frame for `event` on this thread's stream, advancing the
+/// connection cursor. `None` for another thread's event or one already sent.
+fn thread_journal_frame(
+    thread_id: &str,
+    last_seq: &mut u64,
+    event: crate::runtime_threads::RuntimeEventRecord,
+) -> Option<SseEvent> {
+    if event.thread_id != thread_id || event.seq <= *last_seq {
+        return None;
+    }
+    let previous_seq = std::mem::replace(last_seq, event.seq);
+    let event_name = event.event.clone();
+    Some(
+        sse_json(
+            &event_name,
+            runtime_event_payload_with_previous(event, previous_seq),
+        )
+        .id(last_seq.to_string()),
+    )
+}
+
+type ThreadReplayBatches = tokio::sync::mpsc::Receiver<
+    std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
+>;
+
+enum ThreadReplayStep {
+    Events(Vec<crate::runtime_threads::RuntimeEventRecord>),
+    Complete,
+    Failed(String),
+    Shutdown,
+}
+
+/// The next durable-history batch, unless the server starts stopping first.
+async fn next_thread_replay_step(
+    shutdown: &CancellationToken,
+    batches: &mut ThreadReplayBatches,
+) -> ThreadReplayStep {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => ThreadReplayStep::Shutdown,
+        batch = batches.recv() => match batch {
+            None => ThreadReplayStep::Complete,
+            Some(Ok(events)) => ThreadReplayStep::Events(events),
+            Some(Err(error)) => ThreadReplayStep::Failed(error),
+        },
+    }
 }
 
 fn replay_live_thread_events(
     runtime_threads: SharedRuntimeThreadManager,
     thread_id: String,
     mut last_seq: u64,
-    mut backlog: tokio::sync::mpsc::Receiver<
-        std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
-    >,
+    mut backlog: ThreadReplayBatches,
     mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
     progress: bool,
+    shutdown: CancellationToken,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
+    // Every exit below is a `stream.end` followed by `return`; the live loop
+    // never breaks. An EOF this stream produces is therefore never silent.
     stream! {
         if progress { yield Ok(thread_stream_progress(&thread_id, last_seq, false)); }
-        while let Some(batch) = backlog.recv().await {
-            let events = match batch {
-                Ok(events) => events,
-                Err(error) => {
+        loop {
+            match next_thread_replay_step(&shutdown, &mut backlog).await {
+                ThreadReplayStep::Events(events) => {
+                    for event in events {
+                        if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                            yield Ok(frame);
+                        }
+                    }
+                }
+                ThreadReplayStep::Complete => break,
+                ThreadReplayStep::Failed(error) => {
                     tracing::warn!(
                         thread_id = %thread_id,
                         last_seq,
                         %error,
                         "Failed to replay Runtime web event stream from durable history"
                     );
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::ReplayFailed, last_seq));
                     return;
                 }
-            };
-            for event in events {
-                if event.thread_id != thread_id || event.seq <= last_seq {
-                    continue;
+                ThreadReplayStep::Shutdown => {
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                    return;
                 }
-                let previous_seq = last_seq;
-                last_seq = event.seq;
-                let event_name = event.event.clone();
-                yield Ok(sse_json(
-                    &event_name,
-                    runtime_event_payload_with_previous(event, previous_seq),
-                ));
             }
         }
 
@@ -6244,7 +9434,11 @@ fn replay_live_thread_events(
         // before declaring the observation current. These opt-in frames carry
         // transport progress, never new journal events or sequence numbers.
         let mut replaying = progress;
-        'live: loop {
+        loop {
+            if shutdown.is_cancelled() {
+                yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                return;
+            }
             let next = if replaying {
                 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
                 match live.try_recv() {
@@ -6257,19 +9451,21 @@ fn replay_live_thread_events(
                     Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
                     Err(TryRecvError::Closed) => Err(RecvError::Closed),
                 }
-            } else { live.recv().await };
+            } else {
+                let received = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => None,
+                    received = live.recv() => Some(received),
+                };
+                // Shutdown is answered by the check at the top of the loop.
+                let Some(received) = received else { continue };
+                received
+            };
             match next {
                 Ok(event) => {
-                    if event.thread_id != thread_id || event.seq <= last_seq {
-                        continue;
+                    if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                        yield Ok(frame);
                     }
-                    let previous_seq = last_seq;
-                    last_seq = event.seq;
-                    let event_name = event.event.clone();
-                    yield Ok(sse_json(
-                        &event_name,
-                        runtime_event_payload_with_previous(event, previous_seq),
-                    ));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if progress {
@@ -6292,13 +9488,21 @@ fn replay_live_thread_events(
                                 %error,
                                 "Failed to recover lagged Runtime web event stream from durable history"
                             );
-                            break 'live;
+                            yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::CatchUpFailed, last_seq));
+                            return;
                         }
                     };
-                    while let Some(batch) = recovered.recv().await {
-                        let events = match batch {
-                            Ok(events) => events,
-                            Err(error) => {
+                    loop {
+                        match next_thread_replay_step(&shutdown, &mut recovered).await {
+                            ThreadReplayStep::Events(events) => {
+                                for event in events {
+                                    if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                                        yield Ok(frame);
+                                    }
+                                }
+                            }
+                            ThreadReplayStep::Complete => break,
+                            ThreadReplayStep::Failed(error) => {
                                 tracing::warn!(
                                     thread_id = %thread_id,
                                     last_seq,
@@ -6306,24 +9510,22 @@ fn replay_live_thread_events(
                                     %error,
                                     "Failed to recover lagged Runtime web event stream from durable history"
                                 );
-                                break 'live;
+                                yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::CatchUpFailed, last_seq));
+                                return;
                             }
-                        };
-                        for event in events {
-                            if event.thread_id != thread_id || event.seq <= last_seq {
-                                continue;
-                            }
-                            let previous_seq = last_seq;
-                            last_seq = event.seq;
-                            let event_name = event.event.clone();
-                            yield Ok(sse_json(
-                                &event_name,
-                                runtime_event_payload_with_previous(event, previous_seq),
-                            ));
+                            // Answered by the check at the top of the live loop.
+                            ThreadReplayStep::Shutdown => break,
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                // The sender is owned by the `RuntimeThreadManager` this stream
+                // holds an `Arc` of, so it cannot close while the stream runs.
+                // If that ever changes, the live source is gone only because
+                // the Runtime is: say so rather than end silently.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                    return;
+                }
             }
         }
     }
@@ -6342,8 +9544,11 @@ async fn stream_turn(
     let model = runtime_request_model(&state.config.read(), req.model.as_deref())?;
     if req.max_output_tokens.is_some() {
         let config = state.config.read();
+        let identity = config
+            .active_provider_identity()
+            .map_err(ApiError::bad_request)?;
         if model.eq_ignore_ascii_case("auto")
-            || provider_model_output_token_limit_for_api(&config, config.api_provider(), &model)
+            || provider_model_output_token_limit_for_api(&config, &identity, &model)
                 != codewhale_config::route::CapabilityState::Supported
         {
             return Err(ApiError::bad_request(
@@ -6398,6 +9603,8 @@ async fn stream_turn(
         .start_turn(
             &thread.id,
             StartTurnRequest {
+                account_model_owner: None,
+                profile_constitution: None,
                 max_output_tokens: req.max_output_tokens,
                 prompt,
                 images: req.images,
@@ -6771,6 +9978,11 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
                     "remember": payload.get("remember"),
                     "auto": payload.get("auto"),
                     "timeout": payload.get("timeout"),
+                    // Set when the decision was forced by a turn interrupt
+                    // or turn teardown: no user selection was made,
+                    // so clients must clear the pending prompt instead of
+                    // reporting a refusal.
+                    "cancelled": payload.get("cancelled"),
                 }),
             ))
         }
@@ -6855,6 +10067,19 @@ fn sse_json(event: &str, payload: serde_json::Value) -> SseEvent {
     SseEvent::default().event(event).data(data)
 }
 
+/// Read a `Last-Event-ID` cursor off the request.
+///
+/// Only a decimal sequence number is ours. Anything else is ignored rather
+/// than rejected: an opaque id from a proxy or an older client should start
+/// the stream from the durable head, not fail to open it — a refused stream
+/// looks like an outage to a reconnecting client.
+fn last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 fn truncate_text(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
     if char_count <= max_chars {
@@ -6870,6 +10095,10 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
             return config.skills_dir();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && crate::skills::skills_dir_allowed_by_workspace_trust(
+                workspace,
+                &codewhale_skills_dir,
+            )
             && let Ok(canonical_skills) = fs::canonicalize(&codewhale_skills_dir)
         {
             return canonical_skills;
@@ -6886,8 +10115,11 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         Err(_) => return config.skills_dir(),
     };
     for candidate in [
-        canonical_workspace.join(".agents").join("skills"),
-        canonical_workspace.join("skills"),
+        canonical_workspace.join(".codewhale/skills"),
+        canonical_workspace.join(".agents/skills"),
+        canonical_workspace.join(".claude/skills"),
+        canonical_workspace.join(".opencode/skills"),
+        canonical_workspace.join(".cursor/skills"),
     ] {
         // Re-canonicalize the candidate so a `.agents/skills` symlink to e.g.
         // `/etc` cannot promote arbitrary filesystem locations into the
@@ -6896,9 +10128,19 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         if let Ok(canon) = fs::canonicalize(&candidate)
             && canon.starts_with(&canonical_workspace)
             && canon.is_dir()
+            && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canon)
         {
             return canon;
         }
+    }
+    let flat = canonical_workspace.join("skills");
+    if config.skills_config().flat_workspace_root()
+        && let Ok(canonical) = fs::canonicalize(&flat)
+        && canonical.starts_with(&canonical_workspace)
+        && canonical.is_dir()
+        && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canonical)
+    {
+        return canonical;
     }
     config.skills_dir()
 }
@@ -6918,8 +10160,11 @@ fn discover_skills_for_runtime_api(
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
     let directories = skills_search_directories(workspace, skills_dir, mode);
-    let registry =
-        crate::skills::discover_from_directories_with_plugins(directories.clone(), plugins);
+    let registry = crate::skills::discover_from_directories_in_workspace(
+        directories.clone(),
+        Some(workspace),
+        plugins,
+    );
     (registry, directories)
 }
 
@@ -6930,6 +10175,61 @@ fn skill_entry_is_bundled(skill: &crate::skills::Skill, skills_dir: &FsPath) -> 
 
     let expected_path = skills_dir.join(&skill.name).join("SKILL.md");
     paths_refer_to_same_file(&skill.path, &expected_path)
+}
+
+/// One `/v1/skills` row, and the row half of `GET /v1/skills/{name}`. Both
+/// sites read the same fields from the same `Skill`, so a new routing field
+/// lands in the listing and the detail together or not at all.
+fn skill_entry_for(skill: &crate::skills::Skill, enabled: bool, skills_dir: &FsPath) -> SkillEntry {
+    let (path, source, plugin_id, plugin_generation, plugin_content_hash) = match &skill.source {
+        crate::skills::SkillSource::Native => (
+            Some(skill.path.clone()),
+            "native".to_string(),
+            None,
+            None,
+            None,
+        ),
+        crate::skills::SkillSource::Plugin {
+            plugin_id,
+            plugin_name,
+            authority,
+            ..
+        } => (
+            None,
+            format!("reviewed-plugin-snapshot:{plugin_name}"),
+            Some(plugin_id.clone()),
+            Some(authority.state_generation),
+            Some(authority.content_hash.clone()),
+        ),
+    };
+    let is_bundled = skill_entry_is_bundled(skill, skills_dir);
+    SkillEntry {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        path,
+        source,
+        plugin_id,
+        plugin_generation,
+        plugin_content_hash,
+        enabled,
+        is_bundled,
+        invocation: match skill.invocation {
+            crate::skills::SkillInvocation::ModelAndUser => "model+user",
+            crate::skills::SkillInvocation::ExplicitOnly => "explicit-only",
+            crate::skills::SkillInvocation::ModelOnly => "model-only",
+            crate::skills::SkillInvocation::Disabled => "disabled",
+        },
+        aliases: skill.aliases.clone(),
+        // Reported only when `is_bundled` is true, so the two fields cannot
+        // disagree: a row that is not the bundle-path copy of its name gets no
+        // curated tier, however its name reads. `is_bundled` itself is the
+        // pre-existing path test (`skills_dir/<name>/SKILL.md`), and this does
+        // not change what it means.
+        bundled_tier: is_bundled
+            .then(|| crate::skills::bundled_skill_tier(&skill.name))
+            .flatten()
+            .map(|tier| tier.label()),
+    }
 }
 
 fn paths_refer_to_same_file(left: &FsPath, right: &FsPath) -> bool {
@@ -7055,7 +10355,8 @@ async fn restore_snapshot(
 fn restore_snapshot_for_workspace(workspace: &FsPath, id: &str) -> Result<(), ApiError> {
     let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
         .map_err(|e| ApiError::internal(format!("Snapshot repo init failed: {e}")))?;
-    let snapshot_id = crate::snapshot::SnapshotId(id.to_string());
+    let snapshot_id = crate::snapshot::SnapshotId::parse(id)
+        .map_err(|e| ApiError::bad_request(format!("Invalid snapshot id: {e}")))?;
     repo.restore(&snapshot_id)
         .map_err(|e| ApiError::internal(format!("Snapshot restore failed: {e}")))
 }
@@ -7095,13 +10396,16 @@ fn snapshot_entries_for_workspace(
 /// Entry in `GET /v1/providers`.
 ///
 /// Exposes the static provider registry so the GUI can render a dynamic
-/// provider picker instead of hard-coding `deepseek` only. The `id` matches
-/// `ApiProvider::as_str()`; callers must also preserve `model_provider_id`
-/// when present. Both can be pinned to one new thread via `POST /v1/threads`
-/// without mutating the runtime's global provider configuration.
+/// provider picker instead of hard-coding `deepseek` only, plus one entry per
+/// user-defined `[providers.<name>]` route (#1519) — the same routes the TUI's
+/// own provider picker lists, so a route configured in one surface is not
+/// missing from the other. The `id` matches `ProviderKind::as_str()`; callers
+/// must also preserve `model_provider_id` when present. Both can be pinned to
+/// one new thread via `POST /v1/threads` without mutating the runtime's global
+/// provider configuration.
 #[derive(Debug, Clone, Serialize)]
 struct ProviderEntry {
-    /// Stable generic provider kind — matches `ApiProvider::as_str()` and is
+    /// Stable generic provider kind — matches `ProviderKind::as_str()` and is
     /// suitable for `CreateThreadRequest.model_provider`. This is not always
     /// the exact configured route id: named custom routes also require
     /// `model_provider_id` below.
@@ -7180,6 +10484,12 @@ impl From<crate::provider_readiness::CredentialState> for ProviderCredentialStat
 struct ProvidersResponse {
     /// Currently active provider id (matches `GET /v1/config`'s `provider`).
     current: String,
+    /// Exact configured id of the active route, when it has one — the same
+    /// additive identity a [`ProviderEntry`] carries as `model_provider_id`.
+    /// A named custom route reports `current = "custom"` plus this field, so a
+    /// client marks the one route that is actually selected instead of
+    /// whichever entry happens to share the generic kind.
+    current_provider_id: Option<String>,
     providers: Vec<ProviderEntry>,
 }
 
@@ -7375,32 +10685,41 @@ fn push_unique_model(models: &mut Vec<String>, model: &str) {
 
 fn provider_models_for_api(
     config: &Config,
-    active_provider: ApiProvider,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) -> Vec<String> {
+    if config.verify_provider_identity(identity).is_err() {
+        return Vec::new();
+    }
+    let provider = identity.provider;
     let mut models = Vec::new();
     if let Some(model) = config
-        .provider_config_for(provider)
+        .provider_config_for(identity)
         .and_then(|entry| entry.model.as_deref())
     {
         push_unique_model(&mut models, model);
     }
-    if provider == active_provider {
-        let active_model = provider_default_model_for_api(config, active_provider, provider);
+    if config.active_provider_identity().ok().as_ref() == Some(identity) {
+        let active_model = provider_default_model_for_api(config, identity);
         if !active_model.trim().eq_ignore_ascii_case("auto") {
             push_unique_model(&mut models, &active_model);
         }
     }
     let exact_catalog = crate::provider_catalog_live::cached_entry_for_route(
         provider,
-        &config.provider_identity_for(provider),
-        &config.base_url_for_route(provider),
+        identity.key.as_str(),
+        &config.base_url_for_route(identity),
     )
     .ok()
     .flatten()
     .is_some_and(|entry| entry.fetched_at > 0);
-    if !config.model_ids_pass_through_for_provider(provider) || exact_catalog {
-        for model in crate::provider_lake::models_for_provider(config, active_provider, provider) {
+    // A pass-through provider normally lists only what its own live catalog
+    // returned. When that catalog cannot exist (an OAuth route), the catalog
+    // lake's next layers (Models.dev, then the bundled snapshot) answer.
+    if !config.model_ids_pass_through_for_provider(identity)
+        || exact_catalog
+        || crate::provider_lake::live_catalog_unavailable(config, identity)
+    {
+        for model in crate::provider_lake::models_for_provider(config, identity) {
             push_unique_model(&mut models, &model);
         }
     }
@@ -7408,8 +10727,8 @@ fn provider_models_for_api(
         if crate::provider_lake::configured_model_for_route(
             config,
             provider,
-            &config.provider_identity_for(provider),
-            &config.base_url_for_route(provider),
+            identity.key.as_str(),
+            &config.base_url_for_route(identity),
             &model.id,
         )
         .is_some()
@@ -7418,7 +10737,7 @@ fn provider_models_for_api(
             models.push(model.id.clone());
         }
     }
-    if provider == ApiProvider::Ollama {
+    if provider == ProviderKind::Ollama {
         models.retain(|model| !crate::config::is_unresolved_local_ollama_model(model));
     }
     models
@@ -7426,21 +10745,21 @@ fn provider_models_for_api(
 
 fn provider_model_image_input_for_api(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> codewhale_config::route::CapabilityState {
-    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
+    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
         .map(|route| route.candidate.capabilities().image_input)
         .unwrap_or_default()
 }
 
 fn provider_model_output_token_limit_for_api(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> codewhale_config::route::CapabilityState {
     use codewhale_config::route::CapabilityState;
-    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
+    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
         .map(|route| {
             if crate::route_budget::route_supports_output_token_limit(
                 route.identity.provider,
@@ -7456,15 +10775,16 @@ fn provider_model_output_token_limit_for_api(
 
 fn provider_model_entry_for_api(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     model: String,
 ) -> ProviderModelEntry {
     use crate::reasoning_preference::ReasoningEffort;
     use codewhale_config::route::CapabilityState;
 
+    let provider = identity.provider;
     let mut entry = ProviderModelEntry {
-        image_input: provider_model_image_input_for_api(config, provider, &model),
-        output_token_limit: provider_model_output_token_limit_for_api(config, provider, &model),
+        image_input: provider_model_image_input_for_api(config, identity, &model),
+        output_token_limit: provider_model_output_token_limit_for_api(config, identity, &model),
         id: model,
         reasoning_effort: CapabilityState::Unknown,
         reasoning_effort_levels: Vec::new(),
@@ -7472,11 +10792,11 @@ fn provider_model_entry_for_api(
     };
     // A provider kind and a familiar model name do not establish the
     // capabilities of a different endpoint or named compatible route.
-    if provider == ApiProvider::Custom || config.provider_uses_custom_endpoint(provider) {
+    if provider == ProviderKind::Custom || config.provider_uses_custom_endpoint(identity) {
         return entry;
     }
-    if provider == ApiProvider::OpenaiCodex {
-        let roster = crate::codex_model_cache::model_roster();
+    if provider == ProviderKind::OpenaiCodex {
+        let roster = crate::codex_model_cache::model_roster_for(config);
         if roster.freshness != crate::codex_model_cache::CodexModelCacheFreshness::Fresh {
             return entry;
         }
@@ -7510,8 +10830,12 @@ fn provider_model_entry_for_api(
             .map(|effort| effort.as_setting().to_string())
             .collect();
         entry.reasoning_effort_source = Some("catalog");
-    } else if crate::route_runtime::resolve_runtime_route(config, provider, Some(&entry.id))
-        .is_ok_and(|route| route.candidate.capabilities().reasoning == CapabilityState::Unsupported)
+    } else if crate::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        identity,
+        Some(&entry.id),
+    )
+    .is_ok_and(|route| route.candidate.capabilities().reasoning == CapabilityState::Unsupported)
     {
         entry.reasoning_effort = CapabilityState::Unsupported;
         entry.reasoning_effort_source = Some("catalog");
@@ -7524,11 +10848,11 @@ fn provider_model_entry_for_api(
 
 fn provider_default_model_for_api(
     config: &Config,
-    _active_provider: ApiProvider,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) -> String {
-    let model = crate::model_inventory::provider_default_model(config, provider);
-    if provider == ApiProvider::Ollama && crate::config::is_unresolved_local_ollama_model(&model) {
+    let provider = identity.provider;
+    let model = crate::model_inventory::provider_default_model(config, identity);
+    if provider == ProviderKind::Ollama && crate::config::is_unresolved_local_ollama_model(&model) {
         String::new()
     } else {
         model
@@ -7621,12 +10945,40 @@ pub(crate) fn runtime_chat_relay_catalog(
         return Err("Codewhale returned an invalid Runtime Chat relay challenge.".to_string());
     }
 
-    let provider = config.api_provider();
+    let mut account_config;
+    let ready = config
+        .active_provider_identity()
+        .ok()
+        .is_some_and(|identity| {
+            matches!(
+                crate::provider_readiness::credential_state_for_provider(config, &identity),
+                CredentialState::Saved
+                    | CredentialState::ImportedToken
+                    | CredentialState::Local
+                    | CredentialState::NoAuth
+            )
+        });
+    let config = if ready {
+        config
+    } else {
+        account_config = config.clone();
+        let identity = account_config
+            .resolve_persisted_provider_identity(Some("codewhale"), Some("codewhale"))?;
+        if account_config.account_model_api_key(&identity).is_none() {
+            return Err(
+                "Connect account model access before using the Codewhale agent.".to_string(),
+            );
+        }
+        account_config.scope_to_provider_identity(&identity)?;
+        &account_config
+    };
+
     let identity = config
-        .active_provider_identity(provider)
+        .active_provider_identity()
         .map_err(|_| "The active Runtime provider identity is invalid.".to_string())?;
+    let provider = identity.provider;
     let credential_state =
-        match crate::provider_readiness::credential_state_for_provider(config, provider) {
+        match crate::provider_readiness::credential_state_for_provider(config, &identity) {
             CredentialState::Saved | CredentialState::ImportedToken => "configured",
             CredentialState::Local => "local",
             CredentialState::NoAuth => "no_auth",
@@ -7638,9 +10990,9 @@ pub(crate) fn runtime_chat_relay_catalog(
             }
         };
 
-    let models = runtime_chat_safe_models(provider_models_for_api(config, provider, provider))?;
-    let requested_default = provider_default_model_for_api(config, provider, provider);
-    if provider == ApiProvider::Ollama && requested_default.is_empty() {
+    let models = runtime_chat_safe_models(provider_models_for_api(config, &identity))?;
+    let requested_default = provider_default_model_for_api(config, &identity);
+    if provider == ProviderKind::Ollama && requested_default.is_empty() {
         return Err("The active local provider has no fresh default model catalog.".to_string());
     }
     let default_model = models
@@ -7671,6 +11023,8 @@ pub(crate) fn runtime_chat_relay_catalog(
                 "turn_operation_idempotency": true,
                 "turn_image_inputs": true,
                 "turn_output_token_limit": true,
+                "profile_constitution": true,
+                "account_model_owner": true,
                 "tool_execution": false,
                 "stable_event_ids": true,
             },
@@ -7678,11 +11032,11 @@ pub(crate) fn runtime_chat_relay_catalog(
         "providers": [{
             "id": provider.as_str(),
             "modelProviderId": model_provider_id,
-            "displayName": provider.display_name(),
+            "displayName": identity.compatibility().map(|row| row.label).unwrap_or(identity.key.as_str()),
             "defaultModel": default_model,
             "credentialState": credential_state,
             "models": models.into_iter().map(|model| {
-                let entry = provider_model_entry_for_api(config, provider, model);
+                let entry = provider_model_entry_for_api(config, &identity, model);
                 json!({
                     "imageInput": entry.image_input,
                     "outputTokenLimit": entry.output_token_limit,
@@ -7696,6 +11050,58 @@ pub(crate) fn runtime_chat_relay_catalog(
     }))
 }
 
+/// Names of the user-defined `[providers.<name>]` routes this runtime can
+/// route to, sorted case-insensitively.
+///
+/// Mirrors the TUI provider picker's own row filter
+/// (`custom_provider_dashboard_rows`), so the routes one surface offers are the
+/// routes the other offers. A table without the `openai-compatible` kind is not
+/// a routable custom route and stays out of both.
+fn configured_custom_provider_routes(config: &Config) -> Vec<String> {
+    let Some(providers) = config.providers.as_ref() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = providers
+        .custom
+        .iter()
+        .filter(|(_, entry)| entry.is_openai_compatible_custom())
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort_by_key(|name| name.to_ascii_lowercase());
+    names
+}
+
+/// Project one provider route into the `GET /v1/providers` wire shape.
+///
+/// `exact_route` names the user-defined `[providers.<name>]` entry being
+/// listed, and `config` must already be scoped to it. The entry then describes
+/// that route — its own name and its own catalog — while `id` stays the generic
+/// kind every other endpoint addresses it by. Without it, the entry describes
+/// the built-in provider as before.
+fn provider_entry_for_api(
+    config: &Config,
+    identity: &crate::config::ProviderIdentity,
+) -> ProviderEntry {
+    let writeability = secrets::credential_writeability(config, identity);
+    ProviderEntry {
+        id: identity.persisted_kind().to_string(),
+        model_provider_id: identity.persisted_id().map(str::to_string),
+        display_name: identity
+            .compatibility()
+            .map(|row| row.label.to_string())
+            .unwrap_or_else(|| format!("{} (custom)", identity.key)),
+        default_model: provider_default_model_for_api(config, identity),
+        has_model_catalog: !provider_models_for_api(config, identity).is_empty(),
+        credential_state: crate::provider_readiness::credential_state_for_provider(
+            config, identity,
+        )
+        .into(),
+        credential_source: writeability.source,
+        credential_writable: writeability.writable,
+        credential_writable_reason: writeability.reason,
+    }
+}
+
 async fn list_providers(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<ProvidersResponse>, ApiError> {
@@ -7706,44 +11112,20 @@ async fn list_providers(
         let _membership = crate::test_support::join_env_scope(env_ticket);
         let config = state.config.read().clone();
         secrets::invalidate_stale_account_catalog(&config);
-        let active_provider = config.api_provider();
-        let active_identity = config
-            .active_provider_identity(active_provider)
-            .map_err(ApiError::bad_request)?;
-        let current = active_provider.as_str().to_string();
-        let mut providers = Vec::new();
-        for api_provider in ApiProvider::sorted_for_display() {
-            let default_model =
-                provider_default_model_for_api(&config, active_provider, api_provider);
-            let identity = config.provider_identity_for(api_provider);
-            let base_url = config.base_url_for_route_identity(api_provider, &identity);
-            let has_model_catalog = !crate::provider_lake::configured_catalog_models_for_route(
-                &config,
-                api_provider,
-                &identity,
-                &base_url,
-            )
-            .is_empty();
-            let writeability = secrets::credential_writeability(&config, api_provider);
-            providers.push(ProviderEntry {
-                id: api_provider.as_str().to_string(),
-                model_provider_id: (api_provider == active_provider)
-                    .then(|| active_identity.persisted_id().map(str::to_string))
-                    .flatten(),
-                display_name: api_provider.display_name().to_string(),
-                default_model,
-                has_model_catalog,
-                credential_state: crate::provider_readiness::credential_state_for_provider(
-                    &config,
-                    api_provider,
-                )
-                .into(),
-                credential_source: writeability.source,
-                credential_writable: writeability.writable,
-                credential_writable_reason: writeability.reason,
-            });
-        }
-        Ok(Json(ProvidersResponse { current, providers }))
+        let active_identity = config.active_provider_identity().ok();
+        let current = active_identity.as_ref().map_or_else(|| config.provider.clone().unwrap_or_else(|| "unavailable".into()), |identity| identity.persisted_kind().to_string());
+        let mut providers = config.provider_identities().iter().filter(|identity| identity.provider != ProviderKind::Antigravity).map(|identity| provider_entry_for_api(&config, identity)).collect::<Vec<_>>();
+        providers.extend(config.unadmitted_provider_keys().into_iter().map(|key| ProviderEntry {
+            id: key.to_string(), model_provider_id: Some(key.to_string()), display_name: format!("{key} (unavailable)"),
+            default_model: String::new(), has_model_catalog: false,
+            credential_state: ProviderCredentialState::Legacy, credential_source: secrets::ProviderCredentialSource::None,
+            credential_writable: false, credential_writable_reason: Some("This configured route is unavailable; repair its exact provider definition before using it."),
+        }));
+        Ok(Json(ProvidersResponse {
+            current_provider_id: active_identity.as_ref().and_then(|identity| identity.persisted_id()).map(str::to_string),
+            current,
+            providers,
+        }))
     })
     .await
     .map_err(|_| ApiError::internal("Provider listing failed"))?
@@ -7769,38 +11151,28 @@ fn provider_models_identity(
     config: &Config,
     id: &str,
     exact_id: Option<&str>,
-) -> Result<(ApiProvider, Option<crate::config::ProviderIdentity>), ApiError> {
-    let api_provider = ApiProvider::parse(&id)
-        .ok_or_else(|| ApiError::bad_request(format!("Unknown provider id '{id}'")))?;
-    // Reject requests for the legacy deepseek-cn alias that has no
-    // ProviderKind metadata — the GUI should use `deepseek` instead.
-    if api_provider == ApiProvider::DeepseekCN {
+) -> Result<crate::config::ProviderIdentity, ApiError> {
+    if id.is_empty() || id != id.trim() || id.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("provider must be an exact selection"));
+    }
+    if exact_id.is_some_and(|value| {
+        value.is_empty() || value != value.trim() || value.chars().any(char::is_control)
+    }) {
         return Err(ApiError::bad_request(
-            "provider 'deepseek-cn' is a legacy alias; use 'deepseek' instead",
+            "model_provider_id must be an exact configured identity",
         ));
     }
-    let identity = if let Some(exact_id) = exact_id {
-        if exact_id.is_empty()
-            || exact_id != exact_id.trim()
-            || exact_id.chars().any(char::is_control)
-        {
-            return Err(ApiError::bad_request(
-                "model_provider_id must be an exact configured identity",
-            ));
-        }
-        let identity = config
-            .resolve_persisted_provider_identity(Some(api_provider.as_str()), Some(exact_id))
-            .map_err(ApiError::bad_request)?;
-        if identity.provider != api_provider || identity.persisted_id() != Some(exact_id) {
-            return Err(ApiError::bad_request(
-                "model_provider_id does not match this provider route",
-            ));
-        }
-        Some(identity)
-    } else {
-        None
-    };
-    Ok((api_provider, identity))
+    // A supplied pair is re-admitted exactly. An omitted id denotes the named
+    // selection, with literal custom using only its parse-proven root origin.
+    let identity = match exact_id {
+        Some(exact_id) => config.resolve_persisted_provider_identity(Some(id), Some(exact_id)),
+        None => config.legacy_selection_identity(id),
+    }
+    .map_err(ApiError::bad_request)?;
+    config
+        .verify_provider_identity(&identity)
+        .map_err(ApiError::bad_request)?;
+    Ok(identity)
 }
 
 async fn list_provider_models(
@@ -7813,30 +11185,29 @@ async fn list_provider_models(
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
-        let mut config = state.config.read().clone();
+        let config = state.config.read().clone();
         secrets::invalidate_stale_account_catalog(&config);
-        let (api_provider, identity) =
-            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
-        let route_fingerprint = if let Some(identity) = identity {
-            config.scope_to_provider_identity(&identity);
-            let route = serde_json::to_vec(&(
-                api_provider.as_str(),
-                params.model_provider_id.as_deref(),
-                config.base_url_for_route_identity(api_provider, &identity.key),
-            ))
-            .map_err(|error| {
-                ApiError::internal(format!("Could not fingerprint provider route: {error}"))
-            })?;
-            Some(crate::hashing::sha256_hex(route))
-        } else {
-            None
-        };
-        let models = provider_models_for_api(&config, config.api_provider(), api_provider)
+        let identity = provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
+        let route = serde_json::to_vec(&(
+            identity.persisted_kind(),
+            identity.persisted_id(),
+            config.base_url_for_route(&identity),
+        ))
+        .map_err(|error| {
+            ApiError::internal(format!("Could not fingerprint provider route: {error}"))
+        })?;
+        let route_fingerprint = Some(crate::hashing::sha256_hex(route));
+        let models = provider_models_for_api(&config, &identity)
             .into_iter()
-            .map(|id| provider_model_entry_for_api(&config, api_provider, id))
+            .map(|id| provider_model_entry_for_api(&config, &identity, id))
             .collect();
-        paginate_provider_models(api_provider.as_str(), models, &params, route_fingerprint)
-            .map(Json)
+        paginate_provider_models(
+            identity.persisted_kind(),
+            models,
+            &params,
+            route_fingerprint,
+        )
+        .map(Json)
     })
     .await
     .map_err(|_| ApiError::internal("Provider model listing failed"))?
@@ -7860,14 +11231,7 @@ async fn refresh_provider_models(
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
         let config = state.config.read().clone();
-        let (provider, exact) =
-            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
-        let identity = match exact {
-            Some(identity) => identity,
-            None => config
-                .active_provider_identity(provider)
-                .map_err(ApiError::bad_request)?,
-        };
+        let identity = provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
         Ok(Json(runtime.block_on(
             crate::provider_lake::update_provider_catalog(&config, &identity),
         )))
@@ -7888,6 +11252,17 @@ async fn refresh_provider_models(
 struct SwitchProviderRequest {
     #[serde(default)]
     model: Option<String>,
+    /// Exact configured provider id for the target route.
+    ///
+    /// Named `[providers.<name>]` routes are addressed the same way this API
+    /// addresses them everywhere else: the generic kind in the id (`custom`)
+    /// plus this additive exact id, exactly as `ProviderEntry`
+    /// `model_provider_id` and `POST /v1/threads` already carry it. Omitted
+    /// keeps the pre-existing meaning — the built-in id, or the literal
+    /// `[providers.custom]` route (where the older top-level custom route
+    /// lives since #6394).
+    #[serde(default)]
+    model_provider_id: Option<String>,
 }
 
 /// Response for `POST /v1/providers/{id}/switch`.
@@ -7913,6 +11288,11 @@ struct SwitchProviderResponse {
 /// `POST /v1/providers/{id}/switch` — switch the active provider, optionally
 /// overriding the model.
 ///
+/// `{id}` is the generic provider kind (`custom` for every user-defined route).
+/// A named `[providers.<name>]` route is named by `model_provider_id` in the
+/// body, not by the path: the path keeps naming the kind, so one endpoint
+/// cannot disagree with `GET /v1/providers` about what an entry's `id` means.
+///
 /// This is the GUI-facing counterpart of the TUI's `/provider` slash command
 /// (`commands/groups/core/provider.rs`) and `AppAction::SwitchProvider`
 /// (`tui/ui.rs::switch_provider`). It exists so the GUI does not have to
@@ -7935,6 +11315,9 @@ struct SwitchProviderResponse {
 ///   are committed together through the canonical Config writer.
 /// - Config is reloaded from disk and synced to active engines via
 ///   `runtime_threads.reload_config`, exactly like `POST /v1/config/reload`.
+/// - A reload that fails or is rejected rolls the persisted selection back
+///   (only while the file still holds what this write left), so disk and the
+///   running config never disagree about the provider. The error says which.
 async fn switch_provider(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -7942,12 +11325,38 @@ async fn switch_provider(
 ) -> Result<Json<SwitchProviderResponse>, ApiError> {
     use crate::config_persistence;
 
-    let target = ApiProvider::parse(&id)
-        .ok_or_else(|| ApiError::bad_request(format!("Unknown provider id '{id}'")))?;
+    let trimmed_id = id.trim();
+    let _target = ProviderKind::parse_config_identity(trimmed_id).ok_or_else(|| {
+        // A configured `[providers.<name>]` route is a route this runtime can
+        // and does switch to — but only through the generic kind, because the
+        // same name is what `GET /v1/providers` reports as
+        // `model_provider_id`. Tell the caller exactly that instead of
+        // pretending the route does not exist.
+        let named_route = configured_custom_provider_routes(&state.config.read())
+            .iter()
+            .any(|route| route == trimmed_id);
+        if named_route {
+            ApiError::bad_request(format!(
+                "'{trimmed_id}' is a user-defined route: switch to the generic 'custom' kind with model_provider_id = \"{trimmed_id}\" instead"
+            ))
+        } else {
+            ApiError::bad_request(format!(
+                "Unknown provider id '{trimmed_id}'. Call GET /v1/providers for the list of supported ids."
+            ))
+        }
+    })?;
     // Reject the legacy deepseek-cn alias — same guard as list_provider_models.
-    if target == ApiProvider::DeepseekCN {
+    if codewhale_config::descriptors::compatibility_for_selector(trimmed_id)
+        .is_some_and(|row| row.id == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id)
+    {
         return Err(ApiError::bad_request(
             "provider 'deepseek-cn' is a legacy alias; use 'deepseek' instead",
+        ));
+    }
+    let exact_provider_id = req.model_provider_id.as_deref();
+    if exact_provider_id.is_some_and(|value| value.trim().is_empty() || value != value.trim()) {
+        return Err(ApiError::bad_request(
+            "model_provider_id must be a nonempty exact id",
         ));
     }
 
@@ -7956,26 +11365,28 @@ async fn switch_provider(
     // active route — except here we validate against the target provider,
     // because the active route is about to change.
     // Read normalization and persistence identity from the same route snapshot.
-    let (target, model_override, provider_identity) = {
+    let (model_override, provider_identity) = {
         let config = state.config.read();
-        let identity = config
-            .resolve_provider_pin_identity(&id)
-            .map_err(ApiError::bad_request)?;
+        // An additive exact id is the stronger selector: it names one
+        // configured route, so it resolves through the same pinned-identity
+        // path saved threads use. Absent, the id keeps its previous meaning.
+        let identity = match exact_provider_id {
+            Some(exact) => config
+                .resolve_persisted_provider_identity(Some(&id), Some(exact))
+                .map_err(ApiError::bad_request)?,
+            None => config
+                .resolve_provider_pin_identity(&id)
+                .map_err(ApiError::bad_request)?,
+        };
         let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
+        scoped
+            .scope_to_provider_identity(&identity)
+            .map_err(ApiError::bad_request)?;
         let model = match req.model.as_deref().map(str::trim) {
             None | Some("") => None,
-            Some(raw) => Some(normalize_runtime_config_model(
-                &scoped,
-                identity.provider,
-                raw,
-            )?),
+            Some(raw) => Some(normalize_runtime_config_model(&scoped, &identity, raw)?),
         };
-        (
-            identity.provider,
-            model,
-            identity.persisted_id().unwrap_or(&identity.key).to_string(),
-        )
+        (model, identity)
     };
 
     // Persist `provider` (always) + `model` (only when explicitly given).
@@ -7983,66 +11394,115 @@ async fn switch_provider(
     // model arg) MUST NOT write a `model` key, otherwise the user's
     // per-provider `[providers.<id>].model` config gets overwritten with
     // whatever the runtime resolves as the default.
-    config_persistence::persist_provider_selection(
-        state.config_path.as_deref(),
-        target,
-        &provider_identity,
-        model_override.as_deref(),
-    )
-    .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
+    // The save, the reload and the undo of a refused save run as one task
+    // detached from this request: a client that disconnects or times out
+    // mid-reload drops only its wait, never the undo, and never leaves the
+    // engines on the new config while `state.config` keeps the old one.
+    let task_state = state.clone();
+    let task_identity = provider_identity.clone();
+    let task_model = model_override.clone();
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    let (active_provider, active_model) = tokio::spawn(async move {
+        let state = task_state;
+        let _one_switch_at_a_time = state.provider_switches.lock().await;
+        // Keep the cancellation-safe owned switch, while all filesystem and
+        // keyring work runs off the async worker under the same serialization.
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
+            let (config_toml, undo) = config_persistence::persist_provider_selection(
+                state.config_path.as_deref(),
+                &task_identity,
+                task_model.as_deref(),
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
 
-    // Reload config from disk and sync to active engines. This matches
-    // `POST /v1/config/reload` exactly: load → validate thread routes →
-    // swap in the new config. A failure here means an active thread's
-    // route is invalid under the new provider — surface it so the GUI can
-    // tell the user to fix their config.
-    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
-        .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
-    reloaded.account_model_access = state.config.read().account_model_access.clone();
-    state
-        .runtime_threads
-        .reload_config(reloaded.clone())
+            // Reload config from disk and sync to active engines. This matches
+            // `POST /v1/config/reload` exactly: load → validate thread routes →
+            // swap in the new config. A failure here means an active thread's
+            // route is invalid under the new provider — surface it so the GUI can
+            // tell the user to fix their config.
+            let applied =
+                match Config::load(state.config_path.clone(), state.config_profile.as_deref()) {
+                    Ok(mut reloaded) => {
+                        reloaded.account_model_access =
+                            state.config.read().account_model_access.clone();
+                        match runtime.block_on(state.runtime_threads.reload_config(reloaded.clone())) {
+                            Ok(_) => Ok(reloaded),
+                            Err(err) => Err(ApiError::bad_request(format!(
+                                "Config reload rejected: {err}"
+                            ))),
+                        }
+                    }
+                    Err(e) => Err(ApiError::internal(format!("Failed to reload config: {e}"))),
+                };
+            match applied {
+                // Report the route this switch applied, not whatever a later
+                // switch leaves in `state.config` by the time this reply is built.
+                Ok(reloaded) => {
+                    let applied_identity = reloaded.active_provider_identity().map_err(ApiError::bad_request)?;
+                    reloaded.verify_provider_identity(&task_identity).map_err(ApiError::conflict)?;
+                    if applied_identity != task_identity { return Err(ApiError::conflict("Persisted provider selection differs from the captured switch.")); }
+                    let provider = applied_identity.provider;
+                    let model = provider_default_model_for_api(&reloaded, &applied_identity);
+                    *state.config.write() = reloaded;
+                    Ok::<_, ApiError>((provider, model))
+                }
+                // A rejected switch must not stay on disk, or the next restart or
+                // reload silently applies the switch this response reports as
+                // refused. Only this save is taken back; a newer one wins.
+                Err(mut error) => {
+                    let path = config_toml.display();
+                    match undo.undo() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            error.message = format!(
+                                "{}; {path} changed after this switch was saved, so the newer contents were kept",
+                                error.message
+                            );
+                        }
+                        Err(restore) => {
+                            error.message = format!(
+                                "{}; the provider selection could not be reverted in {path}: {restore}",
+                                error.message
+                            );
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        })
         .await
-        .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
-    {
-        let mut config = state.config.write();
-        *config = reloaded;
-    }
-
-    // Read the resolved active model + provider from the freshly reloaded
-    // config. This is the value the GUI must display — NOT the catalog
-    // default and NOT the previously-active model.
-    let (active_provider, active_model) = {
-        let config = state.config.read();
-        let provider = config.api_provider();
-        (
-            provider,
-            provider_default_model_for_api(&config, provider, provider),
-        )
-    };
+        .map_err(|_| ApiError::internal("provider switch blocking task failed"))?
+    })
+    .await
+    .map_err(|_| ApiError::internal("provider switch task failed"))??;
 
     let model_available = !active_model.is_empty();
+    // Name the route the user selected, not the kind it routes through: a
+    // named custom route reports `custom` as its kind, which names nothing the
+    // user ever typed. Every other route keeps reporting its canonical kind.
+    let active_label = if active_provider == ProviderKind::Custom {
+        provider_identity.key.to_string()
+    } else {
+        active_provider.as_str().to_string()
+    };
     let message = if !model_available {
         format!(
-            "Provider switched to {}; refresh its catalog or select an explicit model.",
-            active_provider.as_str()
+            "Provider switched to {active_label}; refresh its catalog or select an explicit model."
         )
     } else if model_override.is_some() {
-        format!(
-            "Provider switched to {} (model: {}).",
-            active_provider.as_str(),
-            active_model
-        )
+        format!("Provider switched to {active_label} (model: {active_model}).")
     } else {
         format!(
-            "Provider switched to {} (model: {}, resolved from config).",
-            active_provider.as_str(),
-            active_model
+            "Provider switched to {active_label} (model: {active_model}, resolved from config)."
         )
     };
 
     Ok(Json(SwitchProviderResponse {
-        provider: active_provider.as_str().to_string(),
+        provider: active_label,
         model: active_model,
         model_available,
         message,
@@ -8140,7 +11600,10 @@ async fn get_config(
     let model_available = resolved_model.is_ok();
     let model = resolved_model.unwrap_or_default();
 
-    let provider = config.provider_identity_for(config.api_provider());
+    let active_identity = config
+        .active_provider_identity()
+        .map_err(ApiError::bad_request)?;
+    let provider = active_identity.key.to_string();
 
     let approval_mode = config
         .approval_policy
@@ -8154,16 +11617,18 @@ async fn get_config(
     // is active, and follows the CN slot while the CN route is active — the CN
     // route resolves `[providers.deepseek_cn].model`, not the primary slot.
     // The root field is a legacy fallback for unmigrated configs.
-    let default_provider = if config.api_provider() == ApiProvider::DeepseekCN {
-        ApiProvider::DeepseekCN
-    } else {
-        ApiProvider::Deepseek
-    };
-    let identity = config
-        .resolve_provider_pin_identity(default_provider.as_str())
-        .map_err(ApiError::bad_request)?;
+    let identity =
+        if active_identity.key.as_str() == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id {
+            active_identity.clone()
+        } else {
+            config
+                .builtin_provider_identity(ProviderKind::Deepseek)
+                .map_err(ApiError::bad_request)?
+        };
     let mut deepseek_config = config.clone();
-    deepseek_config.scope_to_provider_identity(&identity);
+    deepseek_config
+        .scope_to_provider_identity(&identity)
+        .map_err(ApiError::bad_request)?;
     let default_model = deepseek_config.default_model();
     let base_url = config.active_route_base_url().to_string();
 
@@ -8264,31 +11729,36 @@ async fn set_config(
     // route that cannot execute after reload.
     let active_route = {
         let config = state.config.read();
-        let provider = config.api_provider();
         match key.as_str() {
-            "model" => {
-                value = normalize_runtime_config_model(&config, provider, &value)?;
-            }
+            "model" | "base_url" | "provider_url" | "provider_base_url" => Some(
+                config
+                    .active_provider_identity()
+                    .map_err(ApiError::bad_request)?,
+            ),
             "default_model" => {
-                let default_provider = if provider == ApiProvider::DeepseekCN {
-                    ApiProvider::DeepseekCN
-                } else {
-                    ApiProvider::Deepseek
-                };
-                value = normalize_runtime_config_model(&config, default_provider, &value)?;
+                let active = config.active_provider_identity().ok();
+                Some(
+                    match active.filter(|identity| {
+                        identity.key.as_str()
+                            == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id
+                    }) {
+                        Some(identity) => identity,
+                        None => config
+                            .builtin_provider_identity(ProviderKind::Deepseek)
+                            .map_err(ApiError::bad_request)?,
+                    },
+                )
             }
-            _ => {}
+            _ => None,
         }
-        let identity = if key == "model" {
-            let identity = config
-                .active_provider_identity(provider)
-                .map_err(ApiError::bad_request)?;
-            identity.persisted_id().unwrap_or(&identity.key).to_string()
-        } else {
-            config.provider_identity_for(provider)
-        };
-        (provider, identity)
     };
+    if matches!(key.as_str(), "model" | "default_model") {
+        let config = state.config.read();
+        let identity = active_route
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("No admitted model route"))?;
+        value = normalize_runtime_config_model(&config, identity, &value)?;
+    }
 
     // All persisted config keys require a reload to take effect in the
     // runtime (including syncing to active engines). The caller should
@@ -8301,63 +11771,55 @@ async fn set_config(
     if persist {
         let config_path = state.config_path.as_deref();
         let result: anyhow::Result<PathBuf> = match key.as_str() {
-            "model" => config_persistence::persist_provider_model_key(
+            "model" | "default_model" => config_persistence::persist_provider_model_key(
                 config_path,
-                active_route.0,
-                &active_route.1,
+                active_route
+                    .as_ref()
+                    .ok_or_else(|| ApiError::bad_request("No admitted model route"))?,
                 &value,
             ),
-            "default_model" => {
-                // The CN route reads its own `[providers.deepseek_cn]` slot;
-                // writing the primary `deepseek` slot there would be unread.
-                let (default_provider, default_identity) =
-                    if active_route.0 == ApiProvider::DeepseekCN {
-                        (ApiProvider::DeepseekCN, ApiProvider::DeepseekCN.as_str())
-                    } else {
-                        (ApiProvider::Deepseek, ApiProvider::Deepseek.as_str())
-                    };
-                config_persistence::persist_provider_model_key(
-                    config_path,
-                    default_provider,
-                    default_identity,
-                    &value,
-                )
-            }
             "reasoning_effort" => {
                 config_persistence::persist_root_string_key(config_path, "reasoning_effort", &value)
             }
             "approval_mode" | "approval_policy" => {
                 config_persistence::persist_root_string_key(config_path, "approval_policy", &value)
             }
-            "base_url" => config_persistence::persist_root_string_key(
-                config_path,
-                "active_route_base_url",
-                &value,
-            ),
+            "base_url" | "provider_url" | "provider_base_url" => {
+                config_persistence::persist_route_base_url(
+                    config_path,
+                    active_route
+                        .as_ref()
+                        .ok_or_else(|| ApiError::bad_request("No admitted endpoint route"))?,
+                    &value,
+                )
+            }
             "provider" => {
                 // Validate the provider id against the static registry so the
                 // GUI gets a clear error instead of silently persisting an
                 // unknown value that `Config::api_provider()` would later
-                // ignore (falling back to DeepSeek).
-                ApiProvider::parse(&value).ok_or_else(|| {
-                    ApiError::bad_request(format!(
-                        "Unknown provider '{value}'. Call GET /v1/providers for the list of supported ids."
-                    ))
-                })?;
+                // ignore (falling back to DeepSeek). A user-defined
+                // `[providers.<name>]` route is a valid selection as well: the
+                // persistent `provider` key holds exactly that name, and
+                // `Config::resolve_provider_identity` resolves it back to the
+                // route, so refusing it here would refuse a value the runtime
+                // honours. Anything else is still refused.
+                let identity = state
+                    .config
+                    .read()
+                    .resolve_provider_selection_identity(&value)
+                    .map_err(ApiError::bad_request)?;
                 let result =
-                    config_persistence::persist_root_string_key(config_path, "provider", &value);
+                    config_persistence::persist_provider_selection(config_path, &identity, None)
+                        .map(|(path, _undo)| path);
                 if result.is_ok() {
-                    // Keep the in-memory provider in step with the persisted
-                    // value so a following set_config(model) resolves the new
-                    // provider's table instead of clobbering the previous
-                    // provider's model slot (#4658 follow-up).
-                    state.config.write().provider = Some(value.clone());
+                    state.config.write().provider = Some(
+                        identity
+                            .persisted_id()
+                            .unwrap_or(identity.key.as_str())
+                            .to_string(),
+                    );
                 }
                 result
-            }
-            "provider_url" | "provider_base_url" => {
-                let provider = state.config.read().api_provider();
-                config_persistence::persist_provider_base_url_key(config_path, provider, &value)
             }
             "cost_currency"
             | "default_mode"
@@ -8684,9 +12146,14 @@ async fn get_settings_schema(
         state.config_profile.as_deref(),
         &state.workspace,
     );
-    let base_url_row_key = match config.api_provider() {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => "base_url",
-        _ => "provider_url",
+    let base_url_row_key = if config
+        .active_provider_identity()
+        .ok()
+        .is_some_and(|identity| identity.key.as_str() == ProviderKind::Deepseek.as_str())
+    {
+        "base_url"
+    } else {
+        "provider_url"
     };
     let visible = |key: &str| -> bool {
         match key {
@@ -8925,7 +12392,10 @@ async fn get_settings_schema(
 /// omitted rather than approximated.
 fn config_schema_value(key: &str, config: &Config) -> Option<String> {
     match key {
-        "provider" => Some(config.provider_identity_for(config.api_provider())),
+        "provider" => config
+            .active_provider_identity()
+            .ok()
+            .map(|identity| identity.key.to_string()),
         "model" => runtime_request_model(config, None).ok(),
         "approval_policy" => config
             .approval_policy
@@ -8933,8 +12403,14 @@ fn config_schema_value(key: &str, config: &Config) -> Option<String> {
             .or_else(|| Some("suggest".to_string())),
         "telemetry" => Some(crate::telemetry_notice::saved_preference_enabled(config).to_string()),
         "allow_shell" => Some(config.allow_shell().to_string()),
-        "base_url" => Some(config.base_url_for_route(config.api_provider())),
-        "provider_url" => Some(config.base_url_for_route(config.api_provider())),
+        "base_url" => config
+            .active_provider_identity()
+            .ok()
+            .map(|identity| config.base_url_for_route(&identity)),
+        "provider_url" => config
+            .active_provider_identity()
+            .ok()
+            .map(|identity| config.base_url_for_route(&identity)),
         "mcp_config_path" => Some(config.mcp_config_path().display().to_string()),
         "sandbox_mode" => config.sandbox_mode.clone(),
         "fleet.exec.max_spawn_depth" => Some(config.subagent_max_spawn_depth().to_string()),
@@ -8945,24 +12421,32 @@ fn config_schema_value(key: &str, config: &Config) -> Option<String> {
 
 fn normalize_runtime_config_model(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     value: &str,
 ) -> Result<String, ApiError> {
+    config
+        .verify_provider_identity(identity)
+        .map_err(ApiError::bad_request)?;
+    let provider = identity.provider;
     let value = value.trim();
     if crate::provider_lake::configured_model_for_route(
         config,
         provider,
-        &config.provider_identity_for(provider),
-        &config.base_url_for_route(provider),
+        identity.key.as_str(),
+        &config.base_url_for_route(identity),
         value,
     )
     .is_some()
     {
         // The shared resolver preserves exact declarations only after its
         // protocol and provider allowlist guards. Metadata cannot bypass them.
-        return crate::route_runtime::resolve_runtime_route(config, provider, Some(value))
-            .map(|route| route.model)
-            .map_err(ApiError::bad_request);
+        return crate::route_runtime::resolve_runtime_route_for_identity(
+            config,
+            identity,
+            Some(value),
+        )
+        .map(|route| route.model)
+        .map_err(ApiError::bad_request);
     }
     validate_route(provider, value).map_err(ApiError::bad_request)?;
     if value.eq_ignore_ascii_case("auto") {
@@ -9117,7 +12601,8 @@ fn memory_hit_to_record(
 }
 
 /// Resolve a scope query parameter into a `MemoryScope` filter and an
-/// optional workspace_id.  `"all"` / absent → `(None, None)`.
+/// optional workspace_id. `"all"` / absent → `(None, None)`: each caller
+/// decides what "all" spans (see `list_memory` and `clear_memory`).
 fn resolve_memory_scope(
     scope_param: &Option<String>,
     workspace: &FsPath,
@@ -9127,10 +12612,15 @@ fn resolve_memory_scope(
         "global" => Ok((Some(crate::native_memory::MemoryScope::Global), None)),
         "workspace" => {
             let workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(workspace)
-                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?;
+                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "workspace scope requires a git repository with a remote origin",
+                    )
+                })?;
             Ok((
                 Some(crate::native_memory::MemoryScope::Workspace),
-                workspace_id,
+                Some(workspace_id),
             ))
         }
         other => Err(ApiError::bad_request(format!(
@@ -9143,7 +12633,8 @@ fn resolve_memory_scope(
 /// filtering.
 ///
 /// Query params:
-/// - `scope` — `"global"`, `"workspace"`, or `"all"` (default)
+/// - `scope` — `"global"`, `"workspace"`, or `"all"` (default: global memory
+///   plus this repository's workspace memory)
 /// - `q` — FTS search query (max 256 chars; omit to list all)
 /// - `limit` — max results (default 50, max 200)
 async fn list_memory(
@@ -9164,7 +12655,17 @@ async fn list_memory(
 
     let store = native_store_for_state(&state);
     let root = store.root().to_path_buf();
-    let (scope_filter, workspace_id) = resolve_memory_scope(&query.scope, &state.workspace)?;
+    let (scope_filter, mut workspace_id) = resolve_memory_scope(&query.scope, &state.workspace)?;
+    if scope_filter.is_none() {
+        // "all" is global memory plus this repository's. With no identity
+        // (no origin remote, or git unavailable) there is no workspace memory
+        // to show, and the listing still serves global memory.
+        workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(&state.workspace)
+            .unwrap_or_else(|error| {
+                tracing::warn!("memory list shows global memory only: {error}");
+                None
+            });
+    }
 
     let hits = if let Some(ref q) = query.q {
         let q = q.trim();
@@ -9172,6 +12673,9 @@ async fn list_memory(
             return Err(ApiError::bad_request("q must be 1–256 characters"));
         }
         match scope_filter {
+            None if workspace_id.is_some() => {
+                store.search_in_workspace(workspace_id.as_deref(), &state.workspace, q, limit)
+            }
             None => store.search(q, limit),
             Some(crate::native_memory::MemoryScope::Global) => store.search(q, limit).map(|h| {
                 h.into_iter()
@@ -9267,7 +12771,9 @@ async fn create_memory_entry(
 /// `DELETE /v1/memory` — clear all memory entries for the given scope.
 ///
 /// The `scope` query parameter is required: `"global"`, `"workspace"`, or
-/// `"all"`.  This is a destructive, non-reversible operation.
+/// `"all"`. `"all"` clears every local scope, including other repositories'
+/// workspace memory, which is wider than what `GET` lists for `"all"`. This
+/// is a destructive, non-reversible operation.
 async fn clear_memory(
     State(state): State<RuntimeApiState>,
     Query(query): Query<ClearMemoryQuery>,
@@ -9281,6 +12787,28 @@ async fn clear_memory(
 }
 
 const MOBILE_HTML: &str = include_str!("runtime_mobile.html");
+
+// Only stream statuses are localized here; the rest of the mobile shell is
+// still English. Reload the page after changing the Runtime's UI locale.
+fn mobile_html(locale: codewhale_localization::Locale) -> String {
+    use codewhale_localization::{MessageId, tr};
+
+    let messages = json!({
+        "replay_failed": tr(locale, MessageId::MobileStreamReplayFailed),
+        "catch_up_failed": tr(locale, MessageId::MobileStreamCatchUpFailed),
+        "runtime_shutdown": tr(locale, MessageId::MobileStreamRuntimeShutdown),
+        "ended": tr(locale, MessageId::MobileStreamEnded),
+        "closed": tr(locale, MessageId::MobileStreamClosed),
+        "reconnecting": tr(locale, MessageId::MobileStreamReconnecting),
+        "connected": tr(locale, MessageId::MobileStreamConnected),
+    });
+    // JSON quoting protects JS strings; escaping '<' also prevents a catalog
+    // value from closing the enclosing script element.
+    MOBILE_HTML.replace(
+        "__CODEWHALE_STREAM_MESSAGES__",
+        &messages.to_string().replace('<', "\\u003c"),
+    )
+}
 
 /// Built-in dev origins always allowed by the runtime API (whalescale#255).
 const DEFAULT_CORS_ORIGINS: &[&str] = &[
@@ -9314,6 +12842,7 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -9325,6 +12854,10 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
             header::IF_MATCH,
             HeaderName::from_static("x-codewhale-runtime-token"),
             HeaderName::from_static("x-deepseek-runtime-token"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("x-codewhale-stream-end"),
+            HeaderName::from_static("x-codewhale-event-progress"),
         ])
 }
 
@@ -9355,7 +12888,10 @@ fn map_thread_err(err: anyhow::Error) -> ApiError {
         || lower.starts_with("thread not found:")
     {
         ApiError::not_found(message)
+    } else if message.starts_with("shell commands are restricted by ") {
+        ApiError::forbidden(message)
     } else if message.contains("already has an active turn")
+        || message.contains("thread permissions changed during update")
         || message.contains("No active turn")
         || message.contains("is not active")
         // A steer the engine dropped: the turn moved on before the model saw
@@ -9397,9 +12933,12 @@ fn map_agent_mail_err(err: anyhow::Error) -> ApiError {
 }
 
 #[derive(Debug, Clone)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
-    message: String,
+    pub(crate) message: String,
+    /// Stable machine-readable reason, serialized as `error.code` when set,
+    /// for refusals a client must branch on rather than show.
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -9407,6 +12946,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -9414,6 +12954,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -9421,6 +12962,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -9428,6 +12970,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -9435,6 +12978,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -9442,6 +12986,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -9449,7 +12994,29 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
+            code: None,
         }
+    }
+
+    fn gone(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
@@ -9457,12 +13024,21 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(json!({
-                "error": {
-                    "message": self.message,
-                    "status": self.status.as_u16(),
-                }
-            })),
+            Json(match self.code {
+                Some(code) => json!({
+                    "error": {
+                        "message": self.message,
+                        "status": self.status.as_u16(),
+                        "code": code,
+                    }
+                }),
+                None => json!({
+                    "error": {
+                        "message": self.message,
+                        "status": self.status.as_u16(),
+                    }
+                }),
+            }),
         )
             .into_response()
     }
@@ -9533,12 +13109,17 @@ base_url = "http://127.0.0.1:9/v1"
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace)?;
         let config = Config::load(Some(config_path.clone()), None)?;
+        let sessions_dir = root.join("sessions");
+        let mut manager_config =
+            RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime"));
+        manager_config.sessions_dir = Some(sessions_dir.clone());
         let runtime_threads = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
             config.clone(),
             workspace.clone(),
-            RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime")),
+            manager_config,
             Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
         )?);
+        let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
         let task_manager = TaskManager::start_with_runtime_manager(
             TaskManagerConfig {
                 data_dir: root.join("tasks"),
@@ -9556,6 +13137,10 @@ base_url = "http://127.0.0.1:9/v1"
         .await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
+        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+        let workspace_scopes =
+            RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+        let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
         let state = RuntimeApiState {
             config: Arc::new(parking_lot::RwLock::new(config)),
             workspace: workspace.clone(),
@@ -9563,13 +13148,13 @@ base_url = "http://127.0.0.1:9/v1"
             task_manager,
             runtime_threads,
             cors_origins: Vec::new(),
-            sessions_dir: root.join("sessions"),
+            sessions_dir,
             config_path: Some(config_path.clone()),
             config_profile: None,
             automations: Arc::new(Mutex::new(AutomationManager::open_for_test(
                 root.join("automations"),
             )?)),
-            sub_agent_manager: runtime_api_sub_agent_manager(&workspace, 2),
+            sub_agent_manager,
             runtime_token: None,
             skill_state: Arc::new(Mutex::new(SkillStateStore::load_from(
                 root.join("skills_state.toml"),
@@ -9581,8 +13166,12 @@ base_url = "http://127.0.0.1:9/v1"
             mobile: None,
             web: None,
             fleet_codewhale_binary: "unused-test-binary".to_string(),
-            mcp_pool: Arc::new(Mutex::new(None)),
-            lsp_manager: Arc::new(std::sync::OnceLock::new()),
+            workspace_scopes,
+            workspace_scope,
+            computer: computer_display::ComputerState::from_env(),
+            shutdown: RuntimeServerShutdown::default(),
+            git_writes: Arc::new(tokio::sync::Mutex::new(())),
+            provider_switches: Arc::new(tokio::sync::Mutex::new(())),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());
@@ -9609,13 +13198,14 @@ base_url = "http://127.0.0.1:9/v1"
         Ok(body)
     }
 
-    fn assert_declared_route(config_path: &FsPath, provider: ApiProvider, model: &str) {
+    fn assert_declared_route(config_path: &FsPath, provider: ProviderKind, model: &str) {
         let config = Config::load(Some(config_path.to_path_buf()), None).expect("reloaded config");
         let persisted = config
-            .provider_config_for(provider)
+            .provider_config_for(&config.test_identity_for_kind(provider))
             .and_then(|entry| entry.model.as_deref());
         assert_eq!(persisted, Some(model));
-        let selected = provider_default_model_for_api(&config, provider, provider);
+        let selected =
+            provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider));
         assert_eq!(selected, model);
         let route = crate::route_runtime::resolve_runtime_route(&config, provider, Some(&selected))
             .expect("saved declared route");
@@ -9917,7 +13507,7 @@ model = "GLM-5.2"
             post_json(addr, "/v1/config/reload", json!({})).await?;
             let config = state.config.read();
             let identity = config
-                .active_provider_identity(ApiProvider::OllamaCloud)
+                .active_provider_identity()
                 .map_err(anyhow::Error::msg)?;
             assert_eq!(identity.persisted_id(), Some(selector));
             assert_eq!(config.default_model(), model);
@@ -9998,9 +13588,9 @@ model = "GLM-5.2"
         crate::provider_catalog_live::reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
         for (provider, model) in [
-            (ApiProvider::Deepseek, "deepseek-v4pro"),
-            (ApiProvider::Openrouter, "deepseek-v4-pro"),
-            (ApiProvider::Together, "deepseek-v4-pro"),
+            (ProviderKind::Deepseek, "deepseek-v4pro"),
+            (ProviderKind::Openrouter, "deepseek-v4-pro"),
+            (ProviderKind::Together, "deepseek-v4-pro"),
         ] {
             let root = tempfile::tempdir()?;
             let config_path = root.path().join("config.toml");
@@ -10015,7 +13605,7 @@ model = "GLM-5.2"
             .await?;
             assert_eq!(body["model"], model);
             assert_declared_route(&config_path, provider, model);
-            let keys = if provider == ApiProvider::Deepseek {
+            let keys = if provider == ProviderKind::Deepseek {
                 vec!["model", "default_model"]
             } else {
                 vec!["model"]
@@ -10031,7 +13621,10 @@ model = "GLM-5.2"
                 post_json(addr, "/v1/config/reload", json!({})).await?;
                 assert_declared_route(&config_path, provider, model);
                 let reloaded = state.config.read();
-                let selected = provider_default_model_for_api(&reloaded, provider, provider);
+                let selected = provider_default_model_for_api(
+                    &reloaded,
+                    &(reloaded).test_identity_for_kind(provider),
+                );
                 let route = crate::route_runtime::resolve_runtime_route(
                     &reloaded,
                     provider,
@@ -10082,15 +13675,17 @@ model = "GLM-5.2"
         let config = Config::load(Some(config_path), None)?;
         assert_eq!(
             config
-                .provider_config_for(ApiProvider::Deepseek)
+                .provider_config_for(&config.test_identity_for_kind(ProviderKind::Deepseek))
                 .and_then(|provider| provider.model.as_deref()),
             Some("deepseek-v4-pro")
         );
-        let selected =
-            provider_default_model_for_api(&config, ApiProvider::Deepseek, ApiProvider::Deepseek);
+        let selected = provider_default_model_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
+        );
         let route = crate::route_runtime::resolve_runtime_route(
             &config,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             Some(&selected),
         )
         .expect("ordinary saved route");
@@ -10118,15 +13713,24 @@ model = "GLM-5.2"
             toml::from_str(&fixture("deepseek", "deepseek-v4pro")).expect("fixture config");
         config.custom_models.as_mut().unwrap()[0].provider = "other".to_string();
         assert_eq!(
-            normalize_runtime_config_model(&config, ApiProvider::Deepseek, "deepseek-v4pro")
-                .expect("legacy alias remains accepted"),
+            normalize_runtime_config_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Deepseek),
+                "deepseek-v4pro"
+            )
+            .expect("legacy alias remains accepted"),
             "deepseek-v4-pro"
         );
-        for provider in [ApiProvider::OpencodeGo, ApiProvider::OpencodeZen] {
+        for provider in [ProviderKind::OpencodeGo, ProviderKind::OpencodeZen] {
             let config: Config = toml::from_str(&fixture(provider.as_str(), "unlisted-model"))
                 .expect("fixture config");
             assert!(
-                normalize_runtime_config_model(&config, provider, "unlisted-model").is_err(),
+                normalize_runtime_config_model(
+                    &config,
+                    &(config).test_identity_for_kind(provider),
+                    "unlisted-model"
+                )
+                .is_err(),
                 "a declaration cannot expand the {provider:?} protocol roster"
             );
         }

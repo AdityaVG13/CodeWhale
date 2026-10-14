@@ -1,14 +1,42 @@
 {
-  "_comment": "Ceiling for `#[allow(dead_code)]` across crates/. This number may go down freely; raising it needs a reviewer to say why in the PR. Regenerate with: python3 scripts/check-dead-code-budget.py --update",
-  "_issue": "https://github.com/Hmbown/CodeWhale/issues/4785",
-  "total": 185,
+  "_comment": "Ceiling for dead-code suppressions across crates/, counting both `#[allow(dead_code)]` and `#[expect(dead_code)]`. `total` is the sum and is the ratcheted figure. It may go down freely; raising it needs a reviewer to say why in the PR. Regenerate with: python3 scripts/check-dead-code-budget.py --update",
+  "_issue": "https://github.com/codewhale-hq/CodeWhale/issues/4785",
+  "_expect_blind_spot": "Until #6241 this gate counted only the `allow` spelling, so rewriting an allow as an expect lowered the number without removing any dead code. The ceiling was re-based to the true combined count when that was fixed; it is not a regression.",
+  "total": 215,
+  "allow_total": 134,
+  "expect_total": 81,
   "per_crate": {
-    "app-server": 1,
-    "core": 5,
-    "localization": 2,
-    "models": 5,
-    "palette": 20,
-    "tools": 2,
-    "tui": 150
+    "cli": {
+      "allow": 0,
+      "expect": 1
+    },
+    "core": {
+      "allow": 5,
+      "expect": 0
+    },
+    "localization": {
+      "allow": 2,
+      "expect": 0
+    },
+    "models": {
+      "allow": 3,
+      "expect": 0
+    },
+    "palette": {
+      "allow": 9,
+      "expect": 0
+    },
+    "runtime": {
+      "allow": 3,
+      "expect": 2
+    },
+    "tools": {
+      "allow": 2,
+      "expect": 0
+    },
+    "tui": {
+      "allow": 110,
+      "expect": 78
+    }
   }
 }

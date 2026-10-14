@@ -1,4 +1,5 @@
 import type { PublishedReleaseFact } from "./facts";
+import { publishedFeatureNames } from "./features";
 import { REPO_URL } from "./i18n/links";
 import { IDENTITY_PHRASE, SITE_NAME, SITE_URL } from "./page-meta";
 import { ORGANIZATION_ID } from "./site-schema";
@@ -22,6 +23,7 @@ export function buildSoftwareApplicationJsonLd(
     applicationCategory: "DeveloperApplication",
     operatingSystem: "macOS, Linux, Windows, Android",
     ...(publishedRelease?.version ? { softwareVersion: publishedRelease.version } : {}),
+    ...(publishedRelease?.version ? { featureList: publishedFeatureNames(publishedRelease.version) } : {}),
     license: `${REPO_URL}/blob/main/LICENSE`,
     codeRepository: REPO_URL,
     downloadUrl: `${SITE_URL}/en/install`,

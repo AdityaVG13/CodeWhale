@@ -73,27 +73,42 @@ pub(super) fn command_guidance(kind: &ShellKind) -> String {
 }
 
 pub(super) fn runtime_command_guidance() -> &'static str {
+    // A conformance replay of a recorded host names that host's shell, not
+    // whichever shell first initialized this process-wide cache (#6698).
+    #[cfg(all(test, unix))]
+    if let Some(binary) = crate::prompts::recorded_shell() {
+        let kind = ShellKind::Custom {
+            binary,
+            flag: "-c".to_string(),
+        };
+        return Box::leak(command_guidance(&kind).into_boxed_str());
+    }
     static GUIDANCE: OnceLock<String> = OnceLock::new();
     GUIDANCE.get_or_init(|| command_guidance(global_dispatcher().kind()))
 }
 
-pub(super) fn description() -> &'static str {
-    static DESCRIPTION: OnceLock<String> = OnceLock::new();
-    DESCRIPTION.get_or_init(|| {
-        format!(
-            "{} Execute in the workspace. Action \"run\" (default) executes a command; \
+fn render_description(guidance: &str) -> String {
+    format!(
+        "{guidance} Execute in the workspace. Action \"run\" (default) executes a command; \
          \"wait\" blocks for a background task until completion or timeout; \"interact\" sends stdin to a background task; \
          \"cancel\" kills a background task. Pass wait=false for a nonblocking task snapshot. Foreground mode is for bounded commands; \
-         use background=true for work expected to take >5 seconds.",
-            runtime_command_guidance()
-        )
-    })
+         use background=true for work expected to take >5 seconds."
+    )
+}
+
+pub(super) fn description() -> &'static str {
+    #[cfg(all(test, unix))]
+    if crate::prompts::recorded_shell().is_some() {
+        return Box::leak(render_description(runtime_command_guidance()).into_boxed_str());
+    }
+    static DESCRIPTION: OnceLock<String> = OnceLock::new();
+    DESCRIPTION.get_or_init(|| render_description(runtime_command_guidance()))
 }
 
 // Interpreter syntax lives on the command parameter. Repeating it in the
 // tool description adds the same bytes to every active request.
 pub(super) fn foreground_description() -> &'static str {
-    "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is expressed in seconds; when omitted the command is killed after 120 seconds, so pass an explicit timeout for work expected to take longer. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user."
+    "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is the seconds to wait in the foreground (default 30 seconds); a command still running then is never killed for time: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id, so long builds and tests need no special timeout. Find task_shell_wait with tool_search to read more or wait for it. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user."
 }
 
 #[cfg(test)]

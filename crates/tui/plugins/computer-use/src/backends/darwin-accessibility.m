@@ -15,8 +15,6 @@ static BOOL cuOwnerPipe = NO;
 static NSDictionary *cuLeaseKey = nil;
 static pid_t cuLeasePid = 0;
 static NSRunningApplication *cuLeaseApp = nil;
-static BOOL cuLeaseButtons[3] = {NO,NO,NO};
-static CGPoint cuLeasePoint;
 #ifdef CU_TEST
 static NSString *cuTestLockDir = nil;
 static NSString *cuTestReleaseFile = nil;
@@ -71,38 +69,17 @@ static void cuReleaseLease(void) {
     if([up[@"foreground_input"] boolValue] || !cuLeaseApp.terminated) cuPostKey(up,cuLeasePid);
     cuLeaseKey=nil; cuLeaseApp=nil;
   }
-  for(int button=0;button<3;button++) if(cuLeaseButtons[button]) {
-    CGEventType up=button==0?kCGEventLeftMouseUp:button==1?kCGEventRightMouseUp:kCGEventOtherMouseUp;
-    CGEventRef event=CGEventCreateMouseEvent(NULL,up,cuLeasePoint,button);
-    CGEventPost(kCGHIDEventTap,event); CFRelease(event); cuLeaseButtons[button]=NO;
-  }
 }
+// A held lease is only ever a key: the pointer is never held on the user's
+// cursor. Any line (or EOF) from the owner releases it.
 static void cuWaitForLease(void) {
-  NSMutableData *buffer=[NSMutableData data];
   @try {
     while(!cuCancelled) {
       struct pollfd fd={STDIN_FILENO,POLLIN|POLLHUP,0};
       int ready=poll(&fd,1,100);
       if(ready<=0) continue;
       char byte; ssize_t n=read(STDIN_FILENO,&byte,1);
-      if(n<=0) break;
-      if(byte!='\n') { if(buffer.length>=4096) break; [buffer appendBytes:&byte length:1]; continue; }
-      NSDictionary *message=[NSJSONSerialization JSONObjectWithData:buffer options:0 error:nil];
-      [buffer setLength:0];
-      if(![message isKindOfClass:NSDictionary.class]) break;
-      NSDictionary *point=message[@"point"];
-      if([point[@"x"] isKindOfClass:NSNumber.class] && [point[@"y"] isKindOfClass:NSNumber.class]) {
-        cuLeasePoint=CGPointMake([point[@"x"] doubleValue],[point[@"y"] doubleValue]);
-      }
-      if([message[@"release"] boolValue]) break;
-      cuCheckCancelled();
-      if(!cuLeaseButtons[0] || !point) break;
-      cuRequireForeground(cuLeaseApp);
-      CGEventSourceRef source=CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-      CGEventRef event=CGEventCreateMouseEvent(source,kCGEventLeftMouseDragged,cuLeasePoint,kCGMouseButtonLeft);
-      CGEventSetIntegerValueField(event,kCGMouseEventClickState,1);
-      CGEventPost(kCGHIDEventTap,event); CFRelease(event); CFRelease(source);
-      cuPrint(@{@"action_sent":@YES,@"restored":@NO});
+      if(n<=0 || byte=='\n') break;
     }
   } @finally { cuReleaseLease(); }
 }
@@ -563,6 +540,34 @@ static void axPrepare(AXUIElementRef app) {
   AXUIElementSetAttributeValue(app,(__bridge CFStringRef)@"AXEnhancedUserInterface",kCFBooleanTrue);
   AXUIElementSetAttributeValue(app,(__bridge CFStringRef)@"AXManualAccessibility",kCFBooleanTrue);
 }
+static void axSetEnhancedUI(AXUIElementRef app, BOOL on) {
+#ifdef CU_TEST
+  if([(__bridge id)app isKindOfClass:NSMutableDictionary.class]) {
+    NSMutableDictionary *fake=(__bridge NSMutableDictionary *)app;
+    fake[@"AXEnhancedUserInterface"]=@(on);
+    [fake[@"writes"] addObject:on?@"AXEnhancedUserInterface=1":@"AXEnhancedUserInterface=0"];
+    return;
+  }
+#endif
+  AXUIElementSetAttributeValue(app,(__bridge CFStringRef)@"AXEnhancedUserInterface",on?kCFBooleanTrue:kCFBooleanFalse);
+}
+/**
+ * Run window geometry writes with AXEnhancedUserInterface off. While it is on
+ * (axPrepare turns it on for every app we observe, and it stays on for the life
+ * of that process) AppKit animates each AXPosition/AXSize write over ~200 ms,
+ * and a later write cancels the running animation where it stands: a 50 ms
+ * position re-assert froze a 1100x800 -> 1600x900 resize at 1232x827. Window
+ * managers (Rectangle, yabai) clear the attribute around frame writes for the
+ * same reason. It is restored afterwards, even if the writes throw, so content
+ * observation of Chromium/WebKit apps keeps working.
+ */
+static void cuWithoutEnhancedUI(AXUIElementRef app, void (^work)(void)) {
+  id eui=attr(app,@"AXEnhancedUserInterface");
+  BOOL wasOn=[eui isKindOfClass:NSNumber.class] && [eui boolValue];
+  if(wasOn) axSetEnhancedUI(app,NO);
+  @try { work(); }
+  @finally { if(wasOn) axSetEnhancedUI(app,YES); }
+}
 static NSDictionary *geometry(id v, BOOL size) {
   if (!v || CFGetTypeID((__bridge CFTypeRef)v) != AXValueGetTypeID()) return nil;
   if (size) { CGSize s; if (AXValueGetValue((__bridge AXValueRef)v,kAXValueCGSizeType,&s)) return @{ @"w":@(s.width), @"h":@(s.height) }; }
@@ -674,6 +679,64 @@ static BOOL cuFrame(AXUIElementRef el, CGRect *out) {
   if(!p || !z) return NO;
   *out=CGRectMake([p[@"x"] doubleValue],[p[@"y"] doubleValue],[z[@"w"] doubleValue],[z[@"h"] doubleValue]);
   return YES;
+}
+static AXError cuSetWindowGeometry(AXUIElementRef win, NSString *name, AXValueRef value) {
+#ifdef CU_TEST
+  // A fake window records each write with the app's enhanced-UI state at that
+  // moment, then stores the value so cuFrame reads it back.
+  if([(__bridge id)win isKindOfClass:NSMutableDictionary.class]) {
+    NSMutableDictionary *fake=(__bridge NSMutableDictionary *)win, *app=fake[@"app"];
+    [app[@"writes"] addObject:[NSString stringWithFormat:@"%@(AXEnhancedUserInterface=%d)",name,[app[@"AXEnhancedUserInterface"] boolValue]]];
+    if([fake[@"refuse"] boolValue]) return kAXErrorCannotComplete;
+    fake[name]=(__bridge id)value;
+    return kAXErrorSuccess;
+  }
+#endif
+  return AXUIElementSetAttributeValue(win,(__bridge CFStringRef)name,value);
+}
+/**
+ * Write a window's frame and read back what the app actually applied. The
+ * writes and the readback run with AXEnhancedUserInterface off (see
+ * cuWithoutEnhancedUI); pe/se report the position and size write errors.
+ * Throws when the app refuses both.
+ */
+static CGRect cuWriteWindowFrame(AXUIElementRef app, AXUIElementRef win, CGRect target, CGRect before, AXError *outPe, AXError *outSe) {
+  double fx=target.origin.x, fy=target.origin.y, fw=target.size.width, fh=target.size.height;
+  CGPoint p=target.origin; CGSize z=target.size;
+  __block AXError pe=kAXErrorFailure, se=kAXErrorFailure;
+  __block CGRect after=before;
+  @try {
+    cuWithoutEnhancedUI(app,^{
+      AXValueRef pos=AXValueCreate(kAXValueCGPointType,&p), size=AXValueCreate(kAXValueCGSizeType,&z);
+      @try {
+        pe=cuSetWindowGeometry(win,@"AXPosition",pos);
+        se=cuSetWindowGeometry(win,@"AXSize",size);
+        // Some apps re-anchor a window's origin when its size changes; re-assert
+        // the position once after the size has had a run-loop turn to settle.
+        if(pe==kAXErrorSuccess) {
+          [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+          AXError pe2=cuSetWindowGeometry(win,@"AXPosition",pos);
+          if(pe2!=kAXErrorSuccess) pe=pe2;
+        }
+      } @finally { if(pos) CFRelease(pos); if(size) CFRelease(size); }
+      if(pe!=kAXErrorSuccess && se!=kAXErrorSuccess)
+        @throw [NSException exceptionWithName:@"window" reason:@"the app refused the window frame change (it may be fullscreen, tiled or non-resizable)" userInfo:nil];
+      // Apps apply frame changes over a few run-loop turns; verify by reading the
+      // window's own geometry back, not by trusting the set call. The readback
+      // stays inside the enhanced-UI-off window so no animation is in flight
+      // when the attribute is restored.
+      for(int i=0;i<40;i++) {
+        cuCheckCancelled();
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        cuFrame(win,&after);
+        if(fabs(after.origin.x-fx)<1 && fabs(after.origin.y-fy)<1 && fabs(after.size.width-fw)<1 && fabs(after.size.height-fh)<1) break;
+      }
+    });
+  } @finally {
+    if(outPe) *outPe=pe;
+    if(outSe) *outSe=se;
+  }
+  return after;
 }
 /**
  * The CGWindow that should receive input for an element. An AXSheet ancestor
@@ -879,13 +942,23 @@ static NSRunningApplication *resolve(NSDictionary *ref) {
     } else return nil;
   }
   NSString *bundle=ref[@"bundle_id"], *name=ref[@"name"];
+  // A name or bundle shared by several running processes (two instances of
+  // one browser, a helper and its app) must not resolve to whichever happens
+  // to be listed first: that sends observation and input to the wrong window.
+  // Refuse like kill_app does; the observed pid disambiguates.
+  NSMutableArray<NSRunningApplication *> *hits=[NSMutableArray array];
   for(NSRunningApplication *a in NSWorkspace.sharedWorkspace.runningApplications) {
     if(ref[@"pid"] && a.processIdentifier!=[ref[@"pid"] intValue]) continue;
     if(bundle && !matchesName(a.bundleIdentifier,bundle)) continue;
     if(name && !matchesName(a.localizedName,name)) continue;
-    return a;
+    [hits addObject:a];
   }
-  return nil;
+  if(hits.count>1) {
+    NSMutableArray *desc=[NSMutableArray array];
+    for(NSRunningApplication *a in hits) [desc addObject:[NSString stringWithFormat:@"%@ (pid %d)",a.localizedName?:@"?",a.processIdentifier]];
+    @throw [NSException exceptionWithName:@"app" reason:[NSString stringWithFormat:@"several running applications match (%@); pass pid to choose one",[desc componentsJoinedByString:@", "]] userInfo:nil];
+  }
+  return hits.firstObject;
 }
 static CGEventRef textEvent(NSString *text, BOOL down) {
   UniChar *chars=calloc(text.length,sizeof(UniChar)); [text getCharacters:chars range:NSMakeRange(0,text.length)];
@@ -1095,24 +1168,15 @@ static NSDictionary *windowAtPoint(NSArray *windows, CGPoint p) {
 
 static id execute(NSDictionary *p) {
   NSString *tool=p[@"tool"]; NSDictionary *args=p[@"args"]?:@{};
-  if([@[@"bg_key",@"bg_pointer"] containsObject:tool] || ([tool isEqual:@"pointer_sequence"] && [args[@"app_scoped"] boolValue])) cuRequireFocusControl(args);
-  if([tool isEqual:@"pointer_sequence"] && ![args[@"foreground_input"] boolValue])
-    @throw [NSException exceptionWithName:@"shared_pointer_required" reason:@"shared macOS pointer input is unavailable in background mode; use an accessibility action or a separate computer" userInfo:nil];
+  // The user's hardware cursor is never driven: there is no route that posts
+  // mouse events to the HID tap, warps the cursor or holds its buttons.
+  if([@[@"pointer_sequence",@"release_input"] containsObject:tool])
+    @throw [NSException exceptionWithName:@"real_pointer_refused" reason:@"real_pointer_refused: Computer Use never drives the user's cursor; pointer input goes to the bound app's window (bg_pointer)" userInfo:nil];
+  if([@[@"bg_key",@"bg_pointer"] containsObject:tool]) cuRequireFocusControl(args);
   cuOwnerPipe=[args[@"owner_pipe"] boolValue];
-  BOOL mutates=[@[@"type",@"key_event",@"bg_key",@"mouse_event",@"scroll",@"pointer_sequence",@"bg_pointer",@"release_input",@"set_value",@"focus_element",@"select_text",@"perform_action",@"click_element",@"scroll_element"] containsObject:tool]
+  BOOL mutates=[@[@"type",@"key_event",@"bg_key",@"mouse_event",@"scroll",@"bg_pointer",@"set_value",@"focus_element",@"select_text",@"perform_action",@"click_element",@"scroll_element"] containsObject:tool]
     || ([tool isEqual:@"hit_test"] && [args[@"perform"] boolValue])
     || ([tool isEqual:@"app_info"] && [args[@"activate"] boolValue]);
-  if([tool isEqual:@"release_input"]) {
-    if(!AXIsProcessTrusted()) @throw [NSException exceptionWithName:@"permission" reason:@"Accessibility permission is missing" userInfo:nil];
-    cuLockInput();
-    NSDictionary *point=args[@"point"];
-    CGPoint at=CGPointMake([point[@"x"] doubleValue],[point[@"y"] doubleValue]);
-    CGMouseButton button=[args[@"button"] unsignedIntValue];
-    CGEventType up=button==0?kCGEventLeftMouseUp:button==1?kCGEventRightMouseUp:kCGEventOtherMouseUp;
-    CGEventRef event=CGEventCreateMouseEvent(NULL,up,at,button);
-    CGEventPost(kCGHIDEventTap,event); CFRelease(event);
-    return @{@"released":@YES};
-  }
   if([tool isEqual:@"key_event"] && ![args[@"down"] boolValue] && [args[@"owned_release"] boolValue]) {
     if(!AXIsProcessTrusted()) @throw [NSException exceptionWithName:@"permission" reason:@"Accessibility permission is missing" userInfo:nil];
     cuLockInput();
@@ -1137,6 +1201,21 @@ static id execute(NSDictionary *p) {
     cuTestIdleSeconds=args[@"idle_seconds"];
     if([args[@"cancelled"] boolValue]) cuCancelled=1;
     return @{@"yield_ms":@(cuYieldToUser(args))};
+  }
+  if([tool isEqual:@"inspect_enhanced_ui_frame"]) {
+    // Drives the same cuWriteWindowFrame that set_window_frame uses, against a
+    // fake app and window that log every write with the enhanced-UI state.
+    NSMutableDictionary *app=[@{@"writes":[NSMutableArray array]} mutableCopy];
+    if(args[@"enhanced"]) app[@"AXEnhancedUserInterface"]=args[@"enhanced"];
+    NSMutableDictionary *win=[@{@"app":app} mutableCopy];
+    if([args[@"refuse"] boolValue]) win[@"refuse"]=@YES;
+    CGRect before=CGRectMake(0,0,1100,800), after=before;
+    NSString *error=nil;
+    @try {
+      after=cuWriteWindowFrame((__bridge AXUIElementRef)app,(__bridge AXUIElementRef)win,CGRectMake(200,120,1600,900),before,NULL,NULL);
+    } @catch(NSException *e) { error=e.reason; }
+    return @{@"writes":app[@"writes"],@"enhanced":app[@"AXEnhancedUserInterface"]?:NSNull.null,@"error":error?:NSNull.null,
+             @"after":@{@"x":@(after.origin.x),@"y":@(after.origin.y),@"w":@(after.size.width),@"h":@(after.size.height)}};
   }
   if([tool isEqual:@"inspect_click_action"]) return @{@"action":cuClickAction((__bridge AXUIElementRef)args[@"element"],[args[@"context"] boolValue])?:NSNull.null};
   if([tool isEqual:@"inspect_element_identity"]) {
@@ -1349,32 +1428,10 @@ static id execute(NSDictionary *p) {
     AXUIElementRef win=(__bridge AXUIElementRef)windows[idx];
     CGRect before=CGRectNull; cuFrame(win,&before);
     cuCheckCancelled();
-    CGPoint p=CGPointMake(fx,fy); CGSize z=CGSizeMake(fw,fh);
-    AXValueRef pos=AXValueCreate(kAXValueCGPointType,&p), size=AXValueCreate(kAXValueCGSizeType,&z);
-    AXError pe=AXUIElementSetAttributeValue(win,(__bridge CFStringRef)@"AXPosition",pos);
-    AXError se=AXUIElementSetAttributeValue(win,(__bridge CFStringRef)@"AXSize",size);
-    // Some apps re-anchor a window's origin when its size changes; re-assert
-    // the position once after the size has had a run-loop turn to settle.
-    if(pe==kAXErrorSuccess) {
-      [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-      AXError pe2=AXUIElementSetAttributeValue(win,(__bridge CFStringRef)@"AXPosition",pos);
-      if(pe2!=kAXErrorSuccess) pe=pe2;
-    }
-    if(pos) CFRelease(pos); if(size) CFRelease(size);
-    if(pe!=kAXErrorSuccess && se!=kAXErrorSuccess) {
-      CFRelease(app);
-      @throw [NSException exceptionWithName:@"window" reason:@"the app refused the window frame change (it may be fullscreen, tiled or non-resizable)" userInfo:nil];
-    }
-    // Apps apply frame changes over a few run-loop turns; verify by reading the
-    // window's own geometry back, not by trusting the set call.
+    AXError pe=kAXErrorFailure, se=kAXErrorFailure;
     CGRect after=before;
-    for(int i=0;i<40;i++) {
-      cuCheckCancelled();
-      [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-      cuFrame(win,&after);
-      if(fabs(after.origin.x-fx)<1 && fabs(after.origin.y-fy)<1 && fabs(after.size.width-fw)<1 && fabs(after.size.height-fh)<1) break;
-    }
-    CFRelease(app);
+    @try { after=cuWriteWindowFrame(app,win,CGRectMake(fx,fy,fw,fh),before,&pe,&se); }
+    @finally { CFRelease(app); }
     BOOL verified = fabs(after.origin.x-fx)<1 && fabs(after.origin.y-fy)<1 && fabs(after.size.width-fw)<1 && fabs(after.size.height-fh)<1;
     NSMutableDictionary *done=[@{@"action_sent":@YES,@"window_id":@(idx),
              @"before":@{@"x":@(before.origin.x),@"y":@(before.origin.y),@"w":@(before.size.width),@"h":@(before.size.height)},
@@ -1387,7 +1444,7 @@ static id execute(NSDictionary *p) {
     return done;
   }
   NSRunningApplication *inputApp=nil;
-  if([@[@"type",@"key_event",@"bg_key",@"mouse_event",@"scroll",@"hit_test",@"pointer_sequence",@"bg_pointer"] containsObject:tool]) {
+  if([@[@"type",@"key_event",@"bg_key",@"mouse_event",@"scroll",@"hit_test",@"bg_pointer"] containsObject:tool]) {
     if(![args[@"input_app_ref"] isKindOfClass:NSDictionary.class]) @throw [NSException exceptionWithName:@"focus" reason:@"open_application first to bind the input destination" userInfo:nil];
     inputApp=resolve(args[@"input_app_ref"]);
     if(!inputApp || inputApp.terminated) @throw [NSException exceptionWithName:@"focus" reason:@"input application is no longer running; open_application again" userInfo:nil];
@@ -1395,7 +1452,7 @@ static id execute(NSDictionary *p) {
   }
   // A held menu lease is given back before fresh raw input or an explicit
   // activation; AX element actions (the pick itself) leave it alone.
-  if([@[@"bg_pointer",@"type",@"key_event",@"bg_key",@"pointer_sequence"] containsObject:tool]
+  if([@[@"bg_pointer",@"type",@"key_event",@"bg_key"] containsObject:tool]
      || ([tool isEqual:@"app_info"] && [args[@"activate"] boolValue]))
     cuFrontLeaseRestoreIfHeld();
   if(mutates) { cuCheckCancelled(); cuLockInput(); }
@@ -1581,87 +1638,10 @@ static id execute(NSDictionary *p) {
     receipt[@"found"]=@YES; receipt[@"element"]=element; return receipt;
   }
   /**
-   * One pointer gesture, posted to the window server.
-   *
-   * The tested AppKit fixture dropped process-directed mouse/scroll events.
-   * This qualified raw path therefore uses the shared event tap, requiring
-   * explicit foreground control. It moves the real cursor, so the gesture
-   * runs in one call and restores its starting position when requested.
-   * Restoration does not make concurrent desktop use safe.
+   * Pointer gestures are window-routed event records addressed to a window of
+   * the bound app (cuBgPointer). The cursor the user holds is never moved.
    */
   if([tool isEqual:@"bg_pointer"]) return cuBgPointer(inputApp, args);
-  if([tool isEqual:@"pointer_sequence"]) {
-    CGEventRef probe=CGEventCreate(NULL); CGPoint home=CGEventGetLocation(probe); CFRelease(probe);
-    // Shared input is allowed only while the explicitly selected app remains
-    // foreground. A new gesture never reactivates it after the user switches.
-    NSRunningApplication *front=NSWorkspace.sharedWorkspace.frontmostApplication;
-    NSString *before=front.localizedName?:@"";
-    BOOL takes=front.processIdentifier!=inputApp.processIdentifier;
-    cuCheckCancelled();
-    // Activation is a separate, explicit operation. A stale foreground mode
-    // must never reclaim focus after the user has switched applications.
-    // App-scoped clicks stay inside the bound window and do not steal the
-    // foreground; they still move the real cursor and restore it.
-    if([args[@"foreground_input"] boolValue]) cuRequireForeground(inputApp);
-    // A real-pointer stream interleaved with the person's typing is
-    // indistinguishable from a fight over the machine. Wait for a hardware-
-    // input gap before the gesture — app_scoped moves the cursor too, so
-    // the yield is unconditional, not just for foreground mode.
-    double yieldMs=cuYieldToUser(args);
-    // AppKit only assembles a drag out of events that look like they came from
-    // the input hardware; a NULL-source stream delivers down and up but drops
-    // every mouseDragged in between.
-    CGEventSourceRef source=CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-    BOOL held[3]={NO,NO,NO};
-    CGPoint last=home;
-    for(NSDictionary *step in args[@"steps"]) {
-      @try { cuCheckCancelled(); if([args[@"foreground_input"] boolValue]) cuRequireForeground(inputApp); } @catch(NSException *e) { cuCancelled=1; break; }
-      CGEventRef event;
-      if(step[@"scroll"]) {
-        NSArray *d=step[@"scroll"];
-        event=CGEventCreateScrollWheelEvent(source,kCGScrollEventUnitLine,2,[d[1] intValue],[d[0] intValue]);
-      } else {
-        CGPoint p=CGPointMake([step[@"x"] doubleValue],[step[@"y"] doubleValue]);
-        last=p;
-        int button=[step[@"button"] intValue], kind=[step[@"type"] intValue];
-        if(button>=0 && button<3) {
-          if(kind==kCGEventLeftMouseDown || kind==kCGEventRightMouseDown || kind==kCGEventOtherMouseDown) held[button]=YES;
-          if(kind==kCGEventLeftMouseUp || kind==kCGEventRightMouseUp || kind==kCGEventOtherMouseUp) held[button]=NO;
-        }
-        event=CGEventCreateMouseEvent(source,[step[@"type"] unsignedIntValue],p,[step[@"button"] unsignedIntValue]);
-        CGEventSetIntegerValueField(event,kCGMouseEventClickState,[step[@"clickState"] longLongValue]);
-      }
-      CGEventPost(kCGHIDEventTap,event);
-      CFRelease(event);
-      usleep((useconds_t)([step[@"delayMs"] intValue]?:40)*1000);
-    }
-    if([args[@"input_lease"] boolValue] && !cuCancelled) {
-      for(int button=0;button<3;button++) cuLeaseButtons[button]=held[button];
-      cuLeasePoint=last;
-      cuLeaseApp=inputApp;
-    }
-    if(cuCancelled || ![args[@"input_lease"] boolValue]) for(int button=0;button<3;button++) if(held[button]) {
-      CGEventType up=button==0?kCGEventLeftMouseUp:button==1?kCGEventRightMouseUp:kCGEventOtherMouseUp;
-      CGEventRef event=CGEventCreateMouseEvent(source,up,last,button);
-      CGEventPost(kCGHIDEventTap,event); CFRelease(event);
-    }
-    BOOL restore=[args[@"restore"] boolValue] && !cuCancelled;
-    if(restore) {
-      usleep(60000);
-      CGEventRef back=CGEventCreateMouseEvent(source,kCGEventMouseMoved,home,kCGMouseButtonLeft);
-      CGEventPost(kCGHIDEventTap,back); CFRelease(back);
-    }
-    if(source) CFRelease(source);
-    if(cuCancelled) @throw [NSException exceptionWithName:@"cancelled" reason:@"computer request cancelled" userInfo:nil];
-    usleep(150000);   // let the window server settle before reading it back
-    NSString *after=NSWorkspace.sharedWorkspace.frontmostApplication.localizedName?:@"";
-    NSMutableDictionary *gesture=[@{@"action_sent":@YES,@"pointer_moved":@YES,@"restored":@(restore),
-             @"foreground_taken":@(takes),
-             @"foreground_before":before,@"foreground_after":after,
-             @"home":@{@"x":@(home.x),@"y":@(home.y)}} mutableCopy];
-    if(yieldMs>0) gesture[@"yield_ms"]=@(round(yieldMs));
-    return gesture;
-  }
   if([tool isEqual:@"scroll"]) {
     cuCheckCancelled();
     CGEventRef event=CGEventCreateScrollWheelEvent(NULL,kCGScrollEventUnitLine,2,[args[@"dy"] intValue],[args[@"dx"] intValue]); CGEventPostToPid(inputApp.processIdentifier,event); CFRelease(event); return @{@"action_sent":@YES};

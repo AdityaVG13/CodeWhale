@@ -4,7 +4,7 @@
 //! allowing the UI to remain responsive while the engine processes requests.
 
 use crate::compaction::CompactionConfig;
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::route_runtime::ResolvedRuntimeRoute;
 use crate::tools::goal::GoalStatus;
 use codewhale_config::AppMode;
@@ -18,8 +18,16 @@ pub const USER_SHELL_TOOL_ID_PREFIX: &str = "user_shell_";
 
 /// Snapshot of session state for saving to disk.
 /// Returned by `Op::GetSessionSnapshot` via a oneshot channel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SessionSnapshot {
+    /// The live conversation id this engine session is running under.
+    ///
+    /// Every workspace snapshot the conversation takes is tagged with it. A
+    /// Runtime thread's engine runs under the thread's own id; a save that
+    /// names no document persists under this id, so one conversation keeps
+    /// one document. Runtime snapshot ownership is the receipts recorded on
+    /// the thread's turns, not this binding (see `patch_undo_workspace_files`).
+    pub session_id: String,
     pub messages: Vec<Message>,
     pub total_tokens: u64,
     pub model: String,
@@ -41,8 +49,9 @@ pub struct SessionContextBudget {
     /// Total context window for the active route (input + output), in tokens.
     pub window_tokens: u64,
     /// Estimated input tokens on the same basis the visible context meter
-    /// uses (`estimate_input_tokens_conservative`, including its safety
-    /// inflation). This is the number a "context filling up" indicator shows.
+    /// and the auto-compaction gate use (`estimate_input_tokens_for_pressure`,
+    /// without the overflow guard's 1.5x inflation). This is the number a
+    /// "context filling up" indicator shows.
     pub input_tokens: u64,
     /// Provider-billed prompt tokens from the most recent parent-route
     /// request that still describes the live message list. `None` when no
@@ -71,7 +80,7 @@ pub struct SessionContextBudget {
 /// Returned by `Op::GetProviderRuntimeStatus` via a oneshot channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRuntimeStatus {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     pub request_concurrency_limit: Option<usize>,
     pub active_provider_requests: usize,
 }
@@ -161,6 +170,8 @@ impl UserInputProvenance {
 /// variant; the serializable twin is `codewhale_protocol::op::TurnSpec`.
 #[derive(Debug)]
 pub struct TurnSpec {
+    pub profile_constitution:
+        Option<codewhale_config::user_constitution::ProfileConstitutionSnapshot>,
     /// Admitted allowance for this turn only; never changes session settings.
     pub max_output_tokens: Option<std::num::NonZeroU32>,
     pub content: String,
@@ -207,6 +218,18 @@ pub struct TurnSpec {
     /// Structural input origin. This gates whether the turn may inherit
     /// YOLO/auto-approval authority; user-shaped text is not enough.
     pub provenance: UserInputProvenance,
+    /// Host-supplied correlation token for this submission, echoed verbatim on
+    /// the turn's `Event::TurnStarted`. Hosts that arm submit→`TurnStarted`
+    /// window actions (e.g. a deferred stop replay) use the echo to bind those
+    /// actions to the turn that actually started: every engine self-started
+    /// turn (idle sub-agent completion, background shell wake, goal
+    /// continuation) and the composer shell command turn carry no token, so
+    /// their start cannot be mistaken for a pending submission even when it
+    /// overtakes it in the event stream. `None` for callers that do not
+    /// correlate. The token only survives the in-process engine path: the
+    /// wire op projection and the durable-runtime submission path carry none,
+    /// so hosts submitting over those channels cannot correlate.
+    pub submission_id: Option<String>,
 }
 
 /// Operations that can be submitted to the engine.
@@ -354,6 +377,15 @@ pub enum Op {
         mode: AppMode,
     },
 
+    /// Rewind only the exact conversation observed by the caller. The Engine
+    /// compares the full expected state before changing history or caches.
+    /// A rejected rewind returns None and performs no mutation or inference.
+    RewindConversation {
+        expected: Box<SessionSnapshot>,
+        messages: Vec<Message>,
+        tx: tokio::sync::oneshot::Sender<Option<SessionSnapshot>>,
+    },
+
     /// Run context compaction on one exact, structurally resolved provider
     /// route with policy derived from that same descriptor.
     CompactContext {
@@ -423,7 +455,12 @@ pub enum Op {
     /// Edit the last user message: remove the last user+assistant exchange
     /// from the session, then re-send with the new content.
     #[cfg_attr(not(test), expect(dead_code))]
-    EditLastTurn { new_message: String },
+    EditLastTurn {
+        new_message: String,
+        /// Host-supplied correlation token, echoed on the replayed turn's
+        /// `Event::TurnStarted` (see `TurnSpec::submission_id`).
+        submission_id: Option<String>,
+    },
 
     /// Enable or disable the background advisor watcher for this session.
     /// When enabled, a fire-and-forget background task runs after each turn

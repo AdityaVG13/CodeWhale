@@ -197,7 +197,7 @@ new fields, surfaces, and `product_usage` events.
 | `install_id` | uuid v4 | `crates/telemetry/src/envelope.rs` | Random, never derived, rotated every 90 days. See "Where it lives" above. |
 | `app_version` | string | `env!("CARGO_PKG_VERSION")`, as at `crates/telemetry/src/lib.rs:112` | Must match `^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$`. |
 | `git_sha` | string \| null | `option_env!("CODEWHALE_RELEASE_BUILD_SHA")` — a **new** rustc-env | First 12 hex chars. Emitted **only** when `codewhale_build_support::release_build_sha` saw a valid full SHA in `CODEWHALE_BUILD_SHA`, the legacy `DEEPSEEK_BUILD_SHA`, or `GITHUB_SHA`, in that precedence order. `null` for every unstamped build, with no runtime lookup of any kind. **Never** `CODEWHALE_BUILD_COMMIT` — that falls back to `git_commit` and is the builder's private HEAD. **Never** `Thread.git_sha` (`crates/state/src/lib.rs:93`) — that is the user's workspace commit and a red line, one identifier away by name. |
-| `surface` | enum | explicitly set by the emitting client | `tui \| exec \| cli \| app-server \| mcp-server \| serve \| website \| web-app \| desktop \| control-plane`. Runtime metrics keep their existing collector. Browser product counts use the same closed envelope. A declared surface is not proof its client is deployed. |
+| `surface` | enum | explicitly set by the emitting client | `tui \| exec \| cli \| app-server \| mcp-server \| serve \| website \| web-app \| desktop \| control-plane \| vscode-extension`. Runtime metrics keep their existing collector. Browser product counts use the same closed envelope. A declared surface is not proof its client is deployed. `vscode-extension` is an extension client of this schema, deliberately generic the way `web-app` and `desktop` are: the editor's own name and version are **not** collected. Widening this whitelist changes no field, so the schema version is unchanged. |
 | `os` | enum | `std::env::consts::OS`, as at `crates/cli/src/update.rs:41` | Whitelist: `linux \| macos \| windows \| freebsd \| android \| other`. |
 | `arch` | enum | `std::env::consts::ARCH` | `x86_64 \| aarch64 \| other`. |
 | `libc` | enum | `cfg!(target_env)` — **compile time** | `gnu \| musl \| none`. Runtime detection reads distro vendor strings; compile-time is free and leaks nothing. |
@@ -213,6 +213,46 @@ state, resolvable home, valid endpoint, and no persistent opt-out or run kill
 switch. Missing preferences default on. The interactive TUI shows the disclosure;
 headless commands never synthesize consent. Existing runtime events and counters
 are unchanged; adding PostHog does not add a second runtime collector.
+
+### An embedder declares the server it started
+
+A client that starts `codewhale serve` may name itself, so its sessions are not
+counted as anonymous `serve` traffic from nobody in particular. It sets
+`CODEWHALE_TELEMETRY_SURFACE` to a value in the `surface` whitelist before
+spawning the server; the extension client uses `vscode-extension`.
+
+Three properties of that read are deliberate:
+
+- **`serve` only.** The variable is inherited by descendant processes, and an
+  agent's shell command runs `codewhale` descendants carrying this environment.
+  Only the branch that *is* the embedder's own server consults it, so a nested
+  `codewhale exec` cannot report itself as the embedder.
+- **`tui` is refused**, and `serve --mcp` still reports `mcp-server`: nothing
+  starts the interactive terminal UI on a user's behalf, and a server is not an
+  MCP server because an embedder said so.
+- **An unrecognised name is dropped, not repaired.** A value outside the
+  whitelist falls back to `serve` rather than failing startup or being guessed
+  at; the field is a label, and the default is the honest one.
+
+This changes how an embedder's sessions are *labelled*. It does not change
+whether anything may be collected: the server resolves that itself, from the
+same durable config, the same setup state, and the same `CODEWHALE_TELEMETRY`
+run-scoped kill switch. An embedder cannot enable collection where the user has
+turned it off, and a durable opt-out in one client is a durable opt-out for every
+client on the machine, because they share one home and one install identity.
+
+The extension client is the worked example: it holds a single on/off setting and
+passes `CODEWHALE_TELEMETRY=0` when the user turns reporting off. It contains no
+payload builder, no buffer, and no transport of its own — so its sessions share
+the home's `install_id` rather than minting a second one, and one installation is
+one install in every count derived from that id.
+
+Because that switch is run-scoped rather than a durable opt-out, turning it off
+stops the engine this extension starts and leaves the shared buffer and identity
+alone: those belong to every surface on the machine, not to one window, and
+clearing them would silently change what the user's terminal sessions do. A user
+who wants reporting stopped and cleared everywhere does that once, with
+`codewhale config set telemetry false`.
 
 Website and application clients use `product_usage`, with notice version `5`,
 a random browser-local v4 ID rotated after 90 days, `os = other`, `arch = other`,
@@ -272,24 +312,24 @@ The workhorse. Everything a session accumulated ships here, once.
 
 **`exit_class`** — `clean | signal | panic | error`. **Derived from an explicit `AtomicU8`, never from an exit code.** `RunTerminationReason::Canceled` maps to exit 130 (`crates/tui/src/core/runtime_contract/termination.rs:53`), the same value the signal task uses (`crates/tui/src/lib.rs:682`, 128+SIGINT), so a code-based derivation would report every Esc-cancelled turn as a signal. The atomic is set by the panic hook (`crates/tui/src/lib.rs:1582`), by the signal task (`:678-696`) before `std::process::exit`, and on the clean path from `RunTerminationReason::is_success()` (`crates/tui/src/core/runtime_contract/termination.rs:44-46`) — `error` otherwise. Do **not** use `exec_failure_exit_code` (`crates/tui/src/lib.rs:10432`): it knows only `{75, 1}` and would report an approval-required exit (3) as a generic failure.
 
-**`cold_start_bucket`** — from `startup_trace::elapsed_ms()`, which reads `PROCESS_START` directly and is independent of the startup summary's buffer clear (`crates/tui/src/startup_trace.rs:39-45`). Boundaries: `lt_250`, `250_1000`, `1000_3000`, `gte_3000`. Absent on non-TUI surfaces.
+**`cold_start_bucket`** — from `startup_trace::elapsed_ms()`, which reads `PROCESS_START` directly and is independent of the startup summary's buffer clear (`crates/runtime/src/startup_trace.rs:39-45`). Boundaries: `lt_250`, `250_1000`, `1000_3000`, `gte_3000`. Absent on non-TUI surfaces.
 
-**`providers`** — sorted, deduplicated array of `ProviderKind::as_str()` (`crates/config/src/provider_kind.rs:295`, a `&'static str` from a closed enum; `Custom` yields the literal `"custom"`). **The API takes `ProviderKind` by value, never `&str`.** Do not call `ProviderKind::parse` or `parse_config_identity` (`:300`, `:330`) — those are for config-table resolution. **Do not read** `provider_identity_for_persistence()` (`crates/tui/src/tui/app.rs:5049`), `provider_id_for_persistence()` (`:5058`), `ExecStreamMeta.provider_id` (`crates/tui/src/lib.rs:10220`), or `PlannedTurnRoute.effective_provider_label` (`crates/tui/src/turn_route_plan.rs:189-193`) — all four return the customer's own `[providers.<name>]` table key when the route is Custom. This is the single most likely leak in the feature: it is one field away from the natural seam and `/status` already prints it (`crates/tui/src/commands/groups/config/status.rs:24-28`). **No model id is ever sent, for any provider** — `crates/tui/src/safe_label.rs:11-15` documents that a model id can be a path, a URL, or a deployment id that is itself a credential.
+**`providers`** — sorted, deduplicated array of `ProviderKind::as_str()` (`crates/config/src/provider_kind.rs:295`, a `&'static str` from a closed enum; `Custom` yields the literal `"custom"`). **The API takes `ProviderKind` by value, never `&str`.** Do not call `ProviderKind::parse` or `parse_config_identity` (`:300`, `:330`) — those are for config-table resolution. **Do not read** `provider_identity_for_persistence()` (`crates/tui/src/tui/app.rs:5049`), `provider_id_for_persistence()` (`:5058`), `ExecStreamMeta.provider_id` (`crates/tui/src/lib.rs:10220`), or `PlannedTurnRoute.effective_provider_label` (`crates/tui/src/turn_route_plan.rs:189-193`) — all four return the customer's own `[providers.<name>]` table key when the route is Custom. This is the single most likely leak in the feature: it is one field away from the natural seam and `/status` already prints it (`crates/tui/src/commands/groups/config/status.rs:24-28`). **No model id is ever sent, for any provider** — `crates/runtime/src/safe_label.rs:11-15` documents that a model id can be a path, a URL, or a deployment id that is itself a credential.
 
 **`counters`** — closed field set. Every bump happens at the **call site**, never inside a conditionally-entered handler:
 
 | field | source anchor |
 |---|---|
-| `turns` | `crates/tui/src/tui/ui/event_loop.rs:1856` — the *caller* of `execute_turn_end_observer_hook`. Never inside it: that function's first statement is `if !app.hooks.has_hooks_for_event(HookEvent::TurnEnd) { return Ok(()); }` (`crates/tui/src/tui/ui.rs:1035`), and the natural future optimization hoists that check to the call site, silently zeroing the counter for every user without hooks. |
-| `tool_calls` | `crates/tui/src/core/engine/tool_execution.rs:495` — surface-agnostic, fires for exec and CLI too |
-| `fleet_dispatch` | `crates/tui/src/fleet/manager.rs:374` — the single funnel (`create_queued_run_with_descriptor`) that `create_run` and `create_queued_run` both land in; counting at either caller would double-count a plain `fleet run`. |
-| `workflow_run` | counted from the **`WorkflowAction` variant discriminant** returned by `parse_workflow_action` (`crates/tui/src/tools/workflow.rs:752-765`), never from `input["action"]`. The JSON Schema at `:775-779` is what is published *to the model* — a declaration, not a guard; the real parse also accepts `spawn\|wait\|list\|inspect\|stop\|abort`, and its reject arm at `:761-763` embeds the model string verbatim. |
-| `subagent_spawn` | `crates/tui/src/tui/ui/apply.rs:32` |
-| `mcp_server_connected` | count of `.connected` in the snapshot at `crates/tui/src/mcp.rs:4254-4261`; never `name`, `command_or_url`, or `error` — server names are user-chosen and routinely internal infra |
-| `memory_search` | tool name at `crates/tui/src/tools/native_memory.rs:60-61`, counted at the tool_execution choke point |
-| `approval_modal_shown` | `crates/tui/src/tui/ui/event_loop.rs:2372` (consumer of `Event::ApprovalRequired`, `crates/tui/src/core/events.rs:444`) |
-| `approval_auto_allowed` | `crates/tui/src/core/engine.rs:5714`. Count only. Never `matched_rule`, `reason()`, the command, or argv — `auto_allow` patterns are user-authored command strings (`crates/execpolicy/src/command_safety.rs:35/309`) |
-| `command_palette_open` | `crates/tui/src/tui/ui/event_loop.rs:3941` and `crates/tui/src/tui/mouse_ui.rs:1346` |
+| `turns` | `run_event_loop` in `crates/tui/src/tui/ui/event_loop.rs`, immediately before it calls `execute_turn_end_observer_hook`. Never inside that hook: its first statement is `if !app.hooks.has_hooks_for_event(HookEvent::TurnEnd) { return Ok(()); }` (`crates/tui/src/tui/ui/observer_hooks.rs`), and the natural future optimization hoists that check to the call site, silently zeroing the counter for every user without hooks. |
+| `tool_calls` | `execute_tool_with_lock` in `crates/tui/src/core/engine/tool_execution.rs` — surface-agnostic, fires for exec and CLI too |
+| `fleet_dispatch` | `create_queued_run_with_descriptor` in `crates/tui/src/fleet/manager.rs` — the single funnel that `create_run` and `create_queued_run` both land in; counting at either caller would double-count a plain `fleet run`. |
+| `workflow_run` | bumped in `WorkflowTool::execute` (`crates/tui/src/tools/workflow/mod.rs`) only after `parse_workflow_action` returns an `Ok(WorkflowAction)`, never from `input["action"]`. The JSON Schema `enum` in `WorkflowTool::input_schema` is what is published *to the model* — a declaration, not a guard; the real parse also accepts `spawn\|wait\|list\|inspect\|stop\|abort`, and its reject arm (`Invalid workflow action '…'`) embeds the model string verbatim, so a rejected action is never counted. |
+| `subagent_spawn` | `apply_agent_spawned_status_and_observer` in `crates/tui/src/tui/ui/apply.rs` |
+| `mcp_server_connected` | bumped when a server snapshot's `.connected` is true, in `snapshot_from_config` (`crates/tui/src/mcp.rs`); never `name`, `command_or_url`, or `error` — server names are user-chosen and routinely internal infra |
+| `memory_search` | `tool_name == "memory_search"` (the tool registered in `crates/tui/src/tools/native_memory.rs`), counted at the same `execute_tool_with_lock` choke point |
+| `approval_modal_shown` | the `Event::ApprovalRequired` arm of `run_event_loop` (`crates/tui/src/tui/ui/event_loop.rs`; the event is defined in `crates/tui/src/core/events.rs`) |
+| `approval_auto_allowed` | `tool_ask_rule_decision_for_context` in `crates/tui/src/core/engine.rs`. Count only. Never `matched_rule`, `reason()`, the command, or argv — `auto_allow` patterns are user-authored command strings (`crates/execpolicy/src/command_safety.rs:35/309`) |
+| `command_palette_open` | the palette key path in `run_event_loop` (`crates/tui/src/tui/ui/event_loop.rs`) and `handle_context_menu_action` in `crates/tui/src/tui/mouse_ui.rs` |
 
 **`errors`** — closed field set. Every value is a **variant discriminant**, never `err.to_string()`:
 
@@ -304,7 +344,7 @@ The workhorse. Everything a session accumulated ships here, once.
 
 Why discriminants and nothing else: `ToolError::PathEscape`'s `Display` *is* an absolute path (`crates/tools/src/lib.rs:61`); `fim.rs:48-50`'s `Display` *is* a literal source fragment the model emitted; `secrets/src/lib.rs:50`'s `Display` carries the secret store's absolute path; every `LlmError` variant carries the raw provider HTTP body verbatim (`crates/tui/src/llm_client/mod.rs:327`), and a 400 from a content filter routinely echoes the prompt.
 
-**`turn_wall`** — a per-session histogram of counts, never per-turn events. `lt_5s`, `5_30s`, `30_120s`, `gte_120s`. Source `crates/tui/src/tui/ui/event_loop.rs:1857`, which already has `duration` in hand.
+**`turn_wall`** — a per-session histogram of counts, never per-turn events. `lt_5s`, `5_30s`, `30_120s`, `gte_120s`. Recorded by `observe_turn_secs` next to the `turns` bump in `run_event_loop`, which already has the turn duration in hand.
 
 ### Event: `panic`
 

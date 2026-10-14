@@ -180,7 +180,7 @@ mod tests {
                 screen_mode: crate::tui::app::ScreenMode::Inline,
                 max_subagents: 2,
                 mcp_config_path,
-                ..crate::test_support::test_tui_options(PathBuf::from("."))
+                ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
             },
             &Config::default(),
         )

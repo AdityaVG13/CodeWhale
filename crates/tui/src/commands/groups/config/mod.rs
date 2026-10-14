@@ -6,8 +6,7 @@
 #[allow(clippy::module_inception)]
 pub mod config;
 mod import_claude;
-mod permissions;
-mod status;
+pub(in crate::commands) mod policy;
 
 use crate::commands::CommandResult;
 use crate::commands::traits::{Command, CommandGroup, CommandInfo, FunctionCommand};
@@ -21,13 +20,15 @@ impl CommandGroup for ConfigCommands {
         cached_command_list!(vec![
             Box::new(FunctionCommand::new(&CONFIG_INFO, run_config)),
             Box::new(FunctionCommand::new(&IMPORT_CLAUDE_INFO, run_import_claude)),
-            Box::new(FunctionCommand::new(&PERMISSIONS_INFO, run_permissions)),
+            crate::commands::config_policy_host::permissions_registration(),
             Box::new(FunctionCommand::new(&LOGIN_INFO, run_login)),
+            Box::new(FunctionCommand::new(&CONNECT_INFO, run_connect)),
+            Box::new(FunctionCommand::new(&DISCONNECT_INFO, run_disconnect)),
             Box::new(FunctionCommand::new(&AUTH_INFO, run_auth)),
             Box::new(FunctionCommand::new(&RAIL_INFO, run_rail)),
             Box::new(FunctionCommand::new(&PET_INFO, run_pet)),
             Box::new(FunctionCommand::new(&SETTINGS_INFO, run_settings)),
-            Box::new(FunctionCommand::new(&STATUS_INFO, run_status)),
+            crate::commands::config_policy_host::status_registration(),
             Box::new(FunctionCommand::new(&STATUSLINE_INFO, run_statusline)),
             Box::new(FunctionCommand::new(&MODE_INFO, run_mode)),
             Box::new(FunctionCommand::new(&FULLSCREEN_INFO, run_fullscreen)),
@@ -42,9 +43,7 @@ impl CommandGroup for ConfigCommands {
 
 static CONFIG_INFO: CommandInfo = CommandInfo {
     name: "config",
-    // /experiments is a discoverable entry to the same view: the Experimental
-    // section exposes the Workflow, goal, and sub-agent opt-ins (#3182).
-    aliases: &["experiments", "experimental"],
+    aliases: &[],
     usage: "/config [ask-rules|status|<key> [value]]",
     description_id: MessageId::CmdConfigDescription,
 };
@@ -54,22 +53,28 @@ static IMPORT_CLAUDE_INFO: CommandInfo = CommandInfo {
     usage: "/import-claude [--apply]",
     description_id: MessageId::CmdImportClaudeDescription,
 };
-static PERMISSIONS_INFO: CommandInfo = CommandInfo {
-    name: "permissions",
-    aliases: &["permission-rules", "permission_rules"],
-    usage: "/permissions [list|remove <rule-number> [--confirm <token>]]",
-    description_id: MessageId::CmdPermissionsDescription,
-};
 static LOGIN_INFO: CommandInfo = CommandInfo {
     name: "login",
     aliases: &[],
     usage: "/login [status|account|key]",
     description_id: MessageId::CmdLoginDescription,
 };
+static CONNECT_INFO: CommandInfo = CommandInfo {
+    name: "connect",
+    aliases: &[],
+    usage: "/connect [<provider>]",
+    description_id: MessageId::CmdConnectDescription,
+};
+static DISCONNECT_INFO: CommandInfo = CommandInfo {
+    name: "disconnect",
+    aliases: &[],
+    usage: "/disconnect <provider>",
+    description_id: MessageId::CmdDisconnectDescription,
+};
 static AUTH_INFO: CommandInfo = CommandInfo {
     name: "auth",
     aliases: &[],
-    usage: "/auth xai-device|chatgpt|chatgpt-revoke",
+    usage: "/auth xai-device|chatgpt|chatgpt-revoke|orcarouter|orcarouter-revoke",
     description_id: MessageId::CmdAuthDescription,
 };
 static RAIL_INFO: CommandInfo = CommandInfo {
@@ -83,7 +88,7 @@ static RAIL_INFO: CommandInfo = CommandInfo {
 static PET_INFO: CommandInfo = CommandInfo {
     name: "pet",
     aliases: &[],
-    usage: "/pet [on|off|status|appearance|window|source|export|sound on|off]",
+    usage: "/pet [on|off|inspect|status|appearance|style [smooth|pixel]|language [auto|en|zh-Hans|zh-Hant|ja]|window|source|export|sound [on|off]|avatar [whale|cove|braille|pixels|particles|whale-girl|key]|action [name|live]|view [name|live]]",
     description_id: MessageId::CmdPetDescription,
 };
 static SETTINGS_INFO: CommandInfo = CommandInfo {
@@ -91,12 +96,6 @@ static SETTINGS_INFO: CommandInfo = CommandInfo {
     aliases: &[],
     usage: "/settings [text]",
     description_id: MessageId::CmdSettingsDescription,
-};
-static STATUS_INFO: CommandInfo = CommandInfo {
-    name: "status",
-    aliases: &[],
-    usage: "/status",
-    description_id: MessageId::CmdStatusDescription,
 };
 static STATUSLINE_INFO: CommandInfo = CommandInfo {
     name: "statusline",
@@ -107,7 +106,7 @@ static STATUSLINE_INFO: CommandInfo = CommandInfo {
 static MODE_INFO: CommandInfo = CommandInfo {
     name: "mode",
     aliases: &["jihua", "zidong"],
-    usage: "/mode [act|plan|operate|1|2|3]",
+    usage: "/mode [work|plan|operate|1|2|3]",
     description_id: MessageId::CmdModeDescription,
 };
 static FULLSCREEN_INFO: CommandInfo = CommandInfo {
@@ -137,7 +136,7 @@ static VERBOSE_INFO: CommandInfo = CommandInfo {
 static TRUST_INFO: CommandInfo = CommandInfo {
     name: "trust",
     aliases: &["xinren"],
-    usage: "/trust [on|off|add <path>|remove <path>|list]",
+    usage: "/trust [on|off [--save]|add <path>|remove <path>|list]",
     description_id: MessageId::CmdTrustDescription,
 };
 static LOGOUT_INFO: CommandInfo = CommandInfo {
@@ -156,9 +155,6 @@ fn run_config(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_import_claude(app: &mut App, arg: Option<&str>) -> CommandResult {
     import_claude::import_claude_command(app, arg)
 }
-fn run_permissions(app: &mut App, arg: Option<&str>) -> CommandResult {
-    run_registered(app, "permissions", arg)
-}
 fn run_login(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "login", arg)
 }
@@ -173,9 +169,6 @@ fn run_pet(app: &mut App, arg: Option<&str>) -> CommandResult {
 }
 fn run_settings(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "settings", arg)
-}
-fn run_status(app: &mut App, arg: Option<&str>) -> CommandResult {
-    run_registered(app, "status", arg)
 }
 fn run_statusline(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "statusline", arg)
@@ -201,20 +194,32 @@ fn run_trust(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_logout(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "logout", arg)
 }
+fn run_connect(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "connect", arg)
+}
+fn run_disconnect(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "disconnect", arg)
+}
 pub(in crate::commands) fn dispatch(
     app: &mut App,
     command: &str,
     arg: Option<&str>,
 ) -> Option<CommandResult> {
     let result = match command {
-        "config" | "experiments" | "experimental" => config::config_command(app, arg),
+        "config" => config::config_command(app, arg),
         "permissions" | "permission-rules" | "permission_rules" => {
-            permissions::permissions_command(app, arg)
+            crate::commands::config_policy_host::permissions(app, arg)
         }
         "login" => config::login(app, arg),
         "auth" => match arg.map(str::trim) {
             Some("xai-device") | Some("xai_device") => {
                 CommandResult::action(crate::tui::app::AppAction::StartXaiDeviceLogin)
+            }
+            Some("claude") | Some("anthropic") => {
+                CommandResult::action(crate::tui::app::AppAction::StartClaudeLogin)
+            }
+            Some("claude-revoke") => {
+                CommandResult::action(crate::tui::app::AppAction::StartClaudeRevoke)
             }
             Some("chatgpt") | Some("openai-codex") | Some("openai_codex") => {
                 CommandResult::action(crate::tui::app::AppAction::StartChatgptPkceLogin)
@@ -222,12 +227,20 @@ pub(in crate::commands) fn dispatch(
             Some("chatgpt-revoke") | Some("chatgpt_revoke") => {
                 CommandResult::action(crate::tui::app::AppAction::StartChatgptRevoke)
             }
-            _ => CommandResult::error("Usage: /auth xai-device|chatgpt|chatgpt-revoke"),
+            Some("orcarouter") | Some("orca") => {
+                CommandResult::action(crate::tui::app::AppAction::StartOrcarouterPkceLogin)
+            }
+            Some("orcarouter-revoke") | Some("orcarouter_revoke") | Some("orca-revoke") => {
+                CommandResult::action(crate::tui::app::AppAction::StartOrcarouterRevoke)
+            }
+            _ => CommandResult::error(
+                "Usage: /auth xai-device|chatgpt|chatgpt-revoke|claude|claude-revoke|orcarouter|orcarouter-revoke",
+            ),
         },
         "workbar" | "rail" | "sidebar" => config::sidebar(app, arg),
         "pet" => config::pet(app, arg),
         "settings" => config::settings_command(app, arg),
-        "status" => status::status(app),
+        "status" => crate::commands::config_policy_host::status(app, arg),
         "statusline" => config::status_line(app),
         "mode" => config::mode(app, arg),
         "fullscreen" => config::screen(app, crate::tui::app::ScreenMode::Fullscreen, arg),
@@ -238,6 +251,8 @@ pub(in crate::commands) fn dispatch(
         "verbose" => config::verbose(app, arg),
         "trust" | "xinren" => config::trust(app, arg),
         "logout" => config::logout(app),
+        "connect" => config::connect(app, arg),
+        "disconnect" => config::disconnect(app, arg),
         _ => return None,
     };
     Some(result)

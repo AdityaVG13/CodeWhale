@@ -24,6 +24,9 @@ const ELEMENTS = [
   { index: 6, path: [0], windowIndex: -2, role: "AXMenu", actions: [] },
   { index: 7, path: [0, 0], windowIndex: -2, role: "AXMenuItem", label: "Choose", actions: ["AXPress"] },
   { index: 8, path: [0, 2], windowIndex: 0, role: "AXTextField", value: "Fixture text", focused: true, enabled: true, actions: ["AXConfirm"], position: { x: 10, y: 60 }, size: { w: 150, h: 25 } },
+  // Suites that need more controls append them (FAKE_BACKEND_EXTRA_ELEMENTS,
+  // a JSON array) so the shared indices above never shift.
+  ...JSON.parse(process.env.FAKE_BACKEND_EXTRA_ELEMENTS || "[]"),
 ];
 
 function tmpPng(prefix) {
@@ -42,12 +45,17 @@ export function create() {
   // One backend instance owns this binding; serve-mode tests read it back to
   // prove state survives between requests on the same agent process.
   let boundApp = null;
+  let observationNumber = 0;
+  let observationControl;
 
   return {
     platform: "fake",
     async open_application(args = {}) {
       record("open_application", args);
       boundApp = { name: args.name ?? "FakeApp", pid: args.pid ?? 4242, bundle_id: args.bundle_id ?? "com.fake.app" };
+      let ctrl = null;
+      try { ctrl = JSON.parse(fs.readFileSync(controlFile, "utf8")); } catch {}
+      if (ctrl?.open_without_resolved) return { launched: true, name: boundApp.name };
       return { launched: true, activate: !!args.activate, resolved: boundApp, keyboard_delivery: args.activate ? "foreground-guarded" : "process", input_scope: args.activate ? "shared-desktop" : "application", shared_pointer: !!args.activate };
     },
     async list_apps() {
@@ -56,19 +64,31 @@ export function create() {
     },
     async left_mouse_down(args = {}) { record("left_mouse_down", args); return { action_sent: true, at: { x: args.target?.x, y: args.target?.y } }; },
     async left_mouse_up(args = {}) { record("left_mouse_up", args); return { action_sent: true }; },
-    async screenshot({ region } = {}) {
-      record("screenshot", { region });
+    async screenshot(args = {}) {
+      const { region } = args;
+      record("screenshot", args);
       const file = tmpPng("cu-fake-shot-");
       return region
         ? { file, points: { x: region[0], y: region[1], w: region[2], h: region[3] }, pixels: { w: region[2] * 2, h: region[3] * 2 }, scale: 2 }
         : { file, points: { x: 0, y: 0, w: 800, h: 600 }, pixels: { w: 1600, h: 1200 }, scale: 2 };
     },
-    async zoom({ region } = {}) {
-      record("zoom", { region });
+    async zoom(args = {}) {
+      const { region } = args;
+      record("zoom", args);
       return { file: tmpPng("cu-fake-zoom-"), region };
     },
     async get_app_state({ app_ref, detail, include_ocr } = {}) {
       record("get_app_state", { app_ref, detail, include_ocr });
+      let control;
+      try { control = JSON.parse(fs.readFileSync(controlFile, "utf8")); } catch {}
+      const signature = JSON.stringify(control);
+      if (signature !== observationControl) { observationNumber = 0; observationControl = signature; }
+      if (control?.observation || control?.observations) {
+        const observation = control.observation ?? control.observations[Math.min(observationNumber++, control.observations.length - 1)];
+        if (observation.error) throw Object.assign(new Error(observation.error.message), { code: observation.error.code });
+        return { found: true, name: app_ref?.name ?? "FakeApp", ...observation };
+      }
+      observationNumber = 0;
       return { found: true, name: app_ref?.name ?? "FakeApp", elements: ELEMENTS, ...(include_ocr ? { ocr: {
         status: app_ref?.name === "OCR unavailable" ? "unavailable" : "ok",
         raster: { file: "/fixture/ocr.png", points: { x: 100, y: 50, w: 200, h: 100 }, pixels: { w: 400, h: 200 }, scale: 2 },
@@ -93,6 +113,15 @@ export function create() {
     async key(args) { record("key", args); return { action_sent: true, key: args.text ?? "return" }; },
     async focus(args) { record("focus", args); return { action_sent: true, focused: true, strategy: "a11y" }; },
     async get_value(args) { record("get_value", args); return { value: "Fixture text", strategy: "a11y" }; },
+    async invoke_menu(args) { record("invoke_menu", args); return { action_sent: true, strategy: "a11y" }; },
+    // Who would receive input: FAKE_BACKEND_OWNER is the owning app as JSON, or
+    // "null" for the desktop. The server must consult this before any input.
+    async input_owner({ kind, point } = {}) {
+      record("input_owner", { kind, point });
+      const raw = process.env.FAKE_BACKEND_OWNER;
+      return raw && raw !== "null" ? JSON.parse(raw) : null;
+    },
+    async app_script(args) { record("app_script", args); return { result: "fake", language: args.language ?? "applescript" }; },
   };
 }
 

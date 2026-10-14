@@ -3,7 +3,7 @@
 //!
 //! Under the composer: row 1 is the posture bar (permission, mode, live
 //! counts, the one hint that applies now), row 2 is the metrics line (model,
-//! ctx, cost, ttft, tok/s, output tokens); the roster and to-do rows follow
+//! context, cost, ttft, tok/s, output tokens); the roster and to-do rows follow
 //! only when they have content. Every fact below is asserted to appear in
 //! the composed frame exactly once.
 
@@ -24,11 +24,11 @@ use crate::tui::app::App;
 use crate::tui::history::HistoryCell;
 
 fn frame_app() -> App {
-    let mut app = crate::test_support::test_app_with_options(crate::tui::app::TuiOptions {
+    let mut app = crate::tui::test_support::test_app_with_options(crate::tui::app::TuiOptions {
         model: "deepseek-v4-flash".to_string(),
         start_in_agent_mode: true,
         max_subagents: 4,
-        ..crate::test_support::test_tui_options(PathBuf::from("."))
+        ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
     });
     app.onboarding = crate::tui::app::OnboardingState::None;
     app.launch.visible = false;
@@ -43,6 +43,9 @@ fn frame_app() -> App {
     // passed locally and failed on both CI legs until it was pinned. Force
     // the wider, unenforced reading so every host asserts the same row.
     app.sandbox_backend = None;
+    // The fixture config carries no key; a keyless launch paints "model not
+    // connected" (U3). These rows are about a connected route.
+    app.onboarding_needs_api_key = false;
     app
 }
 
@@ -60,6 +63,7 @@ fn subagent(
         git_branch: None,
         agent_type: crate::tools::subagent::FleetRole::Worker,
         assignment: crate::tools::subagent::SubAgentAssignment {
+            native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
         },
@@ -78,6 +82,8 @@ fn subagent(
         duration_ms: 0,
         started_at: None,
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 
@@ -146,7 +152,7 @@ fn count_rows_containing(rows: &[String], needle: &str) -> usize {
 /// exposes the width band the one-owner fixture's notice collapses.
 #[test]
 fn composed_frame_paints_each_fact_in_exactly_one_row() {
-    for (width, height) in [(80u16, 24u16), (120, 32), (160, 40)] {
+    for (width, height) in [(80u16, 24u16), (120, 32), (160, 40), (200, 40)] {
         let mut app = working_app();
         let rows = draw(&mut app, width, height);
         let pct = super::info_context_percent(&app);
@@ -157,23 +163,22 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // The context reading paints exactly once, at every fullness
         // (#5950 — it used to go silent below 50%).
         let mut facts = vec![
-            ("mode chip", format!("· {mode} (")),
-            ("permission chip", format!("▶▶ {permission} (")),
+            ("mode chip", format!("   {mode} (")),
+            // Mark 8: the permission in force is marked `●` and followed by
+            // what its key does, not a parenthesised chord.
+            ("permission chip", format!("● {permission}")),
             ("model", model),
             ("cost", super::session_cost_label(&app)),
             ("agent count", "2 agents".to_string()),
-            (
-                "help hint",
-                crate::tui::shell_key_routing::info_help_hint(app.ui_locale),
-            ),
             ("ttft", "ttft 400ms".to_string()),
         ];
-        facts.push(("context reading", format!("ctx {pct}%")));
+        facts.push(("context reading", format!("context {pct}%")));
+        facts.push(("output rate", "40 avg tok/s".to_string()));
         if width >= 120 {
-            facts.push(("output rate", "40 avg tok/s".to_string()));
-        } else {
-            // The billing tier takes priority over rate at narrow widths.
-            assert_eq!(count_rows_containing(&rows, "40 avg tok/s"), 0);
+            facts.push((
+                "help hint",
+                crate::tui::shell_key_routing::info_help_hint(app.ui_locale),
+            ));
         }
         for (name, needle) in facts {
             if needle.is_empty() {
@@ -190,11 +195,11 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // roster — never the other way round.
         let posture = rows
             .iter()
-            .position(|row| row.contains("▶▶"))
+            .position(|row| row.contains("● "))
             .expect("posture bar");
         let metrics = rows
             .iter()
-            .position(|row| row.contains("ctx "))
+            .position(|row| row.contains("context "))
             .expect("metrics line");
         let composer = app
             .viewport
@@ -218,8 +223,9 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // turn has been doing what it is doing, and how long the session has
         // worked. Both halves shed before the hint and the counts, so a
         // narrow row keeps the affordances and drops the stopwatch. When
-        // both would paint, the session half needs ~120 columns here and
-        // the turn half ~160; each paints in exactly one row wherever it
+        // both would paint, the session half needs ~125 columns here (the
+        // running hint also names the agent arrows, `← for agents · ↓ to
+        // manage`) and the turn half ~200; each paints in exactly one row wherever it
         // paints. The metrics line carries no repository, branch or provider.
         // First turn: the turn half names the phase and stays; the session
         // reading is the identical duration, so it is suppressed rather than
@@ -229,7 +235,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // still just over a 120-column budget, so the hint wins here and
         // the turn half needs ~160. The shed-order contract itself lives
         // in tideline_tests.
-        let turn_needle = "sub-agents underway 1m 15s";
+        let turn_needle = "agents underway 1m 15s";
         if width >= 160 {
             assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
             assert_eq!(
@@ -249,7 +255,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         let mut worked = working_app();
         worked.cumulative_turn_duration = Duration::from_secs(60);
         let rows = draw(&mut worked, width, height);
-        if width >= 120 {
+        if width >= 160 {
             let worked_needle = "worked 2m 15s";
             assert!(rows[posture].contains(worked_needle), "{}", rows[posture]);
             assert_eq!(
@@ -259,7 +265,9 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
                 rows.join("\n")
             );
         }
-        if width >= 160 {
+        // With both clock halves and the running arrow hints, the turn half
+        // needs more than 160 columns.
+        if width >= 200 {
             assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
         }
         assert!(!rows[metrics].contains('⑂'), "{}", rows[metrics]);
@@ -279,13 +287,16 @@ fn idle_frame_keeps_two_chrome_rows_and_last_turn_metrics() {
     app.is_loading = false;
     app.turn_started_at = None;
     app.subagent_cache.clear();
-    let rows = draw(&mut app, 100, 32);
+    // 120 columns: the labeled readings ("thinking: max", "context 0%",
+    // mark 8) are wider than the bare ones, so at 100 columns the output
+    // count (shed priority 7, ahead of the help hint) is shed by design.
+    let rows = draw(&mut app, 120, 32);
     let composer = app.viewport.last_composer_area.unwrap().bottom() as usize;
-    assert!(rows[composer].starts_with("▶▶"), "{}", rows[composer]);
+    assert!(rows[composer].contains("● "), "{}", rows[composer]);
     // The idle fixture sits at 0% context and says so: the reading is on
     // the row at every fullness (#5950), not only once it is a problem.
     assert!(
-        rows[composer + 1].contains("ctx 0%"),
+        rows[composer + 1].contains("context 0%"),
         "{}",
         rows[composer + 1]
     );
@@ -370,8 +381,8 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     // halves only both fit beside the pinned unenforced-scope permission
     // chip from that width up, and this test asserts the full row's clocks.
     let (width, height) = (160u16, 32u16);
-    let posture_row = |rows: &[String]| rows.iter().position(|row| row.contains("▶▶"));
-    let metrics_row = |rows: &[String]| rows.iter().position(|row| row.contains("ctx "));
+    let posture_row = |rows: &[String]| rows.iter().position(|row| row.contains("● "));
+    let metrics_row = |rows: &[String]| rows.iter().position(|row| row.contains("context "));
 
     let mut app = working_app();
     let full = draw(&mut app, width, height);
@@ -405,7 +416,7 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
         "the metrics line keeps its row"
     );
     assert_eq!(
-        count_rows_containing(&rows, "ctx "),
+        count_rows_containing(&rows, "context "),
         1,
         "the context reading is still painted once"
     );
@@ -418,7 +429,7 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     assert_eq!(count_rows_containing(&rows, "deepseek-v4-pro"), 0);
 
     // Compact both: the rows are back, quieter — the posture and the
-    // route/reading/price, none of the live facts or telemetry.
+    // route/reading/price and measured performance, without secondary counts.
     app.posture_bar = ChromeRowPreset::Compact;
     app.metrics_line = ChromeRowPreset::Compact;
     let rows = draw(&mut app, width, height);
@@ -442,13 +453,14 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     );
     let pct = super::info_context_percent(&app);
     assert!(
-        rows[metrics].contains(&format!("ctx {pct}%")),
+        rows[metrics].contains(&format!("context {pct}%")),
         "{:?}",
         rows[metrics]
     );
+    assert!(rows[metrics].contains("ttft 400ms"), "{}", rows[metrics]);
+    assert!(rows[metrics].contains("40 avg tok/s"), "{}", rows[metrics]);
     for gone in [
-        "tok/s",
-        "ttft",
+        "↓ 1.2K",
         crate::tui::shell_key_routing::info_help_hint(app.ui_locale).as_str(),
     ] {
         assert!(
@@ -624,7 +636,7 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
                     context.is_none() && model.is_none(),
                     "hidden chrome has no stale actions: {evidence}"
                 );
-                assert_eq!(count_rows_containing(&rows, "ctx "), 0, "{evidence}");
+                assert_eq!(count_rows_containing(&rows, "context "), 0, "{evidence}");
             } else {
                 let context = context.expect("visible context has an inspector hitbox");
                 let model = model.expect("visible model has a picker hitbox");
@@ -644,10 +656,17 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
                     );
                     assert!(!composer.intersects(target.area), "{evidence}");
                 }
-                assert_eq!(count_rows_containing(&rows, "ctx 0%"), 1, "{evidence}");
+                assert_eq!(count_rows_containing(&rows, "context 0%"), 1, "{evidence}");
             }
             if metrics == ChromeRowPreset::Compact {
-                for shed in ["tok/s", "ttft", "Ctrl+/ help"] {
+                if width >= 60 {
+                    assert!(rows[usize::from(height - 1)].contains("ttft"), "{evidence}");
+                    assert!(
+                        rows[usize::from(height - 1)].contains("avg tok/s"),
+                        "{evidence}"
+                    );
+                }
+                for shed in ["↓ 1.2K", "Ctrl+/ help"] {
                     assert!(!rows[usize::from(height - 1)].contains(shed), "{evidence}");
                 }
             }
@@ -678,7 +697,7 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
 /// missing coverage is evidence, independent of whether today's route is known.
 #[test]
 fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
-    use crate::config::{ApiProvider, ChromeRowPreset, StatusItem};
+    use crate::config::{ChromeRowPreset, ProviderKind, StatusItem};
     use crate::route_billing::{BillingPresentation, UsageChip};
 
     for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32)] {
@@ -687,7 +706,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
             content: "Review saved usage".to_string(),
         }];
         app.resync_history_revisions();
-        app.set_provider_identity(ApiProvider::Custom, "my-gateway");
+        app.set_provider_identity(ProviderKind::Custom, "my-gateway");
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
         app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::High;
@@ -698,13 +717,13 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
         app.metrics_line = ChromeRowPreset::Compact;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let expected = "cost: unknown (saved coverage unavailable)";
-        assert_eq!(app.api_provider, ApiProvider::Custom);
+        assert_eq!(app.api_provider, ProviderKind::Custom);
         assert!(matches!(app.cumulative_usage_chip(), UsageChip::Unknown(_)));
         assert_eq!(super::session_cost_label(&app), expected);
         let (rows, _) = draw_into(&mut app, &mut terminal);
         eprintln!("{width}x{height} custom-saved-unknown\n{}", rows.join("\n"));
         let metrics = rows.last().unwrap();
-        assert!(metrics.contains("ctx 0%"), "{metrics}");
+        assert!(metrics.contains("context 0%"), "{metrics}");
         if width >= 60 {
             assert!(metrics.contains(expected), "{width}: {metrics}");
         } else {
@@ -791,7 +810,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
             priced.last().unwrap().contains("0.42"),
             "real fixture price survives Custom: {priced:?}"
         );
-        app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+        app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
         app.active_route_base_url = "https://api.deepseek.com/v1".to_string();
         app.model = "deepseek-v4-pro".to_string();
         app.billing_presentation = BillingPresentation::Metered;
@@ -801,7 +820,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
             priced.last(),
             "historical price does not follow today's provider"
         );
-        app.set_provider_identity(ApiProvider::Custom, "my-gateway");
+        app.set_provider_identity(ProviderKind::Custom, "my-gateway");
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
         app.billing_presentation = BillingPresentation::Unknown;
@@ -858,7 +877,7 @@ fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
             let (rows, cursor) = draw_into(&mut app, &mut terminal);
             let evidence = format!("{width}x{height} context-{pct}\n{}", rows.join("\n"));
             eprintln!("{evidence}");
-            let label = format!("ctx {pct}%");
+            let label = format!("context {pct}%");
             assert_eq!(count_rows_containing(&rows, &label), 1, "{evidence}");
             assert!(
                 rows.iter()
@@ -885,7 +904,8 @@ fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
                 ChromeInk::Metadata
             };
             let buffer = terminal.backend().buffer();
-            for (x, ink) in [(context.area.x, label_ink), (context.area.x + 4, value_ink)] {
+            // The value starts after the "context " label.
+            for (x, ink) in [(context.area.x, label_ink), (context.area.x + 8, value_ink)] {
                 assert_eq!(
                     buffer[(x, context.area.y)].fg,
                     codewhale_palette::grammar::chrome_style(&app.ui_theme, ink)

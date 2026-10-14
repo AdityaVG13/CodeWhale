@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -43,6 +43,38 @@ const EVENT_CATCHUP_POLL: Duration = Duration::from_millis(200);
 // ignore its eligibility or generation fence.
 const CURRENT_TASK_SCHEMA_VERSION: u32 = 4;
 const STORE_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a worker with nothing claimable naps between queue-fingerprint
+/// checks. An in-process notify still wakes it at once; this only bounds how
+/// soon it notices another process's queue write, so an idle session stats the
+/// queue about once a second per worker instead of five times (#6728, #6573).
+const STORE_SETTLED_NAP: Duration = Duration::from_secs(1);
+/// Retry an empty claim while queue metadata is missing or too recent to
+/// distinguish writes on a coarse-mtime filesystem. Once settled, idle workers
+/// wait for admission notifications or queue changes instead of reloading every
+/// task record on a timer (#6728).
+const STORE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Ceiling for the retry delay after a claim fails (e.g. "Task store is busy").
+/// A failed claim has already waited out `lock_store`'s 5s deadline, so work
+/// written by another process can wait up to about 13s after contention; an
+/// in-process submission or a queue change ends the backoff early.
+const STORE_BUSY_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// A read snapshot is only trusted once both stamps are at least this old, so
+/// a write landing in the same coarse mtime tick as the load (1s or 2s on
+/// some filesystems) cannot hide behind an unchanged stamp (#6573).
+const READ_SNAPSHOT_SETTLE: Duration = Duration::from_secs(2);
+
+/// Only lock contention at the first worker claim may acknowledge a scheduled
+/// retry. Corrupt state and other lock/I/O errors still fail initialization.
+#[derive(Debug)]
+struct TaskStoreBusy;
+
+impl std::fmt::Display for TaskStoreBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Task store is busy; state is unavailable")
+    }
+}
+
+impl std::error::Error for TaskStoreBusy {}
 
 const fn default_task_schema_version() -> u32 {
     CURRENT_TASK_SCHEMA_VERSION
@@ -285,8 +317,17 @@ pub struct TaskRecord {
     pub mode: String,
     pub allow_shell: bool,
     pub trust_mode: bool,
-    #[serde(default = "default_auto_approve")]
+    /// A record without the field (written before it existed) is not
+    /// auto-approved: a missing grant never widens authority.
+    #[serde(default)]
     pub auto_approve: bool,
+    /// Permission posture the task's own thread starts on (`ask`,
+    /// `auto_review`, `full_access`). Absent on records written before the
+    /// field existed and on the in-process callers that still express authority
+    /// through `auto_approve` alone; the thread request then derives the
+    /// posture from that bit exactly as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_posture: Option<String>,
     pub status: TaskStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -425,6 +466,9 @@ pub struct NewTaskRequest {
     pub allow_shell: Option<bool>,
     pub trust_mode: Option<bool>,
     pub auto_approve: Option<bool>,
+    /// Posture for the thread this task runs on. Takes precedence over
+    /// `auto_approve`, which the runtime only reads when no posture is given.
+    pub permission_posture: Option<String>,
     pub owner_session_id: Option<String>,
 }
 
@@ -442,6 +486,7 @@ impl NewTaskRequest {
             allow_shell: Some(task.allow_shell),
             trust_mode: Some(task.trust_mode),
             auto_approve: Some(task.auto_approve),
+            permission_posture: task.permission_posture.clone(),
             owner_session_id: task.owner_session_id.clone(),
         }
     }
@@ -460,6 +505,7 @@ impl NewTaskRequest {
             allow_shell: None,
             trust_mode: None,
             auto_approve: Some(true),
+            permission_posture: None,
             owner_session_id: None,
         }
     }
@@ -649,6 +695,7 @@ pub struct ExecutionTask {
     allow_shell: bool,
     trust_mode: bool,
     auto_approve: bool,
+    permission_posture: Option<String>,
 }
 
 impl From<&TaskRecord> for ExecutionTask {
@@ -664,6 +711,7 @@ impl From<&TaskRecord> for ExecutionTask {
             allow_shell: task.allow_shell,
             trust_mode: task.trust_mode,
             auto_approve: task.auto_approve,
+            permission_posture: task.permission_posture.clone(),
         }
     }
 }
@@ -679,7 +727,28 @@ impl ExecutionTask {
             allow_shell: Some(self.allow_shell),
             trust_mode: Some(self.trust_mode),
             auto_approve: Some(self.auto_approve),
+            permission_posture: self.permission_posture.clone(),
             task_id: Some(self.id.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// The turn request for this task. A task that carries a pinned posture
+    /// runs its turn under that posture: the legacy `auto_approve` bit is only
+    /// sent for records that predate the pinned posture, because a per-turn
+    /// `auto_approve` without a posture re-derives the permission from the
+    /// bit alone and would override what the thread was created with.
+    pub(crate) fn turn_request(&self) -> StartTurnRequest {
+        let pinned = self.permission_posture.is_some();
+        StartTurnRequest {
+            prompt: self.prompt.clone(),
+            input_summary: Some(summarize_text(&self.prompt, TIMELINE_SUMMARY_LIMIT)),
+            model: Some(self.model.clone()),
+            mode: Some(self.mode_label.clone()),
+            permission_posture: self.permission_posture.clone(),
+            allow_shell: Some(self.allow_shell),
+            trust_mode: Some(self.trust_mode),
+            auto_approve: (!pinned).then_some(self.auto_approve),
             ..Default::default()
         }
     }
@@ -707,6 +776,11 @@ pub enum TaskExecutionEvent {
         id: String,
         output: String,
     },
+    /// Emitted while a journal-tracked tool is in flight but the journal is
+    /// silent, so the worker supervisor's idle watchdog counts the window as
+    /// progress instead of idle. Supervisor-side liveness signal only: never
+    /// persisted and never shown on the task timeline.
+    ToolHeartbeat,
     ToolCompleted {
         id: String,
         name: String,
@@ -813,19 +887,7 @@ impl TaskExecutor for EngineTaskExecutor {
         }
         let turn = match self
             .runtime_threads
-            .start_turn(
-                &thread.id,
-                StartTurnRequest {
-                    prompt: task.prompt.clone(),
-                    input_summary: Some(summarize_text(&task.prompt, TIMELINE_SUMMARY_LIMIT)),
-                    model: Some(task.model.clone()),
-                    mode: Some(task.mode_label.clone()),
-                    allow_shell: Some(task.allow_shell),
-                    trust_mode: Some(task.trust_mode),
-                    auto_approve: Some(task.auto_approve),
-                    ..Default::default()
-                },
-            )
+            .start_turn(&thread.id, task.turn_request())
             .await
         {
             Ok(turn) => turn,
@@ -879,6 +941,18 @@ async fn drive_engine_turn(
     // Approval requests this turn is waiting on, each with the deadline the
     // runtime bridge will resolve it by (#6118).
     let mut pending_approvals: HashMap<String, Instant> = HashMap::new();
+    // Journal ids of tool items currently in flight. The journal records a
+    // tool call only at start/completion — nothing in between — so the
+    // idle-progress deadline would run unopposed during any silent build,
+    // test suite, or MCP call and kill healthy work at the idle limit. A
+    // tool that is still running IS progress; the wall-time budget remains
+    // the backstop for a hung one (a genuinely stuck tool also hits its own
+    // execution timeout long before a 30-minute wall budget in the common
+    // case). Both lifecycle edges are keyed by the journal item id:
+    // item.started also carries the engine tool-use id under "tool", but
+    // the terminal events only carry "item", so keying the insert by
+    // tool-use id would never drain the set.
+    let mut running_tools: HashSet<String> = HashSet::new();
 
     loop {
         let batch = match runtime_threads
@@ -910,6 +984,26 @@ async fn drive_engine_turn(
                 .is_some_and(|event_turn| event_turn != turn_id)
             {
                 continue;
+            }
+            match event.event.as_str() {
+                "item.started" => {
+                    // Journal tool items carry a `tool` payload key;
+                    // non-tool items do not. A silent context compaction is
+                    // therefore invisible to this set (disclosed gap: a
+                    // background task mid-compaction can still hit the idle
+                    // deadline — compaction has no heartbeat of its own).
+                    if event.payload.get("tool").is_some()
+                        && let Some(item_id) = journal_item_id(&event)
+                    {
+                        running_tools.insert(item_id);
+                    }
+                }
+                "item.completed" | "item.failed" => {
+                    if let Some(item_id) = journal_item_id(&event) {
+                        running_tools.remove(&item_id);
+                    }
+                }
+                _ => {}
             }
             match event.event.as_str() {
                 // An approval parks the turn on an external decision until
@@ -970,6 +1064,22 @@ async fn drive_engine_turn(
         pending_approvals.retain(|_, until| now < *until);
         if !pending_approvals.is_empty() {
             guard.note_progress(now);
+        }
+
+        // Steady-state progress refresh: the journal is silent for the whole
+        // execution window of an in-flight tool, so the idle check must be
+        // suppressed for as long as any tool is running — not only on event
+        // arrival. The loop below wakes at least every EVENT_CATCHUP_POLL,
+        // so this runs throughout silent builds, test suites, and MCP calls.
+        if !running_tools.is_empty() {
+            guard.note_progress(now);
+            // The worker supervisor (run_task) feeds its own guard from the
+            // task-event channel and cannot see this journal-derived set, so
+            // without a heartbeat its idle deadline would still fire on the
+            // only production path that runs this loop. Publish the in-flight
+            // window on that channel; the heartbeat refreshes the supervisor's
+            // idle clock and is deliberately not persisted or surfaced.
+            emit_task_event(&events, TaskExecutionEvent::ToolHeartbeat).await;
         }
 
         match guard.evaluate(now, cancel.is_cancelled(), false) {
@@ -1067,6 +1177,19 @@ fn runtime_event_is_progress(event: &RuntimeEventRecord) -> bool {
     )
 }
 
+/// The journal receipt id of the item a lifecycle event carries. Every
+/// lifecycle edge (`item.started` / `item.completed` / `item.failed`) repeats
+/// it under `payload.item.id`, which is what makes it a stable tracking key
+/// across both edges of one tool call.
+fn journal_item_id(event: &RuntimeEventRecord) -> Option<String> {
+    event
+        .payload
+        .get("item")
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 async fn ingest_runtime_event(
     event: &RuntimeEventRecord,
     final_text: &mut RuntimeTaskOutput,
@@ -1145,7 +1268,7 @@ async fn ingest_runtime_event(
                 let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
                 if kind == "tool_call" || kind == "file_change" || kind == "command_execution" {
                     let metadata = item.get("metadata");
-                    // Starts carry the provider call ID; item.id is Runtime's
+                    // Starts carry the call execution ID; item.id is Runtime's
                     // separate receipt ID. Runtime preserves the call identity
                     // in terminal metadata, including errors and redacted input.
                     let id = metadata
@@ -1364,8 +1487,166 @@ pub struct TaskManager {
     notify: Notify,
     cancel_token: CancellationToken,
     execution_lease: Arc<TaskExecutionLease>,
-    workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    workers: Mutex<Vec<TaskWorker>>,
     shutdown_drain: Mutex<()>,
+    /// Full store loads performed by this manager (tests only, #6573).
+    #[cfg(test)]
+    store_loads: std::sync::atomic::AtomicUsize,
+    /// Queue fingerprint reads performed by worker loops (tests only, #6728).
+    #[cfg(test)]
+    fingerprint_reads: std::sync::atomic::AtomicUsize,
+}
+
+type InspectionReply = oneshot::Sender<Result<ClaimSchedule>>;
+
+struct TaskWorker {
+    inspect: mpsc::Sender<InspectionReply>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+/// Cheap stat-only view of the shared queue file. Everything that makes work
+/// claimable rewrites `queue.json` through an atomic rename: admission writes
+/// it before promoting the task record, and claims, cancels and startup
+/// recovery write it too. Running tasks flush their records into `tasks/`
+/// every few hundred milliseconds but leave the queue alone, so the tasks
+/// directory is deliberately not part of the fingerprint. Startup still rebuilds
+/// missing queue entries from durable records. Failed claims retry independently,
+/// including a queue removal whose task-status write failed. Missing or recent
+/// metadata keeps a fallback deadline until it can be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoreFingerprint(Option<(std::time::SystemTime, u64, u64)>);
+
+impl StoreFingerprint {
+    fn read(path: &Path) -> Self {
+        Self(fs::metadata(path).ok().and_then(|meta| {
+            #[cfg(unix)]
+            let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+            #[cfg(not(unix))]
+            let inode = 0;
+            Some((meta.modified().ok()?, meta.len(), inode))
+        }))
+    }
+
+    /// True when the stamp is old enough that a later write cannot share it.
+    fn settled(&self, now: std::time::SystemTime) -> bool {
+        self.0.as_ref().is_none_or(|(modified, _, _)| {
+            now.duration_since(*modified)
+                .is_ok_and(|age| age >= READ_SNAPSHOT_SETTLE)
+        })
+    }
+}
+
+/// Stat-only view of everything `load_state` reads, for read-only callers
+/// (#6573). Every task and queue write is an atomic rename, which bumps the
+/// tasks directory's or the queue file's mtime, so an unchanged snapshot
+/// means an unchanged store. The TUI task panel lists tasks every 2.5s; with
+/// this, an idle session answers from memory instead of taking the
+/// cross-process store lock and re-parsing every task record each time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadSnapshot {
+    queue: StoreFingerprint,
+    tasks_dir: StoreFingerprint,
+}
+
+impl ReadSnapshot {
+    fn read(tasks_dir: &Path, queue_path: &Path) -> Self {
+        Self {
+            queue: StoreFingerprint::read(queue_path),
+            tasks_dir: StoreFingerprint::read(tasks_dir),
+        }
+    }
+
+    fn settled(&self, now: std::time::SystemTime) -> bool {
+        self.queue.settled(now) && self.tasks_dir.settled(now)
+    }
+}
+
+/// When an idle worker should next claim from the shared store (#6573).
+///
+/// A worker claims when it was notified in-process, when the queue
+/// fingerprint changed since its last attempt, or when a retry deadline passed.
+/// Settled empty claims have no deadline. Unreadable/recent metadata gets a
+/// fallback and failed claims get exponential backoff ("Task store is busy"). Workers
+/// keep checking the fingerprint every tick during a backoff, so a queue
+/// write from another process still gets an early retry.
+#[derive(Debug, Clone)]
+struct ClaimSchedule {
+    seen: Option<StoreFingerprint>,
+    next_claim: Option<Instant>,
+    failure_backoff: Duration,
+}
+
+impl ClaimSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            seen: None,
+            next_claim: Some(now),
+            failure_backoff: STORE_REFRESH_INTERVAL,
+        }
+    }
+
+    fn should_claim(&self, fingerprint: &StoreFingerprint, now: Instant, woken: bool) -> bool {
+        woken
+            || self.seen.as_ref() != Some(fingerprint)
+            || self.next_claim.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// How long the worker may sleep before its next pass. Nothing claimable
+    /// (a settled empty queue, no retry deadline) only needs to notice another
+    /// process's queue write; pending work or a retry deadline keeps the
+    /// short tick.
+    fn nap(&self) -> Duration {
+        if self.next_claim.is_none() {
+            STORE_SETTLED_NAP
+        } else {
+            STORE_REFRESH_INTERVAL
+        }
+    }
+
+    fn claimed_task(&mut self, now: Instant) {
+        self.seen = None;
+        self.next_claim = Some(now);
+        self.failure_backoff = STORE_REFRESH_INTERVAL;
+    }
+
+    fn found_nothing(
+        &mut self,
+        fingerprint: StoreFingerprint,
+        now: Instant,
+        wall_now: std::time::SystemTime,
+    ) {
+        // Re-read a recent stamp after its coarse mtime tick has passed before
+        // trusting it indefinitely. Missing metadata never proves no change.
+        let settled = fingerprint.0.as_ref().is_some_and(|(modified, _, _)| {
+            wall_now
+                .duration_since(*modified)
+                .is_ok_and(|age| age >= STORE_IDLE_POLL_INTERVAL)
+        });
+        self.seen = Some(fingerprint);
+        self.next_claim = (!settled).then_some(now + STORE_IDLE_POLL_INTERVAL);
+        self.failure_backoff = STORE_REFRESH_INTERVAL;
+    }
+
+    /// Returns the delay before the next claim unless the queue changes.
+    fn claim_failed(&mut self, fingerprint: StoreFingerprint, now: Instant) -> Duration {
+        let delay = self.failure_backoff;
+        self.seen = Some(fingerprint);
+        self.next_claim = Some(now + delay);
+        self.failure_backoff = (delay * 2).min(STORE_BUSY_BACKOFF_MAX);
+        delay
+    }
+}
+
+/// The "store is busy" error, naming the lock holder when its record can be
+/// read. Reading the record is best effort and never fails the caller (#6573).
+fn store_busy_error(lock_path: &Path) -> anyhow::Error {
+    match RuntimeProcessOwnerLock::read_holder(lock_path) {
+        Some((pid, held_for)) => anyhow::Error::new(TaskStoreBusy).context(format!(
+            "Task store is busy; state is unavailable (lock held by pid {pid} for {}s)",
+            held_for.as_secs()
+        )),
+        None => TaskStoreBusy.into(),
+    }
 }
 
 struct ManagerState {
@@ -1374,6 +1655,9 @@ struct ManagerState {
     running_cancel: HashMap<String, CancellationToken>,
     /// Uncommitted typed deltas, reapplied to a fresh record before persistence.
     pending_events: HashMap<String, Vec<TaskExecutionEvent>>,
+    /// Store snapshot that `tasks` and `queue` exactly reflect, set only by a
+    /// read-only refresh and cleared by every path that may change them.
+    read_snapshot: Option<ReadSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -1393,6 +1677,10 @@ impl TaskManager {
         session_id: &str,
         binding: Option<&crate::runtime_threads::RuntimeStoreBinding>,
     ) -> Result<SharedTaskManager> {
+        // Resolve the sessions root's canonical spelling off this runtime
+        // once, so the saved-store confinement checks here and in later
+        // `/resume` / `/load` switches are pure comparisons (#6522).
+        crate::runtime_threads::prepare_canonical_sessions_root().await;
         let runtime_threads = Arc::new(RuntimeThreadManager::open_for_session(
             api_config.clone(),
             cfg.default_workspace.clone(),
@@ -1488,12 +1776,17 @@ impl TaskManager {
                 queue: VecDeque::new(),
                 running_cancel: HashMap::new(),
                 pending_events: HashMap::new(),
+                read_snapshot: None,
             }),
             notify: Notify::new(),
             cancel_token: cancel_token.clone(),
             execution_lease: execution_lease.clone(),
             workers: Mutex::new(Vec::new()),
             shutdown_drain: Mutex::new(()),
+            #[cfg(test)]
+            store_loads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fingerprint_reads: std::sync::atomic::AtomicUsize::new(0),
         });
 
         {
@@ -1507,19 +1800,79 @@ impl TaskManager {
             runtime.retain_task_execution_lease(execution_lease)?;
         }
 
+        manager.initialize_workers(workers).await?;
+        Ok(manager)
+    }
+
+    /// Establish each worker's first claim/retry boundary after loading state.
+    async fn initialize_workers(self: &Arc<Self>, workers: usize) -> Result<Vec<ClaimSchedule>> {
+        let mut startup_guard = self.shutdown_guard();
         for _ in 0..workers {
-            let manager_clone = Arc::clone(&manager);
+            let manager_clone = Arc::clone(self);
+            let (inspect, inspections) = mpsc::channel(1);
             let worker = spawn_supervised(
                 "task-manager-worker",
                 std::panic::Location::caller(),
                 async move {
-                    manager_clone.worker_loop().await;
+                    manager_clone.worker_loop(inspections).await;
                 },
             );
-            manager.workers.lock().await.push(worker);
+            self.workers.lock().await.push(TaskWorker {
+                inspect,
+                join: worker,
+            });
         }
 
-        Ok(manager)
+        // Spawning is not initialization completion. Each worker acknowledges
+        // its first queue inspection after committing its scheduling decision,
+        // before executing any claimed task. A retry remains an explicit part
+        // of that result; startup does not promise a globally idle store.
+        let inspected = self.inspect_workers().await;
+        if inspected.is_err() {
+            self.shutdown_and_wait().await?;
+        }
+        startup_guard.0 = std::sync::Weak::new();
+        inspected
+    }
+
+    /// Inspect through every worker's normal claim path and await its reply.
+    ///
+    /// The reply belongs to this request, so a fast worker cannot acknowledge
+    /// another worker's inspection or race ahead of a subscriber. It is sent
+    /// only after the store operation and schedule update finish. This is a
+    /// per-worker boundary, not a global snapshot or a task-completion promise:
+    /// a claimed task executes after the acknowledgement, and another process
+    /// may subsequently change the queue. No elapsed quiet period proves any
+    /// of these operations complete (the former #6573 test assumed it did).
+    async fn inspect_workers(&self) -> Result<Vec<ClaimSchedule>> {
+        if self.cancel_token.is_cancelled() {
+            bail!("Task worker inspection requested after shutdown");
+        }
+        let senders: Vec<_> = self
+            .workers
+            .lock()
+            .await
+            .iter()
+            .map(|worker| worker.inspect.clone())
+            .collect();
+        let mut replies = Vec::with_capacity(senders.len());
+        for sender in senders {
+            let (reply, received) = oneshot::channel();
+            sender
+                .send(reply)
+                .await
+                .map_err(|_| anyhow!("Task worker stopped before queue inspection"))?;
+            replies.push(received);
+        }
+        let mut schedules = Vec::with_capacity(replies.len());
+        for reply in replies {
+            schedules.push(
+                reply
+                    .await
+                    .context("Task worker stopped during queue inspection")??,
+            );
+        }
+        Ok(schedules)
     }
 
     /// Request shutdown. Ownership remains retained through actual execution.
@@ -1548,7 +1901,7 @@ impl TaskManager {
             while let Some(worker) = workers.last_mut() {
                 // Await by reference: canceling this caller leaves the join in
                 // the manager, so a later drain still waits for actual exit.
-                let result = worker.await;
+                let result = (&mut worker.join).await;
                 workers.pop();
                 if let Err(error) = result {
                     failure = Some(anyhow!("Task worker shutdown failed: {error}"));
@@ -1563,6 +1916,22 @@ impl TaskManager {
 
     pub(crate) fn execution_scope(&self) -> &str {
         &self.execution_lease.scope
+    }
+
+    /// Apply `edit` to the runtime threads' authoritative config and reload
+    /// it, so runtime-chat and queued runtime turns see a setting the UI just
+    /// persisted instead of their startup snapshot. No runtime manager is a
+    /// no-op.
+    pub(crate) async fn reload_runtime_config_with(
+        &self,
+        edit: impl FnOnce(&mut crate::config::Config),
+    ) -> Result<()> {
+        let Some(runtime) = &self.runtime_threads else {
+            return Ok(());
+        };
+        let mut config = runtime.read_config().clone();
+        edit(&mut config);
+        runtime.reload_config(config).await.map(|_| ())
     }
 
     pub(crate) fn session_store_binding(
@@ -1671,6 +2040,18 @@ impl TaskManager {
         {
             bail!("A pinned task provider requires an explicit model");
         }
+        // The worker runs this same projection when it opens the task's
+        // thread. Running it here as well refuses an unknown mode or posture
+        // at the boundary the request crossed, instead of after the task has
+        // sat in the durable queue and a worker has claimed it.
+        crate::runtime_policy::RuntimePolicyProjection::from_request(
+            req.mode
+                .as_deref()
+                .filter(|mode| !mode.trim().is_empty())
+                .unwrap_or(&self.cfg.default_mode),
+            req.permission_posture.as_deref(),
+            req.auto_approve,
+        )?;
         validate_preallocated_task_id(&task_id)?;
 
         let task = TaskRecord {
@@ -1700,6 +2081,7 @@ impl TaskManager {
             // Auto-approval must be opted into explicitly
             // (GHSA-72w5-pf8h-xfp4).
             auto_approve: req.auto_approve.unwrap_or(false),
+            permission_posture: req.permission_posture,
             status: TaskStatus::Queued,
             created_at: Utc::now(),
             started_at: None,
@@ -1854,8 +2236,7 @@ impl TaskManager {
         owner_session_id: Option<&str>,
     ) -> Result<Vec<TaskSummary>> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let mut items = state
             .tasks
             .values()
@@ -1905,8 +2286,7 @@ impl TaskManager {
         owner_session_id: &str,
     ) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let id = resolve_task_id_visible_to_operator(
             &state.tasks,
             id_or_prefix,
@@ -1927,8 +2307,7 @@ impl TaskManager {
     /// ownerless tasks without that provenance still fail closed.
     pub(crate) async fn get_task_for_active_runtime(&self, task_id: &str) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         state
             .tasks
             .get(task_id)
@@ -1946,8 +2325,7 @@ impl TaskManager {
         owner_session_id: Option<&str>,
     ) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let id = resolve_task_id_visible_to(&state.tasks, id_or_prefix, owner_session_id)?;
         state
             .tasks
@@ -2083,8 +2461,7 @@ impl TaskManager {
     /// Return aggregate status counters.
     pub async fn counts(&self) -> Result<TaskCounts> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let mut counts = TaskCounts::default();
         for task in state.tasks.values() {
             match task.status {
@@ -2160,7 +2537,13 @@ impl TaskManager {
     async fn claim_next_task(&self) -> Result<Option<(String, ExecutionTask, CancellationToken)>> {
         let mut state = self.state.lock().await;
         let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        // The worker loop runs this repeatedly; keep the directory scan and
+        // JSON parsing off the async runtime threads (#6573).
+        let (tasks_dir, queue_path) = (self.tasks_dir.clone(), self.queue_path.clone());
+        let loaded = tokio::task::spawn_blocking(move || load_state(&tasks_dir, &queue_path))
+            .await
+            .context("Task store load was interrupted")??;
+        self.apply_loaded_locked(&mut state, loaded)?;
         if self.cancel_token.is_cancelled() {
             return Ok(None);
         }
@@ -2177,6 +2560,7 @@ impl TaskManager {
         else {
             return Ok(None);
         };
+        state.read_snapshot = None;
         state.queue.retain(|queued| queued != &id);
         let task = state
             .tasks
@@ -2209,25 +2593,99 @@ impl TaskManager {
         Ok(Some((id, request, cancel)))
     }
 
-    async fn worker_loop(self: Arc<Self>) {
+    /// Claim and run queued work.
+    ///
+    /// Several processes can share one data dir, and every claim takes the
+    /// cross-process store lock and reloads the whole store. An idle worker
+    /// therefore only claims when it was notified in-process, when the store
+    /// fingerprint changed, or when unreadable/recent metadata needs a retry.
+    /// A settled empty queue does no periodic full reload; failed claims still
+    /// back off exponentially instead of retrying every tick (#6573, #6728).
+    async fn worker_loop(self: Arc<Self>, mut inspections: mpsc::Receiver<InspectionReply>) {
+        let mut schedule = ClaimSchedule::new(Instant::now());
+        let mut woken = true;
+        let mut initial_claim = true;
+        // True while consecutive claims are failing: the first failure of an
+        // episode is an error, repeats are debug until a claim succeeds (#6573).
+        let mut claim_failing = false;
+        // Startup supplies the first inspection request. Waiting for it avoids
+        // running a recovered task before startup can observe its claim result.
+        let mut reply = tokio::select! {
+            _ = self.cancel_token.cancelled() => return,
+            request = inspections.recv() => request,
+        };
         loop {
             if self.cancel_token.is_cancelled() {
                 break;
             }
-            match self.claim_next_task().await {
-                Ok(Some((id, request, cancel))) => {
-                    self.run_task(id, request, cancel).await;
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(%error, "Task claim unavailable; executor was not polled")
+            // Read before claiming so a write racing the claim changes the
+            // fingerprint and is picked up on the next pass.
+            #[cfg(test)]
+            self.fingerprint_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let fingerprint = StoreFingerprint::read(&self.queue_path);
+            if schedule.should_claim(&fingerprint, Instant::now(), woken) {
+                let startup_claim = std::mem::take(&mut initial_claim);
+                match self.claim_next_task().await {
+                    Ok(Some((id, request, cancel))) => {
+                        claim_failing = false;
+                        schedule.claimed_task(Instant::now());
+                        if let Some(reply) = reply.take() {
+                            let _ = reply.send(Ok(schedule.clone()));
+                        }
+                        self.run_task(id, request, cancel).await;
+                        woken = true;
+                        continue;
+                    }
+                    Ok(None) => {
+                        claim_failing = false;
+                        schedule.found_nothing(
+                            fingerprint,
+                            Instant::now(),
+                            std::time::SystemTime::now(),
+                        );
+                    }
+                    Err(error) => {
+                        let retry = schedule.claim_failed(fingerprint, Instant::now());
+                        let retry_ms = retry.as_millis() as u64;
+                        if claim_failing {
+                            tracing::debug!(
+                                %error,
+                                retry_ms,
+                                "Task claim still unavailable; executor was not polled"
+                            );
+                        } else {
+                            claim_failing = true;
+                            tracing::error!(
+                                %error,
+                                retry_ms,
+                                "Task claim unavailable; executor was not polled"
+                            );
+                        }
+                        if let Some(reply) = reply.take() {
+                            if startup_claim && error.is::<TaskStoreBusy>() {
+                                // A committed contention retry is worker readiness,
+                                // not a claim that storage is settled or idle.
+                                let _ = reply.send(Ok(schedule.clone()));
+                            } else {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    }
                 }
             }
+            if let Some(reply) = reply.take() {
+                let _ = reply.send(Ok(schedule.clone()));
+            }
+            woken = false;
             tokio::select! {
                 _ = self.cancel_token.cancelled() => break,
-                _ = self.notify.notified() => {},
-                _ = sleep(STORE_REFRESH_INTERVAL) => {},
+                request = inspections.recv() => {
+                    let Some(request) = request else { break };
+                    reply = Some(request);
+                }
+                _ = self.notify.notified() => woken = true,
+                _ = sleep(schedule.nap()) => {},
             }
         }
     }
@@ -2254,6 +2712,7 @@ impl TaskManager {
         let mut dirty = false;
         let mut accumulated_result_text = String::new();
         let persist_debounce = self.cfg.execution_limits.persist_debounce;
+        let mut persist_deadline = None;
 
         let mut next_store_poll = Instant::now();
         let mut execution_started = false;
@@ -2348,10 +2807,33 @@ impl TaskManager {
                 }
                 GuardAction::Run { wait } => {
                     execution_started = true;
+                    // Keep the first dirty event's deadline across heartbeat
+                    // and ownership-poll wakes. An urgent persisted event
+                    // clears dirty and starts a fresh window for later deltas.
+                    let persist_at = if dirty {
+                        *persist_deadline.get_or_insert_with(|| Instant::now() + persist_debounce)
+                    } else {
+                        persist_deadline = None;
+                        Instant::now()
+                    };
                     tokio::select! {
                         biased;
                         exec_result = &mut exec_fut => {
                             break (guard.preserve_timeout_reason(exec_result), false);
+                        }
+                        // A ready event channel must not starve a due write.
+                        _ = tokio::time::sleep_until(persist_at.into()), if dirty => {
+                            match self.flush_task(&task_id).await {
+                                Ok(()) => {
+                                    dirty = false;
+                                    persist_deadline = None;
+                                }
+                                Err(err) => {
+                                    tracing::error!("Failed to debounce-persist task {task_id}: {err}");
+                                    cancel.cancel();
+                                    persist_deadline = Some(Instant::now() + persist_debounce);
+                                }
+                            }
                         }
                         maybe_event = event_rx.recv(), if blocked_event.is_none() => {
                             if let Some(event) = maybe_event
@@ -2365,15 +2847,6 @@ impl TaskManager {
                         }
                         _ = self.cancel_token.cancelled(), if !self.cancel_token.is_cancelled() => {
                             cancel.cancel();
-                        }
-                        _ = sleep(persist_debounce), if dirty => {
-                            match self.flush_task(&task_id).await {
-                                Ok(()) => dirty = false,
-                                Err(err) => {
-                                    tracing::error!("Failed to debounce-persist task {task_id}: {err}");
-                                    cancel.cancel();
-                                }
-                            }
                         }
                         _ = sleep(wait.min(STORE_REFRESH_INTERVAL)) => {}
                     }
@@ -2437,6 +2910,13 @@ impl TaskManager {
         accumulated_result_text: &mut String,
         dirty: &mut bool,
     ) -> Result<()> {
+        if matches!(event, TaskExecutionEvent::ToolHeartbeat) {
+            // Liveness is in-memory only. In particular, leave any real event's
+            // pending persistence intact; the supervisor still checks execution
+            // ownership and cancellation on its regular store-poll deadline.
+            guard.note_progress(Instant::now());
+            return Ok(());
+        }
         match self.apply_execution_event(task_id, event.clone()).await {
             Ok(outcome) => {
                 if execution_event_is_progress(&event) {
@@ -2578,6 +3058,9 @@ impl TaskManager {
                     },
                 );
             }
+            // Supervisor-side liveness only: recording it would put a
+            // timeline entry behind every poll tick of a silent build.
+            TaskExecutionEvent::ToolHeartbeat => {}
             TaskExecutionEvent::ToolCompleted {
                 id,
                 name,
@@ -2932,11 +3415,13 @@ impl TaskManager {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut wait = Duration::from_millis(5);
         loop {
-            if let Some(owner) = RuntimeProcessOwnerLock::try_acquire_file(&path, true)? {
+            if let Some(mut owner) = RuntimeProcessOwnerLock::try_acquire_file(&path, true)? {
+                // Lets a contender that times out name this process (#6573).
+                owner.record_holder();
                 return Ok(owner);
             }
             if Instant::now() >= deadline {
-                bail!("Task store is busy; state is unavailable");
+                return Err(store_busy_error(&path));
             }
             sleep(wait).await;
             wait = (wait * 2).min(Duration::from_millis(50));
@@ -2944,7 +3429,41 @@ impl TaskManager {
     }
 
     fn refresh_locked(&self, state: &mut ManagerState) -> Result<()> {
+        // Callers go on to change `state`; a failed persist must not leave a
+        // diverged view that a read-only caller would trust.
+        state.read_snapshot = None;
         let loaded = load_state(&self.tasks_dir, &self.queue_path)?;
+        self.apply_loaded_locked(state, loaded)
+    }
+
+    /// Bring `state` up to date for a read-only caller (#6573).
+    ///
+    /// Skips the cross-process lock and the full reload while the store is
+    /// provably unchanged since the last read-only refresh. Several TUIs
+    /// sharing one data dir each list tasks every 2.5s on their event loop;
+    /// without this, every idle session took the store lock and re-parsed
+    /// every task record on each poll, contending with the others.
+    async fn refresh_for_read(&self, state: &mut ManagerState) -> Result<()> {
+        if let Some(snapshot) = &state.read_snapshot
+            && *snapshot == ReadSnapshot::read(&self.tasks_dir, &self.queue_path)
+        {
+            return Ok(());
+        }
+        let _transaction = self.lock_store().await?;
+        // Taken under the lock and before the load, so any later write
+        // changes it.
+        let snapshot = ReadSnapshot::read(&self.tasks_dir, &self.queue_path);
+        self.refresh_locked(state)?;
+        if snapshot.settled(std::time::SystemTime::now()) {
+            state.read_snapshot = Some(snapshot);
+        }
+        Ok(())
+    }
+
+    fn apply_loaded_locked(&self, state: &mut ManagerState, loaded: LoadedTaskState) -> Result<()> {
+        #[cfg(test)]
+        self.store_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         state.tasks = loaded.tasks;
         state.queue = loaded.queue;
         for (id, events) in &state.pending_events {
@@ -3097,6 +3616,10 @@ pub(crate) fn validate_bound_task_request(
         || request
             .trust_mode
             .is_some_and(|value| value != task.trust_mode)
+        || request
+            .permission_posture
+            .as_deref()
+            .is_some_and(|value| Some(value) != task.permission_posture.as_deref())
         || task.auto_approve != request.auto_approve.unwrap_or(false)
     {
         bail!("Task admission replay does not match the bound request");
@@ -3190,6 +3713,7 @@ fn execution_event_is_progress(event: &TaskExecutionEvent) -> bool {
         TaskExecutionEvent::MessageDelta { .. }
             | TaskExecutionEvent::ToolStarted { .. }
             | TaskExecutionEvent::ToolProgress { .. }
+            | TaskExecutionEvent::ToolHeartbeat
             | TaskExecutionEvent::ToolCompleted { .. }
     )
 }
@@ -3200,6 +3724,11 @@ fn execution_event_persist_urgent(event: &TaskExecutionEvent) -> bool {
         TaskExecutionEvent::MessageDelta { .. }
             | TaskExecutionEvent::ToolProgress { .. }
             | TaskExecutionEvent::RuntimeEvent { .. }
+            // Liveness-only signal (see the variant doc): it arrives up to
+            // ~5x/s throughout a silent build, and persisting it would
+            // rewrite the whole task record on every tick while holding the
+            // manager-wide state lock.
+            | TaskExecutionEvent::ToolHeartbeat
     )
 }
 
@@ -3396,10 +3925,6 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("Failed to write {}", path.display()))
 }
 
-fn default_auto_approve() -> bool {
-    true
-}
-
 /// Default task manager data location (`~/.codewhale/tasks`, or legacy
 /// `~/.deepseek/tasks` when only the legacy directory exists).
 #[must_use]
@@ -3460,6 +3985,29 @@ mod tests {
     use tokio::time::Duration;
 
     struct MockExecutor;
+
+    /// Poll until the task is claimed as `Running`, or fail at `timeout`.
+    ///
+    /// A worker claims the task and installs its cancel token under one state
+    /// lock, so observing `Running` means a cancel or shutdown now reaches a
+    /// live executor rather than a still-queued record.
+    async fn wait_for_running(
+        manager: &TaskManager,
+        task_id: &str,
+        timeout: Duration,
+    ) -> Result<TaskRecord> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let task = manager.get_task(task_id).await?;
+            if task.status == TaskStatus::Running {
+                return Ok(task);
+            }
+            if task.status.is_terminal() || std::time::Instant::now() >= deadline {
+                bail!("task {task_id} never started running: {task:?}");
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
 
     fn provider_default_model_cases() -> Vec<(&'static str, Config, &'static str)> {
         let deepseek = Config {
@@ -3602,6 +4150,634 @@ mod tests {
             .wall_time
             .saturating_add(config.execution_limits.cancel_grace);
         config
+    }
+
+    /// The fixture owns the queue timestamp; model an already settled file
+    /// directly instead of sleeping for the filesystem's coarse-mtime window.
+    async fn settle_queue_fixture(manager: &TaskManager) -> Result<()> {
+        let _transaction = manager.lock_store().await?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&manager.queue_path)?
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800))?;
+        Ok(())
+    }
+
+    async fn inspect_settled_workers(manager: &TaskManager) -> Result<()> {
+        // This deadline only detects a stuck worker. Success requires a reply
+        // from every worker, including the result of its scheduling decision.
+        let schedules =
+            tokio::time::timeout(Duration::from_secs(10), manager.inspect_workers()).await??;
+        assert_eq!(
+            schedules.len(),
+            manager.cfg.worker_count.clamp(1, MAX_WORKERS)
+        );
+        for schedule in schedules {
+            assert!(schedule.seen.is_some(), "worker must finish an empty claim");
+            assert!(
+                schedule.next_claim.is_none(),
+                "settled queue must not schedule a reload"
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-enter the constructor's worker-readiness boundary after the initial
+    /// state load, without racing the initial transaction or a wall-clock sleep.
+    async fn stop_idle_workers_for_initialization_fixture(manager: &TaskManager) {
+        let workers = std::mem::take(&mut *manager.workers.lock().await);
+        for worker in workers {
+            worker.join.abort();
+            let _ = worker.join.await;
+        }
+        assert!(!manager.cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn initial_worker_contention_acknowledges_retry_and_recovers() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (started, mut executions) = mpsc::unbounded_channel();
+        let manager = TaskManager::start_with_executor(
+            test_config(root.path().to_path_buf()),
+            Arc::new(ControlledExecutor { started }),
+        )
+        .await?;
+        stop_idle_workers_for_initialization_fixture(&manager).await;
+        let held =
+            RuntimeProcessOwnerLock::try_acquire_file(&root.path().join("task-store.lock"), true)?
+                .context("fixture must own the task store before the first worker claim")?;
+        let schedules =
+            tokio::time::timeout(Duration::from_secs(10), manager.initialize_workers(1)).await??;
+        assert_eq!(schedules.len(), 1);
+        assert!(
+            schedules[0].next_claim.is_some(),
+            "contention must schedule a retry"
+        );
+        assert!(
+            !manager.cancel_token.is_cancelled(),
+            "startup must retain the retrying worker"
+        );
+        drop(held);
+
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt(
+                "recover after startup contention",
+            ))
+            .await?;
+        let (id, finish) = tokio::time::timeout(Duration::from_secs(10), executions.recv())
+            .await?
+            .context("retrying worker must execute work after the lock is released")?;
+        assert_eq!(id, task.id);
+        finish
+            .send(())
+            .map_err(|_| anyhow!("executor stopped before release"))?;
+        tokio::time::timeout(Duration::from_secs(10), manager.inspect_workers()).await??;
+        assert_eq!(
+            manager.get_task(&task.id).await?.status,
+            TaskStatus::Completed
+        );
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_worker_corrupt_store_is_not_acknowledged_as_ready() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root.path().to_path_buf()),
+            Arc::new(MockExecutor),
+        )
+        .await?;
+        stop_idle_workers_for_initialization_fixture(&manager).await;
+        {
+            let _transaction = manager.lock_store().await?;
+            fs::write(&manager.queue_path, b"invalid queue JSON")?;
+        }
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), manager.initialize_workers(1)).await?;
+        let error = result
+            .err()
+            .context("a corrupt first claim must fail startup")?;
+        assert!(
+            !error.is::<TaskStoreBusy>(),
+            "corruption must never be retry readiness"
+        );
+        assert!(format!("{error:#}").contains("queue"));
+        assert!(manager.cancel_token.is_cancelled());
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inspection_replies_cover_every_worker_and_survive_caller_cancellation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manager = TaskManager::start_with_executor(
+            TaskManagerConfig {
+                worker_count: 3,
+                ..test_config(root.path().to_path_buf())
+            },
+            Arc::new(MockExecutor),
+        )
+        .await?;
+        // One constructor load and an acknowledged initial claim per worker.
+        // A reply from one fast worker cannot stand in for the other two.
+        assert!(manager.store_loads.load(Ordering::Relaxed) >= 4);
+        settle_queue_fixture(&manager).await?;
+        inspect_settled_workers(&manager).await?;
+
+        let sender = manager.workers.lock().await[0].inspect.clone();
+        let (reply, received) = oneshot::channel();
+        sender.send(reply).await?;
+        drop(received);
+        // The abandoned reply must not stop the worker or strand the next
+        // caller. FIFO delivery makes this receipt follow the abandoned one.
+        inspect_settled_workers(&manager).await?;
+        manager.shutdown_and_wait().await?;
+        assert!(manager.inspect_workers().await.is_err());
+        let (reply, received) = oneshot::channel();
+        assert!(sender.send(reply).await.is_err());
+        assert!(received.await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inspection_never_reports_a_failed_store_as_settled_and_can_recover() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root.path().to_path_buf()),
+            Arc::new(MockExecutor),
+        )
+        .await?;
+        let queue = fs::read(&manager.queue_path)?;
+        {
+            let _transaction = manager.lock_store().await?;
+            fs::write(&manager.queue_path, b"invalid queue JSON")?;
+        }
+        let inspected =
+            tokio::time::timeout(Duration::from_secs(10), manager.inspect_workers()).await?;
+        // If the normal timer already observed the failure, this inspection
+        // reports its retry state. Otherwise the failed claim replies Err.
+        // Neither outcome is an acknowledgement of settled storage.
+        match inspected {
+            Err(error) => assert!(format!("{error:#}").contains("queue")),
+            Ok(schedules) => {
+                assert_eq!(schedules.len(), 1);
+                assert!(schedules[0].next_claim.is_some());
+            }
+        }
+        {
+            let _transaction = manager.lock_store().await?;
+            fs::write(&manager.queue_path, queue)?;
+        }
+        settle_queue_fixture(&manager).await?;
+        inspect_settled_workers(&manager).await?;
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    /// Execution starts and ends at messages controlled by the caller, so
+    /// worker-boundary tests never infer either transition from elapsed time.
+    struct ControlledExecutor {
+        started: mpsc::UnboundedSender<(String, oneshot::Sender<()>)>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for ControlledExecutor {
+        async fn execute(
+            &self,
+            task: ExecutionTask,
+            _events: mpsc::Sender<TaskExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            let (finish, finished) = oneshot::channel();
+            if self.started.send((task.id, finish)).is_err() {
+                return TaskExecutionResult::from_reason(TaskTerminalReason::Canceled, None);
+            }
+            let reason = tokio::select! {
+                result = finished => if result.is_ok() {
+                    TaskTerminalReason::Completed
+                } else {
+                    TaskTerminalReason::Canceled
+                },
+                _ = cancel.cancelled() => TaskTerminalReason::Canceled,
+            };
+            TaskExecutionResult::from_reason(reason, None)
+        }
+    }
+
+    /// #6573: idle managers sharing one data dir must not reload the store
+    /// (and take its cross-process lock) every 200ms per worker.
+    #[tokio::test]
+    async fn idle_managers_sharing_a_store_do_not_poll_it_continuously() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = || TaskManagerConfig {
+            worker_count: 2,
+            ..test_config(root.path().to_path_buf())
+        };
+        let (started, mut executions) = mpsc::unbounded_channel();
+        let first = TaskManager::start_with_executor_in_scope(
+            config(),
+            Arc::new(ControlledExecutor { started }),
+            "first",
+        )
+        .await?;
+        let second =
+            TaskManager::start_with_executor_in_scope(config(), Arc::new(MockExecutor), "second")
+                .await?;
+        settle_queue_fixture(&first).await?;
+        for manager in [&first, &second] {
+            inspect_settled_workers(manager).await?;
+            manager.store_loads.store(0, Ordering::Relaxed);
+        }
+
+        // Each reply proves the real worker evaluated the unchanged queue.
+        // The schedule assertion also rejects a future fallback reload now,
+        // without hoping a two-second observation window catches it firing.
+        for _ in 0..10 {
+            inspect_settled_workers(&first).await?;
+            inspect_settled_workers(&second).await?;
+        }
+        let loads =
+            first.store_loads.load(Ordering::Relaxed) + second.store_loads.load(Ordering::Relaxed);
+        assert_eq!(
+            loads, 0,
+            "acknowledged idle inspections must not reload the store"
+        );
+
+        // No inspection request triggers this claim: admission's normal Notify
+        // must wake a worker. Its started message establishes that boundary.
+        let task = first
+            .add_task(NewTaskRequest::from_prompt("wake an idle worker"))
+            .await?;
+        let (id, finish) = tokio::time::timeout(Duration::from_secs(10), executions.recv())
+            .await?
+            .context("executor stopped before acknowledging start")?;
+        assert_eq!(id, task.id);
+        finish
+            .send(())
+            .map_err(|_| anyhow!("executor stopped before release"))?;
+        // The busy worker handles this request only after persisting its task's
+        // terminal result. A second worker's reply alone cannot satisfy it.
+        tokio::time::timeout(Duration::from_secs(10), first.inspect_workers()).await??;
+        assert_eq!(
+            first.get_task(&task.id).await?.status,
+            TaskStatus::Completed
+        );
+
+        first.shutdown_and_wait().await?;
+        second.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    /// #6573: the TUI task panel lists tasks every 2.5s. An unchanged store
+    /// must be answered from memory, without the cross-process lock or a
+    /// reload, while a write from another process is still seen.
+    #[tokio::test]
+    async fn repeated_listing_of_an_unchanged_store_does_not_reload_it() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let lister = TaskManager::start_with_executor_in_scope(
+            test_config(root.path().to_path_buf()),
+            Arc::new(MockExecutor),
+            "lister",
+        )
+        .await?;
+        let writer = TaskManager::start_with_executor_in_scope(
+            test_config(root.path().to_path_buf()),
+            Arc::new(MockExecutor),
+            "writer",
+        )
+        .await?;
+        let first = writer
+            .add_task(NewTaskRequest::from_prompt("first"))
+            .await?;
+        wait_for_terminal_state(&writer, &first.id, Duration::from_secs(2)).await?;
+        // Let the store's mtimes settle so a snapshot can be trusted.
+        sleep(READ_SNAPSHOT_SETTLE + Duration::from_millis(300)).await;
+        assert_eq!(lister.list_tasks(None).await?.len(), 1);
+
+        lister.store_loads.store(0, Ordering::Relaxed);
+        for _ in 0..20 {
+            assert_eq!(lister.list_tasks(None).await?.len(), 1);
+            assert_eq!(lister.counts().await?.completed, 1);
+        }
+        let loads = lister.store_loads.load(Ordering::Relaxed);
+        // Only the idle worker's fallback poll may reload in this window.
+        assert!(
+            loads <= 1,
+            "40 read-only calls on an unchanged store reloaded it {loads} times"
+        );
+
+        let second = writer
+            .add_task(NewTaskRequest::from_prompt("second"))
+            .await?;
+        assert!(
+            lister
+                .list_tasks(None)
+                .await?
+                .iter()
+                .any(|task| task.id == second.id),
+            "a write from another process must invalidate the read snapshot"
+        );
+
+        lister.shutdown_and_wait().await?;
+        writer.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    /// #6573: a task running in one process rewrites its record on every
+    /// persisted event. Those writes must not make idle workers in another
+    /// process reload the shared store on every tick.
+    #[tokio::test]
+    async fn running_task_flushes_do_not_wake_idle_workers_elsewhere() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (started, mut executions) = mpsc::unbounded_channel();
+        let busy = TaskManager::start_with_executor_in_scope(
+            test_config(root.path().to_path_buf()),
+            Arc::new(ControlledExecutor { started }),
+            "busy",
+        )
+        .await?;
+        let task = busy
+            .add_task(NewTaskRequest::from_prompt("stream status"))
+            .await?;
+        let (id, finish) = tokio::time::timeout(Duration::from_secs(10), executions.recv())
+            .await?
+            .context("executor stopped before acknowledging start")?;
+        assert_eq!(id, task.id);
+
+        let idle = TaskManager::start_with_executor_in_scope(
+            TaskManagerConfig {
+                worker_count: 2,
+                ..test_config(root.path().to_path_buf())
+            },
+            Arc::new(MockExecutor),
+            "idle",
+        )
+        .await?;
+        settle_queue_fixture(&idle).await?;
+        inspect_settled_workers(&idle).await?;
+        idle.store_loads.store(0, Ordering::Relaxed);
+
+        for chunk in 0..10 {
+            // Await the production persistence operation, then acknowledge
+            // every idle worker's inspection of the resulting store. Sending
+            // an executor event alone would not prove its write had finished.
+            let outcome = busy
+                .apply_execution_event(
+                    &task.id,
+                    TaskExecutionEvent::Status {
+                        message: format!("step {chunk}"),
+                    },
+                )
+                .await?;
+            assert!(outcome.persisted);
+            inspect_settled_workers(&idle).await?;
+        }
+        let persisted = busy.read_bound_task(&task.id)?.context("persisted task")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert_eq!(persisted.timeline.last().unwrap().summary, "step 9");
+        assert_eq!(
+            idle.store_loads.load(Ordering::Relaxed),
+            0,
+            "acknowledged task-record writes must not cause idle queue reloads"
+        );
+
+        finish
+            .send(())
+            .map_err(|_| anyhow!("executor stopped before release"))?;
+        tokio::time::timeout(Duration::from_secs(10), busy.inspect_workers()).await??;
+        assert_eq!(busy.get_task(&task.id).await?.status, TaskStatus::Completed);
+        busy.shutdown_and_wait().await?;
+        idle.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn claim_schedule_backs_off_after_failures_and_retries_on_queue_change() {
+        let fingerprint = |len| StoreFingerprint(Some((std::time::SystemTime::UNIX_EPOCH, len, 1)));
+        let start = Instant::now();
+        let mut schedule = ClaimSchedule::new(start);
+        assert!(schedule.should_claim(&fingerprint(1), start, false));
+
+        // Consecutive failures double the retry delay up to the ceiling.
+        let mut now = start;
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            let delay = schedule.claim_failed(fingerprint(1), now);
+            delays.push(delay.as_millis());
+            assert!(!schedule.should_claim(&fingerprint(1), now + delay / 2, false));
+            now += delay;
+            assert!(schedule.should_claim(&fingerprint(1), now, false));
+        }
+        assert_eq!(delays, [200, 400, 800, 1600, 3200, 6400, 8000, 8000]);
+
+        // During a backoff, a queue change or an in-process wakeup retries
+        // at once.
+        let delay = schedule.claim_failed(fingerprint(1), now);
+        assert_eq!(delay, STORE_BUSY_BACKOFF_MAX);
+        assert!(schedule.should_claim(&fingerprint(2), now, false));
+        assert!(schedule.should_claim(&fingerprint(1), now, true));
+
+        // An empty claim on a settled queue resets backoff without scheduling
+        // another scan, however long the worker stays idle.
+        schedule.found_nothing(
+            fingerprint(2),
+            now,
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+        );
+        assert!(!schedule.should_claim(&fingerprint(2), now, false));
+        assert!(!schedule.should_claim(&fingerprint(2), now + Duration::from_secs(86_400), false));
+        assert_eq!(
+            schedule.claim_failed(fingerprint(2), now),
+            STORE_REFRESH_INTERVAL
+        );
+    }
+
+    #[test]
+    fn claim_schedule_retries_unknown_or_recent_queue_metadata() {
+        let now = Instant::now();
+        let wall_now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        for fingerprint in [
+            StoreFingerprint(None),
+            StoreFingerprint(Some((wall_now, 1, 1))),
+        ] {
+            let mut schedule = ClaimSchedule::new(now);
+            schedule.found_nothing(fingerprint.clone(), now, wall_now);
+            assert!(!schedule.should_claim(&fingerprint, now, false));
+            assert!(schedule.should_claim(&fingerprint, now + STORE_IDLE_POLL_INTERVAL, false));
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_idle_workers_notice_external_queue_writes_without_notify() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (started, mut executions) = mpsc::unbounded_channel();
+        let manager = TaskManager::start_with_executor(
+            TaskManagerConfig {
+                worker_count: 2,
+                ..test_config(root.path().to_path_buf())
+            },
+            Arc::new(ControlledExecutor { started }),
+        )
+        .await?;
+        settle_queue_fixture(&manager).await?;
+        inspect_settled_workers(&manager).await?;
+
+        let mut task = sample_task_record();
+        task.status = TaskStatus::Queued;
+        task.started_at = None;
+        let mut second = task.clone();
+        second.id = "task_0123456789abcdee".into();
+        {
+            // Simulate another process's durable admission, under the real
+            // cross-process transaction lock. No local state or Notify changes.
+            let _transaction = manager.lock_store().await?;
+            manager.persist_task_locked(&task)?;
+            manager.persist_task_locked(&second)?;
+            manager.persist_queue_locked(&VecDeque::from([task.id.clone(), second.id.clone()]))?;
+        }
+        let mut started_ids = Vec::new();
+        for _ in 0..2 {
+            // No local Notify or inspection request drives these claims. Wait
+            // for executor messages proving the normal external-write path ran.
+            let (id, finish) = tokio::time::timeout(Duration::from_secs(10), executions.recv())
+                .await?
+                .context("external task was not acknowledged")?;
+            started_ids.push(id);
+            finish
+                .send(())
+                .map_err(|_| anyhow!("executor stopped before release"))?;
+        }
+        started_ids.sort();
+        let mut expected_ids = vec![task.id.clone(), second.id.clone()];
+        expected_ids.sort();
+        assert_eq!(started_ids, expected_ids);
+        tokio::time::timeout(Duration::from_secs(10), manager.inspect_workers()).await??;
+        for id in [&task.id, &second.id] {
+            assert_eq!(manager.get_task(id).await?.status, TaskStatus::Completed);
+        }
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    /// #6728: with nothing claimable, each worker rechecks the queue about once
+    /// per STORE_SETTLED_NAP rather than every STORE_REFRESH_INTERVAL. The
+    /// bound is an upper limit, so a slow machine only lowers the count.
+    #[tokio::test]
+    async fn settled_idle_workers_check_the_queue_at_the_settled_nap() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let workers = 2;
+        let manager = TaskManager::start_with_executor(
+            TaskManagerConfig {
+                worker_count: workers,
+                ..test_config(root.path().to_path_buf())
+            },
+            Arc::new(MockExecutor),
+        )
+        .await?;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        manager.fingerprint_reads.store(0, Ordering::Relaxed);
+        manager.store_loads.store(0, Ordering::Relaxed);
+
+        let window = Duration::from_secs(3);
+        sleep(window).await;
+        let reads = manager.fingerprint_reads.load(Ordering::Relaxed);
+        let loads = manager.store_loads.load(Ordering::Relaxed);
+        let ticks = (window.as_millis() / STORE_SETTLED_NAP.as_millis()) as usize + 1;
+        assert!(
+            reads <= workers * ticks,
+            "{workers} idle workers read the queue fingerprint {reads} times in {window:?}; \
+             expected at most {}",
+            workers * ticks
+        );
+        assert_eq!(loads, 0, "idle workers reloaded a settled store");
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn claim_schedule_naps_long_only_when_nothing_is_claimable() {
+        let now = Instant::now();
+        let wall_now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let settled = StoreFingerprint(Some((std::time::SystemTime::UNIX_EPOCH, 1, 1)));
+        let mut schedule = ClaimSchedule::new(now);
+        // A fresh schedule has a claim pending.
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+        schedule.found_nothing(settled.clone(), now, wall_now);
+        assert_eq!(schedule.nap(), STORE_SETTLED_NAP);
+        // A failed claim keeps the short tick so a queue change is seen early.
+        schedule.claim_failed(settled.clone(), now);
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+        // Recent or missing metadata retries on a deadline, so it stays short.
+        schedule.found_nothing(StoreFingerprint(None), now, wall_now);
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+        schedule.claimed_task(now);
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+    }
+
+    /// #6573: a busy store names the holder; an unreadable record falls back
+    /// to the bare message without failing.
+    #[test]
+    fn busy_store_error_names_the_lock_holder_when_known() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("task-store.lock");
+        let mut holder =
+            RuntimeProcessOwnerLock::try_acquire_file(&path, true)?.context("first acquire")?;
+        holder.record_holder();
+        assert!(RuntimeProcessOwnerLock::try_acquire_file(&path, true)?.is_none());
+
+        let error = store_busy_error(&path);
+        assert!(
+            error.is::<TaskStoreBusy>(),
+            "holder diagnostics must retain typed contention"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("held by pid {}", std::process::id())),
+            "{message}"
+        );
+
+        // Releasing clears the record, so a later error cannot name a stale pid.
+        drop(holder);
+        assert_eq!(
+            store_busy_error(&path).to_string(),
+            "Task store is busy; state is unavailable"
+        );
+        // Garbage and a missing file also fall back.
+        fs::write(&path, "pid=oops since_ms=\n")?;
+        assert!(RuntimeProcessOwnerLock::read_holder(&path).is_none());
+        fs::remove_file(&path)?;
+        assert!(RuntimeProcessOwnerLock::read_holder(&path).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_task_observes_durable_cancel_without_a_queue_change() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root.path().to_path_buf()),
+            Arc::new(CooperativeIdleCancelExecutor),
+        )
+        .await?;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("durable cancel"))
+            .await?;
+        wait_for_running(&manager, &task.id, Duration::from_secs(2)).await?;
+        let queue_before = StoreFingerprint::read(&manager.queue_path);
+        {
+            let _transaction = manager.lock_store().await?;
+            let mut task = manager
+                .read_bound_task(&task.id)?
+                .context("running fixture")?;
+            task.lifecycle_seq += 1;
+            task.cancel_requested_seq = task.lifecycle_seq;
+            manager.persist_task_locked(&task)?;
+        }
+        let done = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(2)).await?;
+        assert_eq!(done.status, TaskStatus::Canceled);
+        assert_eq!(StoreFingerprint::read(&manager.queue_path), queue_before);
+        manager.shutdown_and_wait().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -4228,6 +5404,7 @@ mod tests {
             allow_shell: true,
             trust_mode: false,
             auto_approve: false,
+            permission_posture: None,
             status: TaskStatus::Running,
             created_at: started_at,
             started_at: Some(started_at),
@@ -4374,14 +5551,17 @@ mod tests {
     #[tokio::test]
     async fn cancel_running_task_marks_canceled() -> Result<()> {
         let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-        let manager =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root),
+            Arc::new(CooperativeIdleCancelExecutor),
+        )
+        .await?;
 
         let task = manager
             .add_task(NewTaskRequest::from_prompt("test cancellation"))
             .await?;
 
-        sleep(Duration::from_millis(10)).await;
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
         let cancellation = manager.cancel_task(&task.id).await?;
         assert_eq!(cancellation.disposition, TaskCancelDisposition::Requested);
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
@@ -4430,6 +5610,7 @@ mod tests {
             allow_shell: None,
             trust_mode: None,
             auto_approve: None,
+            permission_posture: None,
             owner_session_id: None,
         };
         let task = manager.add_task(req).await?;
@@ -4447,6 +5628,68 @@ mod tests {
             "model-omitted trust_mode must default to false"
         );
         Ok(())
+    }
+
+    /// A task's own thread starts on the posture the request pinned, and the
+    /// posture is what the thread's policy is derived from — the legacy
+    /// `auto_approve` bit is only read when no posture is given.
+    #[tokio::test]
+    async fn add_task_pins_the_posture_its_thread_starts_on() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+
+        let task = manager
+            .add_task(NewTaskRequest {
+                permission_posture: Some("auto_review".to_string()),
+                ..NewTaskRequest::from_prompt("pin the posture")
+            })
+            .await?;
+
+        assert_eq!(task.permission_posture.as_deref(), Some("auto_review"));
+        let request = ExecutionTask::from(&task).thread_request();
+        assert_eq!(request.permission_posture.as_deref(), Some("auto_review"));
+        // `from_prompt` asks for auto-approval; the pinned posture outranks it,
+        // so the thread must not silently run wider than what was requested.
+        assert_eq!(request.auto_approve, Some(true));
+        Ok(())
+    }
+
+    /// The worker's thread projection refuses these postures, so admission
+    /// refuses them too: the request came through the Runtime API, and that
+    /// is where the refusal belongs, not in a worker after the task was
+    /// durably queued.
+    #[tokio::test]
+    async fn add_task_refuses_a_posture_the_thread_would_reject() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+
+        for posture in ["sideways", "never"] {
+            let error = manager
+                .add_task(NewTaskRequest {
+                    permission_posture: Some(posture.to_string()),
+                    ..NewTaskRequest::from_prompt("refuse me")
+                })
+                .await
+                .expect_err("a posture the thread cannot honour is refused at admission");
+            assert!(error.to_string().contains("permission posture"), "{error}");
+        }
+        assert!(manager.list_tasks(None).await?.is_empty());
+        Ok(())
+    }
+
+    /// The Runtime's `POST /v1/tasks` body may omit the posture entirely: it is
+    /// optional on the wire, and absent means "derive it from the legacy bits",
+    /// which is what every client that predates the field sends.
+    #[test]
+    fn new_task_request_accepts_a_body_without_a_posture() {
+        let request: NewTaskRequest =
+            serde_json::from_str(r#"{"prompt":"ship it","mode":"agent"}"#).expect("wire body");
+        assert!(request.permission_posture.is_none());
+        assert_eq!(request.mode.as_deref(), Some("agent"));
     }
 
     #[tokio::test]
@@ -4873,6 +6116,7 @@ mod tests {
             allow_shell: false,
             trust_mode: false,
             auto_approve: false,
+            permission_posture: None,
             status: TaskStatus::Running,
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
@@ -4898,6 +6142,30 @@ mod tests {
             tool_calls: Vec::new(),
             timeline: Vec::new(),
         }
+    }
+
+    /// Records persisted before `auto_approve` existed must load as not
+    /// auto-approved, and the thread request they build must say so.
+    #[test]
+    fn task_record_missing_auto_approve_loads_fail_closed() {
+        let mut record = sample_task_record();
+        record.auto_approve = true;
+        let mut value = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(value["auto_approve"], serde_json::json!(true));
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("auto_approve");
+        let loaded: TaskRecord = serde_json::from_value(value).expect("legacy record loads");
+        assert!(!loaded.auto_approve);
+        assert_eq!(
+            ExecutionTask::from(&loaded).thread_request().auto_approve,
+            Some(false)
+        );
+        assert_eq!(
+            ExecutionTask::from(&loaded).turn_request().auto_approve,
+            Some(false)
+        );
     }
 
     #[test]
@@ -5172,7 +6440,7 @@ mod tests {
         let task = manager
             .add_task(NewTaskRequest::from_prompt("stuck during shutdown"))
             .await?;
-        sleep(Duration::from_millis(5)).await;
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
         manager.shutdown();
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
         assert_eq!(finished.status, TaskStatus::Canceled);
@@ -5195,13 +6463,7 @@ mod tests {
             .add_task(NewTaskRequest::from_prompt("stuck during shutdown"))
             .await?;
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while manager.get_task(&task.id).await?.status != TaskStatus::Running {
-            if std::time::Instant::now() >= deadline {
-                bail!("task never started running");
-            }
-            sleep(Duration::from_millis(5)).await;
-        }
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
 
         manager.shutdown();
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
@@ -5262,18 +6524,7 @@ mod tests {
         let task = manager
             .add_task(NewTaskRequest::from_prompt("race complete after cancel"))
             .await?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let current = manager.get_task(&task.id).await?;
-            if current.status == TaskStatus::Running {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                bail!("task never started running");
-            }
-            sleep(Duration::from_millis(5)).await;
-        }
-        sleep(Duration::from_millis(5)).await;
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
         let cancellation = manager.cancel_task(&task.id).await?;
         assert_eq!(cancellation.disposition, TaskCancelDisposition::Requested);
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
@@ -5746,6 +6997,487 @@ mod tests {
         .await;
         assert_eq!(result.status, TaskStatus::Failed);
         assert_eq!(result.terminal_reason, TaskTerminalReason::IdleTimeout);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_running_tool_suppresses_idle_until_it_completes() -> Result<()> {
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let thread_id = thread.id.clone();
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_silent_tool",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_secs(5),
+                    idle_progress: Duration::from_millis(80),
+                    cancel_grace: Duration::from_millis(500),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        // Keyed by the journal item id on the started edge; the payload also
+        // carries the engine tool-use id under "tool" (which must NOT become
+        // the tracking key: the terminal events only repeat "item").
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_silent_tool"),
+                "item.started",
+                json!({
+                    "item": { "id": "item_tool_silent", "status": "in_progress" },
+                    "tool": { "id": "call_build", "name": "exec_command", "input": {} }
+                }),
+            )
+            .await?;
+
+        // A silent build produces no journal traffic for its whole window;
+        // far past the idle deadline the watchdog must still not fire.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            !seen.iter().any(|event| matches!(
+                event,
+                TaskExecutionEvent::Status { message }
+                    if message.contains("idle deadline")
+            )),
+            "idle watchdog fired while a tool was still running"
+        );
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_silent_tool"),
+                "item.completed",
+                json!({ "item": { "id": "item_tool_silent", "status": "completed" } }),
+            )
+            .await?;
+
+        // Completion drains the set; silence afterwards must let the idle
+        // deadline fire again (a drain bug would surface as WallTimeout).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(TaskExecutionEvent::Status { message })
+                        if message.contains("idle deadline") =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("task event stream closed before idle deadline"),
+                }
+            }
+        })
+        .await
+        .context("idle deadline did not fire after the tool completed")?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_silent_tool"),
+                "turn.completed",
+                json!({ "turn": { "status": "interrupted" } }),
+            )
+            .await?;
+        let result = drive.await?;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::IdleTimeout);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_running_tool_heartbeats_the_worker_watchdog() -> Result<()> {
+        // The supervisor's guard (run_task) only sees task events, so the
+        // steady-state suppression must also publish the in-flight window on
+        // the event channel — otherwise the production path still idles out
+        // even though this loop's own guard is satisfied.
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let thread_id = thread.id.clone();
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_heartbeat",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_secs(5),
+                    idle_progress: Duration::from_millis(80),
+                    cancel_grace: Duration::from_millis(500),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_heartbeat"),
+                "item.started",
+                json!({
+                    "item": { "id": "item_tool_hb", "status": "in_progress" },
+                    "tool": { "id": "call_build", "name": "exec_command", "input": {} }
+                }),
+            )
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(TaskExecutionEvent::ToolHeartbeat) => break,
+                    Some(_) => {}
+                    None => panic!("task event stream closed before any heartbeat"),
+                }
+            }
+        })
+        .await
+        .context("no ToolHeartbeat reached the worker channel while a tool was in flight")?;
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_heartbeat"),
+                "item.completed",
+                json!({ "item": { "id": "item_tool_hb", "status": "completed" } }),
+            )
+            .await?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_heartbeat"),
+                "turn.completed",
+                json!({ "turn": { "status": "completed" } }),
+            )
+            .await?;
+        let result = drive.await?;
+        assert_eq!(result.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hung_running_tool_still_hits_the_wall_budget() -> Result<()> {
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let thread_id = thread.id.clone();
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_hung_tool",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_millis(300),
+                    idle_progress: Duration::from_millis(80),
+                    cancel_grace: Duration::from_millis(500),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_hung_tool"),
+                "item.started",
+                json!({
+                    "item": { "id": "item_tool_hung", "status": "in_progress" },
+                    "tool": { "id": "call_hang", "name": "exec_command", "input": {} }
+                }),
+            )
+            .await?;
+
+        // The running-tool suppression only defers the idle watchdog; the
+        // wall-time budget remains the backstop for a tool that never
+        // completes.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(TaskExecutionEvent::Status { message })
+                        if message.contains("wall-time") =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("task event stream closed before wall deadline"),
+                }
+            }
+        })
+        .await
+        .context("wall budget did not fire during a hung tool")?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_hung_tool"),
+                "turn.completed",
+                json!({ "turn": { "status": "interrupted" } }),
+            )
+            .await?;
+        let result = drive.await?;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::WallTimeout);
+        Ok(())
+    }
+
+    /// Mirrors the fixed runtime contract: a ToolStarted edge, then a silent
+    /// window longer than the idle deadline fed only by ToolHeartbeat, then
+    /// completion. Pins the supervisor side of the heartbeat chain — the
+    /// worker idle watchdog must count heartbeats as progress.
+    ///
+    /// Margins: heartbeats every 30 ms across a 1.2 s window against a 500 ms
+    /// idle deadline. The window still outlasts the deadline (so the test
+    /// fails if heartbeats stop counting), while a loaded runner would need a
+    /// half-second stall to starve it; the 150 ms default deadline did starve
+    /// on hosted Windows.
+    struct ToolHeartbeatExecutor;
+
+    const HEARTBEAT_TEST_IDLE_PROGRESS: Duration = Duration::from_millis(500);
+    const HEARTBEAT_TEST_TICKS: u32 = 40;
+
+    #[async_trait]
+    impl TaskExecutor for ToolHeartbeatExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            events: mpsc::Sender<TaskExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            let _ = events
+                .send(TaskExecutionEvent::ToolStarted {
+                    id: "tool_hb".to_string(),
+                    name: "exec_command".to_string(),
+                    input: serde_json::json!({}),
+                })
+                .await;
+            for _ in 0..HEARTBEAT_TEST_TICKS {
+                sleep(Duration::from_millis(30)).await;
+                if cancel.is_cancelled() {
+                    return TaskExecutionResult {
+                        status: TaskStatus::Canceled,
+                        result_text: None,
+                        error: None,
+                        terminal_reason: TaskTerminalReason::Canceled,
+                    };
+                }
+                let _ = events.send(TaskExecutionEvent::ToolHeartbeat).await;
+            }
+            let _ = events
+                .send(TaskExecutionEvent::ToolCompleted {
+                    id: "tool_hb".to_string(),
+                    name: "exec_command".to_string(),
+                    success: true,
+                    output: "build ok".to_string(),
+                    metadata: None,
+                })
+                .await;
+            TaskExecutionResult {
+                status: TaskStatus::Completed,
+                result_text: Some("done".to_string()),
+                error: None,
+                terminal_reason: TaskTerminalReason::Completed,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_supervisor_honors_tool_heartbeats_during_silent_tools() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = short_test_config(root.path().to_path_buf());
+        config.execution_limits.wall_time = Duration::from_secs(5);
+        config.execution_limits.idle_progress = HEARTBEAT_TEST_IDLE_PROGRESS;
+        let manager =
+            TaskManager::start_with_executor(config, Arc::new(ToolHeartbeatExecutor)).await?;
+
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("silent build with heartbeats"))
+            .await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
+        assert_eq!(
+            finished.status,
+            TaskStatus::Completed,
+            "heartbeats from a silent in-flight tool must keep the worker idle watchdog fed"
+        );
+        assert!(
+            !finished
+                .timeline
+                .iter()
+                .any(|entry| entry.summary.contains("heartbeat")),
+            "heartbeats are supervisor-side liveness only and must not surface on the timeline"
+        );
+        Ok(())
+    }
+
+    struct ExposedTaskEventsExecutor {
+        ready: mpsc::UnboundedSender<mpsc::Sender<TaskExecutionEvent>>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for ExposedTaskEventsExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            events: mpsc::Sender<TaskExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            let _ = self.ready.send(events);
+            cancel.cancelled().await;
+            TaskExecutionResult::from_reason(TaskTerminalReason::Canceled, None)
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_heartbeat_is_liveness_only_and_never_persists() -> Result<()> {
+        // Drive the actual supervisor beyond both persistence triggers: more
+        // heartbeats than the pending-event cap, then an idle debounce window.
+        let root = tempfile::tempdir()?;
+        let config = test_config(root.path().to_path_buf());
+        let debounce = config.execution_limits.persist_debounce;
+        assert!(EVENT_CATCHUP_POLL < debounce);
+        let (ready, mut receiver) = mpsc::unbounded_channel();
+        let manager =
+            TaskManager::start_with_executor(config, Arc::new(ExposedTaskEventsExecutor { ready }))
+                .await?;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("heartbeat persistence pin"))
+            .await?;
+        let events = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .context("task never reached its executor")?
+            .context("executor did not expose its event channel")?;
+        let path = manager.tasks_dir.join(format!("{}.json", task.id));
+        let before_bytes = fs::read(&path)?;
+        let before_fingerprint = StoreFingerprint::read(&path);
+        let before_loads = manager.store_loads.load(Ordering::Relaxed);
+        let running: TaskRecord = serde_json::from_slice(&before_bytes)?;
+        assert_eq!(running.status, TaskStatus::Running);
+
+        for _ in 0..TASK_EVENT_CHANNEL_CAPACITY + 8 {
+            events.send(TaskExecutionEvent::ToolHeartbeat).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.capacity() != TASK_EVENT_CHANNEL_CAPACITY {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .context("supervisor did not consume the heartbeat burst")?;
+        sleep(debounce * 3).await;
+        assert_eq!(
+            manager.store_loads.load(Ordering::Relaxed),
+            before_loads,
+            "heartbeats must not even reload the persistent task store"
+        );
+        assert!(
+            !manager
+                .state
+                .lock()
+                .await
+                .pending_events
+                .contains_key(&task.id),
+            "heartbeats must not enter the pending persistence queue"
+        );
+        assert_eq!(fs::read(&path)?, before_bytes);
+        assert_eq!(
+            StoreFingerprint::read(&path),
+            before_fingerprint,
+            "heartbeat traffic must not rewrite even byte-identical task records"
+        );
+
+        // Keep the production heartbeat cadence faster than the default 250ms
+        // debounce until a real delta is saved. Neither the beats nor the
+        // supervisor's ownership-poll wakes may restart its persistence window.
+        events.try_send(TaskExecutionEvent::MessageDelta {
+            content: "real progress survives".to_string(),
+        })?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut heartbeat = tokio::time::interval(EVENT_CATCHUP_POLL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                heartbeat.tick().await;
+                events.send(TaskExecutionEvent::ToolHeartbeat).await?;
+                let saved: TaskRecord = serde_json::from_slice(&fs::read(&path)?)?;
+                if saved.timeline.iter().any(|entry| {
+                    entry.kind == "message" && entry.summary == "real progress survives"
+                }) {
+                    break Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await
+        .context("continuous heartbeats starved the real delta's persistence deadline")??;
+
+        // An urgent edge flushes a newly dirty delta as well as its own data,
+        // then clears that delta's outstanding deadline.
+        events.try_send(TaskExecutionEvent::MessageDelta {
+            content: "urgent progress survives".to_string(),
+        })?;
+        events.try_send(TaskExecutionEvent::ToolStarted {
+            id: "item-1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        })?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let saved: TaskRecord = serde_json::from_slice(&fs::read(&path)?)?;
+                if saved
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.id == "item-1" && call.status == TaskToolStatus::Running)
+                {
+                    assert!(
+                        saved
+                            .timeline
+                            .iter()
+                            .any(|entry| entry.kind == "tool_started")
+                    );
+                    assert!(saved.timeline.iter().any(|entry| {
+                        entry.kind == "message" && entry.summary == "urgent progress survives"
+                    }));
+                    assert!(
+                        !saved
+                            .timeline
+                            .iter()
+                            .any(|entry| entry.summary.contains("heartbeat"))
+                    );
+                    break Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .context("real tool lifecycle edge was not persisted")??;
+        assert_ne!(StoreFingerprint::read(&path), before_fingerprint);
+        let after_urgent = StoreFingerprint::read(&path);
+        sleep(debounce * 2).await;
+        assert_eq!(
+            StoreFingerprint::read(&path),
+            after_urgent,
+            "successful urgent persistence must not leave a pending write deadline"
+        );
+        manager.shutdown_and_wait().await?;
         Ok(())
     }
 

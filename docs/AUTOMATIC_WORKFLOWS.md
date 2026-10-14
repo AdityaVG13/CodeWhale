@@ -1,5 +1,7 @@
 # Automatic Workflows
 
+> 阅读简体中文版：[zh_hans/AUTOMATIC_WORKFLOWS.md](zh_hans/AUTOMATIC_WORKFLOWS.md)。
+
 You do **not** need to write a `.workflow.js` file to coordinate agents. Operate
 handles small or tightly coupled work directly. Multi-step delegation starts
 with a compact Workflow plan: named steps, dependencies, bounded scopes, and
@@ -47,7 +49,7 @@ request orchestration explicitly.
 | `automatic` | `true` | Soft-auto orchestration is enabled |
 | `auto_start_read_only` | `true` | Read-only plans may start without a write-approval card |
 | `require_approval_for_writes` | `true` | Gates the plan-approval card for writes / elevated starts |
-| `max_children` / `max_concurrent` / `max_depth` | `1000` / `16` / `5` | Task count, concurrent children, and plan structure ceilings |
+| `max_children` / `max_concurrent` / `max_depth` | `1000` / `16` / `5` | Task count, concurrent children, and plan-structure (IR shape, not spawn depth) ceilings. The Runtime child-delegation budget (default 3, hard ceiling 8) is a separate quantity with an overlapping name; see `docs/SUBAGENTS.md`. |
 | `default_token_budget` | `0` | Shared admission cap for a run and its children; `0` = none — set it or pass `token_budget` on the call to bound spend |
 
 Elevated work (writes, shell beyond read-only, network, secrets, worktrees, high
@@ -60,9 +62,14 @@ Writes inside a running VM `task()` step are the VM runtime contract
 for each child write.
 
 Worktree isolation and write ownership are separate. A write-capable `task()`
-declares `writeAuthority: "workspace_write"` or `"worktree_write"` plus at
-least one repo-relative `writeRoots`, `exactFiles`, or
-`coordinationContracts` value. `worktree: true` selects isolation but does not
+(`type: "implementer"`, or `writeAuthority: "workspace_write"` /
+`"worktree_write"`) may declare repo-relative `writeRoots`, `exactFiles`, or
+`coordinationContracts`; with none, the spawn boundary claims its
+`deliverables`, or else the workspace root (`.`), exactly as a plain Agent
+spawn does. The coordination ledger refuses a second live writer whose claim
+overlaps, so when a script fans out parallel writers in one checkout it should
+give each one disjoint `writeRoots` or `exactFiles`. Read-only roles cannot
+declare write authority. `worktree: true` selects isolation but does not
 silently grant mutation authority. A prompt-only general task is read-only.
 `dependencies` and `acceptance` carry bounded child-specific prerequisites and
 observable completion checks; they are not a parent-transcript copy.

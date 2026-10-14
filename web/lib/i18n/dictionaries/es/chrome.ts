@@ -12,10 +12,6 @@ import type { ChromeDict } from "../types";
  * Auto-Review / Full Access) under "postura de permisos", `Runtime`,
  * `fleet`, and `Workflow` stay literal product nouns, and "receipt" is
  * "recibo".
- *
- * Secondary nav labels pair the Spanish primary with the short English
- * label, the pattern every non-English locale uses; the Han pair is the
- * English edition's own device.
  */
 export const chrome: ChromeDict = {
   navDocs: "Documentación",
@@ -25,22 +21,12 @@ export const chrome: ChromeDict = {
   navCommunity: "Comunidad",
   navContribute: "Contribuir",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
+  navFeatures: "Capacidades",
   navProduct: "Producto",
   navModels: "Modelos",
   navPlugins: "Plugins",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Saltar al contenido principal",
-
 
   navPrimaryAria: "Navegación principal",
   navHomeAria: "Inicio de Codewhale",
@@ -48,30 +34,8 @@ export const chrome: ChromeDict = {
   installCta: "Instalar →",
 
   authSignIn: "Iniciar sesión",
-  authRegister: "Crear cuenta",
-  authGroupAria: "Cuenta",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "cualquier modelo, en tu máquina",
-
-  issueLabel: "Edición {date}",
   dateLocale: "es-419",
-
-  starsAria: "Estrellas en GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "En vivo",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "fusionado",
-  tickerOpened: "abierto",
-  tickerClosed: "cerrado",
-  tickerReleased: "publicado",
-  tickerFirstContribution: "primera contribución",
-  tickerBy: "por {handle}",
-  tickerAria: "Actividad reciente del repositorio",
-
-  traceLabel: "traza de razonamiento",
-  traceTabsAria: "Extractos de sesión",
 
   menuOpen: "Abrir menú",
   menuClose: "Cerrar menú",
@@ -79,11 +43,11 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "claro",
   themeDark: "oscuro",
-  themeAria: "Tema de la documentación: {mode} (clic para alternar)",
-  themeTitle: "Tema de la documentación · auto / claro / oscuro",
+  themeAria: "Tema: {mode} (clic para alternar)",
+  themeTitle: "Tema · auto / claro / oscuro",
 
   footerTagline:
-    "Crea lo que quieras y automatiza el trabajo cotidiano con los modelos que elijas.",
+    "Crea aplicaciones y automatiza el trabajo con tus modelos y herramientas conectadas.",
   footerProduct: "Producto",
   footerProject: "Proyecto",
   footerDocs: "Documentación",

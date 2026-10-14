@@ -15,7 +15,7 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `F3`                 | Open the provider/model picker (same as `/provider`)          |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
 | `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
-| `Ctrl-B`             | Move a supported foreground shell wait into `/jobs` so the turn can continue; use `/jobs` or `Bash` with `action: "wait"` to inspect it |
+| `Ctrl-B`             | Release the current shell wait so the turn can continue; foreground commands move into `/jobs`, and background tasks keep running. Use `/jobs` or `Bash` with `action: "wait"` to inspect output |
 | `Ctrl-D`             | Quit (only when the composer is empty)                         |
 | `Tab`                | When the composer is empty, cycle TUI mode: Plan → Work → Operate → Plan |
 | `Shift+Tab`          | Cycle permission posture: Ask → Auto-Review → Full Access. Live regardless of composer contents or whether a turn is running (suppressed only while a modal other than Config is open) |
@@ -25,10 +25,10 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `Ctrl-L`             | Compact the conversation context (status line shows progress; no-op while a compaction is already running) |
 | `Ctrl-O`             | Open the reasoning detail for the selected or current turn, regardless of composer contents |
 | `Ctrl-Alt-O`         | Open the whole-turn Turn Inspector, regardless of composer contents |
-| `Alt-V` / `Option-V` (macOS) | Open the details pager for the selected, visible, or most recent tool/sub-agent card; terminals that emit the legacy Option-V glyph are also handled |
+| `Alt-V` / `Option-V` (macOS) | Open the details pager for the selected tool/sub-agent card; with nothing selected, the live inspector of the newest running shell, else the visible or most recent card; terminals that emit the legacy Option-V glyph are also handled |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | Toggle the file tree in the workbar                   |
-| `Ctrl-]` or `Ctrl-Tab` | Cycle the work dock: TODO → Agents → Jobs → Background. `Ctrl-]` is the portable chord — `Ctrl-Tab` only arrives under the kitty keyboard protocol |
-| `Ctrl-Shift-Tab`     | Cycle the work dock backwards                                  |
+| `Ctrl-]` or `Ctrl-Tab` | Cycle the pet view while the pet main view is showing; otherwise cycle the work dock: TODO → Agents → Jobs → Background. `Ctrl-]` is portable; `Ctrl-Tab` requires the kitty keyboard protocol. Terminal.app uses it to switch terminal tabs |
+| `Ctrl-Shift-Tab`     | Cycle the pet view or work dock backwards where the terminal sends the kitty keyboard chord. Terminal.app uses it to switch terminal tabs |
 | `Alt-G` / `Alt-Shift-G` | Scroll transcript to top / bottom when the composer is empty |
 | `Alt-1`-`Alt-8`      | Dispatch Hotbar slots 1-8 when no modal or inline picker is open |
 | `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` | Select the workbar panel: Tasks / Agents / Context / Files |
@@ -64,6 +64,7 @@ Editing the message you're about to send.
 | `Cmd-V` / `Ctrl-Shift-V`    | Terminal-local paste (arrives as bracketed paste when supported) |
 | `Ctrl-V`                    | Direct graphical clipboard paste; rich composer content becomes Markdown |
 | `Ctrl-Y`                    | Yank (paste) from kill buffer                           |
+| `Ctrl-X`                    | Cut the selection. The text is deleted only when a native clipboard confirmed the copy; over SSH or tmux, where only the terminal clipboard (OSC 52) takes it and never confirms, the text is copied and kept |
 | `↑` / `↓`                   | Cycle composer history (also selects popup/attachment items) |
 | `Shift-↑` / `Shift-↓`       | Browse conversation history                              |
 | `Ctrl-P` / `Ctrl-N`         | Navigate slash-command menu entries; `Ctrl-P` opens the file picker when the menu is empty |
@@ -164,7 +165,7 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 | `Alt-G` / `Alt-Shift-G` | Jump to top / bottom                            |
 | `Ctrl-Home` / `Ctrl-End` | Jump to top / bottom (also works from the composer)  |
 | `Alt-[` / `Alt-]`    | Jump between tool output blocks                     |
-| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds) |
+| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds). Rewinds the conversation only; files are not changed, and `/undo` puts them back |
 | `Esc`                | Return focus to composer                           |
 | `Ctrl-Y`             | With an empty composer, copy the focused transcript cell |
 | `Alt-V`              | Open raw detail for the focused tool or message    |
@@ -206,7 +207,7 @@ The mouse is a first-class input. Every row here is wired in
 | Wheel up / down      | Scroll the transcript; over the composer, move the cursor a line at a time |
 | Click                | Activate the row, chip, or tool block under the pointer |
 | Drag                 | Select transcript text, or drag the scrollbar       |
-| Right click          | Open context actions for paste, selection, message details, context, and help |
+| Right click          | Act on what is under the pointer: copy, paste, open details or a `file:line` in your editor, focus or stop an agent. Letters and digits shown in the menu run their row. A stop is confirmed in place: the first Enter or click arms it, and Enter or a click after the double-click window runs it. A letter only arms it, and the second click of a double-click is ignored |
 
 Hover feedback follows the same rule: anything that responds to a click
 highlights under the pointer. A row that highlights but does nothing, or acts
@@ -319,3 +320,13 @@ then `Enter` to submit or `Esc` to return to the options without sending.
 - **Bare Up/Down arrows scroll transcript when composer empty (v0.8.13).** Previously the `should_scroll_with_arrows` gate was hardcoded to false, meaning bare arrows always navigated composer history even when the composer was empty. Users in virtual terminals (Ghostty, Codex, Kitty-protocol) were especially affected because they couldn't use Cmd+Up / Alt+Up shortcuts.
 - **Configurable keymap (#436) and `tui.toml` (#437) remain deferred.** The `TuiPrefs` struct and loader exist in `settings.rs` but are not wired at startup. The named-binding registry that would let `~/.codewhale/tui.toml` override individual entries is still pending.
 - **No other broken bindings found.** Every other chord listed above resolves to a live handler in `crates/tui/src/tui/ui.rs` (key-event dispatch) or `crates/tui/src/tui/app.rs` (mode + state transitions).
+
+## Live Terminal dock
+
+In `/workbar terminal`, click the dock or press `Alt+W` to focus it. Typing,
+Enter, Tab and Ctrl+C reach the selected shell. Esc returns to the composer.
+`Alt+Down` / `Alt+Up` switch sessions; `Ctrl+N` starts a fresh shell.
+Mouse-wheel and PageUp/PageDown scroll output.
+
+See the [Terminal dock guide](GUIDE.md#live-terminal-dock) for permission
+boundaries, paste behavior and supported platforms.

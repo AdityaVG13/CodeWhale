@@ -1,5 +1,7 @@
 # User Memory
 
+> 阅读简体中文版：[zh_hans/MEMORY.md](zh_hans/MEMORY.md)。
+
 User memory gives the model a small, persistent, local store of
 preferences and conventions that should survive across sessions —
 "I prefer pytest over unittest", "this codebase uses 4-space
@@ -51,7 +53,7 @@ re-roots to `~/.codewhale/memory/`:
 ```
 
 The scope directory is `workspace` (singular) — `MemoryScope::directory`,
-`crates/tui/src/native_memory.rs:31-36`. The index filename is
+`crates/runtime/src/native_memory.rs:31-36`. The index filename is
 `index.sqlite3` (`native_memory.rs:175`).
 
 Markdown is the durable source of truth; `index.sqlite3` is a disposable
@@ -193,7 +195,7 @@ its failure rather than silently send notes to another backend.
 A future first-class backend must cover capture, search, correction, deletion,
 scope and error reporting across every memory entry point. It must also keep
 volatile recall in append-only history under the cache contract above. That
-complete migration is tracked in [#6050](https://github.com/Hmbown/CodeWhale/issues/6050);
+complete migration is tracked in [#6050](https://github.com/codewhale-hq/CodeWhale/issues/6050);
 0.9.13 does not claim that migration or a commercial memory integration.
 
 ## Configuration reference
@@ -217,5 +219,5 @@ enabled = true                    # default false; or set DEEPSEEK_MEMORY=on
 - `docs/SUBAGENTS.md` — sub-agents inherit memory and can use the
   `remember` tool too.
 - `docs/CONFIGURATION.md` — full config reference.
-- Issue [#489](https://github.com/Hmbown/CodeWhale/issues/489)
+- Issue [#489](https://github.com/codewhale-hq/CodeWhale/issues/489)
   — phase-1 EPIC tracking the work.

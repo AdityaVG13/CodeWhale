@@ -1,6 +1,6 @@
 //! `/fork` command — interactive picker (#576) + direct fork.
 
-use super::CommandResult;
+use super::{CommandResult, transition_blocked_message};
 
 use codewhale_command_contract::facets::CommandSessionLifecycleContext;
 use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
@@ -67,10 +67,10 @@ pub(in crate::commands) fn fork_portable(
             );
         }
         if lifecycle.transition_blocked() {
-            return CommandResult::error(
-                "Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first."
-                    .to_string(),
-            );
+            return CommandResult::error(transition_blocked_message(
+                "fork a session",
+                &lifecycle.transition_blockers(),
+            ));
         }
         return match lifecycle.fork_from(a) {
             Ok(receipt) => CommandResult::with_message_and_action(
@@ -78,16 +78,16 @@ pub(in crate::commands) fn fork_portable(
                     "Forked session {} -> {} (spawn_depth {})",
                     receipt.parent_label, receipt.fork_label, receipt.spawn_depth
                 ),
-                super::sync_session_action(receipt.sync),
+                codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
             ),
             Err(error) => CommandResult::error(error),
         };
     }
     if lifecycle.transition_blocked() {
-        return CommandResult::error(
-            "Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first."
-                .to_string(),
-        );
+        return CommandResult::error(transition_blocked_message(
+            "fork a session",
+            &lifecycle.transition_blockers(),
+        ));
     }
     match lifecycle.fork_active() {
         Ok(receipt) => CommandResult::with_message_and_action(
@@ -95,7 +95,7 @@ pub(in crate::commands) fn fork_portable(
                 "Forked session {} -> {}",
                 receipt.parent_label, receipt.fork_label
             ),
-            super::sync_session_action(receipt.sync),
+            codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
         ),
         Err(error) => CommandResult::error(error),
     }

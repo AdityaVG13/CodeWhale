@@ -18,16 +18,10 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::skills::{
-    MAX_SKILL_DESCRIPTION_CHARS, Skill, SkillDiscoveryMode, SkillSource,
-    discover_for_workspace_and_dir_with_mode_and_plugins,
+    Skill, SkillDiscoveryMode, SkillSource, discover_for_workspace_and_dir_with_mode_and_plugins,
     discover_in_workspace_with_mode_and_plugins, skill_directories_for_workspace_and_dir,
     skills_directories_for_mode,
 };
-
-/// Max rows in a `load_skill` listing. Past this an unbounded dump costs
-/// more than it routes; the overflow line keeps the count honest and
-/// every skill stays loadable by exact name.
-const LOAD_SKILL_LIST_MAX_ROWS: usize = 100;
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -42,10 +36,11 @@ impl ToolSpec for LoadSkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Load a skill (SKILL.md body + companion file list) into the next turn's context. \
-         Use name=\"list\" to discover the complete enabled catalogue, then load an exact \
-         skill when the user names it or the task clearly matches its description. Faster \
-         than File action=\"read\" plus File action=\"list\"."
+        "Load a named skill's SKILL.md body and companion file list into this turn. Use when \
+         the user names a skill, or when an entry in the system prompt's `## Skills` index \
+         matches the task -- load it before starting the work, not after. Pass query=\"...\" to \
+         search names and descriptions, or name=\"list\" for the whole catalogue. Resolves \
+         global and plugin skills that `read` cannot reach."
     }
 
     fn input_schema(&self) -> Value {
@@ -55,6 +50,10 @@ impl ToolSpec for LoadSkillTool {
                 "name": {
                     "type": "string",
                     "description": "Skill id to load. Omit or pass \"list\" to see all available skills."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search term matched against skill names and descriptions. Use when the index was truncated or no name is known."
                 }
             },
             "additionalProperties": false
@@ -87,8 +86,7 @@ impl ToolSpec for LoadSkillTool {
         // tool's lookup mirrors what the system-prompt skills block
         // already lists, so the model never asks for a name it
         // can't find.
-        let discovery_mode =
-            SkillDiscoveryMode::from_codewhale_only(context.skills_scan_codewhale_only);
+        let discovery_mode = context.skills_discovery_mode;
         let registry = if let Some(skills_dir) = context.skills_dir.as_deref() {
             discover_for_workspace_and_dir_with_mode_and_plugins(
                 &context.workspace,
@@ -105,23 +103,51 @@ impl ToolSpec for LoadSkillTool {
         }
         .into_enabled();
 
-        // Listing mode: empty name, "*", or "list" returns the registry (#4651),
-        // capped at LOAD_SKILL_LIST_MAX_ROWS with descriptions shortened to
-        // the same ceiling the prompt index uses.
-        if name.is_empty() || name == "*" || name == "list" {
-            let skills = registry.list();
+        // Listing mode: empty name, "*", or "list" returns the full registry (#4651).
+        // A `query` filters that listing over the same routing metadata the
+        // ambient index carries, so a truncated index does not force the model
+        // to pull every skill to find one.
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if !query.is_empty() || name.is_empty() || name == "*" || name == "list" {
+            let all = registry.list();
+            let skills: Vec<&_> = all
+                .iter()
+                .filter(|skill| skill.invocation.model_invocable())
+                .filter(|skill| {
+                    query.is_empty()
+                        || skill.name.to_lowercase().contains(&query)
+                        || skill.description.to_lowercase().contains(&query)
+                })
+                .collect();
             if skills.is_empty() {
-                return Ok(ToolResult::success("No skills installed."));
+                return Ok(ToolResult::success(if query.is_empty() {
+                    "No skills installed.".to_string()
+                } else {
+                    format!("No skill matches {query:?}. Pass name=\"list\" for the catalogue.")
+                }));
             }
-            let mut listing = format!("Available skills ({}):\n", skills.len());
-            for skill in skills.iter().take(LOAD_SKILL_LIST_MAX_ROWS) {
-                let description = skill.description.trim();
+            let mut listing = if query.is_empty() {
+                format!("Available skills ({}):\n", skills.len())
+            } else {
+                format!("Skills matching {:?} ({}):\n", query, skills.len())
+            };
+            for (index, skill) in skills.iter().enumerate() {
+                let description = if index < 100 {
+                    skill.description.trim()
+                } else {
+                    ""
+                };
                 if description.is_empty() {
                     listing.push_str(&format!("  - {}\n", skill.name));
                 } else {
                     let capped: String = description
                         .chars()
-                        .take(MAX_SKILL_DESCRIPTION_CHARS)
+                        .take(crate::skills::MAX_SKILL_DESCRIPTION_CHARS)
                         .collect();
                     let marker = if capped.len() < description.len() {
                         "…"
@@ -131,17 +157,16 @@ impl ToolSpec for LoadSkillTool {
                     listing.push_str(&format!("  - {} — {capped}{marker}\n", skill.name));
                 }
             }
-            if skills.len() > LOAD_SKILL_LIST_MAX_ROWS {
-                listing.push_str(&format!(
-                    "  ... and {} more installed; load any by exact name.\n",
-                    skills.len() - LOAD_SKILL_LIST_MAX_ROWS
-                ));
-            }
             return Ok(ToolResult::success(listing));
         }
 
         let Some(skill) = registry.get(name) else {
-            let available: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
+            let available: Vec<&str> = registry
+                .list()
+                .iter()
+                .filter(|s| s.invocation.model_invocable())
+                .map(|s| s.name.as_str())
+                .collect();
             let hint = if available.is_empty() {
                 let dirs: Vec<String> = context
                     .skills_dir
@@ -160,7 +185,7 @@ impl ToolSpec for LoadSkillTool {
                     .map(|p| p.display().to_string())
                     .collect();
                 if dirs.is_empty() {
-                    if context.skills_scan_codewhale_only {
+                    if context.skills_discovery_mode == SkillDiscoveryMode::CodeWhaleOnly {
                         "no skills directories found; install skills under `<workspace>/.codewhale/skills/<name>/SKILL.md` or `~/.codewhale/skills/<name>/SKILL.md`"
                             .to_string()
                     } else {
@@ -179,7 +204,17 @@ impl ToolSpec for LoadSkillTool {
             return Err(ToolError::execution_failed(hint));
         };
 
-        ensure_reviewed_plugin_skill_is_current(skill, &context.workspace)?;
+        if !skill.invocation.model_invocable() {
+            return Err(ToolError::execution_failed(format!(
+                "Skill `{}` does not allow model invocation; ask the user to invoke an enabled skill explicitly",
+                skill.name
+            )));
+        }
+        ensure_reviewed_plugin_skill_is_current_for(
+            skill,
+            &context.workspace,
+            context.plugin_registry.as_deref(),
+        )?;
         ensure_native_skill_file_present(skill)?;
         let body = format_skill_body(skill);
         let (skill_path, skill_source) = match &skill.source {
@@ -225,36 +260,23 @@ fn ensure_native_skill_file_present(skill: &Skill) -> Result<(), ToolError> {
     Err(ToolError::execution_failed(message))
 }
 
+#[cfg(test)]
 fn ensure_reviewed_plugin_skill_is_current(
     skill: &Skill,
     workspace: &std::path::Path,
 ) -> Result<(), ToolError> {
-    let SkillSource::Plugin {
-        plugin_name,
-        authority,
-        ..
-    } = &skill.source
-    else {
+    ensure_reviewed_plugin_skill_is_current_for(skill, workspace, None)
+}
+fn ensure_reviewed_plugin_skill_is_current_for(
+    skill: &Skill,
+    workspace: &std::path::Path,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> Result<(), ToolError> {
+    let Some(provenance) = skill.source.provenance() else {
         return Ok(());
     };
-
-    if authority.workspace != workspace {
-        return Err(ToolError::execution_failed(format!(
-            "Plugin skill `{}` belongs to a different workspace and was denied",
-            skill.name
-        )));
-    }
-
-    crate::plugins::registry::verify_plugin_component_authority(
-        authority,
-        crate::plugins::activation::PluginActivationCapability::Skills,
-    )
-    .map_err(|reason| {
-        ToolError::execution_failed(format!(
-            "Plugin skill `{}` was denied: {reason}. Run `/plugin reload`, inspect `/plugin show {plugin_name}`, then repeat the displayed trust command and enable it before retrying",
-            skill.name
-        ))
-    })
+    provenance.verify_for(workspace,plugins).map_err(|reason| ToolError::execution_failed(format!(
+        "Plugin skill `{}` was denied: {reason}. Reload and select the skill again before retrying", skill.name)))
 }
 
 /// Render the skill body the model will see. Includes the description
@@ -271,6 +293,8 @@ fn format_skill_body(skill: &Skill) -> String {
     let invocation = match skill.invocation {
         crate::skills::SkillInvocation::ModelAndUser => "model+user",
         crate::skills::SkillInvocation::ExplicitOnly => "explicit-only",
+        crate::skills::SkillInvocation::ModelOnly => "model-only",
+        crate::skills::SkillInvocation::Disabled => "disabled",
     };
     out.push_str(&format!("Invocation: `{invocation}`\n"));
     if !skill.aliases.is_empty() {
@@ -295,7 +319,7 @@ fn format_skill_body(skill: &Skill) -> String {
     if !companions.is_empty() {
         out.push_str("\n## Companion files\n\n");
         out.push_str(
-            "Sibling files in the skill directory. Open one with File action=\"read\" when the task requires it; a skill stored outside the workspace has to be read through Bash instead.\n\n",
+            "Sibling files in the skill directory. Open one with `read` (path=...) when the task requires it; a skill stored outside the workspace has to be read through `bash` instead.\n\n",
         );
         for path in &companions {
             out.push_str(&format!("- `{}`\n", path.display()));
@@ -411,11 +435,13 @@ mod tests {
         let tmp = tempdir().unwrap();
         let missing = tmp.path().join("delegate").join("SKILL.md");
         let skill = Skill {
+            legacy_activation_name: None,
             name: "delegate".to_string(),
             description: "delegate work".to_string(),
             localized_descriptions: std::collections::HashMap::new(),
             invocation: crate::skills::SkillInvocation::ModelAndUser,
             aliases: Vec::new(),
+            argument_hint: None,
             body: "cached body".to_string(),
             path: missing.clone(),
             source: SkillSource::Native,
@@ -444,6 +470,7 @@ mod tests {
         plugin.source = SkillSource::Plugin {
             plugin_id: "workspace/1/demo".to_string(),
             plugin_name: "demo".to_string(),
+            native_registration: None,
             authority: Box::new(crate::plugins::types::PluginAuthority {
                 plugin_id: crate::plugins::types::PluginId("workspace/1/demo".to_string()),
                 plugin_name: "demo".to_string(),
@@ -466,16 +493,19 @@ mod tests {
         fs::write(&skill_path, "changed on disk").unwrap();
         fs::write(tmp.path().join("companion.txt"), "changed companion").unwrap();
         let skill = Skill {
+            legacy_activation_name: None,
             name: "demo:hello".to_string(),
             description: "hello".to_string(),
             localized_descriptions: std::collections::HashMap::new(),
             invocation: crate::skills::SkillInvocation::ModelAndUser,
             aliases: Vec::new(),
+            argument_hint: None,
             body: "reviewed body".to_string(),
             path: skill_path.clone(),
             source: SkillSource::Plugin {
                 plugin_id: "workspace/123/demo".to_string(),
                 plugin_name: "demo".to_string(),
+                native_registration: None,
                 authority: Box::new(crate::plugins::types::PluginAuthority {
                     plugin_id: crate::plugins::types::PluginId("workspace/123/demo".to_string()),
                     plugin_name: "demo".to_string(),
@@ -567,6 +597,13 @@ mod tests {
         let body = format_skill_body(skill);
         assert!(body.contains("## Companion files"));
         assert!(body.contains("helper.sh"));
+        // Companion guidance names the model-visible tools only.
+        assert!(body.contains("`read` (path=...)"), "{body}");
+        assert!(body.contains("`bash`"), "{body}");
+        assert!(
+            !body.contains("File action=") && !body.contains("through Bash"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -592,6 +629,7 @@ mod tests {
         let _cw_home =
             crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         let skills_dir = workspace.join(".codewhale").join("skills");
         write_skill(&skills_dir, "alpha-skill", "First demo skill", "Body A.");
         write_skill(&skills_dir, "beta-skill", "", "Body B.");
@@ -626,53 +664,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_listing_caps_rows_and_descriptions_honestly() {
-        let _lock = crate::test_support::lock_test_env();
-        let tmp = tempdir().unwrap();
-        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("home"));
-        let _cw_home =
-            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
-        let workspace = tmp.path().to_path_buf();
-        let skills_dir = workspace.join(".codewhale").join("skills");
-        let long = "d".repeat(500);
-        for index in 0..105 {
-            let description = if index == 0 { long.as_str() } else { "Short." };
-            write_skill(
-                &skills_dir,
-                &format!("skill-{index:03}"),
-                description,
-                "Body.",
-            );
-        }
-
-        let context = ToolContext::new(workspace);
-        let result = LoadSkillTool
-            .execute(json!({"name": "list"}), &context)
-            .await
-            .expect("listing should succeed");
-        assert!(
-            result.content.contains("Available skills (105)"),
-            "{}",
-            result.content
-        );
-        assert!(
-            result
-                .content
-                .contains("... and 5 more installed; load any by exact name."),
-            "{}",
-            result.content
-        );
-        assert!(!result.content.contains("skill-104"), "{}", result.content);
-        let capped: String = "d".repeat(400);
-        assert!(
-            result.content.contains(&format!("skill-000 — {capped}…")),
-            "{}",
-            result.content
-        );
-        assert!(!result.content.contains(&long), "description must shorten");
-    }
-
-    #[tokio::test]
     async fn execute_listing_reports_empty_registry_plainly() {
         let _lock = crate::test_support::lock_test_env();
         let tmp = tempdir().unwrap();
@@ -696,6 +687,7 @@ mod tests {
     async fn execute_finds_skills_in_opencode_dir_via_workspace_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         // Skill installed under workspace `.opencode/skills` (#432).
         let opencode_dir = workspace.join(".opencode").join("skills");
         std::fs::create_dir_all(&opencode_dir).unwrap();
@@ -746,6 +738,7 @@ mod tests {
     async fn execute_respects_codewhale_only_skill_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         write_skill(
             &workspace.join(".claude").join("skills"),
             "claude-only",
@@ -760,7 +753,10 @@ mod tests {
             "Body content marker.",
         );
 
-        let context = ToolContext::new(workspace).with_skills_config(codewhale_dir, true);
+        let context = ToolContext::new(workspace).with_skills_config(
+            codewhale_dir,
+            crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
+        );
         let tool = LoadSkillTool;
 
         let result = tool
@@ -798,7 +794,10 @@ mod tests {
         // `crate::config::effective_home_dir()` cannot be redirected reliably after process start
         // on Windows. The injected-home discovery test in `skills::tests`
         // separately proves that ~/.codewhale/skills enters the default catalog.
-        let context = ToolContext::new(&workspace).with_skills_config(global_skills.clone(), false);
+        let context = ToolContext::new(&workspace).with_skills_config(
+            global_skills.clone(),
+            crate::skills::SkillDiscoveryMode::Compatible,
+        );
         assert!(!context.trust_mode);
         assert!(
             context
@@ -824,6 +823,7 @@ mod tests {
     async fn execute_returns_helpful_error_for_unknown_skill() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         // One real skill so the available list is non-empty.
         write_skill(
             &workspace.join(".agents").join("skills"),
@@ -843,5 +843,107 @@ mod tests {
             msg.contains("imaginary") && msg.contains("real-one"),
             "error must name the missing skill and list available ones: {msg}"
         );
+    }
+    #[tokio::test]
+    async fn model_load_and_listing_obey_independent_invocation_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
+        let root = workspace.join(".codewhale/skills");
+        for (name, policy) in [
+            ("explicit", "disable-model-invocation: true"),
+            (
+                "disabled",
+                "disable-model-invocation: true\nuser-invocable: false",
+            ),
+            ("model", "user-invocable: false"),
+        ] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: routing\n{policy}\n---\nsecret steps for {name}")).unwrap();
+        }
+        let context = ToolContext::new(&workspace)
+            .with_skills_config(&root, SkillDiscoveryMode::CodeWhaleOnly);
+        let tool = LoadSkillTool;
+        for name in ["explicit", "disabled"] {
+            let error = tool
+                .execute(json!({"name":name}), &context)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not allow model invocation")
+            );
+        }
+        let listing = tool
+            .execute(json!({"name":"list"}), &context)
+            .await
+            .unwrap();
+        assert!(listing.content.contains("model"));
+        assert!(!listing.content.contains("explicit"));
+        assert!(!listing.content.contains("disabled"));
+        let query = tool
+            .execute(json!({"query":"explicit"}), &context)
+            .await
+            .unwrap();
+        assert!(!query.content.contains("secret steps"));
+        assert!(!query.content.contains("  - explicit"));
+        assert!(
+            tool.execute(json!({"name":"model"}), &context)
+                .await
+                .unwrap()
+                .content
+                .contains("secret steps for model")
+        );
+    }
+    #[tokio::test]
+    async fn execute_listing_caps_rows_and_descriptions_honestly() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("home"));
+        let _cw_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
+        let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
+        let skills_dir = workspace.join(".codewhale").join("skills");
+        let long = "d".repeat(500);
+        for index in 0..105 {
+            let description = if index == 0 { long.as_str() } else { "Short." };
+            write_skill(
+                &skills_dir,
+                &format!("skill-{index:03}"),
+                description,
+                "Body.",
+            );
+        }
+
+        let context = ToolContext::new(workspace);
+        let result = LoadSkillTool
+            .execute(json!({"name": "list"}), &context)
+            .await
+            .expect("listing should succeed");
+        assert!(
+            result.content.contains("Available skills (105)"),
+            "{}",
+            result.content
+        );
+        for index in 0..105 {
+            assert!(
+                result
+                    .content
+                    .lines()
+                    .any(|line| { line.starts_with(&format!("  - skill-{index:03}")) }),
+                "missing skill-{index:03}: {}",
+                result.content
+            );
+        }
+        let capped: String = "d".repeat(400);
+        assert!(
+            result.content.contains(&format!("skill-000 — {capped}…")),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains(&long), "description must shorten");
     }
 }

@@ -16,12 +16,7 @@ pub struct CommandInfo {
     pub description_id: MessageId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandDiscovery {
-    Primary,
-    Advanced,
-    Compatibility,
-}
+use codewhale_command_contract::CommandDiscovery;
 
 pub(crate) const ADVANCED_DISCOVERY_COMMANDS: &[&str] = &[
     "anchor",
@@ -65,8 +60,8 @@ pub(crate) const COMPATIBILITY_DISCOVERY_COMMANDS: &[&str] = &["subagents"];
 /// control-plane actions through that registry, so it is a substrate rather
 /// than a place to browse. The entry here only stops the product from
 /// *teaching* a route it is not standing behind yet. Founder, 2026-09-03:
-/// "remove /lane", "hide dispatch for now".
-pub(crate) const UNLISTED_COMMANDS: &[&str] = &["lane", "dispatch"];
+/// "remove /lane".
+pub(crate) const UNLISTED_COMMANDS: &[&str] = &["lane"];
 
 /// Small, task-oriented starting set for a bare `/` in the composer.
 ///
@@ -90,12 +85,6 @@ pub(crate) fn bare_slash_discovery_rank(name: &str) -> Option<usize> {
 /// command name — see `palette_paste_only_names_are_registered` in the
 /// command palette tests.
 pub(crate) const PALETTE_PASTE_ONLY: &[&str] = &[];
-
-impl CommandDiscovery {
-    pub fn show_at_root(self) -> bool {
-        matches!(self, CommandDiscovery::Primary)
-    }
-}
 
 /// Bare words in a usage line that stand for a value the operator supplies
 /// rather than a literal token they type. `/workspace [path|worktrees]` reads
@@ -216,7 +205,7 @@ fn leading_literal_token(alternative: &str) -> Option<&str> {
         .unwrap_or(alternative.len());
     let token = &alternative[..end];
     // A word only counts when it is spelled the way a typed verb is spelled:
-    // starting lowercase (or a digit, for `/mode [act|plan|1|2|3]`) and made
+    // starting lowercase (or a digit, for `/mode [work|plan|1|2|3]`) and made
     // of ASCII word characters. `N`, `entry_id`, `--force` and
     // `path/to/export.json` are all values, not verbs.
     let mut chars = token.chars();
@@ -319,7 +308,7 @@ impl CommandInfo {
     }
 
     pub fn show_in_empty_discovery(&self) -> bool {
-        self.discovery().show_at_root()
+        matches!(self.discovery(), CommandDiscovery::Primary)
     }
 
     /// Whether this command may appear in slash completion at all.

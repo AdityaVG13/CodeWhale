@@ -40,7 +40,8 @@ use crate::commands::traits::{CommandGroup, ContextualCommand};
 use crate::tui::app::App;
 use crate::tui::app::AppAction;
 
-pub(crate) mod kimi_import;
+pub(crate) mod dsh_import;
+mod kimi_import;
 pub(crate) mod legacy;
 pub(crate) mod marketplace;
 #[cfg(test)]
@@ -65,7 +66,7 @@ impl CommandGroup for PluginsCommands {
 pub(in crate::commands) const PLUGINS_INFO: CommandInfo = CommandInfo {
     name: "plugin",
     aliases: &["plugins", "extensions"],
-    usage: "/plugin [list|show|suggest|validate|export|install|import|update|uninstall|trust|enable|disable|revoke|reload|tools|marketplace]",
+    usage: "/plugin [list|show|suggest|validate|export|install|import|update|uninstall|trust|enable|disable|revoke|reload|doctor|tools|marketplace|dismissals]",
     description_key: "cmd_plugin_description",
 };
 
@@ -150,14 +151,21 @@ pub(super) fn plugins(
         }),
         ["list"] => list_bundles_and_legacy_tools(presentation, plugin),
         ["help"] => CommandResult::message(format!(
-            "{}\n\n/plugin import kimi [list]\n/plugin import kimi approve <name> <content-hash>",
-            translate(presentation, "cmd_plugin_bundle_usage")
+            "{}\n\n/plugin import kimi [list]\n/plugin import kimi approve <name> <content-hash>\n{}\n{}",
+            translate(presentation, "cmd_plugin_bundle_usage"),
+            dsh_import::USAGE,
+            DOCTOR_USAGE
         )),
         ["marketplace", rest @ ..] => marketplace::dispatch(presentation, plugin, rest),
         ["import", "kimi", rest @ ..] => {
             kimi_import::dispatch(presentation, plugin, rest, kimi_home)
         }
-        ["import", ..] => CommandResult::error(kimi_import::usage(presentation)),
+        ["import", "dsh", rest @ ..] => dsh_import::dispatch(presentation, plugin, rest),
+        ["import", ..] => CommandResult::error(format!(
+            "{}\n{}",
+            kimi_import::usage(presentation),
+            dsh_import::USAGE
+        )),
         ["show", selector] => show_bundle(presentation, plugin, selector),
         ["suggest"] | ["recommend"] => CommandResult::error("Usage: /plugin suggest <task>"),
         ["suggest", task @ ..] | ["recommend", task @ ..] => {
@@ -184,6 +192,13 @@ pub(super) fn plugins(
         ["disable", selector] => mutate_bundle(presentation, plugin, selector, Mutation::Disable),
         ["revoke", selector] => mutate_bundle(presentation, plugin, selector, Mutation::Revoke),
         ["reload"] => reload(presentation, plugin),
+        ["doctor"] => doctor(presentation, plugin, false),
+        ["doctor", "--fix"] => doctor(presentation, plugin, true),
+        ["doctor", ..] => CommandResult::error(DOCTOR_USAGE),
+        ["dismissals"] => list_dismissals(plugin),
+        ["dismissals", "reset"] => reset_dismissals(plugin, None),
+        ["dismissals", "reset", name] => reset_dismissals(plugin, Some(name)),
+        ["dismissals", ..] => CommandResult::error("Usage: /plugin dismissals [reset [<name>]]"),
         ["tools"] => legacy_tools(presentation, plugin, None),
         ["tools", name] => legacy_tools(presentation, plugin, Some(name)),
         [selector] => {
@@ -196,6 +211,57 @@ pub(super) fn plugins(
             }
         }
         _ => CommandResult::error(translate(presentation, "cmd_plugin_bundle_usage")),
+    }
+}
+
+/// `/plugin dismissals`: which plugins suggestions skip, and for how long
+/// (plugin policy rule 9: dismissal is reversible).
+fn list_dismissals(plugin: &dyn CommandPluginContext) -> CommandResult {
+    let dismissals = match plugin.suggestion_dismissals() {
+        Ok(dismissals) => dismissals,
+        Err(error) => return CommandResult::error(error),
+    };
+    if dismissals.persisted.is_empty() && dismissals.session.is_empty() {
+        return CommandResult::message("No plugins are hidden from suggestions.".to_string());
+    }
+    let mut output = String::from("Plugins hidden from suggestions:\n");
+    if !dismissals.persisted.is_empty() {
+        output.push_str("  Don't suggest again (kept across sessions):\n");
+        for name in &dismissals.persisted {
+            let _ = writeln!(output, "    {}", escape_review_text(name));
+        }
+    }
+    if !dismissals.session.is_empty() {
+        output.push_str("  This session only:\n");
+        for name in &dismissals.session {
+            let _ = writeln!(output, "    {}", escape_review_text(name));
+        }
+    }
+    output.push_str(
+        "\nReset with /plugin dismissals reset [<name>]. Manual /plugin commands work either way.",
+    );
+    CommandResult::message(output)
+}
+
+/// `/plugin dismissals reset [<name>]`: let suggestions offer a plugin again.
+fn reset_dismissals(plugin: &mut dyn CommandPluginContext, name: Option<&str>) -> CommandResult {
+    match plugin.reset_suggestion_dismissals(name) {
+        Ok(cleared) if cleared.is_empty() => CommandResult::message(match name {
+            Some(name) => format!(
+                "`{}` was not hidden from suggestions.",
+                escape_review_text(name)
+            ),
+            None => "No plugins were hidden from suggestions.".to_string(),
+        }),
+        Ok(cleared) => CommandResult::message(format!(
+            "Suggestions may offer {} again.",
+            cleared
+                .iter()
+                .map(|name| escape_review_text(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        Err(error) => CommandResult::error(error),
     }
 }
 
@@ -219,6 +285,64 @@ fn reload(
             CommandResult::with_message_and_action(message, AppAction::PluginRegistryChanged)
         }
         Err(error) => action_error(presentation, &format!("Plugin reload failed: {error}")),
+    }
+}
+
+const DOCTOR_USAGE: &str =
+    "Usage: /plugin doctor [--fix]  (report superseded plugin state; --fix applies it)";
+
+/// `/plugin doctor [--fix]`: report, or retire, plugin state that no longer
+/// points at anything: records and snapshots of superseded built-in builds,
+/// inert records for vanished workspaces, orphaned runtime snapshots. The
+/// report is read-only; `--fix` backs `state.json` up, then rewrites it
+/// atomically. The same safe subset also runs automatically at startup.
+fn doctor(
+    presentation: &mut dyn CommandPresentationContext,
+    plugin: &mut dyn CommandPluginContext,
+    fix: bool,
+) -> CommandResult {
+    use crate::plugins::registry::gc;
+
+    let Some(state_path) = plugin.state_path() else {
+        return CommandResult::error("Plugin registry has no persistence store; nothing to check");
+    };
+    let live = match plugin.summaries() {
+        Ok(summaries) => summaries.into_iter().map(|summary| summary.id).collect(),
+        Err(error) => return CommandResult::error(error),
+    };
+    let options = gc::GcOptions::default();
+    // Path identity is resolved off this thread. Reloading the session
+    // registry stays here: that is session state, not the directory walk.
+    let report = gc::run(
+        state_path,
+        live,
+        options,
+        fix.then_some(gc::GcTier::Explicit),
+    );
+    if !fix {
+        return match report {
+            Ok(report) => CommandResult::message(render::render_gc_report(&report, false)),
+            Err(error) => {
+                CommandResult::error(format!("Plugin doctor could not read state: {error}"))
+            }
+        };
+    }
+    match report {
+        Ok(report) => {
+            let message = render::render_gc_report(&report, true);
+            // Rediscover so the session stops listing what was just retired.
+            match plugin.reload() {
+                Ok(_) => CommandResult::with_message_and_action(
+                    message,
+                    AppAction::PluginRegistryChanged,
+                ),
+                Err(error) => action_error(
+                    presentation,
+                    &format!("{message}\nPlugin reload failed: {error}"),
+                ),
+            }
+        }
+        Err(error) => CommandResult::error(format!("Plugin doctor changed nothing: {error}")),
     }
 }
 
@@ -294,6 +418,11 @@ fn list_bundles_and_legacy_tools(
         output
     };
     append_diagnostics(presentation, &mut output, &plugin.registry_diagnostics());
+    // Diagnostics and the stderr tail carry plugin-controlled text.
+    for line in crate::extension_host::status_report().lines() {
+        output.push('\n');
+        output.push_str(&escape_review_text(line));
+    }
 
     if let Ok(Some(scan)) = plugin.legacy_scan() {
         output.push('\n');
@@ -318,6 +447,7 @@ fn list_bundles_and_legacy_tools(
                 escape_review_path(&tool.path)
             );
         }
+        append_diagnostics(presentation, &mut output, &scan.diagnostics);
     }
 
     if let Some(nudge) = plugin.reload_nudge() {
@@ -343,7 +473,98 @@ fn show_bundle(
             );
         }
     };
-    CommandResult::message(render::render_bundle_detail(presentation, &detail, true))
+    let mut output = render::render_bundle_detail(presentation, &detail, true);
+    if let Some(report) = crate::extension_host::owner_report(&detail.id) {
+        append_host_owner_report(presentation, &mut output, &report);
+    }
+    // What the user configured for the plugin is data its code will read, so
+    // it is part of what `/plugin show` puts in front of them (keys only: a
+    // value can be anything, including something they would rather not echo).
+    if let Some(summary) = crate::extension_host::plugin_config_summary(&detail.name) {
+        append_plugin_config_summary(&mut output, &detail.name, &summary);
+    }
+    CommandResult::message(output)
+}
+
+/// The `[plugins."<name>".config]` line of `/plugin show`: the configured
+/// keys, never the values, or why the config is refused. Every part is escaped.
+fn append_plugin_config_summary(
+    output: &mut String,
+    plugin_name: &str,
+    summary: &Result<Vec<String>, String>,
+) {
+    let name = escape_review_text(plugin_name);
+    match summary {
+        Ok(keys) => {
+            let keys = keys
+                .iter()
+                .map(|key| escape_review_text(key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(
+                output,
+                "\n  config from [plugins.\"{name}\".config] in your config.toml (values not shown): {keys}"
+            );
+        }
+        Err(reason) => {
+            let _ = write!(
+                output,
+                "\n  config from [plugins.\"{name}\".config] is refused: {}",
+                escape_review_text(reason)
+            );
+        }
+    }
+}
+
+fn append_host_owner_report(
+    presentation: &dyn CommandPresentationContext,
+    output: &mut String,
+    report: &crate::extension_host::OwnerReport,
+) {
+    use crate::extension_host::registry::OwnerState;
+
+    let (state_key, reason) = match &report.state {
+        Some(OwnerState::Activating) => ("cmd_plugin_owner_activating", None),
+        Some(OwnerState::Active) => ("cmd_plugin_owner_active", None),
+        Some(OwnerState::Failed(reason)) => ("cmd_plugin_owner_failed", Some(reason)),
+        Some(OwnerState::Faulted(reason)) => ("cmd_plugin_owner_faulted", Some(reason)),
+        Some(OwnerState::Revoked) => ("cmd_plugin_owner_revoked", None),
+        None => ("cmd_plugin_owner_inactive", None),
+    };
+    let reason = reason.map(|value| escape_review_text(value));
+    let replacements = reason
+        .as_deref()
+        .map(|value| vec![("reason", value)])
+        .unwrap_or_default();
+    let state = presentation
+        .translate(state_key, &replacements)
+        .unwrap_or_default();
+    let tools = report
+        .tools
+        .iter()
+        .map(|name| escape_review_text(name))
+        .collect::<Vec<_>>();
+    let tool_names = if tools.is_empty() {
+        "—".to_string()
+    } else {
+        tools.join(", ")
+    };
+    output.push('\n');
+    output.push_str(
+        &presentation
+            .translate(
+                "cmd_plugin_owner_report",
+                &[
+                    ("state", &state),
+                    ("count", &tools.len().to_string()),
+                    ("tools", &tool_names),
+                ],
+            )
+            .unwrap_or_default(),
+    );
+    for line in &report.diagnostics {
+        let _ = write!(output, "\n  · {}", escape_review_text(line));
+    }
 }
 
 /// `/plugin export <name> <target-dir>` — publish a loaded bundle as a
@@ -653,8 +874,8 @@ fn update_bundle(
             PluginMutationOutcome::Updated => {
                 let name = receipt.name.clone();
                 let mut output = format!(
-                    "Updated plugin '{name}'. Its content changed, so the previous trust receipt no \
-                     longer matches — review and trust it again before enabling.\n"
+                    "Updated plugin '{name}'. Review its current capabilities and trust it \
+                     if needed before enabling.\n"
                 );
                 if let Some(review) = review_bundle(presentation, plugin, &name).message {
                     output.push('\n');

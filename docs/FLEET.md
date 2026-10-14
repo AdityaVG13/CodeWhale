@@ -26,7 +26,9 @@ existing workspaces, receipts, or scripts:
 
 - the durable ledger `.codewhale/fleet.jsonl` and the log directories
   `.codewhale/fleet/` and `.codewhale/fleet-host/`;
-- saved rosters `fleets/<name>.toml` and their `schema = "fleet"` header;
+- saved rosters `fleets/<name>.toml` and their `schema = "fleet"` header, under
+  `$CODEWHALE_HOME/` or the workspace's `.codewhale/` (checked-in rosters at the
+  workspace root's `fleets/` are still read);
 - the `[fleet]` config table (inline `[fleets.*]` tables were removed in 0.9.14; named fleets live in `fleets/<name>.toml` files);
 - the `codewhale workflow run --fleet <name>` flag;
 - wire, receipt, and control-plane operation ids such as `fleet.status`.
@@ -44,6 +46,7 @@ Workflow authoring, see [fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).
 
 ```sh
 codewhale fleet init
+codewhale fleet run tasks.json --check   # validate only; nothing is created or launched
 codewhale fleet run tasks.json --max-workers 4
 codewhale fleet status
 codewhale fleet inspect <worker-id>
@@ -158,8 +161,8 @@ neither creates the ledger as a side effect of reading it.
 The current interactive session's sub-agents are a **different set**, and now
 have their own name:
 
-- `/fleet workers` (or `/subagents`, or `n`) shows sub-agents attached to the
-  current TUI session. It does not read the persistent ledger.
+- `/fleet workers` (or `/subagents`, or Tab / `w` from the `/fleet` roster)
+  shows sub-agents attached to the current TUI session. It does not read the persistent ledger.
 - `/fleet list|status|interrupt|resume` and `codewhale fleet
   list|status|interrupt|resume` act on the durable ledger.
 - `codewhale fleet restart <worker-id>` is CLI-only: it re-leases the task and
@@ -167,14 +170,14 @@ have their own name:
   silently do a smaller thing — it reports `surface_not_supported` and names
   the CLI command.
 
-Before v0.9.2, `/fleet status` showed session sub-agents. That reading is gone;
-`/fleet workers` replaces it.
-
 The contract behind this — descriptors, availability reasons, exact-identity
 targets, receipts, typed unknowns, and bounds — is documented in
 [`docs/COMMAND_CONTROL_PLANE.md`](COMMAND_CONTROL_PLANE.md).
 
 ## Authoring agent profiles (`/fleet setup`)
+
+Agents: the durable artifact is the profile TOML described below; the
+key-by-key walkthrough is the human interactive path.
 
 `/fleet setup` (also `/fleet setup edit` / `new`) opens an in-TUI wizard for
 authoring a reusable agent-team profile. Bare `/fleet` and the
@@ -230,6 +233,12 @@ live parent. For standalone `codewhale fleet` execution, Runtime instead uses
 the bounded tool-authority envelope minted from the task's explicit write
 scope together with live config, sandbox, and platform enforcement. Neither
 path reads authority from the profile's storage scope or identity selector.
+A worker whose envelope grants read-only shell access runs the same read-only
+command grammar as an in-session read-only agent, including pipelines, chains
+and a leading `cd` (see "Read-only shell commands" in `docs/SUBAGENTS.md`);
+Admitted `gh` reads also need the envelope's network grant. `npm view` remains
+outside the read-only grammar because npm configuration can select executable
+helpers; a network grant does not authorize those helpers.
 
 Picking a concrete model pins its provider explicitly: the saved profile records both
 `model` and `provider` fields, so the route it names doesn't depend on
@@ -241,13 +250,12 @@ user-named OpenAI-compatible provider configured under `[providers.<name>]`
 such as `lm-studio`; the launch path preserves that id and fails closed if the
 provider is not configured.
 
-Profiles are also how the model-facing `agent` tool selects a route since the
-v0.9.9 schema slim (#5324, #5123): the advertised surface no longer carries
-`model` or `thinking` — a child either runs as a `profile` (whose saved route
-and thinking tier it uses exactly) or inherits the operator's model. Removed
-fields stay parse-accepted for saved transcripts, ACP/MCP clients and fleet
-configs; see docs/SUBAGENTS.md for the advertised 12-field list and the
-compat list.
+Profiles are also how the model-facing `agent` tool selects a route: a child
+either runs as a `profile` (whose saved route and thinking tier it uses
+exactly) or inherits the operator's model. Per-task `model`, `model_strength`,
+and `thinking` remain advertised for unpinned roles; saved profile and manual
+role pins refuse overrides. See docs/SUBAGENTS.md for the advertised field
+list and the parse-accepted compat list.
 
 When a provider is configured, the review step also offers model-assisted
 drafting behind an explicit preview-before-save gate:
@@ -314,7 +322,9 @@ header/status signal; avoid repeating emoji-heavy rows for every worker.
 
 A selected v2 fleet freezes each selected member's id, semantic role, provider,
 and model identity into the durable run before a Workflow starts. Save the
-fleet as `fleets/<name>.toml` in the workspace or under `$CODEWHALE_HOME`.
+fleet as `fleets/<name>.toml` under the workspace's `.codewhale/` (where the
+fleet editor saves folder fleets) or under `$CODEWHALE_HOME`; a checked-in
+`fleets/<name>.toml` at the workspace root is also read.
 Models cannot replace those identity or route assignments at runtime:
 
 ```toml
@@ -341,12 +351,21 @@ model = "gpt-5.6"
 ```
 
 The workflow crate's older `schema = "exact"`, revision 1 files are migration
-input only. Do not author them for v0.9.11; the selected roster and setup UI
+input only. Do not author revision-1 files; the selected roster and setup UI
 read and write only `schema = "fleet"`, revision 2.
+
+`workflow(fleet: "release")` runs a saved Fleet without selecting it. At
+Workflow start, a member with no pin takes the Fleet's `[operator]` route or,
+without one, the session route and reasoning tier; that frozen route is what
+runs and what receipts name, and editing the file mid-run changes only the next
+Workflow. If a saved Fleet and an older exact/legacy file share a name, the
+Workflow refuses to guess; qualify the saved one as `user/<name>` or
+`folder/<name>`. Members with `instructions` or `requires` cannot run in a
+Workflow yet.
 
 Reasoning is a separate route-execution decision, not fleet identity. The
 optional Reasoning Router is a reusable Runtime service, not a fleet member.
-Save one profile at `routers/<name>.toml` in either search root and reference it
+Save one profile at `routers/<name>.toml` in any search root and reference it
 from any number of fleets:
 
 ```toml
@@ -364,8 +383,9 @@ Router call itself is capped at `off` or `low`; more expensive values are
 rejected. A manually selected worker reasoning tier makes no Router call. Route
 and reasoning receipts name the worker model and, when used, the Router's exact
 provider/model so the operator can see which model did which job. If the same
-bare Router or fleet name exists in both roots, qualify it as
-`workspace/<name>` or `codewhale_home/<name>` instead of relying on shadowing.
+bare Router or fleet name exists in more than one root, qualify it as
+`codewhale_home/<name>`, `workspace/<name>` (the workspace's `.codewhale/`), or
+`workspace_root/<name>` (the workspace root) instead of relying on shadowing.
 
 Compatibility schemas may serialize `reasoning`, `permissions`, tool hints, or
 other execution settings beside a member. Those values are not fleet identity,
@@ -392,7 +412,7 @@ call actually carries is spelled by that route's own normalizer, not by the tier
 label: an OpenAI Codex route is asked for `xhigh`, not `max`, and cannot be
 asked for `off` at all.
 
-A v0.9.11 durable fleet CLI receipt keeps the selected profile id in
+A durable fleet CLI receipt keeps the selected profile id in
 `effective_permissions.profile_id`, the resolved semantic role in
 `resolved_route.role`, and the effective Runtime surface in the permission,
 shell, and tool-scope fields. An exact Workflow launch receipt records
@@ -481,7 +501,11 @@ next recursive ring rather than trying to show the whole tree at once.
 
 ## Task Spec
 
-`codewhale fleet run` accepts JSON or TOML. A minimal JSON spec:
+`codewhale fleet run` accepts JSON or TOML. `codewhale fleet run <spec> --check`
+runs every validation a real run performs (spec shape, roster members, agent
+profiles, model routes) and prints the same warnings, then stops: no ledger is
+created, no run is written, no worker starts, and nothing is spent. A minimal
+JSON spec:
 
 ```json
 {
@@ -500,6 +524,22 @@ next recursive ring rather than trying to show the whole tree at once.
 Workers are optional. If omitted, Codewhale creates local worker slots up to
 `--max-workers`.
 
+A spec file takes one of three shapes, chosen by its structure before any
+field is read:
+
+- a **document** — an object with `tasks` (and optionally `name`, `labels`,
+  `workers`, `usage_ceiling`);
+- a **task array** — a bare JSON array of task objects;
+- a **single task** — one task object with `id` / `instructions` at the top
+  level (JSON or TOML; a TOML file is never a task array).
+
+Array and single-task files take their run name from the file name. Because
+the shape is picked first, a malformed spec reports the real problem, for
+example ``JSON spec document at tasks[1] (id "review"): missing field
+`instructions` at line 7 column 5``. The checked-in
+[`docs/examples/fleet-dogfood.toml`](examples/fleet-dogfood.toml) and the
+tutorial's `tasks.json` are parsed by the test suite, so they stay valid.
+
 Task specs are typed in Rust and keep verification data separate from worker
 transcripts. Only the `worker` member/role reference participates in fleet
 identity selection. The remaining execution fields are delegated-coordination
@@ -513,7 +553,9 @@ or Runtime inputs applied after the member is resolved. A task can declare:
 
 None of those execution-policy fields becomes part of a fleet identity or an
 alternate member selector. Omitted or zero `max_steps` means no model-step
-ceiling; Codewhale must not synthesize a default step budget. Explicit positive
+ceiling; Codewhale must not synthesize a default step budget. (This is the
+fleet file task-spec convention; model-facing `agent` calls differ — the tool
+parser rejects an explicit zero. See `docs/SUBAGENTS.md`.) Explicit positive
 step limits, timeouts, cancellation, provider safeguards, heartbeats, and
 admission control are enforced independently by the delegated coordinator and
 Runtime.
@@ -779,6 +821,14 @@ SSH workers run through the system `ssh` client with `BatchMode=yes` and a
 bounded connect timeout. Remote environment variables are sent with OpenSSH
 `SendEnv`; values are not embedded in the local ssh argv or fleet logs.
 
+Host keys must already be trusted: connections use `StrictHostKeyChecking=yes`
+and never accept a new key automatically. An explicit `known_hosts` file limits
+trust to that file; when it is omitted, OpenSSH uses its normal known-host stores.
+Verify the host key before adding it to either store. The legacy
+`host_key_fingerprint` field is unsupported and is rejected; migrate it to a
+verified `known_hosts` entry. The `identity` file selects the client login key;
+it does not verify the remote host.
+
 Example SSH worker spec:
 
 ```json
@@ -791,6 +841,7 @@ Example SSH worker spec:
     "user": "codewhale",
     "port": 22,
     "identity": "~/.ssh/codewhale_fleet",
+    "known_hosts": "~/.ssh/codewhale_fleet_known_hosts",
     "working_directory": "/srv/codewhale/work",
     "env_allowlist": ["CODEWHALE_PROFILE"],
     "codewhale_binary": "/usr/local/bin/codewhale"
@@ -842,3 +893,45 @@ For current enforcement behavior, use [Modes](MODES.md),
 [Command Control Plane](COMMAND_CONTROL_PLANE.md). Keep secret values out of
 task instructions, arguments, logs, and receipts; adapter and Runtime layers
 must continue to redact or reject them independently of fleet selection.
+
+## Child grants: 0.10.1 scope and the 0.11 rework (#6298)
+
+A child's authority is one grant object, `ChildGrant`
+(`crates/tui/src/worker_profile.rs`). It shipped in v0.10.0 (966ef974e1,
+#5633). It has `files` (none / read / write), `shell` (none / inspect /
+verify / full), `network`, `desktop`, a tool `surface`, the caller's explicit
+`scope`, and `spawn`. Roles are presets over it (`ChildGrant::for_role`), and
+`ChildGrant::resolve` intersects the preset with the parent-derived profile
+and the caller's scope. The child's tool catalog, its dispatch refusals, and
+its capability envelope all read the same grant, so a tool the child can see
+is a tool it can call. `desktop` is in no preset.
+
+`ShellGrant::Verify` also shipped in v0.10.0: the Verifier preset gets the
+bounded built-in verification surface (default workspace checks, pure test
+selection, bounded Git fetch and merge-tree) instead of a shell grammar.
+
+**Other fixes shipped by v0.10.0** (on top of the grant):
+
+- Children never inherit desktop or computer-control tools (b5e48cd31, #6296).
+- A bounded verify surface for Git: `fetch` against a configured remote name
+  and a read-only `merge_tree` (b89349286).
+- Refusals name the sanctioned alternative and tell a child to report a
+  blocked probe to its parent instead of working around it (23747acea).
+- One reasoning vocabulary (c2bc1244d). Token budgets are tracked but never
+  enforced (a7a8bdb33).
+
+**0.10.1 scope.** This release adds no new grant-model code. #6298 is
+re-scoped to the remainder below, which lands in 0.11 as its own slices.
+
+**0.11 remainder** (one slice at a time):
+
+1. **A `verify` shell mode for builds.** `cargo test`/`check` run under an
+   explicit, bounded write scope (`target/`, refs), so a verifier can run the
+   builds it is handed without a full shell.
+2. **Classified tool families that fail closed.** MCP and desktop tools form a
+   labeled family. A child gets that family only when the spawn grants it with
+   a reason, and an unclassified tool is not granted.
+3. **Legible grants.** The role picker, roster, and receipts show the effective
+   grant, model, and thinking tier in plain words.
+
+Related work is tracked in #6015, #5633, #6194, and #6232.

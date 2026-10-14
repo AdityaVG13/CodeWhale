@@ -1,5 +1,6 @@
 // Real MCP + real transports, with HDC/SSH executables or local backends replaced.
 // Every catalog, downloaded byte and command log belongs to this fixture.
+import { hostKeysLine, attest, attestParams } from "./fixtures/host-decision.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -17,10 +18,19 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 // Every control/catalog write the child or server reads must be atomic:
 // a plain writeFileSync is observable mid-write by the polling readers and
 // surfaces as "Unexpected end of JSON input" instead of the fixture's error.
+// On Windows a rename over a file a fixture process holds open for reading
+// fails EPERM/EACCES/EBUSY (the v0.11.2 tag CI failure); the reader closes
+// within milliseconds, so retry briefly instead of failing the test.
 function writeJsonAtomic(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(value));
-  fs.renameSync(tmp, file);
+  for (let attempt = 0; ; attempt++) {
+    try { fs.renameSync(tmp, file); return; }
+    catch (error) {
+      if (attempt >= 50 || !["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
 }
 
 function fixture(t, backendSource, sshSource) {
@@ -64,6 +74,7 @@ if (args[0] === 'file' && args[1] === 'recv') {
     fs.writeFileSync(env.CODEWHALE_CU_TEST_BACKEND, backendSource);
   }
   const child = spawn(process.execPath, [path.join(ROOT, "mcp/server.mjs")], { env, stdio: ["pipe", "pipe", "pipe"] });
+  child.stdin.write(hostKeysLine());
   let nextId = 0;
   const pending = new Map();
   const lines = createInterface({ input: child.stdout });
@@ -91,7 +102,7 @@ if (args[0] === 'file' && args[1] === 'recv') {
         const response = await new Promise((resolve, reject) => {
           timer = setTimeout(() => reject(new Error(`${name} timed out: ${stderr}`)), 8_000);
           pending.set(id, resolve);
-          child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) + "\n");
+          child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: attest({ name, arguments: args }) }) + "\n");
         });
         assert.ok(response.result, JSON.stringify(response));
         return JSON.parse(response.result.content[0].text);
@@ -111,6 +122,111 @@ if (args[0] === 'file' && args[1] === 'recv') {
 }
 
 const point = { type: "coordinate", x: 10, y: 10 };
+
+// The real SSH executor has no filesLocal flag. These handles exist only in
+// replies from this command fixture; no image or provider is created locally.
+const captureSSH = String.raw`
+  const fs = require('node:fs');
+  const {createInterface} = require('node:readline');
+  const host = process.argv.find(arg => arg.startsWith('fixture-'));
+  let captures = 0, crops = 0;
+  const remoteFile = (kind, index) => '/cu-remote-only-fixture/' + host + '/' + kind + '-' + index + '.png';
+  const reply = (request, value) => process.stdout.write(JSON.stringify({...value, id:request.id}) + '\n');
+  function handle(request) {
+    if (request.tool === 'platform') return reply(request, {ok:true,platform:'linux'});
+    const args = request.args ?? {};
+    fs.appendFileSync(process.env.ROUTE_LOG, JSON.stringify({method:request.tool,host,args}) + '\n');
+    if (request.tool === 'screenshot') return reply(request, {ok:true,data:{
+      file:remoteFile('capture', ++captures), points:{x:100,y:50,w:200,h:100},
+      pixels:{w:400,h:200}, scale:2,
+    }});
+    if (request.tool === 'zoom') return reply(request, {ok:true,data:{
+      file:remoteFile('crop', ++crops), source:args.source, region:args.region,
+    }});
+    if (request.tool === 'left_click') return reply(request, {ok:true,data:{action_sent:true}});
+    return reply(request, {ok:false,error:{code:'unexpected_fixture_tool',message:request.tool}});
+  }
+  const decode = encoded => JSON.parse(Buffer.from(encoded, 'base64'));
+  if (process.argv.includes('--serve')) {
+    createInterface({input:process.stdin}).on('line', line => handle(decode(line)));
+  } else handle(decode(process.argv.at(-1)));
+`;
+
+test("remote-only capture pins preserve nested zoom sources and refuse superseded crops before dispatch", async t => {
+  const f = fixture(t, null, captureSSH);
+  const registration = await f.tool("computer_register", {
+    computer: "remote", transport: "ssh", host: "fixture-capture.test", installAgent: false,
+  });
+  assert.equal(registration.ok, true, JSON.stringify(registration));
+  const shot = await f.tool("screenshot", { computer: "remote" });
+  assert.equal(shot.ok, true, JSON.stringify(shot));
+  assert.equal(shot.computer.transport, "ssh");
+  assert.equal(typeof shot.raster_id, "string");
+  assert.equal(fs.existsSync(shot.file), false, "the remote handle is not a locally readable image");
+
+  const first = await f.tool("zoom", {
+    region: [40, 20, 100, 80], raster_id: shot.raster_id, source: "/untrusted/caller.png",
+  });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.parent_raster_id, shot.raster_id);
+  assert.notEqual(first.raster_id, shot.raster_id);
+  assert.equal(fs.existsSync(first.file), false);
+  assert.equal(f.calls().filter(call => call.method === "zoom").at(-1).args.source, shot.file);
+
+  const before = f.calls().length;
+  const stale = await f.tool("zoom", { region: [0, 0, 10, 10], raster_id: shot.raster_id });
+  assert.equal(stale.error?.code, "raster_stale", JSON.stringify(stale));
+  assert.equal(f.calls().length, before, "a superseded pin sends no crop or input to SSH");
+
+  const child = await f.tool("zoom", { region: [20, 10, 30, 20], raster_id: first.raster_id });
+  assert.equal(child.ok, true, JSON.stringify(child));
+  assert.equal(child.parent_raster_id, first.raster_id);
+  assert.notEqual(child.raster_id, first.raster_id);
+  assert.equal(fs.existsSync(child.file), false);
+  const crops = f.calls().filter(call => call.method === "zoom");
+  assert.deepEqual(crops.map(call => call.args.source), [shot.file, first.file]);
+  assert.ok(crops.every(call => !Object.hasOwn(call.args, "raster_id")), "capture pins stay at the MCP boundary");
+
+  const clicked = await f.tool("left_click", { target: { type: "coordinate", x: 10, y: 8, raster_id: child.raster_id } });
+  assert.equal(clicked.ok, true, JSON.stringify(clicked));
+  assert.equal(clicked.target_raster_id, child.raster_id);
+  const target = f.calls().filter(call => call.method === "left_click").at(-1).args.target;
+  assert.deepEqual({ x: target.x, y: target.y }, { x: 135, y: 69 });
+  assert.equal(target.coordinate_space, "raster");
+  assert.equal(Object.hasOwn(target, "raster_id"), false);
+});
+
+test("identical geometry on another computer cannot accept a foreign capture pin", async t => {
+  const f = fixture(t, null, captureSSH);
+  const shots = [];
+  for (const computer of ["first", "second"]) {
+    const registration = await f.tool("computer_register", {
+      computer, transport: "ssh", host: "fixture-" + computer + ".test", installAgent: false,
+    });
+    assert.equal(registration.ok, true, JSON.stringify(registration));
+    const shot = await f.tool("screenshot", { computer });
+    assert.equal(shot.ok, true, JSON.stringify(shot));
+    shots.push(shot);
+  }
+  assert.deepEqual(shots[0].points, shots[1].points);
+  assert.deepEqual(shots[0].pixels, shots[1].pixels);
+  assert.notEqual(shots[0].raster_id, shots[1].raster_id);
+  const before = f.calls().length;
+  const foreign = await f.tool("left_click", {
+    computer: "second", target: { ...point, raster_id: shots[0].raster_id },
+  });
+  assert.equal(foreign.error?.code, "raster_stale", JSON.stringify(foreign));
+  assert.equal(f.calls().length, before, "foreign pixels never become input on the other computer");
+  const own = await f.tool("left_click", {
+    computer: "second", target: { ...point, raster_id: shots[1].raster_id },
+  });
+  assert.equal(own.ok, true, JSON.stringify(own));
+  assert.equal(own.target_raster_id, shots[1].raster_id);
+  const sent = f.calls().filter(call => call.method === "left_click");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].host, "fixture-second.test");
+  assert.deepEqual({ x: sent[0].args.target.x, y: sent[0].args.target.y }, { x: 105, y: 55 });
+});
 
 test("a warmed HDC backend cannot send input to A after registration reports B", async t => {
   const f = fixture(t);
@@ -389,3 +505,45 @@ for (const mode of ["backend", "reply", "connection"]) {
     });
   }
 }
+
+test("register and spawn never replace a desktop another session spawned", async t => {
+  const f = fixture(t, null, null);
+  const file = path.join(f.dir, "computers.json");
+  const owned = { id: "desk", transport: "docker", label: "desk", container: "cu-spawn-desk-ab12cd", image: "codewhale-cu-linux", platform: "linux", owned: true, spawnedBy: "another-session", registeredAt: new Date().toISOString() };
+  writeJsonAtomic(file, { version: 1, active: "local", computers: { desk: owned } });
+  for (const [name, args] of [["computer_register", { computer: "desk", transport: "hdc", target: "B" }], ["computer_spawn", { computer: "desk", transport: "docker" }]]) {
+    const result = await f.tool(name, args);
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.error.code, "computer_owned_elsewhere");
+    assert.deepEqual(JSON.parse(fs.readFileSync(file)).computers.desk, owned, `${name} must leave the owning session's entry intact`);
+  }
+});
+
+test("SSH registration retains its trusted host-key file after platform discovery", async t => {
+  const f = fixture(t, null, `
+    const fs = require('node:fs');
+    const args = process.argv.slice(2);
+    fs.appendFileSync(process.env.ROUTE_LOG, JSON.stringify({args}) + '\\n');
+    console.log(JSON.stringify({ok:true,platform:'linux'}));
+  `);
+  const knownHosts = path.join(f.dir, "trusted-hosts");
+  const result = await f.tool("computer_register", {
+    computer: "pad", transport: "ssh", host: "fixture.test",
+    knownHosts, installAgent: false,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.registered.knownHosts, knownHosts);
+  assert.equal(result.registered.platformHint, "linux");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, "computers.json"))).computers.pad.knownHosts, knownHosts);
+  const calls = f.calls();
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].args.includes(`UserKnownHostsFile=${process.platform === "win32" ? knownHosts.replaceAll("\\", "/") : knownHosts}`));
+  assert.ok(calls[0].args.includes(`GlobalKnownHostsFile=${process.platform === "win32" ? "NUL" : "/dev/null"}`));
+  assert.ok(calls[0].args.includes("StrictHostKeyChecking=yes"));
+});
+
+test("changing the trusted SSH host-key file changes route identity", () => {
+  const original = {transport: "ssh", host: "fixture.test", knownHosts: "/private/trusted-a"};
+  assert.notEqual(routeFingerprint(original), routeFingerprint({...original, knownHosts: "/private/trusted-b"}));
+  assert.notEqual(routeFingerprint(original), routeFingerprint({...original, knownHosts: undefined}));
+});

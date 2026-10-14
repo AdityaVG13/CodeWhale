@@ -42,13 +42,18 @@ pub(super) fn file_write_preview_lines(tool_name: &str, params: &Value) -> Optio
 
 fn edit_file_preview_lines(params: &Value, max_lines: usize) -> Option<Vec<String>> {
     if let Some(edits) = params.get("edits").and_then(Value::as_array) {
+        // One edit gets the whole per-side budget. Several share the card, so
+        // each shows its first changed line and a count of the rest.
+        let numbered = edits.len() > 1;
+        let per_side = if numbered { 1 } else { max_lines };
         let mut lines = Vec::new();
         for (index, edit) in edits.iter().take(max_lines).enumerate() {
             let old = param_text(edit, &["oldText"])?;
             let new = param_text(edit, &["newText"])?;
-            lines.push(format!("edit {}", index + 1));
-            lines.extend(prefixed_preview_lines("replace this", "- ", &old, 1));
-            lines.extend(prefixed_preview_lines("with this", "+ ", &new, 1));
+            if numbered {
+                lines.push(format!("edit {}", index + 1));
+            }
+            push_changed_lines(&mut lines, &old, &new, per_side);
         }
         if edits.len() > max_lines {
             lines.push(format!("... (+{} more edits)", edits.len() - max_lines));
@@ -58,19 +63,46 @@ fn edit_file_preview_lines(params: &Value, max_lines: usize) -> Option<Vec<Strin
     let search = param_text(params, &["search"])?;
     let replace = param_text(params, &["replace"])?;
     let mut lines = Vec::new();
-    lines.extend(prefixed_preview_lines(
-        "replace this",
-        "- ",
-        &search,
-        max_lines,
-    ));
-    lines.extend(prefixed_preview_lines(
-        "with this",
-        "+ ",
-        &replace,
-        max_lines,
-    ));
+    push_changed_lines(&mut lines, &search, &replace, max_lines);
     Some(lines)
+}
+
+/// Append what an edit removes (`- `) and adds (`+ `), bounded per side.
+///
+/// Lines both sides share at the start and end are left out, and the rows
+/// carry no sub-labels: the card has room for only a few preview rows, so
+/// they go to the change itself. The details pager keeps the exact full text.
+fn push_changed_lines(lines: &mut Vec<String>, old: &str, new: &str, max_lines: usize) {
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let shared = old.len().min(new.len());
+    let mut head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let mut tail = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(shared - head)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if old.len() == new.len() && head == old.len() {
+        // Same lines on both sides (a line-ending-only edit): there is no
+        // changed region to narrow to, so show both sides whole.
+        head = 0;
+        tail = 0;
+    }
+    for (prefix, side) in [
+        ("- ", &old[head..old.len() - tail]),
+        ("+ ", &new[head..new.len() - tail]),
+    ] {
+        lines.extend(
+            side.iter()
+                .take(max_lines)
+                .map(|line| format!("{prefix}{line}")),
+        );
+        if side.len() > max_lines {
+            lines.push(format!("... (+{} more lines)", side.len() - max_lines));
+        }
+    }
 }
 
 pub(super) fn exact_edit_file_preview_lines(params: &Value, locale: Locale) -> Option<Vec<String>> {
@@ -280,30 +312,32 @@ pub(super) fn param_text(params: &Value, keys: &[&str]) -> Option<String> {
 }
 
 pub(super) fn localize_detail_label(label: &str, locale: Locale) -> Cow<'static, str> {
-    match locale {
-        Locale::ZhHans => match label {
-            "Command" => tr(locale, MessageId::ApprovalLabelCommand),
-            "Dir" => tr(locale, MessageId::ApprovalLabelDir),
-            "File" => tr(locale, MessageId::ApprovalLabelFile),
-            "Preview" => tr(locale, MessageId::ApprovalLabelPreview),
-            "proposed content" => tr(locale, MessageId::ApprovalLabelProposedContent),
-            "replace this" => tr(locale, MessageId::ApprovalLabelReplaceThis),
-            "with this" => tr(locale, MessageId::ApprovalLabelWithThis),
-            "replacement content" => tr(locale, MessageId::ApprovalLabelReplacementContent),
-            "Path" => tr(locale, MessageId::ApprovalLabelPath),
-            "Target" => tr(locale, MessageId::ApprovalLabelTarget),
-            "Input" => tr(locale, MessageId::ApprovalLabelInput),
-            "Action" => tr(locale, MessageId::ApprovalLabelAction),
-            "Type" => tr(locale, MessageId::ApprovalLabelType),
-            "Prompt" => tr(locale, MessageId::ApprovalLabelPrompt),
-            "Goal" => "目标".into(),
-            "Children" => "子任务".into(),
-            "Writes" => "写入".into(),
-            "Shell" => "Shell".into(),
-            "Network" => "网络".into(),
-            "Budget" => "预算".into(),
-            _ => label.to_string().into(),
-        },
+    match label {
+        "Command" => tr(locale, MessageId::ApprovalLabelCommand),
+        "Dir" => tr(locale, MessageId::ApprovalLabelDir),
+        "File" => tr(locale, MessageId::ApprovalLabelFile),
+        "Preview" => tr(locale, MessageId::ApprovalLabelPreview),
+        "proposed content" => tr(locale, MessageId::ApprovalLabelProposedContent),
+        "replace this" => tr(locale, MessageId::ApprovalLabelReplaceThis),
+        "with this" => tr(locale, MessageId::ApprovalLabelWithThis),
+        "replacement content" => tr(locale, MessageId::ApprovalLabelReplacementContent),
+        "Path" => tr(locale, MessageId::ApprovalLabelPath),
+        "Target" => tr(locale, MessageId::ApprovalLabelTarget),
+        "Input" => tr(locale, MessageId::ApprovalLabelInput),
+        "Action" => tr(locale, MessageId::ApprovalLabelAction),
+        "Type" => tr(locale, MessageId::ApprovalLabelType),
+        "Prompt" => tr(locale, MessageId::ApprovalLabelPrompt),
+        _ if locale != Locale::ZhHans => label.to_string().into(),
+        "Goal" => "目标".into(),
+        "Children" => "子任务".into(),
+        "Writes" => "写入".into(),
+        "Shell" => "Shell".into(),
+        "Network" => "网络".into(),
+        "Budget" => "预算".into(),
+        "Trust mode" => "信任模式".into(),
+        "Auto-approve" => "自动批准".into(),
+        "Mode" => "模式".into(),
+        "Workspace" => "工作区".into(),
         _ => label.to_string().into(),
     }
 }
@@ -315,9 +349,6 @@ pub(super) fn localize_preview_shell_line(
 ) -> Cow<'static, str> {
     match tool_name {
         "write_file" if line == "proposed content" => localize_detail_label(line, locale),
-        "edit_file" if matches!(line, "replace this" | "with this") => {
-            localize_detail_label(line, locale)
-        }
         _ => line.to_string().into(),
     }
 }
@@ -417,6 +448,15 @@ struct PrintfWriteFilePreview {
 }
 
 fn parse_printf_write_file_command(command: &str) -> Option<PrintfWriteFilePreview> {
+    // A chained or substituted command is not a plain file write: collapsing
+    // it into `printf > target` would hide everything after the operator
+    // from the approval card. Scan the whole command (not the halves around
+    // the redirect) so quote state is never read from a mid-string split.
+    // shlex and the scanners below only understand POSIX quoting. Bash's
+    // ANSI-C and locale quotes need their original command shown in full.
+    if command.contains("$'") || command.contains("$\"") || has_unquoted_shell_control(command) {
+        return None;
+    }
     let (before_redirect, after_redirect) = split_unquoted_redirect(command)?;
     let before_redirect = before_redirect.trim();
     if !before_redirect.starts_with("printf") {
@@ -476,6 +516,44 @@ fn format_printf_write_file_preview(preview: PrintfWriteFilePreview) -> Vec<Stri
     out
 }
 
+/// Whether `text` holds shell syntax that runs or chains another command:
+/// an unquoted `;`, `&`, `|`, newline, `(` (subshell, `$(`, `<(`), or a
+/// command substitution (`$(` / backtick) even inside double quotes.
+fn has_unquoted_shell_control(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev: Option<char> = None;
+    for ch in text.chars() {
+        if escaped {
+            escaped = false;
+            prev = None;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => match ch {
+                '\\' => escaped = true,
+                '"' => quote = None,
+                '`' => return true,
+                '(' if prev == Some('$') => return true,
+                _ => {}
+            },
+            None => match ch {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(ch),
+                ';' | '&' | '|' | '`' | '(' | '\n' | '\r' => return true,
+                _ => {}
+            },
+        }
+        prev = Some(ch);
+    }
+    false
+}
+
 fn split_unquoted_redirect(command: &str) -> Option<(&str, &str)> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
@@ -484,7 +562,7 @@ fn split_unquoted_redirect(command: &str) -> Option<(&str, &str)> {
             escaped = false;
             continue;
         }
-        if ch == '\\' {
+        if ch == '\\' && quote != Some('\'') {
             escaped = true;
             continue;
         }

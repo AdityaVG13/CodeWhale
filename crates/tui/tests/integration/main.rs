@@ -5,6 +5,9 @@
 //! same test names (`integration::adaptive_evidence_acceptance::...`) so
 //! `cargo test -p codewhale-tui adaptive_evidence_acceptance` still filters.
 
+#[path = "../support/binary.rs"]
+mod binary;
+
 // Production modules that are `#[path]`-included by the test files below and
 // that themselves use `crate::`. They must exist at the harness crate root so
 // `crate::config`, `crate::shell_dispatcher`, etc. resolve when the same
@@ -15,6 +18,8 @@
 mod config;
 #[path = "../../src/eval.rs"]
 mod eval;
+#[path = "../../src/skills/frontmatter.rs"]
+mod frontmatter;
 #[path = "../../src/skills/install.rs"]
 #[allow(dead_code)]
 mod install;
@@ -22,6 +27,23 @@ mod install;
 mod llm_client;
 #[path = "../../src/network_policy.rs"]
 mod network_policy;
+/// `skills/install.rs` reads downloads through `crate::utils`; only the
+/// capped body reader is needed, so only that file is included.
+#[path = "../../src/utils/response_body.rs"]
+mod utils;
+/// `network_policy.rs` resolves its audit file through `crate::audit`. The
+/// harness has no audit module, so it gets a per-process scratch log: like the
+/// production cfg(test) path (#6534), a test never appends to the real
+/// `~/.codewhale/audit.log`.
+mod audit {
+    pub fn audit_log_path() -> Option<std::path::PathBuf> {
+        Some(
+            std::env::temp_dir()
+                .join(format!("codewhale-it-audit-{}", std::process::id()))
+                .join("audit.log"),
+        )
+    }
+}
 #[path = "../../src/skills/package_digest.rs"]
 #[allow(dead_code)]
 mod package_digest;
@@ -30,6 +52,8 @@ mod shell_dispatcher;
 // The legacy text tool-call parser lives in codewhale-core now; keep the
 // `crate::tool_parser` path the suites use.
 use codewhale_core::tool_parser;
+// `shell_dispatcher` reaches raw mode through the runtime's terminal port.
+use codewhale_runtime::host_terminal;
 
 mod adaptive_evidence_acceptance;
 mod cache_guard;

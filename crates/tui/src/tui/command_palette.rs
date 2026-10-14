@@ -69,10 +69,11 @@ pub struct CommandPaletteView {
     hovered: Cell<Option<usize>>,
 }
 
+#[cfg(test)]
 pub fn build_entries(
     locale: Locale,
     skills_dir: &Path,
-    skills_scan_codewhale_only: bool,
+    skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     workspace: &Path,
     mcp_config_path: &Path,
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
@@ -80,7 +81,7 @@ pub fn build_entries(
     build_entries_with_plugins(
         locale,
         skills_dir,
-        skills_scan_codewhale_only,
+        skills_discovery_mode,
         workspace,
         mcp_config_path,
         mcp_snapshot,
@@ -91,14 +92,14 @@ pub fn build_entries(
 pub fn build_entries_with_plugins(
     locale: Locale,
     skills_dir: &Path,
-    skills_scan_codewhale_only: bool,
+    skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     workspace: &Path,
     mcp_config_path: &Path,
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
     plugins: &crate::plugins::PluginRegistry,
 ) -> Vec<CommandPaletteEntry> {
     let mut entries = Vec::new();
-    commands::user_registry::with_registry_for_workspace(Some(workspace), |user_registry| {
+    commands::user_registry::with_registry_for_plugins(plugins, |user_registry| {
         let all_user_commands = user_registry.iter().collect::<Vec<_>>();
         for command in commands::command_infos() {
             if command.is_unlisted() {
@@ -168,15 +169,19 @@ pub fn build_entries_with_plugins(
     let skills = skills::discover_for_workspace_and_dir_with_mode_and_plugins(
         workspace,
         skills_dir,
-        skills::SkillDiscoveryMode::from_codewhale_only(skills_scan_codewhale_only),
+        skills_discovery_mode,
         Some(plugins),
     )
     .into_enabled();
-    for skill in skills.list() {
+    for skill in skills
+        .list()
+        .iter()
+        .filter(|skill| skill.invocation.user_invocable())
+    {
         entries.push(CommandPaletteEntry {
             section: PaletteSection::Skill,
             label: format!("${}", skill.name),
-            description: skill.description.clone(),
+            description: skill.user_menu_description(),
             command: format!("${}", skill.name),
             action: CommandPaletteAction::ExecuteCommand {
                 command: format!("${}", skill.name),
@@ -1324,6 +1329,7 @@ mod tests {
     fn command_palette_skills_use_workspace_and_configured_directories() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let workspace_skill_dir = workspace
             .join(".agents")
             .join("skills")
@@ -1347,7 +1353,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             configured_dir.as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             Path::new("mcp.json"),
             None,
@@ -1366,6 +1372,7 @@ mod tests {
     fn command_palette_skills_respect_codewhale_only_scan() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let claude_skill_dir = workspace
             .join(".claude")
             .join("skills")
@@ -1390,7 +1397,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             workspace.join(".codewhale").join("skills").as_path(),
-            true,
+            crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
             workspace.as_path(),
             Path::new("mcp.json"),
             None,
@@ -1435,7 +1442,7 @@ mod tests {
         let entries_before = build_entries_with_plugins(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             &workspace,
             Path::new("mcp.json"),
             None,
@@ -1452,7 +1459,7 @@ mod tests {
         let entries_after = build_entries_with_plugins(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             &workspace,
             Path::new("mcp.json"),
             None,
@@ -1473,7 +1480,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1497,6 +1504,7 @@ mod tests {
         let workspace = tmp.path().join("workspace");
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
+        crate::config::save_workspace_trust(&workspace).expect("trust workspace");
         std::fs::write(
             commands_dir.join("review.md"),
             "---\ndescription: Review with context\nargument-hint: <path>\n---\nReview $ARGUMENTS",
@@ -1506,7 +1514,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1528,6 +1536,7 @@ mod tests {
     fn command_palette_uses_frontmatter_name_usage_and_arguments() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1539,7 +1548,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1574,7 +1583,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1591,6 +1600,7 @@ mod tests {
     fn hidden_frontmatter_name_override_suppresses_shadowed_builtin() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1602,7 +1612,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1618,6 +1628,7 @@ mod tests {
     fn command_palette_filters_shadowed_builtin_aliases_from_description() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1629,7 +1640,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1662,6 +1673,7 @@ mod tests {
         // command (its metadata and action), never the built-in row.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1673,7 +1685,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1707,6 +1719,7 @@ mod tests {
         // matching the shared alias-aware contract.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1718,7 +1731,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1745,6 +1758,7 @@ mod tests {
         // still owning the token (AT-008 boundary in the palette).
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1756,7 +1770,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1777,6 +1791,7 @@ mod tests {
         // from its description.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1788,7 +1803,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             tmp.path().join("skills").as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             workspace.as_path(),
             tmp.path().join("mcp.json").as_path(),
             None,
@@ -1820,7 +1835,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             skills_dir.as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             tmp.path(),
             mcp_config_path.as_path(),
             None,
@@ -1891,7 +1906,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1929,7 +1944,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1951,7 +1966,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             None,
@@ -1989,7 +2004,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             skills_dir.as_path(),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             tmp.path(),
             mcp_config_path.as_path(),
             None,
@@ -2114,7 +2129,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             Some(&snapshot),
@@ -2171,7 +2186,7 @@ mod tests {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
-            false,
+            crate::skills::SkillDiscoveryMode::Compatible,
             Path::new("."),
             Path::new("mcp.json"),
             Some(&snapshot),

@@ -3,7 +3,7 @@
 Stateless, index-free navigation soundings. File tools echo their
 surroundings fresh from source — no index to build, no background work,
 no new dependencies. Every sounding is deterministic (sorted, capped,
-hard-budgeted, `/`-separated paths on every OS), so a repeated call is
+bounded in emitted output and accepted body size, `/`-separated paths on every OS), so a repeated call is
 byte-identical and cache-friendly, and soundings never enter the
 session-pinned prefix: they ride tool results (append-only history)
 only.
@@ -62,3 +62,10 @@ same gates, so an `off:links` trial measures links alone.
   cost of a sounding is bounded by one directory listing plus a
   bounded re-read of small mates.
 - No `patch` (multi-file) echoes yet; single-file write/edit only.
+
+
+## Source and scan limits
+
+Callers are inspected from at most 32 sorted visible language-file candidates. Each accepted caller body is at most 256 KiB; one extra byte detects overflow. Unscanned candidates are reported explicitly. Key-file body sounding accepts at most 8 MiB and detects overflow the same way. Reads use the existing protected regular-file handle and reject unsafe file shapes before parsing. Directory name enumeration and platform/kernel read latency remain outside these body caps. Delete attribution uses the old-side range; replacement attribution uses both old and new ranges. These source rules do not qualify Windows behavior or provider cache savings.
+
+Search pod enumeration reuses the depth-one ignore walker: parent ignore files, global rules, repository gitignore and info/exclude are honored when requested. Symlinks are not followed. Include/exclude/extension and deny guards remain applied, and the unlistable-directory fallback only repeats already matched non-dotfile names. Directed reads bypass ignore filtering while retaining denial and protected-read guards.

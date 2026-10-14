@@ -12,15 +12,11 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 /// Maximum number of deferred schemas a conversation may keep in its active
-/// toolbox. The permanent eager head is not counted here.
+/// toolbox. The permanent `read`/`write`/`edit`/`bash`/`agent`/`tool_search`
+/// router surface is not counted here.
 pub(crate) const TOOL_ACTIVATION_CACHE_MAX_NAMES: usize = 8;
 /// Maximum serialized bytes added to requests by cached deferred schemas.
-/// Sized to co-activate the delegation pair (`agent` 11.7KB + `workflow`
-/// 9.7KB) with room for small companions: at 16KB the two thrashed each
-/// other out of the cache every discovery round. The prefix diet removed
-/// 28KB from the head; this returns 8KB of activation headroom, still a
-/// deep net cut.
-pub(crate) const TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES: usize = 24 * 1024;
+pub(crate) const TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES: usize = 16 * 1024;
 
 /// Bounded, process-local conversation cache for tools activated by
 /// `tool_search`.
@@ -97,17 +93,11 @@ impl ToolActivationCache {
         evicted
     }
 
-    /// Touch requested deferred tools in search-result order. An oversized
-    /// schema is rejected; otherwise least-recently-used entries are evicted
-    /// until both bounds hold.
-    ///
-    /// Push order is the REVERSE of the request order: eviction pops from
-    /// the front, so pushing best-match-last keeps the highest-priority
-    /// tool (which the caller ranked first) alive the longest. Pushing in
-    /// request order stranded large best matches — `agent` (11.7KB) was
-    /// discovered, then immediately evicted by its own small-fry company
-    /// whenever the set overflowed the byte bound. Cross-turn LRU is unaffected:
-    /// every batch entry is still newer than every older entry.
+    /// Touch requested deferred tools in search-result priority order. An
+    /// oversized schema is rejected; otherwise least-recently-used entries
+    /// are evicted until both bounds hold. Insert each batch best-match-last
+    /// so overflow retains its highest-priority tools. Every batch entry is
+    /// still newer than entries from earlier batches.
     pub(crate) fn activate(
         &mut self,
         catalog: &[codewhale_models::Tool],
@@ -118,12 +108,11 @@ impl ToolActivationCache {
             ..ToolActivationDelta::default()
         };
         let mut seen = HashSet::new();
-        let mut ordered: Vec<&String> = requested.iter().collect();
-        ordered.reverse();
-        for name in ordered {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
+        let ordered = requested
+            .iter()
+            .filter(|name| seen.insert(name.as_str()))
+            .collect::<Vec<_>>();
+        for name in ordered.into_iter().rev() {
             let Some(tool) = Self::catalog_tool(catalog, name) else {
                 delta.rejected.push(name.clone());
                 continue;
@@ -471,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_activation_cache_is_lru_bounded_to_eight_names() {
+    fn tool_activation_cache_retains_best_matches_on_count_overflow() {
         let catalog = (0..10)
             .map(|index| deferred_tool(&format!("tool_{index}"), 8))
             .collect::<Vec<_>>();
@@ -483,41 +472,77 @@ mod tests {
         let delta = cache.activate(&catalog, &requested);
 
         assert_eq!(cache.names().count(), TOOL_ACTIVATION_CACHE_MAX_NAMES);
-        // Request order is priority (search ranked best-first), so the
-        // TAIL of the request is evicted first — the retained set is the
-        // eight highest-priority tools.
         assert_eq!(
             cache.names().collect::<Vec<_>>(),
             vec![
                 "tool_7", "tool_6", "tool_5", "tool_4", "tool_3", "tool_2", "tool_1", "tool_0"
             ]
         );
-        assert_eq!(delta.admitted.len(), TOOL_ACTIVATION_CACHE_MAX_NAMES);
-        assert!(delta.evicted.contains(&"tool_8".to_string()));
-        assert!(delta.evicted.contains(&"tool_9".to_string()));
+        assert_eq!(delta.admitted, requested[..TOOL_ACTIVATION_CACHE_MAX_NAMES]);
+        assert_eq!(delta.evicted, vec!["tool_8", "tool_9"]);
     }
 
     #[test]
     fn best_match_survives_byte_overflow_eviction() {
-        // Priority-inversion regression: `agent` (11.7KB, best match) was
-        // discovered, then immediately evicted by its own small-fry company
-        // whenever the set overflowed the byte bound.
-        let mut catalog = vec![deferred_tool("big_best", 20_000)];
-        for index in 0..8 {
-            catalog.push(deferred_tool(&format!("small_{index}"), 1_000));
+        let mut catalog = vec![deferred_tool("big_best", 12_000)];
+        for index in 0..4 {
+            catalog.push(deferred_tool(&format!("small_{index}"), 1_500));
         }
         let requested = catalog
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
+        // Isolate byte overflow: every schema fits alone and the name count
+        // fits, but the combined batch exceeds the current 16 KiB limit.
+        assert!(catalog.iter().all(|tool| {
+            ToolActivationCache::serialized_bytes(tool) <= TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES
+        }));
+        assert!(requested.len() < TOOL_ACTIVATION_CACHE_MAX_NAMES);
+        assert!(
+            catalog
+                .iter()
+                .map(ToolActivationCache::serialized_bytes)
+                .sum::<usize>()
+                > TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES
+        );
         let mut cache = ToolActivationCache::default();
         let delta = cache.activate(&catalog, &requested);
 
-        assert!(
-            delta.admitted.contains(&"big_best".to_string()),
-            "best match must survive its own discovery set: {delta:?}"
-        );
+        assert_eq!(delta.admitted.first().map(String::as_str), Some("big_best"));
+        assert!(cache.names().any(|name| name == "big_best"));
         assert!(delta.admitted.len() < requested.len());
+        assert_eq!(delta.admitted, requested[..delta.admitted.len()]);
+        assert!(!delta.evicted.is_empty());
+        assert!(delta.rejected.is_empty());
+        assert!(cache.total_serialized_bytes(&catalog) <= TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES);
+    }
+
+    #[test]
+    fn duplicate_does_not_lower_first_match_priority() {
+        let catalog = (0..10)
+            .map(|index| deferred_tool(&format!("tool_{index}"), 8))
+            .collect::<Vec<_>>();
+        let mut requested = catalog
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        requested.push("tool_0".to_string());
+        let mut cache = ToolActivationCache::default();
+        let delta = cache.activate(&catalog, &requested);
+
+        assert_eq!(cache.names().count(), TOOL_ACTIVATION_CACHE_MAX_NAMES);
+        assert_eq!(cache.names().filter(|name| *name == "tool_0").count(), 1);
+        assert!(cache.names().any(|name| name == "tool_0"));
+        assert!(
+            !cache
+                .names()
+                .any(|name| name == "tool_8" || name == "tool_9")
+        );
+        // Admission reporting keeps the caller's order, including duplicates,
+        // while the cache itself retains each name only once.
+        let mut expected = requested[..TOOL_ACTIVATION_CACHE_MAX_NAMES].to_vec();
+        expected.push("tool_0".to_string());
+        assert_eq!(delta.admitted, expected);
     }
 
     #[test]
@@ -531,14 +556,14 @@ mod tests {
             .collect::<Vec<_>>();
         let mut cache = ToolActivationCache::default();
         cache.activate(&catalog, &first_eight);
-        cache.activate(&catalog, &["tool_0".to_string()]);
+        // The initial batch puts its lowest-ranked match at the LRU front.
+        // A later touch must protect it from the following batch's eviction.
+        cache.activate(&catalog, &["tool_7".to_string()]);
         cache.activate(&catalog, &["tool_8".to_string()]);
 
         let names = cache.names().collect::<Vec<_>>();
-        assert!(names.contains(&"tool_0"));
-        // tool_7 was the lowest-priority entry of the first batch and was
-        // never re-touched, so it is the eviction victim — not tool_1.
-        assert!(!names.contains(&"tool_7"));
+        assert!(names.contains(&"tool_7"));
+        assert!(!names.contains(&"tool_6"));
         assert_eq!(names.last().copied(), Some("tool_8"));
     }
 

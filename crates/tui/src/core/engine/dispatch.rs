@@ -5,7 +5,6 @@
 //!
 //! * Streaming-buffer parsing into a finalized `serde_json::Value` tool input
 //!   (`final_tool_input`, `parse_tool_input`, fenced/JSON segment helpers).
-//! * The `multi_tool_use.parallel` payload parser.
 //! * Policy predicates the turn loop consults — when a batch can run in
 //!   parallel and the small set of read-only MCP tools that are safe to run
 //!   in parallel.
@@ -28,10 +27,10 @@ const MAX_SCHEMA_CONTAINER_REPAIR_BYTES: usize = 64 * 1024;
 
 // === Types ============================================================
 
-#[allow(dead_code)] // `index` mirrors batch order for diagnostic ergonomics.
 pub(super) struct ToolExecOutcome {
     pub(super) index: usize,
     pub(super) id: String,
+    pub(super) model_call: Option<crate::core::events::ModelToolCall>,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) started_at: std::time::Instant,
@@ -276,6 +275,7 @@ impl FleetDenialGuard {
 pub(super) struct ToolExecutionPlan {
     pub(super) index: usize,
     pub(super) id: String,
+    pub(super) model_call: Option<crate::core::events::ModelToolCall>,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,
@@ -296,20 +296,6 @@ pub(super) enum ToolExecutionBatch {
     Serial(Box<ToolExecutionPlan>),
 }
 
-#[derive(Debug, serde::Serialize)]
-pub(super) struct ParallelToolResultEntry {
-    pub(super) tool_name: String,
-    pub(super) success: bool,
-    pub(super) content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(super) struct ParallelToolResult {
-    pub(super) results: Vec<ParallelToolResultEntry>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ToolApprovalStamp {
     ApprovedByUser,
@@ -317,6 +303,8 @@ pub(super) enum ToolApprovalStamp {
 }
 
 impl ToolApprovalStamp {
+    const ALL: [Self; 2] = [Self::ApprovedByUser, Self::ApprovedWithPolicy];
+
     fn decision(self) -> &'static str {
         match self {
             Self::ApprovedByUser => "approved_by_user",
@@ -361,6 +349,43 @@ pub(super) fn stamp_tool_result_approval(result: &mut ToolResult, approval: Tool
         result.content = note.to_string();
     } else {
         result.content = format!("{note}\n\n{}", result.content);
+    }
+}
+
+/// The tool output a person reads: the result without the note
+/// [`stamp_tool_result_approval`] put in front of it for the model (#6566).
+///
+/// Only a result the engine stamped (`metadata.approval.model_visible`) loses
+/// a note, and only that decision's exact note text followed by a blank line
+/// (or nothing). Output that merely begins with "[approval] " — from a
+/// command, a file, or anything else a tool read — is shown whole, so
+/// injected text cannot hide tool output from the person.
+pub(crate) fn content_without_approval_note(result: &ToolResult) -> &str {
+    let content = result.content.as_str();
+    let approval = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("approval"));
+    let stamped = approval
+        .and_then(|approval| approval.get("model_visible"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let Some(stamp) = approval
+        .and_then(|approval| approval.get("decision"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|decision| {
+            ToolApprovalStamp::ALL
+                .into_iter()
+                .find(|stamp| stamp.decision() == decision)
+        })
+        .filter(|_| stamped)
+    else {
+        return content;
+    };
+    match content.strip_prefix(stamp.model_visible_note()) {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix("\n\n").unwrap_or(content),
+        None => content,
     }
 }
 
@@ -423,7 +448,7 @@ pub(super) fn format_tool_error_with_schema(
             "Path escapes workspace: {}. Use a workspace-relative path or enable trust mode.",
             path.display()
         ),
-        ToolError::ExecutionFailed { message } => message.clone(),
+        ToolError::ExecutionFailed { message, .. } => message.clone(),
         ToolError::Timeout { seconds } => format!(
             "Tool '{tool_name}' timed out after {seconds}s. Try a narrower scope or a longer timeout."
         ),
@@ -433,7 +458,7 @@ pub(super) fn format_tool_error_with_schema(
             // #3020: Pass through self-explanatory messages that already name the
             // cause (mode switch, allow_shell, feature flag).  Avoids appending a
             // conflicting "Check mode, feature flags" suffix on top of
-            // "switch to Act mode" which already gives the recovery path.
+            // a message that already names the mode and who can change it.
             if lower.contains("current tool catalog")
                 || lower.contains("did you mean:")
                 || mentions_mode_word(&lower)
@@ -449,12 +474,15 @@ pub(super) fn format_tool_error_with_schema(
         }
         ToolError::PermissionDenied { message } => {
             let lower = message.to_ascii_lowercase();
-            // #3020: Pass through messages that already name the denial cause.
-            if mentions_mode_word(&lower)
-                || lower.contains("allow_shell")
-                || lower.contains("denied by user")
-            {
+            // #3020: messages that already name the denial cause get no
+            // conflicting "Adjust approval mode" suffix. They keep the
+            // `Tool '…' was denied:` lead, which is how a receipt tells a
+            // call Codewhale blocked from one that ran and failed; an
+            // approval denial already starts `Tool '…' denied by user`.
+            if lower.contains("denied by user") {
                 message.clone()
+            } else if mentions_mode_word(&lower) || lower.contains("allow_shell") {
+                format!("Tool '{tool_name}' was denied: {message}")
             } else {
                 format!(
                     "Tool '{tool_name}' was denied: {message}. Adjust approval mode or request permission."
@@ -682,52 +710,6 @@ fn extract_balanced_segment(text: &str, open: char, close: char) -> Option<Strin
     end.map(|end_idx| text[start..end_idx].to_string())
 }
 
-fn normalize_parallel_tool_name(raw: &str) -> String {
-    let mut name = raw.trim();
-    for prefix in ["functions.", "tools.", "tool."] {
-        if let Some(stripped) = name.strip_prefix(prefix) {
-            name = stripped;
-            break;
-        }
-    }
-    name.to_string()
-}
-
-pub(super) fn parse_parallel_tool_calls(
-    input: &serde_json::Value,
-) -> Result<Vec<(String, serde_json::Value)>, ToolError> {
-    let tool_uses = input
-        .get("tool_uses")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| ToolError::missing_field("tool_uses"))?;
-    if tool_uses.is_empty() {
-        return Err(ToolError::invalid_input(
-            "multi_tool_use.parallel requires at least one tool call",
-        ));
-    }
-
-    let mut calls = Vec::with_capacity(tool_uses.len());
-    for item in tool_uses {
-        let name = item
-            .get("recipient_name")
-            .or_else(|| item.get("tool_name"))
-            .or_else(|| item.get("name"))
-            .or_else(|| item.get("tool"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::missing_field("recipient_name"))?;
-        let params = item
-            .get("parameters")
-            .or_else(|| item.get("input"))
-            .or_else(|| item.get("args"))
-            .or_else(|| item.get("arguments"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        calls.push((normalize_parallel_tool_name(name), params));
-    }
-
-    Ok(calls)
-}
-
 // === Dispatch policy ==================================================
 
 #[cfg(test)]
@@ -806,11 +788,93 @@ pub(super) fn mcp_tool_is_read_only(name: &str) -> bool {
     )
 }
 
-pub(super) fn mcp_tool_approval_description(name: &str) -> String {
-    if mcp_tool_is_read_only(name) {
-        format!("Read-only MCP tool '{name}'")
-    } else {
-        format!("MCP tool '{name}' may have side effects")
+pub(super) fn mcp_tool_approval_description(name: &str, input: &serde_json::Value) -> String {
+    use crate::tools::approval_cache::{ComputerUseUserGate, computer_use_user_gate};
+
+    // K1/K2: a Computer Use consent or script card names exactly what the
+    // person is granting. Generic "may have side effects" text is how a
+    // model-issued consent used to read as routine.
+    match computer_use_user_gate(name, input) {
+        Some(ComputerUseUserGate::Consent {
+            action,
+            app,
+            bundle_id,
+            scope,
+            remember,
+            confirm,
+        }) => {
+            if confirm {
+                // The plugin paused on an action that cannot be taken back
+                // and handed the model a token; approving this card is the
+                // person's confirmation of that one action.
+                return "Computer Use confirmation requested by the model: allow the irreversible action (pay, buy, send, transfer or delete) the plugin just paused on. Approve only if you asked for exactly that action.".to_string();
+            }
+            let target = match scope {
+                "foreground" => {
+                    "shared-desktop foreground control (take the pointer and focus)".to_string()
+                }
+                _ => {
+                    let app = app.as_deref().unwrap_or("<unnamed app>");
+                    match bundle_id.as_deref() {
+                        Some(bundle) => format!("app '{app}' (bundle id {bundle})"),
+                        None => format!("app '{app}' (bundle id not given)"),
+                    }
+                }
+            };
+            let lifetime = if action == "revoke" {
+                "clears session and persisted decisions, including a saved deny"
+            } else if remember {
+                "persisted until revoked"
+            } else {
+                "this session"
+            };
+            let verb = if action == "revoke" {
+                "revoke recorded decisions for"
+            } else {
+                "allow"
+            };
+            return format!(
+                "Computer Use consent requested by the model: {verb} {target}; scope: {scope}; {lifetime}. Approve only if you want this."
+            );
+        }
+        Some(ComputerUseUserGate::AppScript {
+            language,
+            script_sha256,
+            first_line,
+            line_count,
+        }) => {
+            let shown = if line_count > 1 {
+                format!("first of {line_count} lines")
+            } else {
+                "1 line".to_string()
+            };
+            return format!(
+                "Computer Use app_script: run this exact {language} script outside the sandbox (sha256 {}, {shown}): {first_line}",
+                &script_sha256[..16]
+            );
+        }
+        Some(ComputerUseUserGate::Computer {
+            action,
+            transport,
+            destination,
+        }) => {
+            let transport = transport.as_deref().unwrap_or("default");
+            let destination = destination.as_deref().unwrap_or("<not given>");
+            return format!(
+                "Computer Use: {action} a computer the model will then drive (transport {transport}, {destination}). Approve only if you want this machine controlled."
+            );
+        }
+        None => {}
+    }
+    match crate::mcp::mcp_tool_approval_hint(name) {
+        _ if mcp_tool_is_read_only(name) => format!("Read-only MCP tool '{name}'"),
+        Some(crate::mcp::McpToolApprovalHint::TrustedReadOnly) => {
+            format!("Read-only MCP tool '{name}' (declared by a reviewed plugin)")
+        }
+        Some(crate::mcp::McpToolApprovalHint::Destructive) => {
+            format!("MCP tool '{name}' is marked destructive by its server")
+        }
+        None => format!("MCP tool '{name}' may have side effects"),
     }
 }
 

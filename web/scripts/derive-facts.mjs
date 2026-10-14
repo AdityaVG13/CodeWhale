@@ -11,7 +11,8 @@
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildFacts } from "./facts-lib.mjs";
+import { buildFacts, deriveFeatures, REPO_ROOT } from "./facts-lib.mjs";
+import { deriveAgentDocs } from "./docs-sources-lib.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const target = resolve(__dirname, "..", "lib", "facts.generated.ts");
@@ -97,6 +98,8 @@ export const FACTS: RepoFacts = ${JSON.stringify(out, null, 2)};
 `;
 
 writeFileSync(target, ts);
+writeFileSync(resolve(__dirname, "..", "data", "features.generated.json"), `${JSON.stringify(deriveFeatures(), null, 2)}\n`);
+writeFileSync(resolve(__dirname, "..", "data", "agent-docs.generated.json"), `${JSON.stringify(deriveAgentDocs(resolve(__dirname, ".."), REPO_ROOT), null, 2)}\n`);
 console.log(`[derive-facts] wrote ${target}`);
 console.log(
   `[derive-facts] version=${out.version} crates=${out.crates.length} ` +

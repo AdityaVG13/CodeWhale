@@ -20,19 +20,10 @@ export const chrome: ChromeDict = {
   navCommunity: "المجتمع",
   navContribute: "المساهمة",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
+  navFeatures: "القدرات",
   navProduct: "المنتج",
   navModels: "النماذج",
   navPlugins: "الإضافات",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "الانتقال إلى المحتوى الرئيسي",
 
@@ -42,30 +33,8 @@ export const chrome: ChromeDict = {
   installCta: "ثبّت ←",
 
   authSignIn: "تسجيل الدخول",
-  authRegister: "إنشاء حساب",
-  authGroupAria: "الحساب",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "أي نموذج، على جهازك",
-
-  issueLabel: "عدد {date}",
   dateLocale: "ar",
-
-  starsAria: "نجوم GitHub",
-  githubFallback: "GitHub",
-
-  tickerLiveLabel: "مباشر",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "دُمج",
-  tickerOpened: "فُتح",
-  tickerClosed: "أُغلق",
-  tickerReleased: "أُصدر",
-  tickerFirstContribution: "أول مساهمة",
-  tickerBy: "بواسطة {handle}",
-  tickerAria: "آخر نشاط في المستودع",
-
-  traceLabel: "أثر الاستدلال",
-  traceTabsAria: "مقتطفات الجلسات",
 
   menuOpen: "افتح القائمة",
   menuClose: "أغلق القائمة",
@@ -73,11 +42,11 @@ export const chrome: ChromeDict = {
   themeAuto: "تلقائي",
   themeLight: "فاتح",
   themeDark: "داكن",
-  themeAria: "سمة التوثيق: {mode} (انقر للتبديل)",
-  themeTitle: "سمة التوثيق · تلقائي / فاتح / داكن",
+  themeAria: "السمة: {mode} (انقر للتبديل)",
+  themeTitle: "السمة · تلقائي / فاتح / داكن",
 
   footerTagline:
-    "اصنع ما تريد وأتمت العمل اليومي باستخدام النماذج التي تختارها.",
+    "ابنِ تطبيقات وأتمت العمل باستخدام نماذجك وأدواتك المتصلة.",
   footerProduct: "المنتج",
   footerProject: "المشروع",
   footerDocs: "التوثيق",

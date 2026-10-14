@@ -49,10 +49,34 @@ pub(crate) fn parse_usage(usage: Option<&Value>) -> Usage {
         .and_then(Value::as_u64)
         .or(cached_tokens)
         .map(saturating_u32);
+    // Keep reported cache creation separate so pricing can apply its write
+    // rate. Fall back per field: a details object without this field must not
+    // hide the alternate dialect's value.
+    let nested_cache_write_tokens = usage.and_then(|u| {
+        u.pointer("/prompt_tokens_details/cache_write_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                u.pointer("/input_tokens_details/cache_write_tokens")
+                    .and_then(Value::as_u64)
+            })
+    });
+    let prompt_cache_write_tokens = usage
+        .and_then(|u| u.get("prompt_cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or(nested_cache_write_tokens)
+        .map(saturating_u32);
     let prompt_cache_miss_tokens = usage
         .and_then(|u| u.get("prompt_cache_miss_tokens"))
         .and_then(Value::as_u64)
-        .or_else(|| prompt_cache_hit_tokens.map(|hit| input_tokens.saturating_sub(u64::from(hit))))
+        .or_else(|| {
+            // No cache report means unknown, including when usage is absent.
+            // A reported zero is still a report and permits derivation.
+            (prompt_cache_hit_tokens.is_some() || prompt_cache_write_tokens.is_some()).then(|| {
+                let accounted = u64::from(prompt_cache_hit_tokens.unwrap_or(0))
+                    .saturating_add(u64::from(prompt_cache_write_tokens.unwrap_or(0)));
+                input_tokens.saturating_sub(accounted)
+            })
+        })
         .map(saturating_u32);
     // Reasoning tokens are a *subset* of the completion count every provider
     // bills, so they are never added to output. A payload claiming more
@@ -83,7 +107,7 @@ pub(crate) fn parse_usage(usage: Option<&Value>) -> Usage {
         output_tokens: saturating_u32(output_tokens),
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
-        prompt_cache_write_tokens: None,
+        prompt_cache_write_tokens,
         reasoning_tokens,
         reasoning_replay_tokens: None,
         server_tool_use,
@@ -95,34 +119,51 @@ pub(super) fn extract_sse_data_value(line: &str) -> Option<&str> {
         .map(|value| value.strip_prefix(' ').unwrap_or(value))
 }
 
-/// Genuine invalid UTF-8 in an SSE line (or an unterminated flush).
+/// Hard ceiling for one pending SSE line, matching the MCP frame limit.
+/// This does not bound the size of a multi-line event or the whole stream.
+const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Hard ceiling for one assembled SSE event (its `data:` fields joined), so a
+/// peer that never sends the blank line ending an event cannot grow memory
+/// without bound. Same size as the single-line ceiling.
+const MAX_SSE_EVENT_BYTES: usize = MAX_SSE_LINE_BYTES;
+
+/// Invalid or oversized SSE line (or unterminated flush).
 ///
 /// HTTP/2 DATA and other transports may split a multi-byte character across
 /// chunks. That is not this error: callers must buffer raw bytes until a
-/// complete line (or stream end) before decoding. This type is only returned
-/// when `str::from_utf8` rejects the assembled bytes. We never substitute
+/// complete line (or stream end) before decoding. We never substitute
 /// U+FFFD — fail closed so garbled CJK cannot enter the transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct InvalidSseUtf8 {
-    valid_up_to: usize,
+pub(super) enum SseLineError {
+    InvalidUtf8 { valid_up_to: usize },
+    TooLong,
+    EventTooLong,
 }
 
-impl std::fmt::Display for InvalidSseUtf8 {
+impl std::fmt::Display for SseLineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "invalid UTF-8 in SSE stream at byte {}",
-            self.valid_up_to
-        )
+        match self {
+            Self::InvalidUtf8 { valid_up_to } => {
+                write!(f, "invalid UTF-8 in SSE stream at byte {valid_up_to}")
+            }
+            Self::TooLong => write!(
+                f,
+                "SSE line exceeded {MAX_SSE_LINE_BYTES} bytes (8 MiB) — aborting stream"
+            ),
+            Self::EventTooLong => write!(
+                f,
+                "SSE event exceeded {MAX_SSE_EVENT_BYTES} bytes (8 MiB) — aborting stream"
+            ),
+        }
     }
 }
 
-impl std::error::Error for InvalidSseUtf8 {}
+impl std::error::Error for SseLineError {}
 
 /// Decode one assembled SSE line (or stream-end tail) with `str::from_utf8`.
 /// Does not substitute U+FFFD.
-fn decode_sse_line_bytes(bytes: &[u8]) -> Result<&str, InvalidSseUtf8> {
-    std::str::from_utf8(bytes).map_err(|err| InvalidSseUtf8 {
+fn decode_sse_line_bytes(bytes: &[u8]) -> Result<&str, SseLineError> {
+    std::str::from_utf8(bytes).map_err(|err| SseLineError::InvalidUtf8 {
         valid_up_to: err.valid_up_to(),
     })
 }
@@ -134,10 +175,15 @@ fn decode_sse_line_bytes(bytes: &[u8]) -> Result<&str, InvalidSseUtf8> {
 /// split across two reads is never corrupted to U+FFFD, since the `\n`
 /// delimiter is ASCII and can never fall inside a multi-byte sequence.
 ///
-/// Genuine invalid bytes fail closed (`Err(InvalidSseUtf8)`); we do not
+/// Genuine invalid bytes fail closed (`Err(SseLineError)`); we do not
 /// substitute U+FFFD.
-pub(super) fn take_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, InvalidSseUtf8> {
-    let Some(line_end) = buffer.iter().position(|&b| b == b'\n') else {
+pub(super) fn take_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, SseLineError> {
+    let line_end = buffer.iter().position(|&b| b == b'\n');
+    if line_end.unwrap_or(buffer.len()) > MAX_SSE_LINE_BYTES {
+        buffer.clear();
+        return Err(SseLineError::TooLong);
+    }
+    let Some(line_end) = line_end else {
         return Ok(None);
     };
     // Strip a preceding `\r` so CRLF-delimited SSE frames do not leave CR.
@@ -154,7 +200,11 @@ pub(super) fn take_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, Inva
 ///
 /// Same fail-closed UTF-8 contract as [`take_sse_line`]. Empty / whitespace-only
 /// tails yield `Ok(None)`.
-pub(super) fn flush_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, InvalidSseUtf8> {
+pub(super) fn flush_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, SseLineError> {
+    if buffer.len() > MAX_SSE_LINE_BYTES {
+        buffer.clear();
+        return Err(SseLineError::TooLong);
+    }
     if buffer.is_empty() {
         return Ok(None);
     }
@@ -167,12 +217,33 @@ pub(super) fn flush_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, Inv
     decoded.map(|line| (!line.is_empty()).then_some(line))
 }
 
+/// Append one `data:` field to the event being assembled. The SSE spec joins
+/// the `data:` fields of one event with '\n' and dispatches the event at the
+/// blank line that ends it; a provider may split one JSON payload across
+/// several fields, so parsing each field alone would drop the event. Fails
+/// closed (clearing the event) past [`MAX_SSE_EVENT_BYTES`].
+pub(super) fn push_sse_event_data(event: &mut String, data: &str) -> Result<(), SseLineError> {
+    let needed = event
+        .len()
+        .saturating_add(usize::from(!event.is_empty()))
+        .saturating_add(data.len());
+    if needed > MAX_SSE_EVENT_BYTES {
+        event.clear();
+        return Err(SseLineError::EventTooLong);
+    }
+    if !event.is_empty() {
+        event.push('\n');
+    }
+    event.push_str(data);
+    Ok(())
+}
+
 /// Next decoded SSE line. When `at_end` is false, wait for `\n`. When `at_end`
 /// is true, also flush an unterminated tail (stream closed).
 pub(super) fn next_sse_line(
     buffer: &mut Vec<u8>,
     at_end: bool,
-) -> Result<Option<String>, InvalidSseUtf8> {
+) -> Result<Option<String>, SseLineError> {
     match take_sse_line(buffer)? {
         Some(line) => Ok(Some(line)),
         None if at_end => flush_sse_line(buffer),
@@ -194,7 +265,7 @@ impl SseLineDecoder {
         Self { buffer: Vec::new() }
     }
 
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, InvalidSseUtf8> {
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, SseLineError> {
         self.buffer.extend_from_slice(chunk);
         let mut lines = Vec::new();
         while let Some(line) = take_sse_line(&mut self.buffer)? {
@@ -203,7 +274,7 @@ impl SseLineDecoder {
         Ok(lines)
     }
 
-    pub(super) fn finish(mut self) -> Result<Option<String>, InvalidSseUtf8> {
+    pub(super) fn finish(mut self) -> Result<Option<String>, SseLineError> {
         flush_sse_line(&mut self.buffer)
     }
 }
@@ -212,6 +283,139 @@ impl SseLineDecoder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sse_line_limit_rejects_oversized_pending_complete_and_final_lines() {
+        let mut decoder = SseLineDecoder::new();
+        let at_limit = vec![b'x'; MAX_SSE_LINE_BYTES];
+        assert!(decoder.push(&at_limit).unwrap().is_empty());
+        let error = decoder
+            .push(b"x")
+            .expect_err("pending line exceeds the limit");
+        assert_eq!(error, SseLineError::TooLong);
+        assert!(error.to_string().contains("8 MiB"));
+        assert!(decoder.buffer.is_empty());
+
+        let mut complete = at_limit.clone();
+        complete.push(b'\n');
+        assert_eq!(
+            take_sse_line(&mut complete).unwrap().unwrap().len(),
+            MAX_SSE_LINE_BYTES
+        );
+        assert!(complete.is_empty());
+
+        let mut oversized = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        assert_eq!(flush_sse_line(&mut oversized), Err(SseLineError::TooLong));
+        assert!(oversized.is_empty());
+        oversized.resize(MAX_SSE_LINE_BYTES + 1, b'x');
+        oversized.push(b'\n');
+        assert_eq!(
+            next_sse_line(&mut oversized, false),
+            Err(SseLineError::TooLong)
+        );
+        assert!(oversized.is_empty());
+
+        // The cap applies per line, not to a chunk containing several lines.
+        let mut multiple = at_limit;
+        multiple.extend_from_slice(b"\nnext\n");
+        assert!(next_sse_line(&mut multiple, false).unwrap().is_some());
+        assert_eq!(
+            next_sse_line(&mut multiple, false).unwrap().as_deref(),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn parse_usage_preserves_absent_cache_telemetry_and_explicit_zero() {
+        for payload in [
+            None,
+            Some(json!({})),
+            Some(json!({"prompt_tokens": 100, "completion_tokens": 20})),
+        ] {
+            let usage = parse_usage(payload.as_ref());
+            assert_eq!(usage.prompt_cache_hit_tokens, None);
+            assert_eq!(usage.prompt_cache_miss_tokens, None);
+            assert_eq!(usage.prompt_cache_write_tokens, None);
+        }
+        let zero = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_write_tokens": 0,
+            "prompt_tokens_details": {"cache_write_tokens": 75}
+        })));
+        assert_eq!(zero.prompt_cache_hit_tokens, Some(0));
+        assert_eq!(zero.prompt_cache_write_tokens, Some(0));
+        assert_eq!(zero.prompt_cache_miss_tokens, Some(100));
+        let explicit_miss = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_miss_tokens": 0
+        })));
+        assert_eq!(explicit_miss.prompt_cache_miss_tokens, Some(0));
+    }
+
+    #[test]
+    fn parse_usage_cache_write_dialects_partition_the_input_total() {
+        for payload in [
+            json!({
+                "input_tokens": 1000,
+                "prompt_cache_hit_tokens": 600,
+                "prompt_cache_write_tokens": 200
+            }),
+            json!({
+                "prompt_tokens": 1000,
+                "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 200}
+            }),
+            json!({
+                "input_tokens": 1000,
+                "prompt_cache_hit_tokens": 600,
+                "input_tokens_details": {"cache_write_tokens": 200}
+            }),
+            // Both objects can exist; the first lacks the write field.
+            json!({
+                "prompt_tokens": 1000,
+                "prompt_tokens_details": {"cached_tokens": 600},
+                "input_tokens_details": {"cache_write_tokens": 200}
+            }),
+        ] {
+            let usage = parse_usage(Some(&payload));
+            assert_eq!(usage.input_tokens, 1000);
+            assert_eq!(usage.prompt_cache_hit_tokens, Some(600));
+            assert_eq!(usage.prompt_cache_write_tokens, Some(200));
+            assert_eq!(usage.prompt_cache_miss_tokens, Some(200));
+            let priced = crate::pricing::token_usage_for_pricing(&usage);
+            assert_eq!(priced.cache_read, 600);
+            assert_eq!(priced.cache_write, 200);
+            assert_eq!(priced.input, 200);
+            assert_eq!(priced.input + priced.cache_read + priced.cache_write, 1000);
+        }
+        let write_only = parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "input_tokens_details": {"cache_write_tokens": 200}
+        })));
+        assert_eq!(write_only.prompt_cache_hit_tokens, None);
+        assert_eq!(write_only.prompt_cache_write_tokens, Some(200));
+        assert_eq!(write_only.prompt_cache_miss_tokens, Some(800));
+    }
+
+    #[test]
+    fn parse_usage_cache_write_saturates_and_keeps_explicit_miss() {
+        let excessive = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_cache_write_tokens": u64::MAX
+        })));
+        assert_eq!(excessive.input_tokens, 100);
+        assert_eq!(excessive.prompt_cache_write_tokens, Some(u32::MAX));
+        assert_eq!(excessive.prompt_cache_miss_tokens, Some(0));
+        let explicit = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_cache_write_tokens": 20,
+            "prompt_cache_miss_tokens": 10
+        })));
+        assert_eq!(explicit.prompt_cache_write_tokens, Some(20));
+        assert_eq!(explicit.prompt_cache_miss_tokens, Some(10));
+    }
 
     #[test]
     fn parse_usage_scenario() {
@@ -329,14 +533,14 @@ mod tests {
     /// field entirely must not change the cost by a single cent.
     #[test]
     fn reasoning_parser_fixtures_never_exceed_or_add_to_billable_output() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
         use crate::pricing::{calculate_turn_cost_estimate_for_provider, token_usage_for_pricing};
 
         // (label, provider, model, payload)
-        let fixtures: [(&str, ApiProvider, &str, serde_json::Value); 3] = [
+        let fixtures: [(&str, ProviderKind, &str, serde_json::Value); 3] = [
             (
                 "moonshot",
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "kimi-k2.7-code",
                 json!({
                     "prompt_tokens": 30_000,
@@ -348,7 +552,7 @@ mod tests {
             ),
             (
                 "minimax",
-                ApiProvider::Minimax,
+                ProviderKind::Minimax,
                 "minimax-m3",
                 json!({
                     "prompt_tokens": 12_000,
@@ -360,7 +564,7 @@ mod tests {
             ),
             (
                 "openrouter",
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "qwen/qwen3.7-plus",
                 json!({
                     "prompt_tokens": 8_000,
@@ -493,7 +697,7 @@ mod tests {
             invalid.push(b'\n');
             let err = take_sse_line(&mut invalid).expect_err("invalid bytes must fail closed");
             assert!(!err.to_string().contains('\u{FFFD}'));
-            assert_eq!(err.valid_up_to, 8);
+            assert_eq!(err, SseLineError::InvalidUtf8 { valid_up_to: 8 });
             assert!(
                 invalid.is_empty(),
                 "invalid line is consumed so retries cannot loop"
@@ -505,7 +709,7 @@ mod tests {
             buffer.push(0xFF);
             buffer.extend_from_slice(b"\n");
             let err = take_sse_line(&mut buffer).expect_err("0xFF is not UTF-8");
-            assert_eq!(err.valid_up_to, 8);
+            assert_eq!(err, SseLineError::InvalidUtf8 { valid_up_to: 8 });
             assert!(!err.to_string().contains('\u{FFFD}'));
             assert!(buffer.is_empty(), "invalid line must be drained");
         }
@@ -532,7 +736,7 @@ mod tests {
             let mut invalid = vec![0x80, 0xBF];
             let err = flush_sse_line(&mut invalid).expect_err("invalid flush must fail closed");
             assert!(!err.to_string().contains('\u{FFFD}'));
-            assert_eq!(err.valid_up_to, 0);
+            assert_eq!(err, SseLineError::InvalidUtf8 { valid_up_to: 0 });
             assert!(invalid.is_empty());
         }
         // from flush_sse_line_preserves_unterminated_cjk
@@ -550,7 +754,7 @@ mod tests {
             let mut buffer = "data: ".as_bytes().to_vec();
             buffer.extend_from_slice(&"好".as_bytes()[..2]);
             let err = flush_sse_line(&mut buffer).expect_err("truncated UTF-8");
-            assert_eq!(err.valid_up_to, 6);
+            assert_eq!(err, SseLineError::InvalidUtf8 { valid_up_to: 6 });
             assert!(!err.to_string().contains('\u{FFFD}'));
             assert!(buffer.is_empty());
         }
@@ -564,7 +768,7 @@ mod tests {
 
         let err = decode_sse_line_bytes(&[0xFF]).expect_err("bare 0xFF is invalid");
         assert!(!err.to_string().contains('\u{FFFD}'));
-        assert_eq!(err.valid_up_to, 0);
+        assert_eq!(err, SseLineError::InvalidUtf8 { valid_up_to: 0 });
     }
 
     #[test]

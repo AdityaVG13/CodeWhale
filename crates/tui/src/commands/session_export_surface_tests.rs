@@ -24,13 +24,13 @@ use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler};
 use crate::commands::session_export_test_support::{
     assert_only_export_facet_exposed, normalize_export_time,
 };
-use crate::commands::traits::CommandDiscovery;
 use crate::commands::{CommandResult, execute};
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::test_support::{EnvVarGuard, TestEnvLock};
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::clipboard::ClipboardHandler;
 use crate::tui::command_palette;
+use codewhale_command_contract::CommandDiscovery;
 use codewhale_localization::Locale;
 use codewhale_models::{ContentBlock, Message, Role};
 
@@ -68,7 +68,7 @@ impl SurfaceHarness {
             memory_path: temp.path().join("memory.md"),
             notes_path: temp.path().join("notes.txt"),
             mcp_config_path: temp.path().join("mcp.json"),
-            ..crate::test_support::test_tui_options(temp.path())
+            ..crate::tui::test_support::test_tui_options(temp.path())
         };
         let app = App::new(options, &Config::default());
         Self {
@@ -219,7 +219,7 @@ fn export_is_discoverable_by_name_and_alias_in_palette_and_slash_completion() {
     let entries = command_palette::build_entries(
         Locale::En,
         &skills_dir,
-        false,
+        crate::skills::SkillDiscoveryMode::Compatible,
         workspace,
         &mcp_config,
         None,
@@ -245,7 +245,7 @@ fn export_is_discoverable_by_name_and_alias_in_palette_and_slash_completion() {
         &[],
         Locale::En,
         Some(workspace),
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
     );
     assert!(
         by_prefix.iter().any(|hint| hint.name == "/export"),
@@ -258,7 +258,7 @@ fn export_is_discoverable_by_name_and_alias_in_palette_and_slash_completion() {
         &[],
         Locale::En,
         Some(workspace),
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
     );
     let alias_row = by_alias
         .iter()
@@ -508,11 +508,11 @@ fn portable_export_source_has_no_host_dependency() {
     let production = portable_production_source(source);
 
     // Only the external contract, the pure sanitizer, `serde_json`, `std`, and
-    // the temporary FEAT-037 `CommandResult` exception may be imported.
+    // the shared session `CommandResult` may be imported.
     let allowed_use_prefixes = [
         "use std::",
         "use codewhale_command_contract",
-        "use codewhale_secrets",
+        "use codewhale_sanitize",
         "use serde_json",
         "use super::CommandResult",
     ];
@@ -566,11 +566,10 @@ fn portable_export_source_has_no_host_dependency() {
         );
     }
 
-    // The bounded FEAT-037 exception is exactly `CommandResult`: no action
-    // payload, deferred effect, or host receipt type may cross the boundary.
+    // The group result is shared; no concrete host type may cross the boundary.
     assert!(
         !production.contains("super::App"),
-        "only CommandResult may cross the FEAT-037 boundary"
+        "portable export must not import a host type"
     );
 }
 
@@ -617,16 +616,16 @@ fn portable_export_source_carries_no_hidden_authority() {
 
 #[test]
 fn shared_sanitizer_is_one_pure_acyclic_implementation() {
-    // Both `/export` and the still-legacy `/structcopy` consume the single
-    // implementation in the pure `codewhale-secrets` crate.
+    // Both portable commands consume the single pure implementation in
+    // codewhale-sanitize, independently of credential storage.
     let export_source = include_str!("groups/session/export.rs");
     let structcopy_source = include_str!("groups/session/structcopy.rs");
     assert!(
-        export_source.contains("use codewhale_secrets::sanitize::"),
+        export_source.contains("use codewhale_sanitize::sanitize::"),
         "portable /export must consume the shared sanitizer"
     );
     assert!(
-        structcopy_source.contains("use codewhale_secrets::sanitize::"),
+        structcopy_source.contains("use codewhale_sanitize::sanitize::"),
         "/structcopy must consume the same shared sanitizer"
     );
     // The module prose must name the new owner: a stale `export::<helper>` seam
@@ -640,17 +639,30 @@ fn shared_sanitizer_is_one_pure_acyclic_implementation() {
 
     // Fast local tripwire only. The authoritative check is the graph scan in
     // `scripts/check-command-crate-boundaries.py`, which asserts that neither
-    // `codewhale-command-contract` nor `codewhale-secrets` reaches the TUI; this
+    // the contract nor the sanitizer reaches host services; this
     // manifest read just fails sooner when someone edits the manifest by hand.
-    let secrets_manifest = std::fs::read_to_string(concat!(
+    let sanitizer_manifest = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../secrets/Cargo.toml"
+        "/../sanitize/Cargo.toml"
     ))
     .expect("the shared sanitizer crate manifest must be readable");
     assert!(
-        !secrets_manifest.contains("codewhale-tui"),
+        !sanitizer_manifest.contains("codewhale-tui"),
         "the shared sanitizer crate must not depend on codewhale-tui"
     );
+
+    for forbidden in [
+        "codewhale-secrets",
+        "codewhale-core",
+        "keyring",
+        "dbus",
+        "reqwest",
+    ] {
+        assert!(
+            !sanitizer_manifest.contains(forbidden),
+            "pure sanitizer must not import {forbidden}"
+        );
+    }
 
     // There is no second sanitizer implementation hiding in the portable slice.
     let production = portable_production_source(export_source);

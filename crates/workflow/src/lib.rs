@@ -5,7 +5,6 @@
 //! top only after their cancellation and evidence semantics are proven.
 
 mod elevation;
-pub mod experimental_search;
 /// Setup-time Fleet composition: a suggestion schema with no runtime authority.
 ///
 /// Deliberately **not** re-exported from the crate root. The setup wizard uses
@@ -23,8 +22,6 @@ mod model_policy;
 mod named_fleet;
 pub mod reasoning_router;
 pub mod redaction;
-mod replay;
-mod review_repair;
 mod role_resolve;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,7 +69,7 @@ pub use model_policy::*;
 pub use named_fleet::{
     FleetDocument, FleetSchema, FleetSearchRoot, NamedFleet, NamedFleetError,
     STOPSHIP_REQUIRED_ROLES, exact_schema_revision, load_named_fleet, load_named_fleet_file,
-    parse_named_fleet,
+    parse_named_fleet, split_qualified_fleet_name, validate_fleet_file_stem,
 };
 pub use reasoning_router::{
     CapturedReasoningRouter, FleetRouterRef, LEGACY_INLINE_ROUTER_ORIGIN, QualifiedRouterId,
@@ -82,11 +79,6 @@ pub use reasoning_router::{
 pub use redaction::{
     REDACTION_ABSOLUTE_PATH, REDACTION_RELATIVE_PATH, REDACTION_SECRET, Redaction,
     redact_for_disclosure,
-};
-pub use replay::*;
-pub use review_repair::{
-    IterationReceipt, IterationVerdict, ReviewRepairBounds, ReviewRepairError, ReviewRepairLoop,
-    ReviewRepairPolicy, RouteReceipt, RoutedBy, StopReason,
 };
 pub use role_resolve::{
     FleetRoleMap, FleetRoleResolveError, ResolvedWorkflowAgent, normalize_token,
@@ -763,7 +755,6 @@ pub enum WorkflowRunStatus {
     Failed,
     Cancelled,
     BudgetExceeded,
-    ReplayDiverged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -818,10 +809,6 @@ impl WorkflowExecution {
 
     pub fn mark_budget_exceeded(&mut self) {
         self.status = WorkflowRunStatus::BudgetExceeded;
-    }
-
-    pub(crate) fn mark_replay_diverged(&mut self) {
-        self.status = WorkflowRunStatus::ReplayDiverged;
     }
 
     fn should_stop_mock_execution(&self) -> bool {
@@ -1276,7 +1263,6 @@ fn mark_execution_for_status(execution: &mut WorkflowExecution, status: Workflow
         WorkflowRunStatus::Failed => execution.mark_failed(),
         WorkflowRunStatus::Cancelled => execution.mark_cancelled(),
         WorkflowRunStatus::BudgetExceeded => execution.mark_budget_exceeded(),
-        WorkflowRunStatus::ReplayDiverged => execution.mark_replay_diverged(),
     }
 }
 

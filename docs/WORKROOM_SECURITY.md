@@ -1,5 +1,7 @@
 # Workroom Security Model
 
+> 阅读简体中文版：[zh_hans/WORKROOM_SECURITY.md](zh_hans/WORKROOM_SECURITY.md)。
+
 ## Scope
 
 This document covers the security boundaries of Codewhale Workrooms — the
@@ -63,7 +65,7 @@ model-visible link resolution remain follow-up work.
 ## API auth
 
 Future workroom endpoints should inherit the same auth middleware as other
-protected routes (`/thread`, `/app`, `/tool`, etc.):
+protected routes (`/thread`, `/app`, `/prompt`, etc.):
 
 - `Authorization: Bearer <token>` header required
 - Token validated against the runtime's configured bearer token(s)

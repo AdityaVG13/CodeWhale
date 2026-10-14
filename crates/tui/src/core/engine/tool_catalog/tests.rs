@@ -26,14 +26,41 @@ fn tool(name: &str) -> Tool {
     }
 }
 
-/// `code_execution` writes the script to a tempdir and runs it as a plain
-/// child process in the workspace — no seccomp, no jail, no container. The
-/// description is model-facing, so calling it a sandbox would tell the model
-/// it has isolation the runtime never provides.
+/// The shared launcher applies policy only where enforcement is available.
+/// The model-facing description must not promise unconditional isolation.
 #[test]
 fn code_execution_description_does_not_claim_process_sandboxing() {
     assert!(CODE_EXECUTION_DESCRIPTION.contains("local Python interpreter"));
     assert!(!CODE_EXECUTION_DESCRIPTION.contains("sandbox"));
+}
+
+/// Python output must match our UTF-8 decoder even with non-UTF-8 parent stdio.
+#[tokio::test]
+async fn code_execution_returns_utf8_stdout_and_stderr() {
+    use crate::dependencies::ExternalTool as _;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    let _env_lock = lock_test_env();
+    if !crate::dependencies::Python::available() {
+        return;
+    }
+    let _encoding = EnvVarGuard::set("PYTHONIOENCODING", "gbk");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let result = super::execute_code_execution_tool(
+        &json!({"code": r#"import sys; print("\u4e2d\u6587"); print("\u9519\u8bef", file=sys.stderr)"#}),
+        tmp.path(),
+        &crate::tools::spec::ToolContext::new(tmp.path()),
+    )
+    .await
+    .expect("code execution should run");
+    let payload = result.metadata.expect("payload");
+    assert_eq!(
+        (
+            payload["stdout"].as_str().map(str::trim_end),
+            payload["stderr"].as_str().map(str::trim_end),
+        ),
+        (Some("中文"), Some("错误")),
+    );
 }
 
 /// The published synthetic-name list and the predicate that classifies a
@@ -70,20 +97,36 @@ fn published_synthetic_names_agree_with_the_synthetic_predicate() {
 
 #[test]
 fn first_turn_surface_is_stable_across_plan_work_and_operate() {
-    // Token diet: agent+workflow (21KB of schema) and get/update_goal
-    // (meaningless without an active goal) stay deferred; discovery via
-    // tool_search restores them on demand.
     assert_eq!(
         DEFAULT_ACTIVE_NATIVE_TOOLS,
-        &["read", "write", "edit", "bash", "todo_write", "create_goal"]
+        &[
+            "read",
+            "write",
+            "edit",
+            "file_search",
+            "bash",
+            "agent",
+            "workflow",
+            "todo_write",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+            "load_skill"
+        ]
     );
     let expected = [
+        "agent",
         "bash",
         "create_goal",
+        "get_goal",
+        "update_goal",
         "edit",
+        "file_search",
+        "load_skill",
         "read",
         "todo_write",
         "tool_search",
+        "workflow",
         "write",
     ]
     .into_iter()
@@ -95,6 +138,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "read",
             "write",
             "edit",
+            "file_search",
             "bash",
             "agent",
             "workflow",
@@ -156,7 +200,6 @@ fn eager_workflow_still_respects_command_allow_and_deny_gates() {
                 allow.map(|name| vec![name.to_string()]),
                 deny.map(|name| vec![name.to_string()]),
                 None,
-                codewhale_execpolicy::ApprovalMode::Suggest,
                 ToolMode::Direct,
             );
             assert_eq!(policy.allows_tool("workflow"), expected);
@@ -220,15 +263,16 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
         &catalog,
         &mut active,
         &mut cache,
-        "deferred-0"
+        "deferred-7"
     ));
     let delta = cache.activate(&catalog, &["deferred-8".to_string()]);
     remove_evicted_cache_activations(&catalog, &mut active, delta.evicted);
     active.extend(delta.admitted);
+    // The batch is ranked best-first; using its oldest retained match
+    // promotes it ahead of the next batch without granting an unseen tool.
+    assert!(cache.names().any(|name| name == "deferred-7"));
     assert!(cache.names().any(|name| name == "deferred-0"));
-    // Priority order: deferred-7 was the lowest-priority entry of the
-    // first batch and was never re-touched, so it is the victim.
-    assert!(!cache.names().any(|name| name == "deferred-7"));
+    assert!(!cache.names().any(|name| name == "deferred-6"));
 
     assert!(!touch_cached_tool_after_execution(
         &catalog,
@@ -310,7 +354,7 @@ fn unknown_and_wildcard_allowlists_keep_mcp_startup() {
 }
 
 #[test]
-fn compact_surface_keeps_agent_and_workflow_deferred() {
+fn compact_surface_keeps_agent_and_workflow_eager() {
     let catalog = build_model_tool_catalog_with_surface(
         [
             "read",
@@ -336,27 +380,9 @@ fn compact_surface_keeps_agent_and_workflow_deferred() {
                 .iter()
                 .find(|definition| definition.name == name)
                 .and_then(|definition| definition.defer_loading),
-            Some(true),
+            Some(false),
             "{name}"
         );
-    }
-}
-
-#[test]
-fn deferred_core_tools_restore_through_always_load() {
-    // The diet's escape hatch: discovery/activation and the goal-aware
-    // catalog build in `engine.rs` re-eager exactly these names.
-    let mut catalog = ["agent", "workflow", "get_goal", "update_goal", "read"]
-        .into_iter()
-        .map(tool)
-        .collect::<Vec<_>>();
-    let always_load = ["agent", "workflow", "get_goal", "update_goal"]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
-    apply_native_tool_deferral(&mut catalog, &always_load);
-    for definition in &catalog {
-        assert_eq!(definition.defer_loading, Some(false), "{}", definition.name);
     }
 }
 
@@ -386,12 +412,14 @@ fn catalog_build_does_not_append_registry_guidance_to_the_shell_tool() {
 fn requested_tool_mode_prefers_model_hint_then_flag_then_direct() {
     use crate::features::{Feature, Features};
 
-    let off = Features::with_defaults();
-    assert_eq!(requested_tool_mode(None, &off), ToolMode::Direct);
-
-    let mut on = Features::with_defaults();
-    on.enable(Feature::CodeMode);
+    // #6562: code mode is the default; `[features] code_mode = false` is the
+    // escape hatch back to Direct.
+    let on = Features::with_defaults();
     assert_eq!(requested_tool_mode(None, &on), ToolMode::CodeMode);
+
+    let mut off = Features::with_defaults();
+    off.disable(Feature::CodeMode);
+    assert_eq!(requested_tool_mode(None, &off), ToolMode::Direct);
 
     // Model metadata wins over config, in both directions (Codex parity).
     assert_eq!(
@@ -429,4 +457,77 @@ fn execute_tools_is_eager_in_code_mode_and_deferred_in_direct() {
             .iter()
             .all(|definition| definition.name != "execute_tools")
     );
+}
+
+/// A timed-out or cancelled `code_execution` kills the interpreter and what the
+/// script started; a bare `output()` left both running.
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_code_execution_kills_the_interpreter_tree() {
+    if crate::dependencies::resolve_python_interpreter().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pid_file = tmp.path().join("grandchild.pid");
+    let code = format!(
+        "import subprocess\np = subprocess.Popen(['sleep', '300'])\nopen({:?}, 'w').write(str(p.pid))\np.wait()\n",
+        pid_file.display().to_string()
+    );
+    let input = json!({ "code": code });
+    let context = crate::tools::spec::ToolContext::new(tmp.path());
+    let run = super::execute_code_execution_tool(&input, tmp.path(), &context);
+    let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+    assert!(
+        crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),
+        "a process the script started outlived the dropped code_execution call"
+    );
+}
+
+#[test]
+fn compact_surface_keeps_agent_and_workflow_deferred() {
+    let catalog = build_model_tool_catalog_with_surface(
+        [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "agent",
+            "workflow",
+            "todo_write",
+        ]
+        .into_iter()
+        .map(tool)
+        .collect(),
+        Vec::new(),
+        AppMode::Agent,
+        &HashSet::new(),
+        crate::model_profile::ToolSurfaceBudget::Compact,
+    );
+
+    for name in ["agent", "workflow"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|definition| definition.name == name)
+                .and_then(|definition| definition.defer_loading),
+            Some(false),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn deferred_core_tools_restore_through_always_load() {
+    let mut catalog = ["agent", "workflow", "get_goal", "update_goal", "read"]
+        .into_iter()
+        .map(tool)
+        .collect::<Vec<_>>();
+    let always_load = ["agent", "workflow", "get_goal", "update_goal"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    apply_native_tool_deferral(&mut catalog, &always_load);
+    for definition in &catalog {
+        assert_eq!(definition.defer_loading, Some(false), "{}", definition.name);
+    }
 }

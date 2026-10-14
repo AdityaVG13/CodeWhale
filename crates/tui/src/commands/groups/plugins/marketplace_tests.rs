@@ -22,7 +22,7 @@ fn create_test_app(root: &Path) -> (App, TempDir) {
         memory_path: temp.path().join("memory.md"),
         notes_path: temp.path().join("notes.txt"),
         mcp_config_path: temp.path().join("mcp.json"),
-        ..crate::test_support::test_tui_options(root)
+        ..crate::tui::test_support::test_tui_options(root)
     };
     let config = Config::default();
     let discovery = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv();
@@ -118,8 +118,17 @@ fn marketplace_builtin_candidate_routes_to_existing_bundle_review() {
         Some("marketplace install codewhale computer-use"),
         None,
     );
-    assert!(result.is_error);
-    assert!(result.message.unwrap().contains("already exists"));
+    // B5: the published install command succeeds and says it is built in.
+    assert!(!result.is_error, "{:?}", result.message);
+    let message = result.message.unwrap();
+    assert!(message.contains("built into Codewhale"), "{message}");
+    assert!(
+        message.contains(&format!(
+            "/plugin show {}",
+            escape_review_text(original.id.as_str())
+        )),
+        "{message}"
+    );
     let retained = app.plugin_registry.get("computer-use").unwrap();
     assert_eq!(retained.content_hash, original.content_hash);
     assert_eq!(retained.trust_status, original.trust_status);
