@@ -263,7 +263,7 @@ fn parse_workflow_control_action(app: &App, arg: Option<&str>) -> Option<Command
         }),
         "status" | "runs" | "list" | "inspect" => Some(workflow_status(app, rest)),
         "cancel" | "stop" | "abort" => Some(workflow_cancel(app, rest)),
-        "settings" | "config" => Some(super::super::config::workflow_settings(app)),
+        "settings" | "config" => Some(crate::commands::config_main_host::workflow_settings(app)),
         "help" | "?" => Some(CommandResult::message(WORKFLOW_USAGE)),
         // Saved definitions use the same two-turn review/confirm gate as a
         // conversational Workflow. The draft turn has an empty tool catalog;
@@ -452,7 +452,7 @@ pub fn workflows(app: &mut App, arg: Option<&str>) -> CommandResult {
     match verb {
         "status" | "runs" | "list" | "inspect" => workflow_status(app, rest),
         "cancel" | "stop" | "abort" => workflow_cancel(app, rest),
-        "settings" | "config" => super::super::config::workflow_settings(app),
+        "settings" | "config" => crate::commands::config_main_host::workflow_settings(app),
         "help" | "?" => CommandResult::message(WORKFLOWS_USAGE),
         _ => CommandResult::error(
             "/workflows observes runs — it never launches one. Use /workflow <objective> to run one, or bare /workflow to orchestrate the current work.",

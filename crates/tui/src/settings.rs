@@ -1804,114 +1804,290 @@ impl Settings {
     }
 
     /// Get all settings as a displayable string
+    /// Test-only whole-report renderer; the command renders from [`Self::command_report`].
+    #[cfg(test)]
     pub fn display(&self, locale: codewhale_localization::Locale) -> String {
         use codewhale_localization::{MessageId, tr};
+        let report = self.command_report();
         let mut lines = Vec::new();
         lines.push(tr(locale, MessageId::SettingsTitle).to_string());
         lines.push("─────────────────────────────".to_string());
-        lines.push(format!("  auto_compact:       {}", self.auto_compact));
-        lines.push(format!(
-            "  auto_compact_pct:   {:.0}",
-            self.auto_compact_threshold_percent
-        ));
-        lines.push(format!("  calm_mode:          {}", self.calm_mode));
-        lines.push(format!("  pet_mode:           {}", self.pet_mode));
-        lines.push(format!("  tool_collapse:      {}", self.tool_collapse_mode));
-        lines.push(format!("  low_motion:         {}", self.low_motion));
-        lines.push(format!("  fancy_animations:   {}", self.fancy_animations));
-        lines.push(format!("  focus_texture:      {}", self.focus_texture));
-        lines.push(format!(
-            "  work_surface:       {}",
-            self.work_surface_placement
-        ));
-        lines.push(format!(
-            "  work_top_height:    {}",
-            self.work_surface_top_height
-        ));
-        lines.push(format!(
-            "  work_side_width:    {}",
-            self.work_surface_side_width
-        ));
-        lines.push(format!("  rail_panel:         {}", self.rail_panel));
-        lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
-        lines.push(format!(
-            "  paste_burst_detect: {}",
-            self.paste_burst_detection
-        ));
-        lines.push(format!("  mention_menu_limit: {}", self.mention_menu_limit));
-        lines.push(format!("  mention_walk_depth: {}", self.mention_walk_depth));
-        lines.push(format!(
-            "  mention_behavior:   {}",
-            self.mention_menu_behavior
-        ));
-        lines.push(format!("  show_thinking:      {}", self.show_thinking));
-        lines.push(format!(
-            "  thinking_expanded:   {}",
-            self.thinking_default_expanded
-        ));
-        lines.push(format!(
-            "  thinking_preview:    {}",
-            self.thinking_preview_lines
-        ));
-        lines.push(format!("  thinking_highlight: {}", self.thinking_highlight));
-        lines.push(format!(
-            "  help_expand_groups:  {}",
-            self.help_expand_groups
-        ));
-        lines.push(format!("  pin_last_prompt:    {}", self.pin_last_prompt));
-        lines.push(format!("  contextual_tips:    {}", self.contextual_tips));
-        lines.push(format!("  show_tool_details:  {}", self.show_tool_details));
-        lines.push(format!("  inline_diffs:      {}", self.inline_diffs));
-        lines.push(format!("  locale:            {}", self.locale));
-        lines.push(format!("  theme:              {}", self.theme));
-        lines.push(format!(
-            "  background_color:   {}",
-            self.background_color.as_deref().unwrap_or("(default)")
-        ));
-        lines.push(format!("  composer_density:   {}", self.composer_density));
-        lines.push(format!("  composer_border:    {}", self.composer_border));
-        lines.push(format!(
-            "  composer_multiline_mode: {}",
-            self.composer_multiline_mode
-        ));
-        lines.push(format!("  composer_vim_mode:  {}", self.composer_vim_mode));
-        lines.push(format!("  transcript_spacing: {}", self.transcript_spacing));
-        lines.push(format!("  status_indicator:   {}", self.status_indicator));
-        lines.push(format!(
-            "  synchronized_output: {}",
-            self.synchronized_output
-        ));
-        lines.push(format!(
-            "  workspace_follow_symlinks: {}",
-            self.workspace_follow_symlinks
-        ));
-        lines.push(format!("  default_mode:       {}", self.default_mode));
-        lines.push(format!("  context_panel:      {}", self.context_panel));
-        lines.push(format!("  cost_currency:      {}", self.cost_currency));
-        lines.push(format!("  max_history:        {}", self.max_input_history));
-        lines.push("  model defaults:     config.toml (use /config)".to_string());
-        lines.push(format!(
-            "  reasoning_effort:   {}",
-            self.reasoning_effort
-                .as_deref()
-                .unwrap_or("(config/default)")
-        ));
-        lines.push(format!(
-            "  permission_posture: {}",
-            self.permission_posture
-                .as_deref()
-                .unwrap_or("(config/default)")
-        ));
-        lines.push(format!(
-            "  sandbox_mode:       {}  # filesystem scope (not approval)",
-            self.sandbox_mode.as_deref().unwrap_or("(config/default)")
-        ));
+        lines.extend(report.rows.iter().map(|row| {
+            format!(
+                "  {:<width$}{}",
+                row.label,
+                row.value,
+                width = row.label_width
+            )
+        }));
         lines.push(String::new());
         lines.push(format!(
             "{} {}",
             tr(locale, MessageId::SettingsConfigFile),
-            Self::path().map_or_else(|_| "(unknown)".to_string(), |p| p.display().to_string())
+            report.config_file
         ));
+        if !report.from_settings.is_empty() || !report.session_overrides.is_empty() {
+            lines.push(String::new());
+            if !report.from_settings.is_empty() {
+                lines.push(format!(
+                    "  from settings.toml: {}",
+                    report.from_settings.join(", ")
+                ));
+            }
+            if !report.session_overrides.is_empty() {
+                lines.push(format!(
+                    "  session override: {}",
+                    report.session_overrides.join(", ")
+                ));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Typed `/settings text` report: the command owns the frame and joining.
+    #[must_use]
+    pub fn command_report(&self) -> codewhale_command_contract::config::CommandSettingsReport {
+        let mut rows = Vec::new();
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "auto_compact:".to_string(),
+            value: self.auto_compact.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "auto_compact_pct:".to_string(),
+            value: format!("{:.0}", self.auto_compact_threshold_percent),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "calm_mode:".to_string(),
+            value: self.calm_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "pet_mode:".to_string(),
+            value: self.pet_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "tool_collapse:".to_string(),
+            value: self.tool_collapse_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "low_motion:".to_string(),
+            value: self.low_motion.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "fancy_animations:".to_string(),
+            value: self.fancy_animations.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "focus_texture:".to_string(),
+            value: self.focus_texture.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "work_surface:".to_string(),
+            value: self.work_surface_placement.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "work_top_height:".to_string(),
+            value: self.work_surface_top_height.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "work_side_width:".to_string(),
+            value: self.work_surface_side_width.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "rail_panel:".to_string(),
+            value: self.rail_panel.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "bracketed_paste:".to_string(),
+            value: self.bracketed_paste.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "paste_burst_detect:".to_string(),
+            value: self.paste_burst_detection.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "mention_menu_limit:".to_string(),
+            value: self.mention_menu_limit.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "mention_walk_depth:".to_string(),
+            value: self.mention_walk_depth.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "mention_behavior:".to_string(),
+            value: self.mention_menu_behavior.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "show_thinking:".to_string(),
+            value: self.show_thinking.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "thinking_expanded:".to_string(),
+            value: self.thinking_default_expanded.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "thinking_preview:".to_string(),
+            value: self.thinking_preview_lines.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "thinking_highlight:".to_string(),
+            value: self.thinking_highlight.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "help_expand_groups:".to_string(),
+            value: self.help_expand_groups.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "pin_last_prompt:".to_string(),
+            value: self.pin_last_prompt.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "contextual_tips:".to_string(),
+            value: self.contextual_tips.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "show_tool_details:".to_string(),
+            value: self.show_tool_details.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "inline_diffs:".to_string(),
+            value: self.inline_diffs.to_string(),
+            label_width: 19,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "locale:".to_string(),
+            value: self.locale.to_string(),
+            label_width: 19,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "theme:".to_string(),
+            value: self.theme.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "background_color:".to_string(),
+            value: self
+                .background_color
+                .as_deref()
+                .unwrap_or("(default)")
+                .to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_density:".to_string(),
+            value: self.composer_density.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_border:".to_string(),
+            value: self.composer_border.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_multiline_mode:".to_string(),
+            value: self.composer_multiline_mode.to_string(),
+            label_width: 25,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "composer_vim_mode:".to_string(),
+            value: self.composer_vim_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "transcript_spacing:".to_string(),
+            value: self.transcript_spacing.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "status_indicator:".to_string(),
+            value: self.status_indicator.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "synchronized_output:".to_string(),
+            value: self.synchronized_output.to_string(),
+            label_width: 21,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "workspace_follow_symlinks:".to_string(),
+            value: self.workspace_follow_symlinks.to_string(),
+            label_width: 27,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "default_mode:".to_string(),
+            value: self.default_mode.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "context_panel:".to_string(),
+            value: self.context_panel.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "cost_currency:".to_string(),
+            value: self.cost_currency.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "max_history:".to_string(),
+            value: self.max_input_history.to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "model defaults:".to_string(),
+            value: "config.toml (use /config)".to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "reasoning_effort:".to_string(),
+            value: self
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("(config/default)")
+                .to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "permission_posture:".to_string(),
+            value: self
+                .permission_posture
+                .as_deref()
+                .unwrap_or("(config/default)")
+                .to_string(),
+            label_width: 20,
+        });
+        rows.push(codewhale_command_contract::config::CommandSettingsRow {
+            label: "sandbox_mode:".to_string(),
+            value: format!(
+                "{}  # filesystem scope (not approval)",
+                self.sandbox_mode.as_deref().unwrap_or("(config/default)")
+            ),
+            label_width: 20,
+        });
         // Provenance footer: which keys this load actually owns versus the
         // schema defaults, so `/settings` says what the user set. Session
         // marks only appear when the instance outlives a `set()` (the CLI
@@ -1927,16 +2103,13 @@ impl Settings {
                 Layer::ManagedPolicy | Layer::CliFlag | Layer::ProjectConfig | Layer::Default => {}
             }
         }
-        if !user.is_empty() || !session.is_empty() {
-            lines.push(String::new());
-            if !user.is_empty() {
-                lines.push(format!("  from settings.toml: {}", user.join(", ")));
-            }
-            if !session.is_empty() {
-                lines.push(format!("  session override: {}", session.join(", ")));
-            }
+        codewhale_command_contract::config::CommandSettingsReport {
+            rows,
+            config_file: Self::path()
+                .map_or_else(|_| "(unknown)".to_string(), |p| p.display().to_string()),
+            from_settings: user.into_iter().map(str::to_string).collect(),
+            session_overrides: session.into_iter().map(str::to_string).collect(),
         }
-        lines.join("\n")
     }
 
     /// Toggle one exact provider/model pin without touching credentials or

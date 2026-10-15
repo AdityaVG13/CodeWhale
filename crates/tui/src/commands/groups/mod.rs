@@ -33,7 +33,7 @@ pub fn all_command_groups() -> &'static [&'static dyn CommandGroup] {
             vec![
                 &core::CoreCommands,
                 &super::session_group::SessionCommands,
-                &config::ConfigCommands,
+                &super::config_group::ConfigCommands,
                 &super::debug_group::DebugCommands,
                 &project::ProjectCommands,
                 &skills::SkillsCommands,

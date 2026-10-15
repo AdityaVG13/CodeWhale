@@ -7,7 +7,7 @@ use codewhale_command_contract::outcome::ConfigPolicyCommandResult as CommandRes
 #[path = "permissions.rs"]
 pub mod permissions;
 #[path = "policy_messages.rs"]
-pub(crate) mod policy_messages;
+pub mod policy_messages;
 #[path = "status.rs"]
 pub mod status;
 

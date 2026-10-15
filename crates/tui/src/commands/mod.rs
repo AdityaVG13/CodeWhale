@@ -6,10 +6,15 @@
 //! module keeps registry construction, user-command precedence, and the
 //! fall-through behaviour.
 
+mod config_group;
+mod config_host;
+mod config_main_host;
+mod config_main_import_host;
+#[cfg(test)]
 mod config_policy_host;
 mod contract;
 pub mod discovery;
-mod groups;
+pub(crate) mod groups;
 
 // FEAT-025 host services for the session-export slice: the shared recovery
 // writer and the protected export-destination resolver/writer. Declared at the
@@ -59,7 +64,7 @@ mod session_lifecycle_regression_tests;
 
 use std::sync::OnceLock;
 
-pub(crate) use groups::config::config::{set_workspace_trust, trust_change_note};
+pub(crate) use config_main_host::{set_workspace_trust, trust_change_note};
 pub(crate) use groups::core::open_constitution_manager;
 
 /// Stage a rollback of the last exchange for the UI to apply, or `None` when
@@ -363,14 +368,10 @@ fn execute_in_context(
     // command's `CommandInfo` metadata.
     match command.as_str() {
         "jihua" => {
-            return groups::config::dispatch(app, "jihua", arg).unwrap_or_else(|| {
-                CommandResult::error("The /jihua alias could not be dispatched.")
-            });
+            return config_group::mode_alias(app, "plan");
         }
         "zidong" => {
-            return groups::config::dispatch(app, "zidong", arg).unwrap_or_else(|| {
-                CommandResult::error("The /zidong alias could not be dispatched.")
-            });
+            return config_group::mode_alias(app, "yolo");
         }
         _ => {}
     }
@@ -446,12 +447,16 @@ fn execute_in_context(
 
 /// Update a configuration value programmatically (used by interactive UI views).
 pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) -> CommandResult {
-    groups::config::config::set_config_value(app, key, value, persist)
+    let locale = app.ui_locale;
+    config_host::render_config_reply(
+        config_main_host::set_config_value(app, key, value, persist),
+        locale,
+    )
 }
 
 /// Switch the interaction mode (plan / work / operate).
 pub fn switch_mode(app: &mut App, mode: AppMode) -> String {
-    groups::config::config::switch_mode(app, mode)
+    config_main_host::switch_mode(app, mode)
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -2210,9 +2215,27 @@ mod tests {
             "export",
             // FEAT-026 completes the session structural-copy slice.
             "structcopy",
-            // FEAT-027 config policy/status slice; remaining config stays legacy.
+            // FEAT-027 config policy/status slice.
             "permissions",
             "status",
+            // FEAT-028 completes the config group (all 19 commands portable).
+            "config",
+            "import-claude",
+            "login",
+            "connect",
+            "disconnect",
+            "auth",
+            "workbar",
+            "pet",
+            "settings",
+            "statusline",
+            "mode",
+            "fullscreen",
+            "inline",
+            "theme",
+            "verbose",
+            "trust",
+            "logout",
             // FEAT-029 complete debug group, including receipts and mutation.
             "tokens",
             "cost",

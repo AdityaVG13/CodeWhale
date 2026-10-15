@@ -4,7 +4,7 @@ use codewhale_command_contract::handler::{CommandCapabilities as Caps, CommandHa
 
 #[test]
 fn config_policy_keeps_host_registry_order_metadata_and_exact_capabilities() {
-    let group = crate::commands::groups::config::ConfigCommands;
+    let group = crate::commands::config_group::ConfigCommands;
     assert_eq!(
         group
             .commands()

@@ -31,13 +31,16 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+mod config_main;
 pub(in crate::commands) mod config_policy;
 #[cfg(test)]
 mod config_policy_baseline;
+use config_main::{ConfigAdapter, LoginAdapter, PetAdapter, TrustAdapter, WorkSurfaceAdapter};
 use config_policy::{ConfigStatusAdapter, PermissionsAdapter};
 mod debug_diagnostics;
 pub(in crate::commands) mod debug_operations;
 use debug_operations::DebugOperationsAdapter;
+pub(in crate::commands) mod config_messages;
 mod config_policy_messages;
 mod diagnostics_messages;
 #[cfg(test)]
@@ -106,7 +109,7 @@ use codewhale_localization::{MessageId, tr};
 /// (`scripts/check-command-migration-manifest.py`) reads this exact
 /// declaration by source regex and the Rust frontier tests assert it.
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) const PENDING_GROUPS: &[&str] = &["config", "core"];
+pub(crate) const PENDING_GROUPS: &[&str] = &["core"];
 
 // ---------------------------------------------------------------------------
 // Boundary-value mappings (D8)
@@ -184,6 +187,8 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_clear_description" => MessageId::CmdClearDescription,
         "cmd_compact_description" => MessageId::CmdCompactDescription,
         "cmd_config_description" => MessageId::CmdConfigDescription,
+        "cmd_connect_description" => MessageId::CmdConnectDescription,
+        "cmd_disconnect_description" => MessageId::CmdDisconnectDescription,
         "cmd_constitution_description" => MessageId::CmdConstitutionDescription,
         "cmd_context_description" => MessageId::CmdContextDescription,
         "cmd_cost_description" => MessageId::CmdCostDescription,
@@ -195,17 +200,21 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_feedback_description" => MessageId::CmdFeedbackDescription,
         "cmd_fleet_description" => MessageId::CmdFleetDescription,
         "cmd_fork_description" => MessageId::CmdForkDescription,
+        "cmd_fullscreen_description" => MessageId::CmdFullscreenDescription,
         "cmd_goal_description" => MessageId::CmdGoalDescription,
         "cmd_help_description" => MessageId::CmdHelpDescription,
         "cmd_hf_description" => MessageId::CmdHfDescription,
         "cmd_home_description" => MessageId::CmdHomeDescription,
         "cmd_hooks_description" => MessageId::CmdHooksDescription,
+        "cmd_import_claude_description" => MessageId::CmdImportClaudeDescription,
+        "cmd_inline_description" => MessageId::CmdInlineDescription,
         "cmd_hotbar_description" => MessageId::CmdHotbarDescription,
         "cmd_init_description" => MessageId::CmdInitDescription,
         "cmd_jobs_description" => MessageId::CmdJobsDescription,
         "cmd_lane_description" => MessageId::CmdLaneDescription,
         "cmd_links_description" => MessageId::CmdLinksDescription,
         "cmd_load_description" => MessageId::CmdLoadDescription,
+        "cmd_login_description" => MessageId::CmdLoginDescription,
         "cmd_logout_description" => MessageId::CmdLogoutDescription,
         "cmd_lsp_description" => MessageId::CmdLspDescription,
         "cmd_mcp_description" => MessageId::CmdMcpDescription,
@@ -218,6 +227,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_new_description" => MessageId::CmdNewDescription,
         "cmd_note_description" => MessageId::CmdNoteDescription,
         "cmd_permissions_description" => MessageId::CmdPermissionsDescription,
+        "cmd_pet_description" => MessageId::CmdPetDescription,
         "cmd_pin_description" => MessageId::CmdPinDescription,
         "cmd_plugin_description" => MessageId::CmdPluginDescription,
         "cmd_plugin_detail_description" => MessageId::CmdPluginDetailDescription,
@@ -2029,6 +2039,59 @@ impl CommandModePolicyContext for ModePolicyAdapter<'_> {
     fn policy_locked(&self) -> bool {
         self.host.app.borrow().approval_policy_locked()
     }
+
+    fn select_mode(
+        &mut self,
+        mode: CommandMode,
+    ) -> codewhale_command_contract::facets::CommandModeSelection {
+        use codewhale_command_contract::facets::CommandModeSelection;
+        match self
+            .host
+            .app
+            .borrow_mut()
+            .select_mode(from_command_mode(mode))
+        {
+            crate::tui::app::SettingSelection::Changed => CommandModeSelection::Changed,
+            crate::tui::app::SettingSelection::PersistedSame => CommandModeSelection::PersistedSame,
+            crate::tui::app::SettingSelection::Refused => CommandModeSelection::Refused,
+        }
+    }
+
+    fn select_yolo_compat(&mut self) -> codewhale_command_contract::facets::CommandModeSelection {
+        use codewhale_command_contract::facets::CommandModeSelection;
+        match self.host.app.borrow_mut().select_yolo_compat() {
+            crate::tui::app::SettingSelection::Changed => CommandModeSelection::Changed,
+            crate::tui::app::SettingSelection::PersistedSame => CommandModeSelection::PersistedSame,
+            crate::tui::app::SettingSelection::Refused => CommandModeSelection::Refused,
+        }
+    }
+
+    fn mode_startup_default_receipt(&self, mode: CommandMode) -> String {
+        self.host
+            .app
+            .borrow()
+            .mode_startup_default_receipt(from_command_mode(mode))
+    }
+
+    fn setting_locked_mode_message(&self) -> String {
+        self.host
+            .app
+            .borrow()
+            .setting_locked_message(MessageId::SettingSubjectMode)
+    }
+
+    fn mode_label(&self, mode: CommandMode) -> String {
+        use crate::tui::app::AppModeUi;
+        let locale = self.host.app.borrow().ui_locale;
+        from_command_mode(mode)
+            .display_name_localized(locale)
+            .to_string()
+    }
+
+    fn yolo_compat_label(&self) -> String {
+        let locale = self.host.app.borrow().ui_locale;
+        codewhale_localization::tr(locale, MessageId::HotbarActionModeYoloName).to_string()
+    }
 }
 
 /// Read access to the effective system prompt.
@@ -2116,6 +2179,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| key_to_session_message_id(key))
             .or_else(|| diagnostics_messages::resolve(key))
             .or_else(|| config_policy_messages::resolve(key))
+            .or_else(|| config_messages::resolve(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -2260,7 +2324,10 @@ pub(crate) fn key_to_project_message_id(key: &str) -> Option<MessageId> {
 ///
 /// Returns `None` when the replacement set does not exactly cover every
 /// placeholder in the template (missing, extra, or duplicate names).
-fn apply_named_replacements(template: &str, replacements: &[(&str, &str)]) -> Option<String> {
+pub(in crate::commands) fn apply_named_replacements(
+    template: &str,
+    replacements: &[(&str, &str)],
+) -> Option<String> {
     let supplied: std::collections::BTreeMap<&str, &str> = replacements.iter().copied().collect();
     if supplied.len() != replacements.len() {
         return None; // duplicate replacement name
@@ -2282,11 +2349,19 @@ fn apply_named_replacements(template: &str, replacements: &[(&str, &str)]) -> Op
     if placeholders != supplied.keys().copied().collect() {
         return None;
     }
-    let mut out = template.to_string();
-    for (name, value) in replacements {
-        out = out.replace(&format!("{{{name}}}"), value);
-    }
-    Some(out)
+    let placeholders: Vec<_> = replacements
+        .iter()
+        .map(|(name, _)| format!("{{{name}}}"))
+        .collect();
+    let replacements: Vec<_> = placeholders
+        .iter()
+        .zip(replacements)
+        .map(|(placeholder, (_, value))| (placeholder.as_str(), *value))
+        .collect();
+    Some(codewhale_protocol::display::interpolate(
+        template,
+        &replacements,
+    ))
 }
 
 /// Atomic composer/media adapter (FEAT-018 D4).
@@ -2563,7 +2638,7 @@ impl CommandProjectContext for ProjectAdapter<'_> {
         // state, so the formatted result is intentionally not forwarded.
         let mut app = self.host.app.borrow_mut();
         let arg = if enabled { "on" } else { "off" };
-        let _ = crate::commands::groups::config::config::lsp_command(&mut app, Some(arg));
+        let _ = crate::commands::config_main_host::lsp_command(&mut app, Some(arg));
         Ok(())
     }
 
@@ -2616,7 +2691,7 @@ pub(crate) struct SkillGroupAdapter<'a> {
 /// `block_in_place` + `Handle::current().block_on` bridges sync handlers back
 /// into the async ecosystem. Mirrors `groups/skills/skills.rs::run_async`;
 /// the legacy copy is removed in Phase 4 when the handlers are ported.
-fn run_async<F, T>(future: F) -> T
+pub(super) fn run_async<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -4541,6 +4616,11 @@ pub(crate) struct CommandContextBundle<'a> {
     debug_diagnostics: DebugDiagnosticsAdapter<'a>,
     permissions: PermissionsAdapter<'a>,
     config_status: ConfigStatusAdapter<'a>,
+    config: ConfigAdapter<'a>,
+    pet: PetAdapter<'a>,
+    trust: TrustAdapter<'a>,
+    login: LoginAdapter<'a>,
+    work_surface: WorkSurfaceAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4622,6 +4702,21 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::CONFIG_STATUS) {
             contexts = contexts.with_config_status(&mut self.config_status);
         }
+        if capabilities.contains(CommandCapabilities::CONFIG) {
+            contexts = contexts.with_config(&mut self.config);
+        }
+        if capabilities.contains(CommandCapabilities::PET) {
+            contexts = contexts.with_pet(&mut self.pet);
+        }
+        if capabilities.contains(CommandCapabilities::TRUST) {
+            contexts = contexts.with_trust(&mut self.trust);
+        }
+        if capabilities.contains(CommandCapabilities::LOGIN) {
+            contexts = contexts.with_login(&mut self.login);
+        }
+        if capabilities.contains(CommandCapabilities::WORK_SURFACE) {
+            contexts = contexts.with_work_surface(&mut self.work_surface);
+        }
         contexts
     }
 
@@ -4652,7 +4747,12 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::DEBUG_UNDO)
             .union(CommandCapabilities::DEBUG_DIAGNOSTICS)
             .union(CommandCapabilities::PERMISSIONS)
-            .union(CommandCapabilities::CONFIG_STATUS);
+            .union(CommandCapabilities::CONFIG_STATUS)
+            .union(CommandCapabilities::CONFIG)
+            .union(CommandCapabilities::PET)
+            .union(CommandCapabilities::TRUST)
+            .union(CommandCapabilities::LOGIN)
+            .union(CommandCapabilities::WORK_SURFACE);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4698,7 +4798,12 @@ impl App {
             debug_undo: DebugOperationsAdapter { host: host.clone() },
             debug_diagnostics: DebugDiagnosticsAdapter { host: host.clone() },
             permissions: PermissionsAdapter { host: host.clone() },
-            config_status: ConfigStatusAdapter { host },
+            config_status: ConfigStatusAdapter { host: host.clone() },
+            config: ConfigAdapter { host: host.clone() },
+            pet: PetAdapter { host: host.clone() },
+            trust: TrustAdapter { host: host.clone() },
+            login: LoginAdapter { host: host.clone() },
+            work_surface: WorkSurfaceAdapter { host },
         }
     }
 }

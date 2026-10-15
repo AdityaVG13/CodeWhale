@@ -1,5 +1,5 @@
 [package]
-name = "codewhale-portable-config-policy"
+name = "codewhale-portable-config"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 codewhale-command-contract = { path = "../../crates/command-contract", version = "0.10.1" }
 codewhale-protocol = { path = "../../crates/protocol", version = "0.10.1" }
+serde_json.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

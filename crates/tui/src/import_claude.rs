@@ -14,13 +14,14 @@
 //! - **Hooks** and **paths** (e.g. `~/.claude/CLAUDE.md`) are listed as manual
 //!   follow-ups with exact target commands.
 //!
-//! The command writes a report and an *unapplied* bundle file. Applying any
-//! part always requires its own explicit consent path.
+//! The plan model and all rendering live in the contract and the portable
+//! group; this module only reads the Claude sources and builds the plan.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
+use codewhale_command_contract::config::{
+    CommandClaudePlan, CommandMcpCandidate, CommandSourceStatus,
+};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// Maximum size accepted for any single Claude source file. Generous for
 /// real `~/.claude.json` files with many projects; bounded so a pathological
@@ -49,106 +50,29 @@ const SAFE_ENV_KEYS: &[&str] = &[
 /// values a migration should not carry.
 const MAX_ENV_VALUE_LEN: usize = 200;
 
-/// Status of one Claude source file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SourceStatus {
-    Found,
-    NotFound,
-    Unreadable(String),
-    Oversize(u64),
-    InvalidJson,
-}
-
-impl SourceStatus {
-    fn describe(&self, path: &Path) -> String {
-        match self {
-            Self::Found => format!("found: {}", crate::utils::display_path(path)),
-            Self::NotFound => format!("not found: {}", crate::utils::display_path(path)),
-            Self::Unreadable(error) => {
-                format!("unreadable: {} ({error})", crate::utils::display_path(path))
-            }
-            Self::Oversize(bytes) => format!(
-                "skipped, too large ({} bytes): {}",
-                bytes,
-                crate::utils::display_path(path)
-            ),
-            Self::InvalidJson => {
-                format!("invalid JSON: {}", crate::utils::display_path(path))
-            }
-        }
-    }
-}
-
-/// One parsed MCP candidate (name + one-line summary), already filtered to the
-/// Claude sources by the caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct McpCandidateLine {
-    pub(crate) name: String,
-    pub(crate) summary: String,
-    pub(crate) hard_blocked: bool,
-}
-
-/// The full `/import-claude` plan. Pure data: building it mutates nothing.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ClaudeImportPlan {
-    pub(crate) sources: Vec<(PathBuf, SourceStatus)>,
-    /// MCP servers from `~/.claude.json` (top level), for `/mcp import`.
-    pub(crate) mcp_candidates: Vec<McpCandidateLine>,
-    /// Names of MCP servers found under `projects.<path>.mcpServers`, listed
-    /// for provenance only in v1.
-    pub(crate) per_project_mcp: Vec<String>,
-    /// Safe env entries proposed for the portable bundle.
-    pub(crate) env_safe: BTreeMap<String, String>,
-    /// Env keys skipped because they are secret-shaped or not allowlisted.
-    pub(crate) env_skipped: Vec<String>,
-    /// Claude `permissions.defaultMode`, when present.
-    pub(crate) permissions_default_mode: Option<String>,
-    pub(crate) permissions_allow: Vec<String>,
-    pub(crate) permissions_ask: Vec<String>,
-    pub(crate) permissions_deny: Vec<String>,
-    /// Hook event names with counts, e.g. `PreToolUse (2)`.
-    pub(crate) hook_events: Vec<String>,
-    /// True when `~/.claude/CLAUDE.md` exists.
-    pub(crate) has_claude_md: bool,
-    /// Project workspace paths recorded in `~/.claude.json` (bounded).
-    pub(crate) claude_projects: Vec<String>,
-}
-
-impl ClaudeImportPlan {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.mcp_candidates.is_empty()
-            && self.per_project_mcp.is_empty()
-            && self.env_safe.is_empty()
-            && self.env_skipped.is_empty()
-            && self.permissions_default_mode.is_none()
-            && self.permissions_allow.is_empty()
-            && self.permissions_ask.is_empty()
-            && self.permissions_deny.is_empty()
-            && self.hook_events.is_empty()
-            && !self.has_claude_md
-            && self.claude_projects.is_empty()
-    }
-}
-
-fn read_bounded_json(path: &Path) -> Result<Value, SourceStatus> {
+fn read_bounded_json(path: &Path) -> Result<Value, CommandSourceStatus> {
     let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => SourceStatus::NotFound,
-        _ => SourceStatus::Unreadable(e.to_string()),
+        std::io::ErrorKind::NotFound => CommandSourceStatus::NotFound,
+        _ => CommandSourceStatus::Unreadable(e.to_string()),
     })?;
     if !meta.is_file() {
-        return Err(SourceStatus::NotFound);
+        return Err(CommandSourceStatus::NotFound);
     }
     if meta.len() > MAX_SOURCE_BYTES {
-        return Err(SourceStatus::Oversize(meta.len()));
+        return Err(CommandSourceStatus::Oversize(meta.len()));
     }
-    let raw = std::fs::read(path).map_err(|e| SourceStatus::Unreadable(e.to_string()))?;
-    serde_json::from_slice::<Value>(&raw).map_err(|_| SourceStatus::InvalidJson)
+    let raw = std::fs::read(path).map_err(|e| CommandSourceStatus::Unreadable(e.to_string()))?;
+    serde_json::from_slice::<Value>(&raw).map_err(|_| CommandSourceStatus::InvalidJson)
 }
 
 /// Read the Claude sources under `home` (usually `~`).
 pub(crate) fn read_sources(
     home: &Path,
-) -> (Vec<(PathBuf, SourceStatus)>, Option<Value>, Option<Value>) {
+) -> (
+    Vec<(PathBuf, CommandSourceStatus)>,
+    Option<Value>,
+    Option<Value>,
+) {
     let claude_json = home.join(".claude.json");
     let settings = home.join(".claude").join("settings.json");
     let mut sources = Vec::new();
@@ -156,14 +80,14 @@ pub(crate) fn read_sources(
     let mut settings_value = None;
     match read_bounded_json(&claude_json) {
         Ok(value) => {
-            sources.push((claude_json.clone(), SourceStatus::Found));
+            sources.push((claude_json.clone(), CommandSourceStatus::Found));
             claude_value = Some(value);
         }
         Err(status) => sources.push((claude_json, status)),
     }
     match read_bounded_json(&settings) {
         Ok(value) => {
-            sources.push((settings.clone(), SourceStatus::Found));
+            sources.push((settings.clone(), CommandSourceStatus::Found));
             settings_value = Some(value);
         }
         Err(status) => sources.push((settings, status)),
@@ -186,16 +110,16 @@ fn safe_env_value(value: &Value) -> Option<String> {
 /// Build the plan from already-read sources plus MCP candidates discovered by
 /// the existing external-import machinery (so server parsing stays single-sourced).
 pub(crate) fn build_plan(
-    sources: Vec<(PathBuf, SourceStatus)>,
+    sources: Vec<(PathBuf, CommandSourceStatus)>,
     claude: Option<Value>,
     settings: Option<Value>,
     home: &Path,
-    mcp_candidates: Vec<McpCandidateLine>,
-) -> ClaudeImportPlan {
-    let mut plan = ClaudeImportPlan {
+    mcp_candidates: Vec<CommandMcpCandidate>,
+) -> CommandClaudePlan {
+    let mut plan = CommandClaudePlan {
         sources,
         mcp_candidates,
-        ..ClaudeImportPlan::default()
+        ..CommandClaudePlan::default()
     };
     if let Some(claude) = claude.as_ref()
         && let Some(projects) = claude.get("projects").and_then(Value::as_object)
@@ -218,7 +142,7 @@ pub(crate) fn build_plan(
                 if SAFE_ENV_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
                     match safe_env_value(value) {
                         Some(text) => {
-                            plan.env_safe.insert(key.clone(), text);
+                            plan.env_safe.push((key.clone(), text));
                         }
                         None => plan.env_skipped.push(format!("{key} (value not portable)")),
                     }
@@ -254,141 +178,8 @@ pub(crate) fn build_plan(
         }
     }
     plan.has_claude_md = home.join(".claude").join("CLAUDE.md").is_file();
+    plan.env_safe.sort();
     plan
-}
-
-/// Claude `permissions.defaultMode` → the Codewhale approval-posture
-/// recommendation (report text only; nothing is applied).
-pub(crate) fn approval_posture_recommendation(mode: Option<&str>) -> &'static str {
-    match mode {
-        Some("acceptEdits") => "auto-review posture (/permissions) matches acceptEdits",
-        Some("plan") => "plan mode matches Claude's plan default",
-        Some("bypassPermissions") => {
-            "Full Access (yolo) matches bypassPermissions — confirm you want it"
-        }
-        _ => "the default Ask posture matches Claude's default",
-    }
-}
-
-/// One-line migration guidance for a Claude permission rule.
-pub(crate) fn permission_rule_guidance(rule: &str) -> String {
-    let rule = rule.trim();
-    if rule.starts_with("Bash(") {
-        format!("{rule} → an execpolicy rule for that command family (/permissions)")
-    } else if rule.starts_with("WebFetch(domain:") || rule.starts_with("WebSearch(") {
-        format!("{rule} → a fetch/network rule for that host or surface")
-    } else if rule.starts_with("mcp__") {
-        format!("{rule} → enable that MCP tool in your mcp.json enabled_tools")
-    } else if rule.starts_with("Read(") || rule.starts_with("Edit(") || rule.starts_with("Write(") {
-        format!("{rule} → a path-scoped ask rule (reads stay workspace-bounded by default)")
-    } else {
-        format!("{rule} → review against /permissions before mapping")
-    }
-}
-
-/// The unapplied portable bundle document for the safe env entries. JSON is a
-/// first-class bundle format (`config import` accepts `.json`), so the
-/// generated file goes through the same strict parser as any hand-written one.
-pub(crate) fn portable_bundle_json(plan: &ClaudeImportPlan) -> String {
-    let global: BTreeMap<&str, &str> = plan
-        .env_safe
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    serde_json::json!({
-        "schema_version": 1,
-        "kind": "codewhale.portable-config",
-        "metadata": {
-            "name": "claude-import",
-            "generator": "codewhale /import-claude",
-        },
-        "global": global,
-    })
-    .to_string()
-}
-
-/// Render the reviewable plan shown in the transcript.
-pub(crate) fn render_plan(plan: &ClaudeImportPlan) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    out.push_str("Claude import plan (nothing is applied without its own consent):\n");
-    for (path, status) in &plan.sources {
-        let _ = writeln!(out, "  · {}", status.describe(path));
-    }
-    if !plan.mcp_candidates.is_empty() {
-        out.push_str("\nMCP servers (apply each with `/mcp import <name> --approve`):\n");
-        for candidate in &plan.mcp_candidates {
-            let blocked = if candidate.hard_blocked {
-                " [blocked]"
-            } else {
-                ""
-            };
-            let _ = writeln!(
-                out,
-                "  · {}{blocked} — {}",
-                candidate.name, candidate.summary
-            );
-        }
-    }
-    if !plan.per_project_mcp.is_empty() {
-        out.push_str("\nProject-scoped MCP servers (listed for provenance only):\n");
-        for name in plan.per_project_mcp.iter().take(8) {
-            let _ = writeln!(out, "  · {name}");
-        }
-    }
-    if !plan.env_safe.is_empty() {
-        out.push_str("\nSafe env settings proposed for the portable bundle:\n");
-        for key in plan.env_safe.keys() {
-            let _ = writeln!(out, "  · {key}");
-        }
-    }
-    if !plan.env_skipped.is_empty() {
-        out.push_str("\nEnv keys not imported (secret-shaped or unmapped; values never shown):\n");
-        for key in plan.env_skipped.iter().take(12) {
-            let _ = writeln!(out, "  · {key}");
-        }
-    }
-    let _ = writeln!(
-        out,
-        "\nApproval posture: {}.",
-        approval_posture_recommendation(plan.permissions_default_mode.as_deref())
-    );
-    for (label, rules) in [
-        ("Allow", &plan.permissions_allow),
-        ("Ask", &plan.permissions_ask),
-        ("Deny", &plan.permissions_deny),
-    ] {
-        if !rules.is_empty() {
-            let _ = writeln!(out, "\n{label} rules (map manually; not auto-applied):");
-            for rule in rules.iter().take(8) {
-                let _ = writeln!(out, "  · {}", permission_rule_guidance(rule));
-            }
-        }
-    }
-    if !plan.hook_events.is_empty() {
-        out.push_str("\nHook events (map manually with /hooks):\n");
-        for event in &plan.hook_events {
-            let _ = writeln!(out, "  · {event}");
-        }
-    }
-    if plan.has_claude_md {
-        out.push_str("\nStanding instructions: ~/.claude/CLAUDE.md found — copy it to ~/.codewhale/instructions.md (or the repo's AGENTS.md) to carry it over.\n");
-    }
-    out
-}
-
-/// The written follow-through report (markdown).
-pub(crate) fn report_markdown(plan: &ClaudeImportPlan) -> String {
-    let mut out = String::from(
-        "# Claude import report\n\nGenerated by `/import-claude`. Nothing was applied automatically.\n\n",
-    );
-    out.push_str(&render_plan(plan));
-    if !plan.env_safe.is_empty() {
-        out.push_str("\n## Apply the portable bundle\n\nReview the generated bundle, then run:\n\n    codewhale config import <bundle path>\n\n");
-    }
-    out.push_str("\n## Manual follow-ups\n\n- MCP: `/mcp import <name> --approve` per server (consent is recorded).\n- Permissions: map rules in /permissions and execpolicy.\n- Hooks: re-create matching hooks with /hooks.\n- Paths: copy CLAUDE.md if you want those standing instructions.\n");
-    out
 }
 
 #[cfg(test)]
@@ -403,6 +194,13 @@ mod tests {
         (dir, home)
     }
 
+    fn env_safe_value(plan: &CommandClaudePlan, key: &str) -> Option<String> {
+        plan.env_safe
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
     #[test]
     fn missing_sources_report_not_found_and_plan_is_empty() {
         let (dir, home) = temp_home("missing");
@@ -412,7 +210,7 @@ mod tests {
         assert!(
             plan.sources
                 .iter()
-                .any(|(_, s)| *s == SourceStatus::NotFound)
+                .any(|(_, s)| *s == CommandSourceStatus::NotFound)
         );
         assert!(dir.path().exists());
     }
@@ -448,14 +246,12 @@ mod tests {
         let (sources, _claude, settings) = read_sources(&home);
         let plan = build_plan(sources, None, settings, &home, Vec::new());
         assert_eq!(
-            plan.env_safe
-                .get("BASH_DEFAULT_TIMEOUT_MS")
-                .map(String::as_str),
+            env_safe_value(&plan, "BASH_DEFAULT_TIMEOUT_MS").as_deref(),
             Some("120000")
         );
-        assert!(plan.env_safe.contains_key("USE_BUILTIN_RIPGREP"));
-        assert!(!plan.env_safe.contains_key("EDITOR"));
-        assert!(!plan.env_safe.contains_key("ANTHROPIC_API_KEY"));
+        assert!(env_safe_value(&plan, "USE_BUILTIN_RIPGREP").is_some());
+        assert!(env_safe_value(&plan, "EDITOR").is_none());
+        assert!(env_safe_value(&plan, "ANTHROPIC_API_KEY").is_none());
         assert!(
             plan.env_skipped
                 .iter()
@@ -473,20 +269,6 @@ mod tests {
         );
         assert_eq!(plan.permissions_deny.len(), 1);
         assert_eq!(plan.hook_events.len(), 2);
-
-        let rendered = render_plan(&plan);
-        assert!(!rendered.contains("sk-ant-secret-value"), "{rendered}");
-        assert!(!rendered.contains("sk-editor-secret-value"), "{rendered}");
-        assert!(!rendered.contains("sk-rule-secret-value"), "{rendered}");
-        assert!(rendered.contains("[redacted]"), "{rendered}");
-        assert!(rendered.contains("Bash(git status:*) → an execpolicy rule"));
-        assert!(rendered.contains("acceptEdits"));
-
-        let bundle = portable_bundle_json(&plan);
-        assert!(!bundle.contains("sk-ant-secret-value"), "{bundle}");
-        assert!(!bundle.contains("sk-editor-secret-value"), "{bundle}");
-        assert!(bundle.contains("codewhale.portable-config"));
-        assert!(bundle.contains("BASH_DEFAULT_TIMEOUT_MS"));
     }
 
     #[test]
@@ -507,7 +289,7 @@ mod tests {
         .expect("claude.json");
 
         let (sources, claude, _settings) = read_sources(&home);
-        let candidates = vec![McpCandidateLine {
+        let candidates = vec![CommandMcpCandidate {
             name: "top".to_string(),
             summary: "stdio server (node)".to_string(),
             hard_blocked: false,
@@ -529,15 +311,7 @@ mod tests {
         assert!(
             sources
                 .iter()
-                .any(|(_, s)| matches!(s, SourceStatus::InvalidJson))
+                .any(|(_, s)| matches!(s, CommandSourceStatus::InvalidJson))
         );
-    }
-
-    #[test]
-    fn posture_recommendations_cover_the_four_claude_modes() {
-        assert!(approval_posture_recommendation(Some("acceptEdits")).contains("auto-review"));
-        assert!(approval_posture_recommendation(Some("plan")).contains("plan"));
-        assert!(approval_posture_recommendation(Some("bypassPermissions")).contains("Full Access"));
-        assert!(approval_posture_recommendation(None).contains("Ask"));
     }
 }

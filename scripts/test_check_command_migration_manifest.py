@@ -420,10 +420,10 @@ class LiveGateTests(unittest.TestCase):
         self.assertEqual(len(frontier), len(set(frontier)))
         # FEAT-018 removed utility, FEAT-019 removed memory, FEAT-020 removed plugins,
         # FEAT-021 removed project, FEAT-022 removed skills, FEAT-029 completed debug,
-        # and FEAT-026 completed session; config/core remain.
+        # FEAT-026 completed session, and FEAT-028 completed config; core remains.
         self.assertEqual(
             set(frontier),
-            {"config", "core"},
+            {"core"},
         )
 
 

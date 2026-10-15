@@ -121,8 +121,21 @@ pub(crate) fn assert_only_export_facet_exposed(parts: ContextParts<'_>) {
         debug_diagnostics,
         permissions,
         config_status,
+        config,
+        pet,
+        trust,
+        login,
+        work_surface,
     } = parts;
-    assert!(permissions.is_none() && config_status.is_none());
+    assert!(
+        permissions.is_none()
+            && config_status.is_none()
+            && config.is_none()
+            && pet.is_none()
+            && trust.is_none()
+            && login.is_none()
+            && work_surface.is_none()
+    );
 
     assert!(export.is_some(), "the export facet must be exposed");
 

@@ -1,305 +1,253 @@
-//! `/import-claude` — explicit, reviewable Claude Code migration (#5557).
+//! Portable `/import-claude` plan rendering (FEAT-028).
+//!
+//! Pure formatting over the contract-owned [`CommandClaudePlan`]: no `App`, no
+//! filesystem. The host builds the plan and performs the writes; the command
+//! owns the flow and the messages.
 
-use crate::commands::CommandResult;
-use crate::import_claude::{self, McpCandidateLine};
-use crate::tui::app::App;
+use codewhale_command_contract::config::CommandClaudePlan;
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
-pub(super) fn import_claude_command(app: &mut App, arg: Option<&str>) -> CommandResult {
-    let apply = arg.map(str::trim).is_some_and(|arg| {
-        arg.eq_ignore_ascii_case("--apply") || arg.eq_ignore_ascii_case("apply")
-    });
-    let home = crate::config::effective_home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let (sources, claude, settings) = import_claude::read_sources(&home);
-
-    // MCP candidates come from the same discovery the `/mcp import` consent
-    // flow uses, filtered to the Claude sources: provenance stays single-sourced.
-    let markets = Vec::new();
-    let mcp_candidates =
-        crate::mcp::external_import::discover_external_sources(&home, &app.workspace, &markets)
-            .into_iter()
-            .filter(|candidate| {
-                matches!(
-                    candidate.source_kind,
-                    crate::mcp::external_import::ExternalMcpSourceKind::ClaudeJson
-                )
-            })
-            .map(|candidate| McpCandidateLine {
-                summary: candidate.summary,
-                hard_blocked: candidate.hard_blocked,
-                name: candidate.name,
-            })
-            .collect::<Vec<_>>();
-
-    let plan = import_claude::build_plan(sources, claude, settings, &home, mcp_candidates);
-    if plan.is_empty() {
-        return CommandResult {
-            message: Some(
-                "No Claude configuration found to import (looked for ~/.claude.json and \
-                 ~/.claude/settings.json)."
-                    .to_string(),
-            ),
-            action: None,
-            is_error: false,
-        };
-    }
-
-    // The plan is shown before anything is written; the only writes are the
-    // report and an *unapplied* bundle file. Applying always goes through a
-    // separate consent path (`/mcp import approve <review-token>`, `config import`).
-    let imports_dir = codewhale_config::codewhale_home()
-        .map(|home| home.join("imports"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(".codewhale/imports"));
-    let report_path = imports_dir.join("claude-import-report.md");
-    let bundle_path = imports_dir.join("claude-portable-bundle.json");
-    let wrote_report = codewhale_config::persistence::atomic_write(
-        &report_path,
-        import_claude::report_markdown(&plan).as_bytes(),
-    )
-    .is_ok();
-    let wrote_bundle = if plan.env_safe.is_empty() {
-        false
-    } else {
-        codewhale_config::persistence::atomic_write(
-            &bundle_path,
-            import_claude::portable_bundle_json(&plan).as_bytes(),
-        )
-        .is_ok()
-    };
-
-    if apply {
-        return apply_plan(&plan, &report_path, wrote_report);
-    }
-
-    let mut message = import_claude::render_plan(&plan);
-    message.push_str(
-        "\n\nNothing above is applied yet. `/import-claude --apply` carries over the \
-         standing instructions. Review MCP servers individually with `/mcp import`; hooks and \
-         permission rules stay manual because they run code.",
-    );
-    if wrote_report {
-        message.push_str(&format!(
-            "\nFull report: {}",
-            crate::utils::display_path(&report_path)
-        ));
-    } else {
-        message.push_str("\n(the report could not be written; the plan above is complete)");
-    }
-    if wrote_bundle {
-        message.push_str(&format!(
-            "\nPortable bundle (review, then `codewhale config import {}`): apply it there for the consent/rollback path.",
-            crate::utils::display_path(&bundle_path)
-        ));
-    }
-    CommandResult {
-        message: Some(message),
-        action: None,
-        is_error: false,
+/// Claude `permissions.defaultMode` → the Codewhale approval-posture
+/// recommendation (report text only; nothing is applied).
+pub(crate) fn approval_posture_recommendation(mode: Option<&str>) -> &'static str {
+    match mode {
+        Some("acceptEdits") => "auto-review posture (/permissions) matches acceptEdits",
+        Some("plan") => "plan mode matches Claude's plan default",
+        Some("bypassPermissions") => {
+            "Full Access (yolo) matches bypassPermissions — confirm you want it"
+        }
+        _ => "the default Ask posture matches Claude's default",
     }
 }
 
-/// Carry over what can be carried over safely, and say exactly what was done.
-///
-/// `--apply` is the consent: the plan is printed first by the bare command, and
-/// this path never overwrites an existing file, never imports MCP servers,
-/// and never touches hooks or permission rules — those run code, so
-/// they stay a human decision.
-fn apply_plan(
-    plan: &import_claude::ClaudeImportPlan,
-    report_path: &std::path::Path,
-    wrote_report: bool,
-) -> CommandResult {
-    let mut done: Vec<String> = Vec::new();
-    let mut manual: Vec<String> = Vec::new();
-
-    // 1. Standing instructions: a plain file copy, and only when the
-    //    destination does not already exist. Clobbering the operator's own
-    //    instructions would be the one unrecoverable thing here.
-    if plan.has_claude_md {
-        match codewhale_config::codewhale_home() {
-            Ok(home) => {
-                let destination = home.join("instructions.md");
-                let source = crate::config::effective_home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".claude")
-                    .join("CLAUDE.md");
-                if destination.exists() {
-                    manual.push(format!(
-                        "{} already exists — left untouched; merge from {} by hand if you want both.",
-                        crate::utils::display_path(&destination),
-                        crate::utils::display_path(&source)
-                    ));
-                } else {
-                    match std::fs::read(&source) {
-                        Ok(bytes)
-                            if codewhale_config::persistence::atomic_write(
-                                &destination,
-                                &bytes,
-                            )
-                            .is_ok() =>
-                        {
-                            done.push(format!(
-                                "Standing instructions copied to {}.",
-                                crate::utils::display_path(&destination)
-                            ));
-                        }
-                        _ => manual.push(format!(
-                            "Could not copy {} — copy it to {} by hand.",
-                            crate::utils::display_path(&source),
-                            crate::utils::display_path(&destination)
-                        )),
-                    }
-                }
-            }
-            Err(_) => manual.push(
-                "Could not resolve the Codewhale home, so standing instructions were not copied."
-                    .to_string(),
-            ),
-        }
-    }
-
-    // MCP approval must bind the exact bytes and current managed-config
-    // revision shown by the shared preview. Blanket migration cannot grant it.
-    for candidate in &plan.mcp_candidates {
-        manual.push(if candidate.hard_blocked {
-            format!("MCP `{}` is disabled at its source and was not imported.", candidate.name)
-        } else {
-            format!("MCP `{}` needs a separate review: run /mcp import, then use its displayed approval command. It will be imported OFF.", candidate.name)
-        });
-    }
-
-    // 3. What stays human, always.
-    if !plan.hook_events.is_empty() {
-        manual.push(format!(
-            "{} hook event(s) still need mapping with /hooks — hooks run code, so they are never imported for you.",
-            plan.hook_events.len()
-        ));
-    }
-    if !plan.permissions_allow.is_empty()
-        || !plan.permissions_ask.is_empty()
-        || !plan.permissions_deny.is_empty()
-    {
-        manual.push(
-            "Permission rules are listed in the report; apply the ones you want with /permissions."
-                .to_string(),
-        );
-    }
-
-    let mut message = String::new();
-    if done.is_empty() {
-        message.push_str("Nothing was applied.\n");
+/// One-line migration guidance for a Claude permission rule.
+pub(crate) fn permission_rule_guidance(rule: &str) -> String {
+    let rule = rule.trim();
+    if rule.starts_with("Bash(") {
+        format!("{rule} → an execpolicy rule for that command family (/permissions)")
+    } else if rule.starts_with("WebFetch(domain:") || rule.starts_with("WebSearch(") {
+        format!("{rule} → a fetch/network rule for that host or surface")
+    } else if rule.starts_with("mcp__") {
+        format!("{rule} → enable that MCP tool in your mcp.json enabled_tools")
+    } else if rule.starts_with("Read(") || rule.starts_with("Edit(") || rule.starts_with("Write(") {
+        format!("{rule} → a path-scoped ask rule (reads stay workspace-bounded by default)")
     } else {
-        message.push_str("Applied:\n");
-        for line in &done {
-            message.push_str(&format!("  · {line}\n"));
+        format!("{rule} → review against /permissions before mapping")
+    }
+}
+
+/// The unapplied portable bundle document for the safe env entries.
+pub(crate) fn portable_bundle_json(plan: &CommandClaudePlan) -> String {
+    let global: BTreeMap<&str, &str> = plan
+        .env_safe
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "codewhale.portable-config",
+        "metadata": {
+            "name": "claude-import",
+            "generator": "codewhale /import-claude",
+        },
+        "global": global,
+    })
+    .to_string()
+}
+
+/// Render the reviewable plan shown in the transcript.
+pub(crate) fn render_plan(
+    plan: &CommandClaudePlan,
+    display: &dyn Fn(&std::path::Path) -> String,
+) -> String {
+    let mut out = String::new();
+    out.push_str("Claude import plan (nothing is applied without its own consent):\n");
+    for (path, status) in &plan.sources {
+        let _ = writeln!(out, "  · {}", status.describe(&display(path)));
+    }
+    if !plan.mcp_candidates.is_empty() {
+        out.push_str("\nMCP servers (apply each with `/mcp import <name> --approve`):\n");
+        for candidate in &plan.mcp_candidates {
+            let blocked = if candidate.hard_blocked {
+                " [blocked]"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "  · {}{blocked} — {}",
+                candidate.name, candidate.summary
+            );
         }
     }
-    if !manual.is_empty() {
-        message.push_str("\nStill yours to do:\n");
-        for line in &manual {
-            message.push_str(&format!("  · {line}\n"));
+    if !plan.per_project_mcp.is_empty() {
+        out.push_str("\nProject-scoped MCP servers (listed for provenance only):\n");
+        for name in plan.per_project_mcp.iter().take(8) {
+            let _ = writeln!(out, "  · {name}");
         }
     }
-    if !done.is_empty() {
-        message.push_str("\nRun /mcp reload to connect the imported servers after reviewing them.");
+    if !plan.env_safe.is_empty() {
+        out.push_str("\nSafe env settings proposed for the portable bundle:\n");
+        for (key, _) in &plan.env_safe {
+            let _ = writeln!(out, "  · {key}");
+        }
     }
-    if wrote_report {
-        message.push_str(&format!(
-            "\nFull report: {}",
-            crate::utils::display_path(report_path)
-        ));
+    if !plan.env_skipped.is_empty() {
+        out.push_str("\nEnv keys not imported (secret-shaped or unmapped; values never shown):\n");
+        for key in plan.env_skipped.iter().take(12) {
+            let _ = writeln!(out, "  · {key}");
+        }
     }
-    CommandResult {
-        message: Some(message),
-        action: None,
-        is_error: false,
+    let _ = writeln!(
+        out,
+        "\nApproval posture: {}.",
+        approval_posture_recommendation(plan.permissions_default_mode.as_deref())
+    );
+    for (label, rules) in [
+        ("Allow", &plan.permissions_allow),
+        ("Ask", &plan.permissions_ask),
+        ("Deny", &plan.permissions_deny),
+    ] {
+        if !rules.is_empty() {
+            let _ = writeln!(out, "\n{label} rules (map manually; not auto-applied):");
+            for rule in rules.iter().take(8) {
+                let _ = writeln!(out, "  · {}", permission_rule_guidance(rule));
+            }
+        }
     }
+    if !plan.hook_events.is_empty() {
+        out.push_str("\nHook events (map manually with /hooks):\n");
+        for event in &plan.hook_events {
+            let _ = writeln!(out, "  · {event}");
+        }
+    }
+    if plan.has_claude_md {
+        out.push_str("\nStanding instructions: ~/.claude/CLAUDE.md found — copy it to ~/.codewhale/instructions.md (or the repo's AGENTS.md) to carry it over.\n");
+    }
+    out
+}
+
+/// The written follow-through report (markdown).
+pub(crate) fn report_markdown(
+    plan: &CommandClaudePlan,
+    display: &dyn Fn(&std::path::Path) -> String,
+) -> String {
+    let mut out = String::from(
+        "# Claude import report\n\nGenerated by `/import-claude`. Nothing was applied automatically.\n\n",
+    );
+    out.push_str(&render_plan(plan, display));
+    if !plan.env_safe.is_empty() {
+        out.push_str("\n## Apply the portable bundle\n\nReview the generated bundle, then run:\n\n    codewhale config import <bundle path>\n\n");
+    }
+    out.push_str("\n## Manual follow-ups\n\n- MCP: `/mcp import <name> --approve` per server (consent is recorded).\n- Permissions: map rules in /permissions and execpolicy.\n- Hooks: re-create matching hooks with /hooks.\n- Paths: copy CLAUDE.md if you want those standing instructions.\n");
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::tui::app::TuiOptions;
-    use std::fs;
-    use tempfile::TempDir;
+    use codewhale_command_contract::config::{CommandMcpCandidate, CommandSourceStatus};
+    use std::path::PathBuf;
 
-    /// A home with a Claude `CLAUDE.md`, plus a Codewhale home to import into.
-    fn sandbox() -> (TempDir, App) {
-        let temp = TempDir::new().expect("tempdir");
-        let home = temp.path().join("home");
-        let claude = home.join(".claude");
-        fs::create_dir_all(&claude).expect("claude dir");
-        fs::write(claude.join("CLAUDE.md"), b"be excellent\n").expect("CLAUDE.md");
-        fs::write(claude.join("settings.json"), b"{}").expect("settings");
-        fs::write(home.join(".claude.json"), b"{}").expect("claude.json");
+    fn sample_plan() -> CommandClaudePlan {
+        CommandClaudePlan {
+            sources: vec![(PathBuf::from("~/.claude.json"), CommandSourceStatus::Found)],
+            mcp_candidates: vec![CommandMcpCandidate {
+                name: "top".into(),
+                summary: "stdio server (node)".into(),
+                hard_blocked: false,
+            }],
+            per_project_mcp: vec!["inner (project /tmp/p)".into()],
+            env_safe: vec![("BASH_DEFAULT_TIMEOUT_MS".into(), "120000".into())],
+            env_skipped: vec!["ANTHROPIC_API_KEY".into()],
+            permissions_default_mode: Some("acceptEdits".into()),
+            permissions_allow: vec!["Bash(git status:*)".into(), "[redacted]".into()],
+            permissions_ask: vec![],
+            permissions_deny: vec!["Read(./.env)".into()],
+            hook_events: vec!["PreToolUse (1)".into()],
+            has_claude_md: true,
+            claude_projects: vec!["/tmp/proj-a".into()],
+        }
+    }
 
-        let workspace = temp.path().join("ws");
-        fs::create_dir_all(&workspace).expect("workspace");
-        let options = TuiOptions {
-            config_path: Some(temp.path().join("config.toml")),
-            skills_dir: temp.path().join("skills"),
-            memory_path: temp.path().join("memory.md"),
-            notes_path: temp.path().join("notes.txt"),
-            mcp_config_path: temp.path().join("mcp.json"),
-            ..crate::tui::test_support::test_tui_options(&workspace)
+    #[test]
+    fn render_plan_never_echoes_secret_values_and_maps_rules() {
+        let plan = sample_plan();
+        let rendered = render_plan(&plan, &|path| path.display().to_string());
+        assert!(!rendered.contains("sk-"), "{rendered}");
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        assert!(rendered.contains("Bash(git status:*) → an execpolicy rule"));
+        assert!(rendered.contains("acceptEdits"));
+        assert!(rendered.contains("Standing instructions: ~/.claude/CLAUDE.md found"));
+    }
+
+    #[test]
+    fn portable_bundle_is_the_portable_config_document() {
+        let plan = sample_plan();
+        let bundle = portable_bundle_json(&plan);
+        assert!(bundle.contains("codewhale.portable-config"));
+        assert!(bundle.contains("BASH_DEFAULT_TIMEOUT_MS"));
+        assert!(bundle.contains("120000"));
+    }
+
+    #[test]
+    fn report_markdown_includes_the_plan_and_manual_follow_ups() {
+        let plan = sample_plan();
+        let report = report_markdown(&plan, &|path| path.display().to_string());
+        assert!(report.starts_with("# Claude import report"));
+        assert!(report.contains("## Manual follow-ups"));
+        assert!(report.contains("## Apply the portable bundle"));
+    }
+
+    #[test]
+    fn posture_recommendations_cover_the_four_claude_modes() {
+        assert!(approval_posture_recommendation(Some("acceptEdits")).contains("auto-review"));
+        assert!(approval_posture_recommendation(Some("plan")).contains("plan"));
+        assert!(approval_posture_recommendation(Some("bypassPermissions")).contains("Full Access"));
+        assert!(approval_posture_recommendation(None).contains("Ask"));
+    }
+
+    #[test]
+    fn source_status_wording_matches_the_baseline() {
+        assert_eq!(
+            CommandSourceStatus::Found.describe("~/.claude.json"),
+            "found: ~/.claude.json"
+        );
+        assert_eq!(
+            CommandSourceStatus::NotFound.describe("~/.claude.json"),
+            "not found: ~/.claude.json"
+        );
+        assert_eq!(
+            CommandSourceStatus::Oversize(5).describe("~/.claude.json"),
+            "skipped, too large (5 bytes): ~/.claude.json"
+        );
+        assert_eq!(
+            CommandSourceStatus::InvalidJson.describe("~/.claude.json"),
+            "invalid JSON: ~/.claude.json"
+        );
+        assert_eq!(
+            CommandSourceStatus::Unreadable("boom".into()).describe("~/.claude.json"),
+            "unreadable: ~/.claude.json (boom)"
+        );
+    }
+
+    #[test]
+    fn render_plan_uses_the_host_display_projection_not_an_absolute_home_path() {
+        let plan = CommandClaudePlan {
+            sources: vec![(
+                PathBuf::from("/home/review-user/.claude.json"),
+                CommandSourceStatus::Found,
+            )],
+            ..Default::default()
         };
-        let app = App::new(options, &Config::default());
-        (temp, app)
-    }
-
-    #[test]
-    fn the_bare_command_applies_nothing_and_says_how_to_apply() {
-        let _lock = crate::test_support::lock_test_env();
-        let (temp, mut app) = sandbox();
-        let home = temp.path().join("home");
-        let _home = crate::test_support::EnvVarGuard::set("HOME", &home);
-        let _profile = crate::test_support::EnvVarGuard::set("USERPROFILE", &home);
-        let cw_home = temp.path().join("cw");
-        let _cw = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &cw_home);
-
-        let result = import_claude_command(&mut app, None);
-        let message = result.message.expect("a plan");
+        let rendered = render_plan(&plan, &|path| {
+            path.display().to_string().replace("/home/review-user", "~")
+        });
+        assert!(rendered.contains("found: ~/.claude.json"), "{rendered}");
         assert!(
-            message.contains("/import-claude --apply"),
-            "the plan must say how to apply it: {message}"
-        );
-        assert!(
-            !cw_home.join("instructions.md").exists(),
-            "the bare command must not write instructions.md"
-        );
-    }
-
-    #[test]
-    fn apply_carries_the_standing_instructions_and_never_clobbers_them() {
-        let _lock = crate::test_support::lock_test_env();
-        let (temp, mut app) = sandbox();
-        let home = temp.path().join("home");
-        let _home = crate::test_support::EnvVarGuard::set("HOME", &home);
-        let _profile = crate::test_support::EnvVarGuard::set("USERPROFILE", &home);
-        let cw_home = temp.path().join("cw");
-        let _cw = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &cw_home);
-
-        let result = import_claude_command(&mut app, Some("--apply"));
-        let message = result.message.expect("an outcome");
-        let destination = cw_home.join("instructions.md");
-        assert!(destination.exists(), "instructions were copied: {message}");
-        assert_eq!(
-            fs::read_to_string(&destination).expect("read"),
-            "be excellent\n"
-        );
-
-        // Running it again must not overwrite the operator's own file.
-        fs::write(&destination, b"mine now\n").expect("overwrite");
-        let again = import_claude_command(&mut app, Some("--apply"));
-        let message = again.message.expect("an outcome");
-        assert_eq!(
-            fs::read_to_string(&destination).expect("read"),
-            "mine now\n",
-            "an existing instructions.md is never clobbered: {message}"
-        );
-        assert!(
-            message.contains("already exists"),
-            "and the reason is said out loud: {message}"
+            !rendered.contains("/home/review-user"),
+            "the OS account name must not leak: {rendered}"
         );
     }
 }

@@ -412,7 +412,7 @@ fn safety_summary(view: &ConfigStatusView, locale: &Messages) -> Cow<'static, st
 /// every narrower posture and is irreversible, so "sandbox disabled" alone
 /// would promise `sudo`/setuid workflows the process tree cannot perform.
 /// `None` is a platform without the flag, where the plain label is accurate.
-pub(crate) fn safety_disabled_message(no_new_privs_active: Option<bool>) -> MessageId {
+pub fn safety_disabled_message(no_new_privs_active: Option<bool>) -> MessageId {
     match no_new_privs_active {
         Some(true) => MessageId::StatusSafetyDisabledSetuidBlocked,
         Some(false) => MessageId::StatusSafetyDisabledSetuidAllowed,

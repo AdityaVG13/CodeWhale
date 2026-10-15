@@ -1,11 +1,10 @@
 //! Host registration/action conversion for the portable policy inventory.
 use super::CommandResult;
 use super::groups::config::policy::portable_handlers;
-use super::traits::{Command, ContextualCommand};
-use crate::tui::app::{App, AppAction};
+use crate::tui::app::App;
 use codewhale_command_contract::handler::CommandHandler;
 use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
-use codewhale_command_contract::outcome::{ConfigPolicyAction, ConfigPolicyCommandResult};
+use codewhale_command_contract::outcome::ConfigPolicyCommandResult;
 
 struct Registration<const INDEX: usize>;
 impl<const INDEX: usize> RegisterCommand<CommandResult> for Registration<INDEX> {
@@ -29,17 +28,10 @@ impl<const INDEX: usize> RegisterCommand<CommandResult> for Registration<INDEX> 
         }
     }
 }
-pub(super) fn permissions_registration() -> Box<dyn Command> {
-    Box::new(
-        ContextualCommand::from_contract::<Registration<0>>().expect("permissions registration"),
-    )
-}
-pub(super) fn status_registration() -> Box<dyn Command> {
-    Box::new(ContextualCommand::from_contract::<Registration<1>>().expect("status registration"))
-}
 pub(super) fn permissions(app: &mut App, args: Option<&str>) -> CommandResult {
     execute::<0>(app, args)
 }
+#[cfg(test)]
 pub(super) fn status(app: &mut App, args: Option<&str>) -> CommandResult {
     execute::<1>(app, args)
 }
@@ -60,8 +52,8 @@ fn host_result(result: ConfigPolicyCommandResult) -> CommandResult {
     CommandResult {
         message: result.message,
         is_error: result.is_error,
-        action: result.action.map(|action| match action {
-            ConfigPolicyAction::PermissionRulesChanged => AppAction::PermissionRulesChanged,
-        }),
+        action: result
+            .action
+            .map(super::config_host::config_action_to_app_action),
     }
 }

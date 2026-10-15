@@ -105,10 +105,60 @@ pub enum SessionRemoteControlAction {
 
 pub type SessionCommandResult = CommandResult<SessionAction>;
 
-/// Only permission removal can request a host action in the config policy slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigPolicyAction {
+/// Complete config-group action vocabulary (FEAT-028 D5). Unifies the FEAT-027
+/// policy action with the auth, picker, view, screen-mode, trust and
+/// host-effect actions of the main config slice. Constructing one never
+/// executes it; the TUI host adapter converts it to a concrete `AppAction`
+/// outside the movable closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigAction {
+    /// A permission rule was safely removed; the host reloads active rules.
     PermissionRulesChanged,
+    // Auth flows (no host observation needed).
+    StartXaiDeviceLogin,
+    StartClaudeLogin,
+    StartClaudeRevoke,
+    StartChatgptPkceLogin,
+    StartChatgptRevoke,
+    StartOrcarouterPkceLogin,
+    StartOrcarouterRevoke,
+    // Views and pickers.
+    OpenConfigView,
+    OpenModePicker,
+    OpenThemePicker,
+    OpenStatusPicker,
+    OpenProviderPicker,
+    StartPluginLogin {
+        provider: String,
+    },
+    StartPluginLogout {
+        provider: String,
+    },
+    SetScreenMode(crate::types::CommandScreenMode),
+    SetWorkspaceTrust {
+        trusted: bool,
+        save: bool,
+    },
+    // Engine/route effects carrying the exact host payload.
+    ModeChanged(crate::types::CommandMode),
+    ApprovalPolicyChanged {
+        policy: Option<String>,
+    },
+    SwitchProvider {
+        provider: crate::types::CommandProviderId,
+        model: Option<String>,
+    },
+    CompactionChanged(crate::config::CommandCompactionConfig),
+    StreamChunkTimeoutChanged(u64),
+    SubagentRuntimeChanged(crate::config::CommandSubagentRuntimeConfig),
+    SearchProviderChanged(crate::config::CommandSearchProvider),
+    PromptSuggestionChanged {
+        enabled: bool,
+    },
+    NotificationChanged(crate::config::CommandNotificationUpdate),
 }
-pub type ConfigPolicyCommandResult = CommandResult<ConfigPolicyAction>;
+pub type ConfigCommandResult = CommandResult<ConfigAction>;
+/// FEAT-027 compatibility alias; the whole group now standardizes on `ConfigAction`.
+pub type ConfigPolicyAction = ConfigAction;
+pub type ConfigPolicyCommandResult = ConfigCommandResult;
 pub type ConfigStatusCommandResult = CommandResult<std::convert::Infallible>;

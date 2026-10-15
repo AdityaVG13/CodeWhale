@@ -325,6 +325,13 @@ mod tests {
             assert!(
                 p.debug_diff.is_none() && p.debug_undo.is_none() && p.debug_diagnostics.is_none()
             );
+            assert!(
+                p.config.is_none()
+                    && p.pet.is_none()
+                    && p.trust.is_none()
+                    && p.login.is_none()
+                    && p.work_surface.is_none()
+            );
         }
         assert!(
             bundle

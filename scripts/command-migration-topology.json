@@ -279,7 +279,6 @@
     }
   },
   "frontier": [
-    "config",
     "core"
   ]
 }

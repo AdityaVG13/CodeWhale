@@ -3,6 +3,7 @@
 //! Host registration and adapters remain with their clients. Decoupled command
 //! groups move into `codewhale-commands` with all consumers migrated per slice.
 
+pub mod config;
 pub mod config_policy;
 pub mod elapsed;
 pub mod facets;
