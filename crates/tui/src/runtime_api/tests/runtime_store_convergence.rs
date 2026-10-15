@@ -777,7 +777,7 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
     #[cfg(windows)]
     let socket = PathBuf::from(format!(r"\\.\pipe\scope-owner-{}", Uuid::new_v4()));
     let token = "cwrt_scope_operator_only";
-    let workers = runtime_api_sub_agent_manager(&original_workspace, 2);
+    let workers = runtime_api_sub_agent_manager(&original_workspace, 2)?;
     let (scope_tx, scope_rx) = oneshot::channel();
     let (original, manager, server) =
         spawn_test_server_with_root_token_mobile_workspace_and_overrides(

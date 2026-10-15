@@ -53,9 +53,9 @@ use crate::tools::spec::{
 };
 use crate::tools::subagent::{
     FleetRole, ForegroundChildRegistry, Mailbox, MailboxMessage, SharedSubAgentManager,
-    SubAgentCompletion, SubAgentForkContext, SubAgentManager, SubAgentResult, SubAgentRuntime,
-    SubAgentStatus, agent_worker_owner_snapshot,
-    new_shared_subagent_manager_with_state_root_and_timeout,
+    SubAgentCompletion, SubAgentExecutionLimits, SubAgentForkContext, SubAgentManager,
+    SubAgentResult, SubAgentRuntime, SubAgentStatus, TerminalEventDelivery,
+    agent_worker_owner_snapshot, new_shared_subagent_manager_with_state_root_and_timeout,
 };
 use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
@@ -762,6 +762,7 @@ pub struct EngineHandle {
     /// straight to it: the engine may be streaming or running tools and not
     /// reading approvals for a long time.
     subagent_manager: SharedSubAgentManager,
+    terminal_worker_events: Option<Arc<TerminalEventDelivery>>,
 }
 
 const MAX_PENDING_COMPACTION_CANCELLATIONS: usize = 64;
@@ -814,6 +815,35 @@ impl CompactionCancellationState {
 }
 
 impl EngineHandle {
+    #[must_use]
+    pub(crate) fn subagent_manager(&self) -> SharedSubAgentManager {
+        self.subagent_manager.clone()
+    }
+
+    pub(crate) fn mark_worker_event_delivery_failed(&self) {
+        if let Some(events) = self.terminal_worker_events.as_ref() {
+            events.mark_failed();
+        }
+    }
+
+    pub(crate) async fn wait_terminal_worker_events(&self) -> Result<()> {
+        if let Some(events) = self.terminal_worker_events.as_ref() {
+            tokio::time::timeout(FOREGROUND_CHILD_SETTLE_GRACE, events.wait())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "terminal worker event delivery timed out during Runtime shutdown"
+                    )
+                })??;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_subagent_manager(&mut self, manager: SharedSubAgentManager) {
+        self.subagent_manager = manager;
+    }
+
     /// Publish typed compaction cancellation immediately, then enqueue the
     /// matching operation when capacity permits. The shared authority is what
     /// stops a running provider future; the operation keeps the mailbox
@@ -943,6 +973,7 @@ pub struct Engine {
     /// state stays alive across model turns.
     repl_kernel: Option<crate::repl::PythonRuntime>,
     subagent_manager: SharedSubAgentManager,
+    subagent_execution_limits: Option<SubAgentExecutionLimits>,
     /// The deterministic Auto-Review policy shared with every child runtime
     /// so children are gated by the same rules as the parent turn.
     shared_auto_review_policy: Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
@@ -1875,9 +1906,18 @@ impl Engine {
     }
 
     fn new_admitted(
+        config: EngineConfig,
+        api_config: &Config,
+        host: Option<EngineHostSetup>,
+    ) -> (Self, EngineHandle) {
+        Self::new_admitted_with_subagent_manager(config, api_config, host, None)
+    }
+
+    fn new_admitted_with_subagent_manager(
         mut config: EngineConfig,
         api_config: &Config,
         mut host: Option<EngineHostSetup>,
+        supplied_subagent_manager: Option<SharedSubAgentManager>,
     ) -> (Self, EngineHandle) {
         crate::tls::ensure_rustls_crypto_provider();
 
@@ -2126,28 +2166,50 @@ impl Engine {
             codewhale_core::prefix_cache::PrefixStabilityManager::new_unpinned()
         });
 
-        let subagent_manager = host.as_ref().map_or_else(
-            || {
-                let subagent_state_root = config
-                    .subagent_state_root
-                    .clone()
-                    .unwrap_or_else(|| config.workspace.clone());
-                new_shared_subagent_manager_with_state_root_and_timeout(
-                    config.workspace.clone(),
-                    subagent_state_root,
+        let subagent_execution_limits = supplied_subagent_manager
+            .as_ref()
+            .map(|_| {
+                SubAgentExecutionLimits::new(
                     config.max_subagents,
                     config.max_admitted_subagents,
                     config.subagent_heartbeat_timeout,
                     config.launch_concurrency,
-                    // #5324: defaults are captured operator config, not call fields.
                     api_config.subagent_default_max_steps(),
                     api_config
                         .subagent_default_wall_time_secs()
-                        .map(std::time::Duration::from_secs),
+                        .map(Duration::from_secs),
                 )
-            },
-            |host| Arc::clone(host.subagent_manager()),
-        );
+            })
+            .or_else(|| match host.as_ref() {
+                Some(EngineHostSetup::Child(child)) => {
+                    child.authority.runtime.execution_limits.clone()
+                }
+                _ => None,
+            });
+        let subagent_manager = supplied_subagent_manager.unwrap_or_else(|| {
+            host.as_ref().map_or_else(
+                || {
+                    let subagent_state_root = config
+                        .subagent_state_root
+                        .clone()
+                        .unwrap_or_else(|| config.workspace.clone());
+                    new_shared_subagent_manager_with_state_root_and_timeout(
+                        config.workspace.clone(),
+                        subagent_state_root,
+                        config.max_subagents,
+                        config.max_admitted_subagents,
+                        config.subagent_heartbeat_timeout,
+                        config.launch_concurrency,
+                        // #5324: defaults are captured operator config, not call fields.
+                        api_config.subagent_default_max_steps(),
+                        api_config
+                            .subagent_default_wall_time_secs()
+                            .map(std::time::Duration::from_secs),
+                    )
+                },
+                |host| Arc::clone(host.subagent_manager()),
+            )
+        });
         // The OS wrappers below only cover child processes. Codewhale's own
         // `read_file`/`read`/`read_media` tools read in-process, so the same
         // deny-list is installed process-wide for them to consult (S1).
@@ -2264,6 +2326,7 @@ impl Engine {
             session,
             repl_kernel: None,
             subagent_manager,
+            subagent_execution_limits,
             shared_auto_review_policy,
             shell_manager,
             file_read_tracker,
@@ -2344,6 +2407,10 @@ impl Engine {
             compaction_cancellation,
             turn_heartbeat: Arc::clone(&engine.turn_heartbeat),
             subagent_manager: Arc::clone(&engine.subagent_manager),
+            terminal_worker_events: engine
+                .subagent_execution_limits
+                .as_ref()
+                .map(|limits| limits.terminal_events.clone()),
         };
 
         (engine, handle)
@@ -2353,6 +2420,7 @@ impl Engine {
     /// client. The event loop, prompt assembly, tool registry/execution,
     /// cancellation, and session projection are unchanged; only the model I/O
     /// boundary is replaced.
+    #[cfg(test)]
     pub fn new_with_model_client(
         config: EngineConfig,
         api_config: &Config,
@@ -3839,15 +3907,24 @@ impl Engine {
                         self.config.subagent_api_timeout = Duration::from_secs(api_timeout_secs);
                         self.config.subagent_heartbeat_timeout =
                             Duration::from_secs(heartbeat_timeout_secs);
-                        let launch_gate_applied = {
-                            let mut manager = self.subagent_manager.write().await;
-                            manager.update_runtime_limits(
-                                self.config.max_subagents,
-                                self.config.max_admitted_subagents,
-                                self.config.subagent_heartbeat_timeout,
-                                self.config.launch_concurrency,
-                            )
-                        };
+                        let launch_gate_applied =
+                            if let Some(limits) = self.subagent_execution_limits.as_mut() {
+                                limits.update(
+                                    self.config.max_subagents,
+                                    self.config.max_admitted_subagents,
+                                    self.config.subagent_heartbeat_timeout,
+                                    self.config.launch_concurrency,
+                                );
+                                true
+                            } else {
+                                let mut manager = self.subagent_manager.write().await;
+                                manager.update_runtime_limits(
+                                    self.config.max_subagents,
+                                    self.config.max_admitted_subagents,
+                                    self.config.subagent_heartbeat_timeout,
+                                    self.config.launch_concurrency,
+                                )
+                            };
                         let launch_note = if launch_gate_applied {
                             ""
                         } else {
@@ -5669,6 +5746,7 @@ impl Engine {
                 .with_locale_tag(route.locale_tag.clone())
                 .with_role_models(route.role_models.clone())
                 .with_api_config((*route.api_config).clone())
+                .with_execution_limits(self.subagent_execution_limits.clone())
                 .with_auto_model(route.auto_model)
                 .with_reasoning_effort(route.reasoning_effort.clone(), route.reasoning_effort_auto)
                 .with_agent_tool_surface_options(
@@ -7149,6 +7227,7 @@ impl Engine {
         .with_locale_tag(self.config.locale_tag.clone())
         .with_role_models(self.subagent_role_models())
         .with_api_config(self.api_config.clone())
+        .with_execution_limits(self.subagent_execution_limits.clone())
         .with_auto_model(self.session.auto_model)
         .with_reasoning_effort(
             self.session.reasoning_effort.clone(),
@@ -9365,6 +9444,8 @@ pub(crate) fn spawn_engine_with_authoritative_route_config(
     host_profile: EngineHostProfile,
     authoritative_route_config: Arc<parking_lot::RwLock<Config>>,
     model_client: Option<SharedModelClient>,
+    subagent_manager: Option<SharedSubAgentManager>,
+    execution_admission: CancellationToken,
 ) -> (EngineHandle, tokio::task::JoinHandle<()>) {
     // `model_client` replaces only the model I/O boundary (see
     // `Engine::new_with_model_client`); hosts pass `None` for the provider
@@ -9374,10 +9455,17 @@ pub(crate) fn spawn_engine_with_authoritative_route_config(
         config.goal_max_steps = None;
         config.subagents_enabled = false;
     }
-    let (mut engine, handle) = match model_client {
-        Some(client) => Engine::new_with_model_client(config, api_config, client),
-        None => Engine::new(config, api_config),
-    };
+    let (mut engine, mut handle) =
+        Engine::new_admitted_with_subagent_manager(config, api_config, None, subagent_manager);
+    if let Some(limits) = engine.subagent_execution_limits.as_mut() {
+        limits.admission = execution_admission;
+    }
+    if let Some(client) = model_client {
+        engine.model_client = Some(client);
+        engine.model_client_injected = true;
+        engine.codewhale_client_error = None;
+        handle.client_preflight_required = false;
+    }
     engine.host_profile = host_profile;
     engine.authoritative_route_config = Some(authoritative_route_config);
 
@@ -9542,6 +9630,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
             std::env::temp_dir(),
             1,
         ),
+        terminal_worker_events: Some(Arc::new(TerminalEventDelivery::default())),
     };
 
     MockEngineHandle {

@@ -1288,9 +1288,13 @@ async fn build_test_server(
     }
 
     let auth_required = runtime_token.is_some();
-    let sub_agent_manager = overrides
-        .sub_agent_manager
-        .unwrap_or_else(|| runtime_api_sub_agent_manager(&workspace, 2));
+    let sub_agent_manager = match overrides.sub_agent_manager {
+        Some(manager) => manager,
+        None => runtime_api_sub_agent_manager(&workspace, 2)?,
+    };
+    runtime_threads
+        .attach_subagent_manager(sub_agent_manager.clone())
+        .await?;
     // A std listener: the server thread registers it with its own runtime
     // after setup is reported (see `spawn_product_stack_server`).
     let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -2657,7 +2661,7 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
     let root = std::env::temp_dir().join(format!("codewhale-fleet-api-{}", Uuid::new_v4()));
     let workspace = root.join("workspace");
     fs::create_dir_all(&workspace)?;
-    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2)?;
     let manager = FleetManager::open(&workspace)?
         .with_sub_agent_manager(sub_agent_manager.clone())
         .with_session_model(DEFAULT_TEXT_MODEL)
@@ -2972,6 +2976,7 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             launch_manifest: None,
         },
         owner_session_id: "session-receipt".to_string(),
+        runtime_origin_turn_id: None,
         actor_kind: "subagent".to_string(),
         parent_run_id: Some("parent_run".to_string()),
         follow_up: AgentRunFollowUpTarget {
@@ -3051,15 +3056,14 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
     )?;
 
     let sessions_dir = root.join("sessions");
-    let Some((addr, _runtime_threads, handle)) =
-        spawn_test_server_with_root_token_mobile_workspace(
-            root.clone(),
-            sessions_dir,
-            None,
-            false,
-            workspace,
-        )
-        .await?
+    let Some((addr, runtime_threads, handle)) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        sessions_dir,
+        None,
+        false,
+        workspace.clone(),
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -3105,6 +3109,60 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
         .status();
     assert_eq!(missing, StatusCode::NOT_FOUND);
 
+    assert!(run.get("runtime_origin_turn_id").is_none());
+    assert!(
+        serde_json::from_value::<AgentWorkerRecord>(run.clone())?
+            .runtime_origin_turn_id
+            .is_none()
+    );
+    let thread = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest::default())
+        .await?;
+    let engine = runtime_threads.get_engine(&thread.id).await?;
+    let actual = engine.subagent_manager();
+    let mut spec = serde_json::from_value::<AgentWorkerSpec>(run["spec"].clone())?;
+    spec.worker_id = "ordinary_receipt".into();
+    spec.run_id = "ordinary_run".into();
+    spec.parent_run_id = None;
+    actual
+        .write()
+        .await
+        .register_worker_for_session_with_origin(
+            spec,
+            &thread.id,
+            None,
+            Some("turn_original_receipt".into()),
+        );
+    let listed: serde_json::Value = client
+        .get(format!("http://{addr}/v1/agent-runs"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let records = listed["runs"].as_array().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["spec"]["worker_id"] == "agent_receipt")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["spec"]["worker_id"] == "ordinary_receipt")
+            .count(),
+        1
+    );
+    let ordinary: serde_json::Value = client
+        .get(format!("http://{addr}/v1/agent-runs/ordinary_run"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(ordinary["owner_session_id"], thread.id);
+    assert_eq!(ordinary["runtime_origin_turn_id"], "turn_original_receipt");
+    runtime_threads.shutdown_and_wait().await?;
     handle.abort();
     Ok(())
 }

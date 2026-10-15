@@ -892,6 +892,7 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
             std::env::temp_dir(),
             1,
         ),
+        terminal_worker_events: None,
     };
 
     // Fill the op channel with one message (capacity = 1).

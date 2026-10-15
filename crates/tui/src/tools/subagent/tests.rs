@@ -1197,7 +1197,12 @@ fn coordination_hot_paths_count_only_active_authoritative_owners() {
 #[test]
 fn headless_worker_registration_enforces_live_claims_and_projects_context() {
     let tmp = tempdir().expect("tempdir");
-    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 8);
+    let authority_a = new_shared_runtime_subagent_manager(tmp.path().to_path_buf(), 8)
+        .expect("admit Runtime writer");
+    let authority_b = new_shared_runtime_subagent_manager(tmp.path().join("."), 8)
+        .expect("reuse canonical Runtime writer");
+    assert!(Arc::ptr_eq(&authority_a, &authority_b));
+    let mut manager = authority_a.try_write().expect("first authority lock");
     manager
         .record_coordination_decision(DecisionRecord {
             decision_id: "decision-src-a".into(),
@@ -1218,7 +1223,7 @@ fn headless_worker_registration_enforces_live_claims_and_projects_context() {
         spec.role = Some("worker".into());
         spec.runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
         spec.launch_manifest = Some(ChildLaunchManifest {
-            owner_session: "fleet-run".into(),
+            owner_session: format!("owner-{id}"),
             child_id: id.into(),
             profile: spec.runtime_profile.clone(),
             prompt: spec.objective.clone(),
@@ -1237,11 +1242,14 @@ fn headless_worker_registration_enforces_live_claims_and_projects_context() {
     };
 
     let worker_a = worker("worker-a", "src/a");
+    let origin_a = manager
+        .capture_direct_worker_origin(tmp.path(), "owner-worker-a")
+        .expect("capture first owner");
     manager
-        .preflight_worker_coordination(&worker_a)
+        .preflight_worker_coordination_in_origin(&worker_a, &origin_a)
         .expect("first worker preflight");
     manager
-        .register_worker_with_coordination(worker_a)
+        .register_worker_with_coordination_in_origin(worker_a, origin_a)
         .expect("first worker registration");
     let record = manager
         .get_worker_record("worker-a")
@@ -1257,21 +1265,82 @@ fn headless_worker_registration_enforces_live_claims_and_projects_context() {
             .contains("src-a-contract")
     );
 
+    let origin_b = manager
+        .capture_direct_worker_origin(tmp.path(), "owner-worker-b")
+        .expect("capture overlapping owner");
     let overlap = manager
-        .preflight_worker_coordination(&worker("worker-b", "src/a/nested"))
+        .preflight_worker_coordination_in_origin(&worker("worker-b", "src/a/nested"), &origin_b)
         .expect_err("overlapping live Fleet writer must remain queued");
     assert!(overlap.contains("worker-a"), "{overlap}");
     assert_eq!(manager.coordination.contentions.len(), 1);
     assert!(manager.get_worker_record("worker-b").is_none());
 
     let worker_c = worker("worker-c", "src/b");
+    let origin_c = manager
+        .capture_direct_worker_origin(tmp.path(), "owner-worker-c")
+        .expect("capture non-overlapping owner");
     manager
-        .preflight_worker_coordination(&worker_c)
+        .preflight_worker_coordination_in_origin(&worker_c, &origin_c)
         .expect("non-overlapping worker preflight");
     manager
-        .register_worker_with_coordination(worker_c)
+        .register_worker_with_coordination_in_origin(worker_c, origin_c)
         .expect("non-overlapping workers may proceed concurrently");
     assert_eq!(manager.coordination.write_claims.len(), 2);
+    manager
+        .worker_records
+        .get_mut("worker-a")
+        .unwrap()
+        .runtime_origin_turn_id = Some("turn-owner-a".into());
+    manager
+        .worker_records
+        .get_mut("worker-c")
+        .unwrap()
+        .runtime_origin_turn_id = Some("turn-owner-c".into());
+    manager
+        .persist_state_synchronously()
+        .expect("persist both owners");
+    drop(manager);
+    let persisted = load_persisted_agent_worker_records_with_state_root(tmp.path(), tmp.path())
+        .expect("read shared durable history");
+    assert_eq!(persisted.len(), 2);
+    assert!(
+        persisted
+            .iter()
+            .any(|record| record.owner_session_id == "owner-worker-a")
+    );
+    assert!(
+        persisted
+            .iter()
+            .any(|record| record.owner_session_id == "owner-worker-c")
+    );
+    let independent =
+        SubAgentManager::new(tmp.path().to_path_buf(), 8).require_coordination_process_lock();
+    assert!(independent.ensure_coordination_process_lock().is_err());
+    assert!(independent.persist_state_synchronously().is_err());
+    drop(independent);
+    drop(authority_a);
+    drop(authority_b);
+    let reopened = new_shared_runtime_subagent_manager(tmp.path().to_path_buf(), 8)
+        .expect("reopen after actual writer release");
+    let reopened = reopened.try_read().expect("reopened owner lock");
+    assert!(reopened.get_worker_record("worker-a").is_some());
+    assert!(reopened.get_worker_record("worker-c").is_some());
+    assert_eq!(
+        reopened
+            .get_worker_record("worker-a")
+            .unwrap()
+            .runtime_origin_turn_id
+            .as_deref(),
+        Some("turn-owner-a")
+    );
+    assert_eq!(
+        reopened
+            .get_worker_record("worker-c")
+            .unwrap()
+            .runtime_origin_turn_id
+            .as_deref(),
+        Some("turn-owner-c")
+    );
 }
 
 #[test]
@@ -6953,6 +7022,9 @@ async fn full_event_channel_still_delivers_agent_complete() {
         .expect("fill the only slot");
     let mut runtime = runtime_with_depth(1, None);
     runtime.event_tx = Some(event_tx);
+    let limits = SubAgentExecutionLimits::new(2, 2, Duration::from_secs(60), 2, None, None);
+    let delivery = limits.terminal_events.clone();
+    runtime.execution_limits = Some(limits);
     agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
     manager.agents.insert(agent_id.clone(), agent);
     manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
@@ -6965,6 +7037,9 @@ async fn full_event_channel_still_delivers_agent_complete() {
         "the roster leaves Running"
     );
 
+    let waiting = delivery.wait();
+    tokio::pin!(waiting);
+    assert!(futures_util::poll!(&mut waiting).is_pending());
     let filler = event_rx.recv().await.expect("filler event");
     assert!(matches!(filler, Event::Status { .. }));
     let delivered = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
@@ -6975,6 +7050,18 @@ async fn full_event_channel_still_delivers_agent_complete() {
         &delivered,
         Event::AgentComplete { id, outcome: Some(SubAgentStatus::Cancelled), .. } if id == &agent_id
     ));
+    waiting.await.expect("actual terminal send completed");
+    let failed = Arc::new(TerminalEventDelivery::default());
+    let (tx, rx) = mpsc::channel(1);
+    tx.try_send(Event::status("full")).unwrap();
+    send_terminal_event_with_delivery(&tx, Event::status("terminal"), Some(&failed));
+    drop(rx);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), failed.wait())
+            .await
+            .expect("closed sender settles without hanging")
+            .is_err()
+    );
 }
 
 /// #6560 D02-06: a nested parent's completion inbox is bounded and has no
@@ -11855,7 +11942,7 @@ fn coordination_lock_refuses_linked_codewhale_without_writing_through_it() {
     std::fs::create_dir_all(&outside).expect("mkdir outside");
     std::os::unix::fs::symlink(&outside, workspace.join(".codewhale")).expect("link .codewhale");
 
-    let Err(err) = CoordinationProcessLock::acquire(&workspace) else {
+    let Err(err) = CoordinationProcessLock::acquire(&workspace, false) else {
         panic!("a linked .codewhale must be refused");
     };
     let message = format!("{err:#}");
@@ -15567,6 +15654,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         worker_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
         event_tx: None,
         manager: new_shared_subagent_manager(workspace, 5),
+        execution_limits: None,
         spawn_depth: 0,
         max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
         cancel_token: CancellationToken::new(),
@@ -18257,10 +18345,14 @@ async fn launch_gate_queues_extra_direct_children() {
     runtime.context = ToolContext::new(tmp.path());
     runtime.mailbox = Some(mailbox);
 
-    let gate = Arc::new(governor::DynamicGate::new(1));
-    let held_launch_permit = Arc::clone(&gate)
+    runtime.spawn_depth = 1;
+    let limits = SubAgentExecutionLimits::new(1, 4, Duration::from_secs(60), 1, None, None);
+    let held_launch_permit = limits
+        .launch_gate
         .try_acquire()
-        .expect("test holds the single launch permit");
+        .expect("hold owner route slot");
+    runtime.execution_limits = Some(limits);
+    let gate = manager.read().await.launch_gate.clone();
     let spawn = |agent_id: &str, gate: Option<Arc<governor::DynamicGate>>| {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let agent = SubAgent::new(
@@ -18335,6 +18427,11 @@ async fn launch_gate_queues_extra_direct_children() {
     assert!(
         queued.is_ok(),
         "second child must publish a visible queued reason: {messages:?}"
+    );
+    assert_eq!(
+        gate.available_permits(),
+        4,
+        "a route-blocked owner must not hold an aggregate slot"
     );
     drop(held_launch_permit);
 

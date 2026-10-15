@@ -87,6 +87,7 @@ async fn completion_usage_live_terminal_counts_grandchildren_and_continuations_o
                 parent_completion_tx: Some(tx),
                 mailbox: None,
                 event_tx: Some(event_tx),
+                event_delivery: None,
                 session_id: "workspace".into(),
             });
         let mut result = terminal_result(&manager, &root);

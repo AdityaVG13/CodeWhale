@@ -88,7 +88,7 @@ use crate::task_manager::{
 };
 use crate::tools::subagent::{
     AgentWorkerRecord, AgentWorkerStatus, SharedSubAgentManager, SubAgentStatus,
-    new_shared_subagent_manager_with_timeout,
+    new_shared_runtime_subagent_manager,
 };
 #[cfg(test)]
 pub(super) use codewhale_models::{ContentBlock, Message};
@@ -1369,15 +1369,11 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
     }
 }
 
-fn runtime_api_sub_agent_manager(workspace: &FsPath, workers: usize) -> SharedSubAgentManager {
-    let max_agents = workers.max(1);
-    new_shared_subagent_manager_with_timeout(
-        workspace.to_path_buf(),
-        max_agents,
-        max_agents,
-        Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
-        max_agents,
-    )
+fn runtime_api_sub_agent_manager(
+    workspace: &FsPath,
+    workers: usize,
+) -> Result<SharedSubAgentManager> {
+    new_shared_runtime_subagent_manager(workspace.to_path_buf(), workers)
 }
 
 #[derive(Debug, Serialize)]
@@ -1971,6 +1967,13 @@ pub async fn run_http_server(
         existing_binding.as_ref(),
     )?;
     let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
+    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers)?;
+    runtime_threads
+        .attach_subagent_manager(sub_agent_manager.clone())
+        .await?;
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
     if let Some(tap) = options.runtime_event_tap {
         tap(runtime_threads.subscribe_events());
     }
@@ -2020,7 +2023,6 @@ pub async fn run_http_server(
     };
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
-    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let shutdown = RuntimeServerShutdown::default();
     // Opening a thread is every client's first read, and the store can only
     // answer it after one pass over the whole items directory (an item's
@@ -2033,9 +2035,7 @@ pub async fn run_http_server(
             tracing::warn!(%error, "thread item index warm-up failed");
         }
     });
-    let workspace_scopes =
-        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
-    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
+
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -13184,7 +13184,10 @@ base_url = "http://127.0.0.1:9/v1"
         .await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2)?;
+        runtime_threads
+            .attach_subagent_manager(sub_agent_manager.clone())
+            .await?;
         let workspace_scopes =
             RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
         let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
