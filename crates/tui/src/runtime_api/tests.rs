@@ -2,6 +2,7 @@ use super::*;
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
 use crate::core::ops::{Op, TurnSpec};
 use crate::runtime_threads::RuntimeEventRecord;
+use crate::runtime_threads::install_mock_engine;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use anyhow::{Context, bail};
 use codewhale_models::Role;
@@ -952,12 +953,13 @@ async fn spawn_test_server_with_root_token_and_mobile(
         tokio::task::JoinHandle<()>,
     )>,
 > {
+    let workspace = root.join("workspace");
     spawn_test_server_with_root_token_mobile_workspace(
         root,
         sessions_dir,
         runtime_token,
         mobile_enabled,
-        PathBuf::from("."),
+        workspace,
     )
     .await
 }
@@ -3410,10 +3412,7 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
         }
     };
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     let (release_overlap, wait_for_overlap_release) = oneshot::channel();
@@ -3616,10 +3615,7 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
         }
     };
 
-    let mut harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let (submission_tx, submission_rx) = oneshot::channel();
     let (release_completion, wait_for_completion_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
@@ -4044,10 +4040,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
     // Install a mock engine so the turn completes without calling the real API.
     // The mock handles both SendMessage and CompactContext ops so the
     // compact endpoint tested later also works.
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
@@ -4224,10 +4217,7 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
         .await?;
     let thread_id = created["id"].as_str().context("thread id")?.to_string();
 
-    let mut harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = send_count.clone();
     let tx_event = harness.tx_event.clone();
@@ -4361,10 +4351,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
         .build()?;
     let thread = manager.create_thread(Default::default()).await?;
     let other_thread = manager.create_thread(Default::default()).await?;
-    let mut engine = crate::core::engine::mock_engine_handle();
-    manager
-        .install_test_engine(&thread.id, engine.handle.clone())
-        .await?;
+    let mut engine = install_mock_engine(&manager, &thread.id).await;
     let key = "cwc-http-operation-lookup";
     let accepted = client
         .post(format!("http://{addr}/v1/threads/{}/turns", thread.id))
@@ -4571,10 +4558,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
         .to_string();
 
     // Install a mock engine so the turn completes without calling the real API.
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
@@ -5501,10 +5485,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         .context("missing thread id")?
         .to_string();
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let mut rx_steer = harness.rx_steer;
     let tx_event = harness.tx_event;
@@ -6046,10 +6027,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
         .context("missing thread id")?
         .to_string();
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
@@ -7033,10 +7011,7 @@ async fn session_save_without_an_id_keeps_the_conversation_that_owns_the_snapsho
     // can state it. It stands in for the id the real engine stamps on every
     // snapshot the conversation takes.
     const CONVERSATION_ID: &str = "3f9c7b1e-58b4-4d2a-9f5a-8a1e0c6d2b70";
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
@@ -7433,7 +7408,7 @@ async fn patch_undo_endpoint_refuses_turns_it_cannot_prove() -> Result<()> {
         std::env::temp_dir().join(format!("deepseek-patch-undo-endpoint-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
-        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        spawn_test_server_with_root(root.join("server"), sessions_dir).await?
     else {
         return Ok(());
     };
@@ -8487,10 +8462,7 @@ async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
         .send()
         .await?
         .error_for_status()?;
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let _harness = install_mock_engine(&runtime_threads, &thread_id).await;
     runtime_threads
         .set_active_turn_for_test(&thread_id, Some("turn_live"))
         .await?;
@@ -8616,10 +8588,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
         .context("missing thread id")?
         .to_string();
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     let (active_tx, active_rx) = oneshot::channel();
@@ -11494,10 +11463,7 @@ async fn submit_user_input_404s_without_entering_engine_mailbox_for_unknown_id()
     let thread = runtime_threads
         .create_thread(CreateThreadRequest::default())
         .await?;
-    let mut harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread.id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&runtime_threads, &thread.id).await;
 
     let response = crate::tls::reqwest_client()
         .post(format!(
@@ -15148,10 +15114,7 @@ api_key = "local-test-key"
             ..Default::default()
         })
         .await?;
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread.id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread.id).await;
 
     // The loaded thread's route is removed on disk outside this runtime, so
     // any reload now rejects it.
@@ -19562,10 +19525,7 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
             "input_summary": "silent settlement fixture", "created_at": Utc::now()
         }))?;
         manager.test_store().save_turn(&turn)?;
-        let mut mock = crate::core::engine::mock_engine_handle();
-        manager
-            .install_test_engine(&thread.id, mock.handle.clone())
-            .await?;
+        let mut mock = install_mock_engine(&manager, &thread.id).await;
         let approval = if event_name == "approval.required" {
             Some(manager.register_pending_approval_for_thread_for_test(&thread.id, "request"))
         } else {
@@ -19703,10 +19663,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     .await?
     .context("loopback listener required for image contract proof")?;
     let thread = manager.create_thread(Default::default()).await?;
-    let mut harness = crate::core::engine::mock_engine_handle();
-    manager
-        .install_test_engine(&thread.id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
     let client = crate::tls::reqwest_client();
     let url = format!("http://{addr}/v1/threads/{}/turns", thread.id);
     let good = runtime_image_fixture(7);
@@ -19854,10 +19811,7 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
     }
     // Cleanup refuses a loaded or accepted session instead of erasing uncertain work.
     let retained = manager.create_thread(Default::default()).await?;
-    let harness = crate::core::engine::mock_engine_handle();
-    manager
-        .install_test_engine(&retained.id, harness.handle.clone())
-        .await?;
+    let _harness = install_mock_engine(&manager, &retained.id).await;
     assert!(manager.discard_empty_thread(&retained.id).await.is_err());
     assert!(manager.get_thread(&retained.id).await.is_ok());
     server.abort();

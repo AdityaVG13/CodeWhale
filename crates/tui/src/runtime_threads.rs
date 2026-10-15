@@ -16381,6 +16381,21 @@ impl RuntimeThreadManager {
                         })
                     };
                     if !owns_turn {
+                        match &event {
+                            EngineEvent::ApprovalRequired { id, .. }
+                            | EngineEvent::ElevationRequired { tool_id: id, .. } => {
+                                let _ = handle
+                                    .deny_tool_call_by(
+                                        id,
+                                        crate::approval_log::ApprovalDecider::Host,
+                                    )
+                                    .await;
+                            }
+                            EngineEvent::UserInputRequired { id, .. } => {
+                                let _ = handle.cancel_user_input(id).await;
+                            }
+                            _ => {}
+                        }
                         break;
                     }
                     tokio::select! {
@@ -20502,6 +20517,22 @@ pub use turn_artifacts::{
     FileChangeKind, TurnArtifactKind, TurnArtifactRef, TurnWorkspaceArtifacts, TurnWorkspaceReason,
     TurnWorkspaceState,
 };
+
+#[cfg(test)]
+pub(crate) async fn install_mock_engine(
+    manager: &RuntimeThreadManager,
+    thread_id: &str,
+) -> crate::core::engine::MockEngineHandle {
+    let mut harness = crate::core::engine::mock_engine_handle();
+    if let Some(authority) = manager.subagent_manager.lock().await.as_ref() {
+        harness.handle.set_subagent_manager(authority.clone());
+    }
+    manager
+        .install_test_engine(thread_id, harness.handle.clone())
+        .await
+        .expect("install mock engine");
+    harness
+}
 
 #[cfg(test)]
 mod tests;

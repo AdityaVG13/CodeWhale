@@ -6704,21 +6704,6 @@ fn sample_item(turn_id: &str, item_id: &str, status: TurnItemLifecycleStatus) ->
     }
 }
 
-async fn install_mock_engine(
-    manager: &RuntimeThreadManager,
-    thread_id: &str,
-) -> crate::core::engine::MockEngineHandle {
-    let mut harness = mock_engine_handle();
-    if let Some(authority) = manager.subagent_manager.lock().await.as_ref() {
-        harness.handle.set_subagent_manager(authority.clone());
-    }
-    manager
-        .install_test_engine(thread_id, harness.handle.clone())
-        .await
-        .expect("install mock engine");
-    harness
-}
-
 async fn wait_for_sender_strong_count<T>(
     sender: &tokio::sync::mpsc::Sender<T>,
     minimum: usize,
@@ -12768,14 +12753,14 @@ async fn approval_required_with_stale_active_turn_is_denied() -> Result<()> {
         harness.rx_op.recv().await,
         Some(Op::SendMessage(TurnSpec { .. }))
     ));
-    {
+    let active_turn = {
         let mut active = manager.active.lock().await;
         let state = active
             .engines
             .get_mut(&thread.id)
             .context("missing active thread state")?;
-        state.active_turn = None;
-    }
+        state.active_turn.take().context("missing active turn")?
+    };
 
     harness
         .tx_event
@@ -12798,6 +12783,15 @@ async fn approval_required_with_stale_active_turn_is_denied() -> Result<()> {
         })
     );
 
+    manager
+        .active
+        .lock()
+        .await
+        .engines
+        .get_mut(&thread.id)
+        .context("missing active thread state")?
+        .active_turn = Some(active_turn);
+
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
@@ -12816,7 +12810,8 @@ async fn approval_required_with_stale_active_turn_is_denied() -> Result<()> {
         .await?;
 
     let terminal = wait_for_terminal_turn(&manager, &turn.id).await?;
-    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+    assert_eq!(terminal.error.as_deref(), Some(EMPTY_TURN_REASON));
     Ok(())
 }
 
@@ -17399,14 +17394,14 @@ async fn elevation_required_with_stale_active_turn_is_denied() -> Result<()> {
         harness.rx_op.recv().await,
         Some(Op::SendMessage(TurnSpec { .. }))
     ));
-    {
+    let active_turn = {
         let mut active = manager.active.lock().await;
         let state = active
             .engines
             .get_mut(&thread.id)
             .context("missing active thread state")?;
-        state.active_turn = None;
-    }
+        state.active_turn.take().context("missing active turn")?
+    };
 
     harness
         .tx_event
@@ -17427,6 +17422,15 @@ async fn elevation_required_with_stale_active_turn_is_denied() -> Result<()> {
         })
     );
 
+    manager
+        .active
+        .lock()
+        .await
+        .engines
+        .get_mut(&thread.id)
+        .context("missing active thread state")?
+        .active_turn = Some(active_turn);
+
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
@@ -17445,7 +17449,8 @@ async fn elevation_required_with_stale_active_turn_is_denied() -> Result<()> {
         .await?;
 
     let terminal = wait_for_terminal_turn(&manager, &turn.id).await?;
-    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+    assert_eq!(terminal.error.as_deref(), Some(EMPTY_TURN_REASON));
     Ok(())
 }
 
@@ -20481,10 +20486,7 @@ mod runtime_image_inputs {
                     .is_err()
             );
             assert!(!manager.active.lock().await.engines.contains_key(&fork.id));
-            let mut harness = crate::core::engine::mock_engine_handle();
-            manager
-                .install_test_engine(&fork.id, harness.handle.clone())
-                .await?;
+            let mut harness = install_mock_engine(&manager, &fork.id).await;
             let turn = manager
                 .start_turn_from_stored_images(&fork.id, request.clone())
                 .await?;
@@ -20605,6 +20607,11 @@ fn output_cap_wire_requires_positive_integer_and_preserves_legacy_absence() -> R
 /// the rest clear on ack.
 #[tokio::test]
 async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result<()> {
+    use crate::tools::subagent::{
+        AgentWorkerSpec, AgentWorkerToolProfile, FleetRole, SubAgentManager,
+    };
+    use crate::worker_profile::WorkerRuntimeProfile;
+
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
         .create_thread(CreateThreadRequest {
@@ -20620,7 +20627,16 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
             ..Default::default()
         })
         .await?;
-    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let mut harness = mock_engine_handle();
+    harness
+        .handle
+        .set_subagent_manager(Arc::new(tokio::sync::RwLock::new(SubAgentManager::new(
+            thread.workspace.clone(),
+            1,
+        ))));
+    manager
+        .install_test_engine(&thread.id, harness.handle.clone())
+        .await?;
     let turn = manager
         .start_turn(
             &thread.id,
@@ -20634,8 +20650,38 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
         harness.rx_op.recv().await,
         Some(Op::SendMessage(TurnSpec { .. }))
     ));
-    // Agent-scoped events before TurnStarted are control-plane receipts and
-    // are skipped; the turn must start before completions count.
+    harness
+        .handle
+        .subagent_manager()
+        .write()
+        .await
+        .register_worker_for_session_with_origin(
+            AgentWorkerSpec {
+                worker_id: "agent_done".into(),
+                run_id: "agent_done".into(),
+                parent_run_id: None,
+                workflow_run_id: None,
+                session_name: None,
+                objective: "fixture".into(),
+                role: None,
+                agent_type: FleetRole::Verifier,
+                model: "fixture".into(),
+                workspace: thread.workspace.clone(),
+                git_branch: None,
+                context_mode: "fresh".into(),
+                fork_context: false,
+                tool_profile: AgentWorkerToolProfile::Inherited,
+                runtime_profile: WorkerRuntimeProfile::default(),
+                max_steps: 2,
+                spawn_depth: 1,
+                max_spawn_depth: 3,
+                child_route: None,
+                launch_manifest: None,
+            },
+            &thread.id,
+            None,
+            Some(turn.id.clone()),
+        );
     harness
         .tx_event
         .send(EngineEvent::TurnStarted {

@@ -10564,6 +10564,7 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
         boot_id,
     );
     existing.session_name = "researcher".to_string();
+    existing.owner_session_id = runtime.context.state_namespace.clone();
     existing.status = SubAgentStatus::Running;
     let existing_id = existing.id.clone();
     {
