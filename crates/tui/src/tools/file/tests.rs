@@ -528,7 +528,7 @@ async fn contract_read_accepts_whole_number_floats_and_still_refuses_fractions()
     .expect("float-typed ranged read");
     assert_eq!(
         ranged.content,
-        "two\n\n[1 more lines in file (13B total). Use offset=3 to continue.]"
+        "two\n\n[1 more lines in file (13B total). Use offset=3 to continue.]\n\n[Pod (1): lines.txt (this file)]"
     );
 
     for (key, bad) in [
@@ -1155,7 +1155,7 @@ async fn contract_read_newline_dense_ranges_preserve_trailing_and_empty_lines() 
     )
     .await
     .unwrap();
-    assert_eq!(result.content, "\n");
+    assert_eq!(result.content, "\n\n\n[Pod (1): dense.txt (this file)]");
     let metadata = result.metadata.as_ref().unwrap();
     assert_eq!(metadata["size"], text.len());
     assert_eq!(metadata["line_count"], text.len() + 1);
@@ -1168,7 +1168,7 @@ async fn contract_read_newline_dense_ranges_preserve_trailing_and_empty_lines() 
     .unwrap();
     assert_eq!(
         empty.content,
-        "\n\n[1 more lines in file (2.0MB total). Use offset=2097153 to continue.]"
+        "\n\n[1 more lines in file (2.0MB total). Use offset=2097153 to continue.]\n\n[Pod (1): dense.txt (this file)]"
     );
 }
 
