@@ -466,8 +466,8 @@ its tool `<tool>`") and decides whether one is shown.
 
 **When `exec.core` exists.** Only when the model called your tool directly and
 the turn loop is serving its permission gate for that call. It is absent for a
-command, a timer, activation code, a sub-agent's call, and a tool run from
-inside `execute_tools` (code mode gives nested tools no gate); the core refuses
+command, a timer, activation code, and a tool run from inside
+`execute_tools` (code mode gives nested tools no gate); the core refuses
 a `core/call` from any of them. It also ends with the call: when your `execute`
 returns, fails, times out or is cancelled, or your plugin is disabled, or the
 host exits, pending core calls are cancelled and a waiting approval card is

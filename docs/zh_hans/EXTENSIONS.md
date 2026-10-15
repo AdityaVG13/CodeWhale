@@ -259,7 +259,7 @@ async execute({ path }, exec) {
 
 核心调用沿用 allow/deny、hooks、Auto-Review、仓库规则、worker 权限和审批检查。
 审批卡片及来源由 Rust 生成，插件不能批准或指定票据。该句柄不出现在激活、timer、
-用户命令、sub-agent 调用或 `execute_tools` 中的嵌套扩展工具执行里；调用结束、取消、
+用户命令或 `execute_tools` 中的嵌套扩展工具执行里；调用结束、取消、
 插件停用或宿主退出后失效，等待中的审批以取消结果撤回。
 
 嵌套 shell 和网络调用强制要求用户审批，已记住的授权不满足它们；Ask 和

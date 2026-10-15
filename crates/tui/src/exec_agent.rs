@@ -535,7 +535,14 @@ pub(crate) async fn run_exec_agent(
         model: effective_model.clone(),
         active_route_limits,
         workspace: workspace.clone(),
-        session_id: fleet_capture.as_ref().map(|(id, _)| id.clone()),
+        session_id: fleet_capture
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                resume_session
+                    .as_ref()
+                    .map(|saved| saved.metadata.id.clone())
+            }),
         subagent_state_root: None,
         plugin_registry: Some(std::sync::Arc::clone(&engine_plugin_registry)),
         allow_shell: exec_allow_shell,

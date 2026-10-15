@@ -42,6 +42,7 @@ struct ExportHarness {
     // temporary files are removed (matches ControlHarness).
     _home: EnvVarGuard,
     _codewhale_home: EnvVarGuard,
+    _ssh: [EnvVarGuard; 3],
     _env_lock: TestEnvLock,
     temp: TempDir,
 }
@@ -54,6 +55,7 @@ impl ExportHarness {
         std::fs::create_dir_all(&home).expect("home dir");
         let _home = EnvVarGuard::set("HOME", &home);
         let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+        let _ssh = ["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"].map(EnvVarGuard::remove);
         let options = TuiOptions {
             skills_dir: temp.path().join("skills"),
             memory_path: temp.path().join("memory.md"),
@@ -66,6 +68,7 @@ impl ExportHarness {
             app,
             _home,
             _codewhale_home,
+            _ssh,
             _env_lock: env_lock,
             temp,
         }

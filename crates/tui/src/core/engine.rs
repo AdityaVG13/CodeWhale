@@ -7602,7 +7602,7 @@ impl Engine {
     /// Weak between sweeps, but an in-flight handshake holds the pool. Keep
     /// its abort handle so a boundary stops that work and queued diagnoses.
     fn ensure_mcp_supervisor(&mut self) {
-        if self.mcp_supervisor_rx.is_some() {
+        if self.child_host.is_some() || self.mcp_supervisor_rx.is_some() {
             return;
         }
         let Some(pool) = self.mcp_pool.as_ref() else {
@@ -7703,8 +7703,9 @@ impl Engine {
 
     fn mcp_connecting_names(pool: &McpPool, errors: &HashMap<String, String>) -> Vec<String> {
         // The pool tracks spawned-but-unresolved connects (#6033). Inferring
-        // "connecting" from enabled-minus-connected mislabels every lazy —
-        // configured but never-started — server as mid-handshake.
+        // "connecting" from enabled-minus-connected mislabels every on-demand
+        // server — `lazy = true` or plugin-contributed, never started — as
+        // mid-handshake.
         pool.connecting_servers()
             .into_iter()
             .filter(|name| !errors.contains_key(name))
@@ -8151,12 +8152,12 @@ impl Engine {
     /// selects their tools; `mcp_tools` snapshots whatever is already ready.
     ///
     /// Returns the event generation the pass owns, or `Ok(0)` when nothing
-    /// was started (the feature gate skipped a session boot). Progress and
-    /// the finished receipt flow as `Event::McpSessionBoot` updates under
-    /// that generation.
+    /// was started (the feature gate, or a child engine sharing its parent's
+    /// pool, skipped a session boot). Progress and the finished receipt flow
+    /// as `Event::McpSessionBoot` updates under that generation.
     async fn start_mcp_session_boot(&mut self, refresh: McpConnectRefresh) -> anyhow::Result<u64> {
         if matches!(refresh, McpConnectRefresh::IfChanged)
-            && !self.config.features.enabled(Feature::Mcp)
+            && (self.child_host.is_some() || !self.config.features.enabled(Feature::Mcp))
         {
             // Nothing to start. The only caller that reads the generation is
             // the explicit reload, which never takes this branch.
@@ -8353,16 +8354,67 @@ impl Engine {
             .ensure_mcp_pool()
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let prepared = {
+            let mut pool = pool.lock().await;
+            pool.take_retry_connect(name).map(|pending| {
+                (
+                    pending,
+                    pool.connect_timeouts(),
+                    pool.cloned_network_policy(),
+                    pool.current_catalog_generation(),
+                    pool.backend(),
+                )
+            })
+        };
+        let attempt = match prepared {
+            Ok((pending, timeouts, network_policy, generation, backend)) => {
+                let mut connects = McpPool::spawn_pending_connects(
+                    vec![pending],
+                    timeouts,
+                    network_policy,
+                    generation,
+                    backend,
+                );
+                let connection = match connects.join_next().await {
+                    Some(Ok((_, connection))) => connection,
+                    Some(Err(error)) => Err(error.into()),
+                    None => Err(anyhow::anyhow!(
+                        "MCP connection task did not start for {name}"
+                    )),
+                };
+                Ok((generation, connection))
+            }
+            Err(error) => Err(error),
+        };
         let mut pool = pool.lock().await;
+        let result = match attempt {
+            Ok((generation, connection)) => {
+                let stale = pool.current_catalog_generation() != generation;
+                let stored = connection.and_then(|connection| {
+                    let tools = connection.tools().len();
+                    pool.store_ready_connection(name.to_string(), connection)
+                        .map(|()| tools)
+                });
+                if let Err(error) = &stored {
+                    if stale {
+                        pool.cancel_connecting(&HashSet::from([name.to_string()]));
+                    } else {
+                        pool.note_connect_failure(name, error);
+                    }
+                }
+                stored
+            }
+            Err(error) => Err(error),
+        };
         // The outcome is logged here, at the one manager every surface drives,
         // so a panel retry, `/mcp retry`, and the runtime API all leave the
         // same receipt in the session log.
-        match pool.retry_connection(name).await {
-            Ok(connection) => {
+        match result {
+            Ok(tools) => {
                 tracing::info!(
                     target: "mcp",
                     server = %name,
-                    tools = connection.tools().len(),
+                    tools,
                     "MCP server connected on retry"
                 );
                 self.mcp_connection_errors.remove(name);

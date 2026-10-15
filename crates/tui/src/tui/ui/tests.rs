@@ -2788,7 +2788,10 @@ fn plain_mcp_show_refreshes_discovery_counts() {
         !mcp_ui_action_refreshes_discovery(&McpUiAction::Show),
         "plain /mcp snapshots the engine-owned live pool, not a UI discovery pool"
     );
-    assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Validate));
+    assert!(
+        !mcp_ui_action_refreshes_discovery(&McpUiAction::Validate),
+        "validate reports the last observed live pool, not a UI discovery pool"
+    );
     assert!(!mcp_ui_action_refreshes_discovery(&McpUiAction::Login {
         name: "fixture".to_string(),
         scopes: Vec::new(),

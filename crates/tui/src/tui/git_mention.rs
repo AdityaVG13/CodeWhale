@@ -9,15 +9,24 @@
 //! Two deliberate boundaries:
 //!
 //! * **Read-only and bounded.** Only `git status` and `git diff` run, always
-//!   with an explicit byte budget. A repository with a huge working-tree diff
-//!   truncates with a visible marker rather than flooding the turn.
+//!   with an explicit byte budget and time limit. A repository with a huge
+//!   working-tree diff truncates with a visible marker rather than flooding
+//!   the turn, and a wedged git reports a timeout instead of hanging it.
 //! * **Honest when unavailable.** No git binary, or a directory that is not a
 //!   repository, produces an explicit `<git-unavailable>` block. A mention
 //!   never silently contributes nothing.
 
+use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::dependencies::{ExternalTool, Git};
+use crate::snapshot::repo::run_bounded_git_with_timeout;
+
+const GIT_MENTION_TIMEOUT: Duration = Duration::from_secs(10);
+const GIT_COMMAND_FAILED: &str = "git command failed";
+const GIT_COMMAND_TIMED_OUT: &str = "git command timed out";
+const GIT_COMMAND_NOT_RUN: &str = "git could not run safely";
 
 /// Byte ceiling for the inlined `@diff` payload. Documented here because the
 /// context inspector reports the budget alongside actual size.
@@ -154,8 +163,12 @@ pub fn resolve_git_mention(kind: GitMentionKind, cwd: &Path) -> GitMentionPayloa
     if !Git::available() {
         return GitMentionPayload::unavailable(kind, "git not found on PATH");
     }
-    if !is_git_repository(cwd) {
-        return GitMentionPayload::unavailable(kind, "not a git repository");
+    match git_output(&["rev-parse", "--is-inside-work-tree"], cwd) {
+        Ok(out) if out.trim() == "true" => {}
+        Ok(_) | Err(GIT_COMMAND_FAILED) => {
+            return GitMentionPayload::unavailable(kind, "not a git repository");
+        }
+        Err(reason) => return GitMentionPayload::unavailable(kind, reason),
     }
 
     let raw = match kind {
@@ -165,8 +178,9 @@ pub fn resolve_git_mention(kind: GitMentionKind, cwd: &Path) -> GitMentionPayloa
             cwd,
         ),
     };
-    let Some(raw) = raw else {
-        return GitMentionPayload::unavailable(kind, "git command failed");
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(reason) => return GitMentionPayload::unavailable(kind, reason),
     };
 
     if raw.trim().is_empty() {
@@ -206,27 +220,39 @@ pub fn resolve_git_mention(kind: GitMentionKind, cwd: &Path) -> GitMentionPayloa
 
 /// `git status` plus the branch line, so the model does not have to infer the
 /// branch from a porcelain listing.
-fn git_status_payload(cwd: &Path) -> Option<String> {
-    let status = git_output(&["status", "--short", "--branch"], cwd)?;
-    Some(status)
+fn git_status_payload(cwd: &Path) -> Result<String, &'static str> {
+    git_output(&["status", "--short", "--branch"], cwd)
 }
 
-/// True when `cwd` is inside a git work tree.
-fn is_git_repository(cwd: &Path) -> bool {
-    git_output(&["rev-parse", "--is-inside-work-tree"], cwd).is_some_and(|out| out.trim() == "true")
-}
-
-/// Run git and return stdout, or `None` when the binary is missing or the
-/// command exits non-zero.
+/// Run git and return stdout, or the `<git-unavailable>` reason when the
+/// binary is missing, the command exits non-zero, or it outlives
+/// `GIT_MENTION_TIMEOUT` and is killed.
 ///
 /// Runs under [`Git::review_command`], so repository-configured filters,
 /// fsmonitor and hooks do not execute while reading the working tree.
-fn git_output(args: &[&str], cwd: &Path) -> Option<String> {
-    let output = Git::review_command(cwd).ok()?.args(args).output().ok()?;
+fn git_output(args: &[&str], cwd: &Path) -> Result<String, &'static str> {
+    let mut command = Git::review_command(cwd).map_err(|err| {
+        if err
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(|cause| cause.kind() == io::ErrorKind::TimedOut)
+        {
+            GIT_COMMAND_TIMED_OUT
+        } else {
+            GIT_COMMAND_NOT_RUN
+        }
+    })?;
+    command.args(args);
+    let subcommand = args.first().copied().unwrap_or("git");
+    let output = run_bounded_git_with_timeout(&mut command, subcommand, GIT_MENTION_TIMEOUT)
+        .map_err(|err| match err.kind() {
+            io::ErrorKind::TimedOut => GIT_COMMAND_TIMED_OUT,
+            _ => GIT_COMMAND_NOT_RUN,
+        })?;
     if !output.status.success() {
-        return None;
+        return Err(GIT_COMMAND_FAILED);
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Cut `text` to at most `budget` bytes without splitting a UTF-8 scalar.

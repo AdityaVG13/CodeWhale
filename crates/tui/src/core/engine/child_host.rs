@@ -822,9 +822,18 @@ impl Engine {
         surface: &mut ToolSurfacePolicy,
     ) {
         let discoverable = !authority.grant.scope.as_ref().is_some_and(Vec::is_empty);
+        let code_mode = surface.registry.context().tool_authority.is_none()
+            && authority
+                .validate(
+                    &surface.registry,
+                    tool_catalog::EXECUTE_TOOLS_TOOL_NAME,
+                    &serde_json::json!({}),
+                )
+                .is_ok();
         surface.catalog.retain(|tool| {
             surface.registry.contains(&tool.name)
                 || (discoverable && tool_catalog::is_tool_search_tool(&tool.name))
+                || (code_mode && tool.name == tool_catalog::EXECUTE_TOOLS_TOOL_NAME)
         });
         surface
             .active_names

@@ -15627,6 +15627,10 @@ impl RuntimeThreadManager {
                 }
                 manager
             };
+            let mut features = cfg.features();
+            if self.host_profile.is_acp() {
+                features.disable(crate::features::Feature::Mcp);
+            }
             let engine_cfg = EngineConfig {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
@@ -15676,7 +15680,7 @@ impl RuntimeThreadManager {
                 launch_concurrency: cfg.launch_concurrency_for_provider(&route_identity),
                 subagents_enabled: !isolated_chat
                     && cfg.subagents_enabled_for_provider(&route_identity),
-                features: cfg.features(),
+                features,
                 auto_review_policy: cfg.auto_review_policy(),
                 compaction,
                 todos: new_shared_todo_list(),

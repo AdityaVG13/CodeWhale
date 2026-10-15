@@ -4122,6 +4122,10 @@ mod tests {
         ));
         fs::create_dir_all(&temp_root).unwrap();
         let _guard = EnvGuard::new(&temp_root);
+        let _tmux = EnvVarGuard::remove("TMUX");
+        let _sty = EnvVarGuard::remove("STY");
+        let _tilix_id = EnvVarGuard::remove("TILIX_ID");
+        let _terminator_uuid = EnvVarGuard::remove("TERMINATOR_UUID");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = EnvVarGuard::remove("SSH_CLIENT");

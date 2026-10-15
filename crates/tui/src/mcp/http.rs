@@ -186,7 +186,7 @@ impl McpTransport for HttpTransport {
 
     fn probe_dead(&self) -> bool {
         match &self.mode {
-            HttpTransportMode::Streamable(_) => false,
+            HttpTransportMode::Streamable(_) => self.cancel_token.is_cancelled(),
             HttpTransportMode::Sse(transport) => transport.probe_dead(),
         }
     }

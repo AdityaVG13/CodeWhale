@@ -1122,6 +1122,8 @@ impl Git {
         "--ignore-submodules=dirty",
     ];
 
+    const REVIEW_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Construct a read-only review command with content conversion disabled.
     /// Review callers also pass [`Self::REVIEW_DIFF_ARGS`] for diffs.
     /// Configured filters otherwise execute even when those flags are present.
@@ -1152,23 +1154,44 @@ impl Git {
         // Probe once for this process's cached executable, before any read.
         // A random value prevents repository config from spoofing support.
         static REVIEW_CONFIG_SUPPORTED: OnceLock<bool> = OnceLock::new();
-        if !*REVIEW_CONFIG_SUPPORTED.get_or_init(|| {
-            let Some(mut probe) = Self::command() else {
-                return false;
-            };
-            let value = uuid::Uuid::new_v4().to_string();
-            probe
-                .current_dir(workspace)
-                .stdin(std::process::Stdio::null())
-                .env_remove("GIT_CONFIG")
-                .env_remove("GIT_CONFIG_PARAMETERS")
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "codewhale.reviewConfigCapability")
-                .env("GIT_CONFIG_VALUE_0", &value)
-                .args(["config", "--get", "codewhale.reviewConfigCapability"]);
-            matches!(probe.output(), Ok(output)
-                if output.status.success() && output.stdout == format!("{value}\n").as_bytes())
-        }) {
+        let supported = match REVIEW_CONFIG_SUPPORTED.get() {
+            Some(supported) => *supported,
+            None => {
+                let supported = match Self::command() {
+                    None => false,
+                    Some(mut probe) => {
+                        let value = uuid::Uuid::new_v4().to_string();
+                        probe
+                            .current_dir(workspace)
+                            .env_remove("GIT_CONFIG")
+                            .env_remove("GIT_CONFIG_PARAMETERS")
+                            .env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "codewhale.reviewConfigCapability")
+                            .env("GIT_CONFIG_VALUE_0", &value)
+                            .args(["config", "--get", "codewhale.reviewConfigCapability"]);
+                        match crate::snapshot::repo::run_bounded_git_with_timeout(
+                            &mut probe,
+                            "config",
+                            Self::REVIEW_CONFIG_TIMEOUT,
+                        ) {
+                            Ok(output) => {
+                                output.status.success()
+                                    && output.stdout == format!("{value}\n").as_bytes()
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                                let context = format!(
+                                    "Cannot safely inspect Git review configuration: {error}"
+                                );
+                                return Err(anyhow::Error::new(error).context(context));
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                };
+                *REVIEW_CONFIG_SUPPORTED.get_or_init(|| supported)
+            }
+        };
+        if !supported {
             anyhow::bail!(
                 "Cannot safely inspect Git review configuration: Git runtime configuration overrides are unavailable; upgrade Git (2.31 or newer)"
             );
@@ -1202,16 +1225,20 @@ impl Git {
     ) -> anyhow::Result<Vec<(String, &'static str)>> {
         use anyhow::{Context, bail};
 
-        let output = Self::review_base(workspace)?
-            .args([
-                "config",
-                "--null",
-                "--name-only",
-                "--get-regexp",
-                r"^filter\..*\.(clean|process|required)$",
-            ])
-            .output()
-            .context("Failed to inspect Git review filters")?;
+        let mut command = Self::review_base(workspace)?;
+        command.args([
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process|required)$",
+        ]);
+        let output = crate::snapshot::repo::run_bounded_git_with_timeout(
+            &mut command,
+            "config",
+            Self::REVIEW_CONFIG_TIMEOUT,
+        )
+        .context("Failed to inspect Git review filters")?;
         let no_filters =
             output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
         if (!output.status.success() && !no_filters)

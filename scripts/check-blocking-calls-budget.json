@@ -388,7 +388,7 @@
     "std_fs": 1
   },
   "crates/tui/src/tools/search.rs": {
-    "path_canonicalize": 2
+    "path_canonicalize": 3
   },
   "crates/tui/src/tools/shell.rs": {
     "path_canonicalize": 2,
