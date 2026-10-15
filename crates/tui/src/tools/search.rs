@@ -195,6 +195,7 @@ impl ToolSpec for GrepFilesTool {
         // can't pin the async runtime and leave the stop button unresponsive.
         let result = run_blocking_grep(GREP_FILES_TIMEOUT, cancel_token.clone(), move || {
             let cancel_token = cancel_token.as_ref();
+            let workspace_canonical = workspace.canonicalize().ok();
 
             // Stream the walk: each file is searched as it is discovered and
             // the traversal stops as soon as the match budget is exhausted.
@@ -233,6 +234,12 @@ impl ToolSpec for GrepFilesTool {
                     // Get relative path from workspace
                     let relative_path = file_path
                         .strip_prefix(&workspace)
+                        .ok()
+                        .or_else(|| {
+                            workspace_canonical
+                                .as_deref()
+                                .and_then(|canonical| file_path.strip_prefix(canonical).ok())
+                        })
                         .unwrap_or(file_path)
                         .to_string_lossy()
                         .to_string();
