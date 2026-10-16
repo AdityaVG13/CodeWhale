@@ -985,8 +985,7 @@ pub(crate) fn mcp_server_diagnosis(app: &App, name: &str) -> String {
 pub(crate) fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> bool {
     matches!(
         action,
-        crate::tui::app::McpUiAction::Validate
-            | crate::tui::app::McpUiAction::Logout { .. }
+        crate::tui::app::McpUiAction::Logout { .. }
             | crate::tui::app::McpUiAction::ImportList
             | crate::tui::app::McpUiAction::ImportApprove { .. }
     )

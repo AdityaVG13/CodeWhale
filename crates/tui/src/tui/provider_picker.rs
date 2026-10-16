@@ -3108,6 +3108,11 @@ impl ProviderPickerView {
         // every visible row is clickable, so record this frame's geometry for
         // hover + click handling (mirrors the model picker hitboxes).
         self.list_row_hitboxes.borrow_mut().clear();
+        let name_column = filtered
+            .iter()
+            .map(|(_, row)| crate::tui::ui_text::text_display_width(&row.display_name))
+            .max()
+            .unwrap_or(0);
         let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
         for (pos, (idx, row)) in filtered
             .iter()
@@ -3152,10 +3157,21 @@ impl ProviderPickerView {
             } else {
                 Style::default().fg(palette::STATUS_WARNING)
             };
-            let prefix = format!(" {arrow} {}{active_dot}  ", row.display_name);
+            let full_hint = row.list_row_hint(self.view);
+            let unpadded_prefix = format!(" {arrow} {}{active_dot}  ", row.display_name);
+            let spare = usize::from(layout.list.width).saturating_sub(
+                crate::tui::ui_text::text_display_width(&unpadded_prefix)
+                    + crate::tui::ui_text::text_display_width(&full_hint),
+            );
+            let name_pad = " ".repeat(
+                name_column
+                    .saturating_sub(crate::tui::ui_text::text_display_width(&row.display_name))
+                    .min(spare),
+            );
+            let prefix = format!(" {arrow} {}{active_dot}{name_pad}  ", row.display_name);
             let hint = crate::tui::ui_text::semantic_truncate_between_affixes(
                 &prefix,
-                &row.list_row_hint(self.view),
+                &full_hint,
                 "",
                 usize::from(layout.list.width),
             );
@@ -3165,6 +3181,7 @@ impl ProviderPickerView {
                 Span::styled(" ", spacer_style),
                 Span::styled(row.display_name.as_str(), label_style),
                 Span::styled(active_dot, label_style),
+                Span::styled(name_pad, spacer_style),
                 Span::styled("  ", spacer_style),
                 Span::styled(hint, hint_style),
             ]);

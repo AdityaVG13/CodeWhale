@@ -179,9 +179,14 @@ rather than a traced write path.
   runtime code asks the terminal UI for a terminal effect. It never depends on
   the TUI, `ratatui` or `crossterm`; `scripts/check-command-crate-boundaries.py`
   enforces that and ratchets the runtime -> UI references still in `crates/tui`.
-- **`crates/secrets`** - OS keyring integration for API key storage, plus the
-  shared output sanitizer (`sanitize`) and redaction (`redact`) that UI and
-  runtime code both call.
+- **`crates/secrets`** - Secret storage. API keys and MCP OAuth tokens live in
+  a private file store (`~/.codewhale/secrets/secrets.json`, mode `0600` on
+  Unix) by default; the OS keyring is used only when
+  `CODEWHALE_SECRET_BACKEND=system` opts in, and a keyring that fails its probe
+  falls back to the file store. Account sessions always use the file store.
+  The crate also re-exports the shared output sanitizer (`sanitize`) and
+  redaction (`redact`) from `crates/sanitize`, which UI and runtime code both
+  call.
 - **`crates/state`** - SQLite thread/session persistence layer.
 - **`crates/telemetry`** - Anonymous, user-disableable aggregate usage
   counting; the only crate allowed to build or send a telemetry payload

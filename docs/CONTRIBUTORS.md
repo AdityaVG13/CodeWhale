@@ -32,6 +32,8 @@ changelog or release notes, and this contributor record.
 
 **Merged or adapted contributions**
 
+- **[printf033](https://github.com/printf033)** — confined-file I/O on Android/Termux: SELinux-denied `open("/", O_RDONLY|O_DIRECTORY)` anchor replaced with an `O_PATH` walk (Linux-cfg-gated) plus a re-materialized final parent, restoring journal, compaction and artifact writes in search-only SELinux domains ([#6983](https://github.com/codewhale-hq/Codewhale/pull/6983)), with the diagnosis and on-device reproducer in [#6980](https://github.com/codewhale-hq/Codewhale/issues/6980).
+
 </details>
 
 <details open>

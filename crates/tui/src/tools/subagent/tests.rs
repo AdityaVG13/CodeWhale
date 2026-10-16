@@ -1197,7 +1197,12 @@ fn coordination_hot_paths_count_only_active_authoritative_owners() {
 #[test]
 fn headless_worker_registration_enforces_live_claims_and_projects_context() {
     let tmp = tempdir().expect("tempdir");
-    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 8);
+    let authority_a = new_shared_runtime_subagent_manager(tmp.path().to_path_buf(), 8)
+        .expect("admit Runtime writer");
+    let authority_b = new_shared_runtime_subagent_manager(tmp.path().join("."), 8)
+        .expect("reuse canonical Runtime writer");
+    assert!(Arc::ptr_eq(&authority_a, &authority_b));
+    let mut manager = authority_a.try_write().expect("first authority lock");
     manager
         .record_coordination_decision(DecisionRecord {
             decision_id: "decision-src-a".into(),
@@ -1218,7 +1223,7 @@ fn headless_worker_registration_enforces_live_claims_and_projects_context() {
         spec.role = Some("worker".into());
         spec.runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
         spec.launch_manifest = Some(ChildLaunchManifest {
-            owner_session: "fleet-run".into(),
+            owner_session: format!("owner-{id}"),
             child_id: id.into(),
             profile: spec.runtime_profile.clone(),
             prompt: spec.objective.clone(),
@@ -1237,11 +1242,14 @@ fn headless_worker_registration_enforces_live_claims_and_projects_context() {
     };
 
     let worker_a = worker("worker-a", "src/a");
+    let origin_a = manager
+        .capture_direct_worker_origin(tmp.path(), "owner-worker-a")
+        .expect("capture first owner");
     manager
-        .preflight_worker_coordination(&worker_a)
+        .preflight_worker_coordination_in_origin(&worker_a, &origin_a)
         .expect("first worker preflight");
     manager
-        .register_worker_with_coordination(worker_a)
+        .register_worker_with_coordination_in_origin(worker_a, origin_a)
         .expect("first worker registration");
     let record = manager
         .get_worker_record("worker-a")
@@ -1257,21 +1265,82 @@ fn headless_worker_registration_enforces_live_claims_and_projects_context() {
             .contains("src-a-contract")
     );
 
+    let origin_b = manager
+        .capture_direct_worker_origin(tmp.path(), "owner-worker-b")
+        .expect("capture overlapping owner");
     let overlap = manager
-        .preflight_worker_coordination(&worker("worker-b", "src/a/nested"))
+        .preflight_worker_coordination_in_origin(&worker("worker-b", "src/a/nested"), &origin_b)
         .expect_err("overlapping live Fleet writer must remain queued");
     assert!(overlap.contains("worker-a"), "{overlap}");
     assert_eq!(manager.coordination.contentions.len(), 1);
     assert!(manager.get_worker_record("worker-b").is_none());
 
     let worker_c = worker("worker-c", "src/b");
+    let origin_c = manager
+        .capture_direct_worker_origin(tmp.path(), "owner-worker-c")
+        .expect("capture non-overlapping owner");
     manager
-        .preflight_worker_coordination(&worker_c)
+        .preflight_worker_coordination_in_origin(&worker_c, &origin_c)
         .expect("non-overlapping worker preflight");
     manager
-        .register_worker_with_coordination(worker_c)
+        .register_worker_with_coordination_in_origin(worker_c, origin_c)
         .expect("non-overlapping workers may proceed concurrently");
     assert_eq!(manager.coordination.write_claims.len(), 2);
+    manager
+        .worker_records
+        .get_mut("worker-a")
+        .unwrap()
+        .runtime_origin_turn_id = Some("turn-owner-a".into());
+    manager
+        .worker_records
+        .get_mut("worker-c")
+        .unwrap()
+        .runtime_origin_turn_id = Some("turn-owner-c".into());
+    manager
+        .persist_state_synchronously()
+        .expect("persist both owners");
+    drop(manager);
+    let persisted = load_persisted_agent_worker_records_with_state_root(tmp.path(), tmp.path())
+        .expect("read shared durable history");
+    assert_eq!(persisted.len(), 2);
+    assert!(
+        persisted
+            .iter()
+            .any(|record| record.owner_session_id == "owner-worker-a")
+    );
+    assert!(
+        persisted
+            .iter()
+            .any(|record| record.owner_session_id == "owner-worker-c")
+    );
+    let independent =
+        SubAgentManager::new(tmp.path().to_path_buf(), 8).require_coordination_process_lock();
+    assert!(independent.ensure_coordination_process_lock().is_err());
+    assert!(independent.persist_state_synchronously().is_err());
+    drop(independent);
+    drop(authority_a);
+    drop(authority_b);
+    let reopened = new_shared_runtime_subagent_manager(tmp.path().to_path_buf(), 8)
+        .expect("reopen after actual writer release");
+    let reopened = reopened.try_read().expect("reopened owner lock");
+    assert!(reopened.get_worker_record("worker-a").is_some());
+    assert!(reopened.get_worker_record("worker-c").is_some());
+    assert_eq!(
+        reopened
+            .get_worker_record("worker-a")
+            .unwrap()
+            .runtime_origin_turn_id
+            .as_deref(),
+        Some("turn-owner-a")
+    );
+    assert_eq!(
+        reopened
+            .get_worker_record("worker-c")
+            .unwrap()
+            .runtime_origin_turn_id
+            .as_deref(),
+        Some("turn-owner-c")
+    );
 }
 
 #[test]
@@ -5681,6 +5750,7 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
         }],
     };
     let fork_context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: vec![parent_message.clone()],
         structured_state_block: Some("## Fork State\n- Mode: `AGENT`".to_string()),
         work_source: None,
@@ -6952,6 +7022,9 @@ async fn full_event_channel_still_delivers_agent_complete() {
         .expect("fill the only slot");
     let mut runtime = runtime_with_depth(1, None);
     runtime.event_tx = Some(event_tx);
+    let limits = SubAgentExecutionLimits::new(2, 2, Duration::from_secs(60), 2, None, None);
+    let delivery = limits.terminal_events.clone();
+    runtime.execution_limits = Some(limits);
     agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
     manager.agents.insert(agent_id.clone(), agent);
     manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
@@ -6964,6 +7037,9 @@ async fn full_event_channel_still_delivers_agent_complete() {
         "the roster leaves Running"
     );
 
+    let waiting = delivery.wait();
+    tokio::pin!(waiting);
+    assert!(futures_util::poll!(&mut waiting).is_pending());
     let filler = event_rx.recv().await.expect("filler event");
     assert!(matches!(filler, Event::Status { .. }));
     let delivered = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
@@ -6974,6 +7050,18 @@ async fn full_event_channel_still_delivers_agent_complete() {
         &delivered,
         Event::AgentComplete { id, outcome: Some(SubAgentStatus::Cancelled), .. } if id == &agent_id
     ));
+    waiting.await.expect("actual terminal send completed");
+    let failed = Arc::new(TerminalEventDelivery::default());
+    let (tx, rx) = mpsc::channel(1);
+    tx.try_send(Event::status("full")).unwrap();
+    send_terminal_event_with_delivery(&tx, Event::status("terminal"), Some(&failed));
+    drop(rx);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), failed.wait())
+            .await
+            .expect("closed sender settles without hanging")
+            .is_err()
+    );
 }
 
 /// #6560 D02-06: a nested parent's completion inbox is bounded and has no
@@ -8527,6 +8615,7 @@ fn small_surface_warms_explicitly_allowed_deferred_tools() {
 async fn small_surface_fork_context_survives_fresh_child_discovery() {
     let registry = small_surface_registry(FleetRole::Builder);
     let context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: vec![
             Message {
                 role: Role::Assistant,
@@ -10475,6 +10564,7 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
         boot_id,
     );
     existing.session_name = "researcher".to_string();
+    existing.owner_session_id = runtime.context.state_namespace.clone();
     existing.status = SubAgentStatus::Running;
     let existing_id = existing.id.clone();
     {
@@ -11853,7 +11943,7 @@ fn coordination_lock_refuses_linked_codewhale_without_writing_through_it() {
     std::fs::create_dir_all(&outside).expect("mkdir outside");
     std::os::unix::fs::symlink(&outside, workspace.join(".codewhale")).expect("link .codewhale");
 
-    let Err(err) = CoordinationProcessLock::acquire(&workspace) else {
+    let Err(err) = CoordinationProcessLock::acquire(&workspace, false) else {
         panic!("a linked .codewhale must be refused");
     };
     let message = format!("{err:#}");
@@ -12481,6 +12571,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     );
 
     let fork_context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -12512,6 +12603,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         &direct_child,
         "agent_parent",
         SubAgentForkContext {
+            live_header: crate::prompt_zones::new_live_header_cell(),
             messages: Vec::new(),
             structured_state_block: None,
             work_source: None,
@@ -13285,6 +13377,7 @@ async fn parent_todo_state_still_reaches_children_as_immutable_fork_context() {
     let mut parent = stub_runtime();
     write_todos_as(&parent, &["parent step one"]).await;
     parent.fork_context = Some(SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: Vec::new(),
         structured_state_block: Some(
             "## Fork State\n\n### Work\n\nTo-do (0% settled)\n- [ ] #1 parent step one\n"
@@ -13293,10 +13386,54 @@ async fn parent_todo_state_still_reaches_children_as_immutable_fork_context() {
         work_source: None,
     });
 
+    let parent_header = Arc::clone(&parent.fork_context.as_ref().unwrap().live_header);
+    *parent_header.lock().unwrap() = Some(crate::prompt_zones::LiveHeaderSnapshot {
+        system: Some(codewhale_models::SystemPrompt::Text(
+            "captured parent header".to_string(),
+        )),
+        tools_json: String::new(),
+        active_names: Vec::new(),
+        model: parent.model.clone(),
+        provider: crate::config::ProviderKind::Deepseek,
+        provider_identity: "fixture-parent".to_string(),
+        endpoint_fingerprint: Some("fixture-endpoint".to_string()),
+        route_receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
+            crate::config::ProviderKind::Deepseek,
+            "fixture-parent",
+            &parent.model,
+            "https://api.example.test/v1",
+            "fake-cache-key",
+        )),
+        history: Vec::new(),
+        last_hit_tokens: Some(1),
+    });
     let direct = parent.child_runtime();
     let nested = direct.child_runtime();
+    parent_header.lock().unwrap().as_mut().unwrap().system = Some(
+        codewhale_models::SystemPrompt::Text("later parent header".to_string()),
+    );
 
     for (label, child) in [("direct child", &direct), ("nested child", &nested)] {
+        let child_header = &child.fork_context.as_ref().unwrap().live_header;
+        assert!(!Arc::ptr_eq(&parent_header, child_header));
+        let header = child_header.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            header.route_receipt.as_ref(),
+            Some(&crate::route_receipt::TurnRouteReceipt::new(
+                crate::config::ProviderKind::Deepseek,
+                "fixture-parent",
+                &parent.model,
+                "https://api.example.test/v1",
+                "fake-cache-key",
+            ))
+        );
+        assert_eq!(
+            header.system,
+            Some(codewhale_models::SystemPrompt::Text(
+                "captured parent header".to_string()
+            )),
+            "{label} must retain the header captured at spawn"
+        );
         let block = child
             .fork_context
             .as_ref()
@@ -15518,6 +15655,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         worker_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
         event_tx: None,
         manager: new_shared_subagent_manager(workspace, 5),
+        execution_limits: None,
         spawn_depth: 0,
         max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
         cancel_token: CancellationToken::new(),
@@ -17541,6 +17679,7 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
     let (root_tx, mut root_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let direct_child_runtime = runtime_with_depth(1, Some(root_tx));
     let fork_context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: Vec::new(),
         structured_state_block: None,
         work_source: None,
@@ -18207,10 +18346,14 @@ async fn launch_gate_queues_extra_direct_children() {
     runtime.context = ToolContext::new(tmp.path());
     runtime.mailbox = Some(mailbox);
 
-    let gate = Arc::new(governor::DynamicGate::new(1));
-    let held_launch_permit = Arc::clone(&gate)
+    runtime.spawn_depth = 1;
+    let limits = SubAgentExecutionLimits::new(1, 4, Duration::from_secs(60), 1, None, None);
+    let held_launch_permit = limits
+        .launch_gate
         .try_acquire()
-        .expect("test holds the single launch permit");
+        .expect("hold owner route slot");
+    runtime.execution_limits = Some(limits);
+    let gate = manager.read().await.launch_gate.clone();
     let spawn = |agent_id: &str, gate: Option<Arc<governor::DynamicGate>>| {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let agent = SubAgent::new(
@@ -18285,6 +18428,11 @@ async fn launch_gate_queues_extra_direct_children() {
     assert!(
         queued.is_ok(),
         "second child must publish a visible queued reason: {messages:?}"
+    );
+    assert_eq!(
+        gate.available_permits(),
+        4,
+        "a route-blocked owner must not hold an aggregate slot"
     );
     drop(held_launch_permit);
 
@@ -27399,4 +27547,142 @@ async fn settled_projection_waiter_releases_origin_lease_and_mailbox_before_meta
     let usage = record.usage.as_ref().unwrap();
     assert_eq!(usage.total_tokens, Some(20));
     assert_eq!(usage.cost_microusd, Some(7));
+}
+
+#[test]
+fn small_surface_starts_with_core_tools_and_discoverable_goal_control() {
+    let registry = small_surface_registry(FleetRole::Builder);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
+    let mut surface = ChildSurfaceProbe::new(catalog, &[]);
+
+    assert_eq!(
+        model_tool_names(model_request_tools(&mut surface)),
+        [
+            "agent",
+            "bash",
+            "edit",
+            "file_search",
+            "get_goal",
+            "load_skill",
+            "read",
+            "todo_write",
+            "tool_search",
+            "workflow",
+            "write"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    assert_eq!(
+        surface
+            .catalog()
+            .iter()
+            .find(|tool| tool.name == "get_goal")
+            .and_then(|tool| tool.defer_loading),
+        Some(false)
+    );
+    let strict = surface.request_tools(surface.catalog().to_vec(), true);
+    assert_eq!(
+        strict
+            .iter()
+            .find(|tool| tool.name == "read")
+            .and_then(|tool| tool.strict),
+        Some(true)
+    );
+}
+
+#[test]
+fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
+    let catalog = vec![
+        Tool {
+            defer_loading: Some(false),
+            ..synthetic_deferred_tool("read", 8)
+        },
+        synthetic_deferred_tool("agent", 8),
+        Tool {
+            defer_loading: Some(false),
+            ..synthetic_deferred_tool(TOOL_SEARCH_NAME, 8)
+        },
+    ];
+    let warm = ["agent".to_string()];
+    let mut first = ChildSurfaceProbe::new(catalog.clone(), &warm);
+    let mut second = ChildSurfaceProbe::new(catalog.clone(), &warm);
+    let first_wire = model_request_tools(&mut first);
+    let second_wire = model_request_tools(&mut second);
+    let first_json = crate::prompt_zones::wire_tool_catalog_json(&first_wire).expect("serializes");
+    let second_json =
+        crate::prompt_zones::wire_tool_catalog_json(&second_wire).expect("serializes");
+    assert_eq!(first_json, second_json, "same catalog plus same names");
+    assert!(first_wire.iter().any(|tool| tool.name == "agent"));
+    let mut cold = ChildSurfaceProbe::new(catalog, &[]);
+    let cold_wire = model_request_tools(&mut cold);
+    let cold_json = crate::prompt_zones::wire_tool_catalog_json(&cold_wire).expect("serializes");
+    assert_ne!(cold_json, first_json, "warming must change the wire block");
+    assert!(!cold_wire.iter().any(|tool| tool.name == "agent"));
+}
+
+#[test]
+fn eager_agent_and_workflow_stay_offered_without_search_rejection() {
+    use crate::core::engine::tool_catalog::{TOOL_SEARCH_NAME, execute_tool_search_with_cache};
+    use crate::core::session::ToolActivationCache;
+    use std::collections::HashSet;
+
+    let registry = small_surface_registry(FleetRole::Builder);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
+    let mut surface = ChildSurfaceProbe::new(catalog.clone(), &[]);
+    let eager_names = model_tool_names(model_request_tools(&mut surface));
+    for name in ["agent", "workflow"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.defer_loading),
+            Some(false),
+            "{name} is registered and eager"
+        );
+        assert!(eager_names.contains(name), "{name} must already be offered");
+    }
+
+    for (query, match_kind, wanted) in [
+        ("agent", "regex", "agent"),
+        ("workflow", "regex", "workflow"),
+        ("spawn subagent worker", "bm25", "agent"),
+        ("spawn subagent worker", "bm25", "workflow"),
+    ] {
+        let mut active = eager_names.iter().cloned().collect::<HashSet<_>>();
+        let mut cache = ToolActivationCache::default();
+        let metadata = execute_tool_search_with_cache(
+            TOOL_SEARCH_NAME,
+            &json!({"query": query, "match": match_kind}),
+            &catalog,
+            &mut active,
+            &mut cache,
+        )
+        .expect("tool_search runs")
+        .metadata
+        .expect("metadata");
+        let found = metadata["tool_references"].as_array().expect("refs");
+        let unavailable = metadata["unavailable_tool_references"]
+            .as_array()
+            .expect("unavailable refs");
+        assert!(
+            active.contains(wanted),
+            "{match_kind} {query:?} must keep {wanted} offered"
+        );
+        for name in ["agent", "workflow"] {
+            assert!(active.contains(name), "{name} must stay active");
+            assert!(
+                !found.iter().any(|value| value.as_str() == Some(name)),
+                "{match_kind} {query:?} must not re-offer eager {name}: {found:?}"
+            );
+            assert!(
+                !unavailable
+                    .iter()
+                    .any(|value| value["tool_name"].as_str() == Some(name)),
+                "{match_kind} {query:?} must not reject eager {name}: {unavailable:?}"
+            );
+            assert!(!cache.names().any(|cached| cached == name));
+        }
+    }
 }

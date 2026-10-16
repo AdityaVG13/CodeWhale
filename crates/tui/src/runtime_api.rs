@@ -88,7 +88,7 @@ use crate::task_manager::{
 };
 use crate::tools::subagent::{
     AgentWorkerRecord, AgentWorkerStatus, SharedSubAgentManager, SubAgentStatus,
-    new_shared_subagent_manager_with_timeout,
+    new_shared_runtime_subagent_manager,
 };
 #[cfg(test)]
 pub(super) use codewhale_models::{ContentBlock, Message};
@@ -240,6 +240,7 @@ struct RuntimeWorkspaceScope {
     canonical: PathBuf,
     directory: Arc<std::fs::File>,
     mcp: Mutex<Option<(u64, Arc<Mutex<McpPool>>)>>,
+    mcp_policy: parking_lot::Mutex<Value>,
     lsp: std::sync::OnceLock<Arc<crate::lsp::LspManager>>,
     owner: SharedRuntimeThreadManager,
     cleanup_runtime: tokio::runtime::Handle,
@@ -445,6 +446,7 @@ impl RuntimeWorkspaceScopes {
                 canonical,
                 directory,
                 mcp: Mutex::new(None),
+                mcp_policy: parking_lot::Mutex::new(Value::Null),
                 lsp: std::sync::OnceLock::new(),
                 owner: owner.owner.clone(),
                 cleanup_runtime: owner.cleanup_runtime.clone(),
@@ -1367,15 +1369,11 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
     }
 }
 
-fn runtime_api_sub_agent_manager(workspace: &FsPath, workers: usize) -> SharedSubAgentManager {
-    let max_agents = workers.max(1);
-    new_shared_subagent_manager_with_timeout(
-        workspace.to_path_buf(),
-        max_agents,
-        max_agents,
-        Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
-        max_agents,
-    )
+fn runtime_api_sub_agent_manager(
+    workspace: &FsPath,
+    workers: usize,
+) -> Result<SharedSubAgentManager> {
+    new_shared_runtime_subagent_manager(workspace.to_path_buf(), workers)
 }
 
 #[derive(Debug, Serialize)]
@@ -1969,6 +1967,13 @@ pub async fn run_http_server(
         existing_binding.as_ref(),
     )?;
     let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
+    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers)?;
+    runtime_threads
+        .attach_subagent_manager(sub_agent_manager.clone())
+        .await?;
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
     if let Some(tap) = options.runtime_event_tap {
         tap(runtime_threads.subscribe_events());
     }
@@ -2018,7 +2023,6 @@ pub async fn run_http_server(
     };
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
-    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let shutdown = RuntimeServerShutdown::default();
     // Opening a thread is every client's first read, and the store can only
     // answer it after one pass over the whole items directory (an item's
@@ -2031,9 +2035,7 @@ pub async fn run_http_server(
             tracing::warn!(%error, "thread item index warm-up failed");
         }
     });
-    let workspace_scopes =
-        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
-    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
+
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -6280,52 +6282,62 @@ async fn mcp_pool_handle(
             .workspace_scopes
             .mcp_generation
             .load(std::sync::atomic::Ordering::SeqCst);
+        let policy = mcp_pool_policy(&state.config.read());
         if let Some((admitted, pool)) = slot.as_ref() {
-            if *admitted == generation {
+            let policy_changed = *state.workspace_scope.mcp_policy.lock() != policy;
+            if *admitted == generation && !policy_changed {
                 return Ok(Some(pool.clone()));
             }
             let mut held = pool.clone().lock_owned().await;
             let current = state.clone();
             #[cfg(test)]
             let env_ticket = crate::test_support::env_scope_ticket();
-            codewhale_app_server::daemon_socket::owner_work(move || {
-                #[cfg(test)]
-                let _membership = crate::test_support::join_env_scope(env_ticket);
-                // Keep the exact scope/owner alive through synchronous disk
-                // reload even if this request is cancelled after admission.
-                current.workspace_scope.validate_sync()?;
-                let path = current.config.read().mcp_config_path();
-                let plugins = current
-                    .plugin_discovery
-                    .registry_for_workspace(&current.workspace);
-                held.switch_workspace_config_source(&path, &current.workspace, plugins)
-            })
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+            if policy_changed {
+                let (rebuilt, admitted_policy) =
+                    codewhale_app_server::daemon_socket::owner_work(move || {
+                        #[cfg(test)]
+                        let _membership = crate::test_support::join_env_scope(env_ticket);
+                        load_mcp_management_pool(&current)
+                    })
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(format!("Failed to load MCP config: {error}"))
+                    })?;
+                held.shutdown_all().await;
+                *held = rebuilt;
+                *state.workspace_scope.mcp_policy.lock() = admitted_policy;
+            } else {
+                codewhale_app_server::daemon_socket::owner_work(move || {
+                    #[cfg(test)]
+                    let _membership = crate::test_support::join_env_scope(env_ticket);
+                    // Keep the exact scope/owner alive through synchronous disk
+                    // reload even if this request is cancelled after admission.
+                    current.workspace_scope.validate_sync()?;
+                    let path = current.config.read().mcp_config_path();
+                    let plugins = current
+                        .plugin_discovery
+                        .registry_for_workspace(&current.workspace);
+                    held.switch_workspace_config_source(&path, &current.workspace, plugins)
+                })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            }
             slot.as_mut().expect("retained pool").0 = generation;
         } else if create {
             let current = state.clone();
             #[cfg(test)]
             let env_ticket = crate::test_support::env_scope_ticket();
-            let pool = codewhale_app_server::daemon_socket::owner_work(move || {
-                #[cfg(test)]
-                let _membership = crate::test_support::join_env_scope(env_ticket);
-                current.workspace_scope.validate_sync()?;
-                let path = current.config.read().mcp_config_path();
-                let plugins = current
-                    .plugin_discovery
-                    .registry_for_workspace(&current.workspace);
-                let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
-                    &path,
-                    &current.workspace,
-                    plugins,
-                )?
-                .with_backend(crate::mcp::McpBackend::from_config(&current.config.read()));
-                pool.dynamic_servers = current.workspace_scopes.dynamic_servers.clone();
-                Ok(pool)
-            })
-            .await
-            .map_err(|error| ApiError::internal(format!("Failed to load MCP config: {error}")))?;
+            let (pool, admitted_policy) =
+                codewhale_app_server::daemon_socket::owner_work(move || {
+                    #[cfg(test)]
+                    let _membership = crate::test_support::join_env_scope(env_ticket);
+                    load_mcp_management_pool(&current)
+                })
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load MCP config: {error}"))
+                })?;
+            *state.workspace_scope.mcp_policy.lock() = admitted_policy;
             *slot = Some((generation, Arc::new(Mutex::new(pool))));
         } else {
             return Ok(None);
@@ -6333,6 +6345,41 @@ async fn mcp_pool_handle(
         // A concurrent global mutation may have settled during disk work.
         // Repeat validation under the same pool; no second connection owner.
     }
+}
+
+fn mcp_pool_policy(config: &Config) -> Value {
+    json!([
+        config
+            .network
+            .clone()
+            .map(crate::config::NetworkPolicyToml::into_runtime),
+        config.mcp_oauth_callback_port,
+        config.mcp_oauth_callback_url,
+    ])
+}
+
+fn load_mcp_management_pool(state: &RuntimeApiState) -> Result<(McpPool, Value)> {
+    state.workspace_scope.validate_sync()?;
+    let path = state.config.read().mcp_config_path();
+    let plugins = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let mut pool =
+        McpPool::from_config_path_with_workspace_and_plugins(&path, &state.workspace, plugins)?;
+    let config = state.config.read();
+    pool = pool
+        .with_backend(crate::mcp::McpBackend::from_config(&config))
+        .with_oauth_callback(
+            config.mcp_oauth_callback_port,
+            config.mcp_oauth_callback_url.clone(),
+        );
+    if let Some(network) = config.network.clone() {
+        pool = pool.with_network_policy(
+            crate::network_policy::NetworkPolicyDecider::with_default_audit(network.into_runtime()),
+        );
+    }
+    pool.dynamic_servers = state.workspace_scopes.dynamic_servers.clone();
+    Ok((pool, mcp_pool_policy(&config)))
 }
 
 fn mcp_connection_outcome(
@@ -13137,7 +13184,10 @@ base_url = "http://127.0.0.1:9/v1"
         .await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2)?;
+        runtime_threads
+            .attach_subagent_manager(sub_agent_manager.clone())
+            .await?;
         let workspace_scopes =
             RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
         let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;

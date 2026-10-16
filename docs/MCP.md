@@ -172,12 +172,19 @@ Codewhale keeps its stricter rule: provenance and foreign policy are display
 metadata only, never inherited trust or automatic installation. For full
 bundle and marketplace semantics, see [Plugin bundles](PLUGIN_BUNDLES.md).
 
-`/mcp validate` (alias `/mcp doctor`) reconnects for UI discovery only: it
-refreshes the manager snapshot you see in the pager, not the catalog the model
-gets.
+`/mcp validate` (alias `/mcp doctor`) with no name reports each server's state
+from the last MCP snapshot the TUI recorded, in a pager over
+**Extensions → MCP**. That snapshot is usually the engine pool's latest report,
+but some actions, such as `/mcp import`, replace it with a separate UI
+discovery pass that also connects `lazy` and plugin servers the engine has not
+started. Validate also re-reads the MCP config files without connecting: it
+reports a config load error first, lists configured servers the snapshot has
+not observed, and says when a `/mcp reload` is pending. It does not reconnect
+anything or change the catalog the model gets; `/mcp reload` is the fresh
+probe.
 
 `/mcp reload` (aliases `/mcp reconnect`, `/mcp restart`) is the hot-reload path.
-It re-reads the MCP config sources and reconnects every enabled server that is not `lazy` through the engine-owned pool,
+It re-reads the MCP config sources and reconnects the servers session boot starts (see [Connection Lifecycle](#connection-lifecycle)) through the engine-owned pool,
 so the rebuilt catalog is the exact one the next model turn uses — no TUI
 restart. Config edits made from the TUI are written immediately and the manager
 marks the snapshot reload-required until you run it; a failed reload leaves the
@@ -339,6 +346,59 @@ the Hugging Face provider route, Hugging Face MCP, and explicit Hub workflows.
 
 Official docs: <https://huggingface.co/docs/hub/hf-mcp-server>
 
+## OpenDesign
+
+[OpenDesign](https://github.com/nexu-io/open-design) ships a stdio MCP server
+(`od mcp`) that lets an agent read files from local OpenDesign projects and
+create project-scoped artifacts. Its `od mcp install` has no Codewhale target,
+so add the entry by hand:
+
+1. Start OpenDesign so its daemon is running.
+2. Copy the launch spec your install generated, from **Settings → MCP server**
+   in the desktop app or from `curl -s http://127.0.0.1:7456/api/mcp/install-info`
+   (use your daemon's port). It has a `command` (the absolute path of
+   OpenDesign's Node-compatible runtime), `args` (the absolute path of its CLI
+   entry, then `mcp`, then `--daemon-url http://127.0.0.1:<port>` unless the
+   daemon runs as a sidecar) and an `env` map that pins `OD_DATA_DIR`.
+3. Put those three fields under one server name in your resolved MCP config,
+   inside the server map the file already has. Files written by
+   `codewhale mcp init` and `codewhale mcp add` use `servers`; OpenDesign's
+   generic snippet uses `mcpServers`. Keep exactly one of the two keys: a file
+   with both fails to parse.
+4. Run `/mcp reload`, or check from a shell with
+   `codewhale mcp tools open-design`.
+
+A placeholder-only shape:
+
+```json
+{
+  "servers": {
+    "open-design": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/open-design/cli.js", "mcp", "--daemon-url", "http://127.0.0.1:7456"],
+      "env": { "OD_DATA_DIR": "/absolute/path/to/open-design-data" }
+    }
+  }
+}
+```
+
+Copy every `env` entry the snippet gives you; a packaged app adds more, such
+as `ELECTRON_RUN_AS_NODE=1` when `command` is the app's own binary.
+`codewhale mcp add` cannot set `env`, so edit the file instead. By default the
+`od mcp` process exits after 30 idle minutes; set `OD_MCP_STDIO_IDLE_EXIT_MS`
+to `"0"` in `env` to keep it running until Codewhale disconnects.
+
+OpenDesign can also launch Codewhale as its agent. Its "DeepSeek TUI" runtime
+adapter runs `deepseek`, falling back to `codewhale`, as
+`exec --auto [--model <id>] <prompt>`, reads plain-text output, and caps the
+prompt at 30,000 bytes of argv. A dedicated adapter could instead pipe the
+prompt into `codewhale exec --auto --output-format stream-json --prompt-file -`,
+list models with `codewhale models --json`, and continue a run with
+`codewhale exec --resume <id>`, taking the id from the `saved_session_id` field
+of the `session_capture` event; the terminal `metadata` event carries only a
+fingerprint. [Agent runtime](AGENT_RUNTIME.md#event-vocabulary) describes the
+event stream.
+
 ## Config File Location
 
 Default path:
@@ -481,10 +541,12 @@ codewhale mcp tools codewhale
 
 ## Connection Lifecycle
 
-Session boot connects in the background: every enabled, allowed server is
-started at session start, concurrently and without holding the first turn.
-Mark a heavy server `lazy = true` to keep it unstarted until something asks for
-it — a turn whose `allowed_tools`/`tools.always_load` selection covers its
+Session boot connects in the background: every enabled, allowed
+user-configured server is started at session start, concurrently and without
+holding the first turn. Servers contributed by a plugin connect on demand
+unless `required` or named by the session's tool selection. Mark a heavy
+server `lazy = true` to keep it unstarted until something asks for it — a
+turn whose `allowed_tools`/`tools.always_load` selection covers its
 `mcp_<server>_*` names, a model call that resolves to one of its tools, or an
 explicit `/mcp retry <name>`. Servers marked `required` connect at boot even if
 `lazy`, so their failure surfaces before the first turn. A server that has not
@@ -563,8 +625,11 @@ Avoid committing literal `Authorization` headers. Prefer `env_headers`,
 ## Troubleshooting
 
 - Run `codewhale doctor` to confirm the MCP config path it resolved and whether it exists.
-- In the TUI, run `/mcp validate` to refresh the visible server/tool snapshot.
+- In the TUI, run `/mcp validate` to see each server's state from the last
+  recorded MCP snapshot, plus any config load error and configured servers that
+  have not connected.
 - If tools are missing from the model's catalog after a config or credential
-  change, run `/mcp reload` — `/mcp validate` only refreshes the UI snapshot.
+  change, run `/mcp reload` — `/mcp validate` only reports the last recorded
+  snapshot and never reconnects.
 - If the MCP config is missing, run `codewhale mcp init --force` to regenerate it.
 - If tools don’t appear, verify the server command works from your shell and that the server supports MCP `tools/list`.

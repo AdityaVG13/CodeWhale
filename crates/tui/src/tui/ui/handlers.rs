@@ -913,7 +913,65 @@ pub(crate) async fn handle_mcp_ui_action(
     let action_result = match action {
         crate::tui::app::McpUiAction::Diagnose { name } => {
             let receipt = mcp_server_diagnosis(app, &name);
+            if app.view_stack.extensions_is_top() {
+                open_text_pager(app, name.clone(), receipt.clone());
+            }
             report_mcp_login(app, receipt, StatusToastLevel::Info);
+            return;
+        }
+        crate::tui::app::McpUiAction::Validate => {
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            let configured = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp::load_config_with_workspace_and_plugins(&path, &workspace, plugins.as_ref())
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("MCP config read failed")));
+            let mut names: std::collections::BTreeSet<String> = app
+                .mcp_snapshot
+                .iter()
+                .flat_map(|snapshot| snapshot.servers.iter().map(|server| server.name.clone()))
+                .collect();
+            let mut sections = Vec::new();
+            let config_loaded = match configured {
+                Ok(config) => {
+                    names.extend(config.servers.into_keys());
+                    true
+                }
+                Err(err) => {
+                    sections.push(format!(
+                        "MCP config could not be loaded: {}. Fix it, then run /mcp reload.",
+                        mcp::format_mcp_error_for_display(&err)
+                    ));
+                    false
+                }
+            };
+            if app.mcp_reload_required {
+                sections.push(
+                    "MCP config changed since the live pool loaded. Run /mcp reload to apply it."
+                        .to_string(),
+                );
+            }
+            if names.is_empty() && config_loaded {
+                sections.push(app.tr(MessageId::ExtensionsMcpEmpty).into_owned());
+            }
+            sections.extend(names.iter().map(|name| mcp_server_diagnosis(app, name)));
+            let receipt = sections.join("\n\n");
+            if !app.view_stack.extensions_is_top() {
+                open_mcp_extensions(app);
+            }
+            open_text_pager(
+                app,
+                app.tr(MessageId::ConfigSectionMcp).into_owned(),
+                receipt.clone(),
+            );
+            add_mcp_message(app, receipt);
+            app.needs_redraw = true;
             return;
         }
         crate::tui::app::McpUiAction::Show => Ok(()),
@@ -1054,7 +1112,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 Err(_) => Err(anyhow::anyhow!("MCP import failed")),
             }
         }
-        crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
+        crate::tui::app::McpUiAction::Reload => Ok(()),
         // Dispatched before this match.
         crate::tui::app::McpUiAction::Retry { .. } => Ok(()),
     };

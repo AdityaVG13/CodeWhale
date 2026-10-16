@@ -53,9 +53,9 @@ use crate::tools::spec::{
 };
 use crate::tools::subagent::{
     FleetRole, ForegroundChildRegistry, Mailbox, MailboxMessage, SharedSubAgentManager,
-    SubAgentCompletion, SubAgentForkContext, SubAgentManager, SubAgentResult, SubAgentRuntime,
-    SubAgentStatus, agent_worker_owner_snapshot,
-    new_shared_subagent_manager_with_state_root_and_timeout,
+    SubAgentCompletion, SubAgentExecutionLimits, SubAgentForkContext, SubAgentManager,
+    SubAgentResult, SubAgentRuntime, SubAgentStatus, TerminalEventDelivery,
+    agent_worker_owner_snapshot, new_shared_subagent_manager_with_state_root_and_timeout,
 };
 use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
@@ -762,6 +762,7 @@ pub struct EngineHandle {
     /// straight to it: the engine may be streaming or running tools and not
     /// reading approvals for a long time.
     subagent_manager: SharedSubAgentManager,
+    terminal_worker_events: Option<Arc<TerminalEventDelivery>>,
 }
 
 const MAX_PENDING_COMPACTION_CANCELLATIONS: usize = 64;
@@ -814,6 +815,35 @@ impl CompactionCancellationState {
 }
 
 impl EngineHandle {
+    #[must_use]
+    pub(crate) fn subagent_manager(&self) -> SharedSubAgentManager {
+        self.subagent_manager.clone()
+    }
+
+    pub(crate) fn mark_worker_event_delivery_failed(&self) {
+        if let Some(events) = self.terminal_worker_events.as_ref() {
+            events.mark_failed();
+        }
+    }
+
+    pub(crate) async fn wait_terminal_worker_events(&self) -> Result<()> {
+        if let Some(events) = self.terminal_worker_events.as_ref() {
+            tokio::time::timeout(FOREGROUND_CHILD_SETTLE_GRACE, events.wait())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "terminal worker event delivery timed out during Runtime shutdown"
+                    )
+                })??;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_subagent_manager(&mut self, manager: SharedSubAgentManager) {
+        self.subagent_manager = manager;
+    }
+
     /// Publish typed compaction cancellation immediately, then enqueue the
     /// matching operation when capacity permits. The shared authority is what
     /// stops a running provider future; the operation keeps the mailbox
@@ -943,6 +973,7 @@ pub struct Engine {
     /// state stays alive across model turns.
     repl_kernel: Option<crate::repl::PythonRuntime>,
     subagent_manager: SharedSubAgentManager,
+    subagent_execution_limits: Option<SubAgentExecutionLimits>,
     /// The deterministic Auto-Review policy shared with every child runtime
     /// so children are gated by the same rules as the parent turn.
     shared_auto_review_policy: Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
@@ -1003,6 +1034,7 @@ pub struct Engine {
     /// status on the same model (#6889). Cleared when a request opens its
     /// stream or fails some other way.
     repeated_upstream_failure: Option<streaming::RepeatedUpstreamFailure>,
+    live_header: crate::prompt_zones::SharedLiveHeader<crate::route_receipt::TurnRouteReceipt>,
     api_provider: ProviderKind,
     /// One captured admitted route. Presentation snapshots derive strings from
     /// it; a changed table cannot be blessed by reinterpreting those strings.
@@ -1874,9 +1906,18 @@ impl Engine {
     }
 
     fn new_admitted(
+        config: EngineConfig,
+        api_config: &Config,
+        host: Option<EngineHostSetup>,
+    ) -> (Self, EngineHandle) {
+        Self::new_admitted_with_subagent_manager(config, api_config, host, None)
+    }
+
+    fn new_admitted_with_subagent_manager(
         mut config: EngineConfig,
         api_config: &Config,
         mut host: Option<EngineHostSetup>,
+        supplied_subagent_manager: Option<SharedSubAgentManager>,
     ) -> (Self, EngineHandle) {
         crate::tls::ensure_rustls_crypto_provider();
 
@@ -2125,28 +2166,50 @@ impl Engine {
             codewhale_core::prefix_cache::PrefixStabilityManager::new_unpinned()
         });
 
-        let subagent_manager = host.as_ref().map_or_else(
-            || {
-                let subagent_state_root = config
-                    .subagent_state_root
-                    .clone()
-                    .unwrap_or_else(|| config.workspace.clone());
-                new_shared_subagent_manager_with_state_root_and_timeout(
-                    config.workspace.clone(),
-                    subagent_state_root,
+        let subagent_execution_limits = supplied_subagent_manager
+            .as_ref()
+            .map(|_| {
+                SubAgentExecutionLimits::new(
                     config.max_subagents,
                     config.max_admitted_subagents,
                     config.subagent_heartbeat_timeout,
                     config.launch_concurrency,
-                    // #5324: defaults are captured operator config, not call fields.
                     api_config.subagent_default_max_steps(),
                     api_config
                         .subagent_default_wall_time_secs()
-                        .map(std::time::Duration::from_secs),
+                        .map(Duration::from_secs),
                 )
-            },
-            |host| Arc::clone(host.subagent_manager()),
-        );
+            })
+            .or_else(|| match host.as_ref() {
+                Some(EngineHostSetup::Child(child)) => {
+                    child.authority.runtime.execution_limits.clone()
+                }
+                _ => None,
+            });
+        let subagent_manager = supplied_subagent_manager.unwrap_or_else(|| {
+            host.as_ref().map_or_else(
+                || {
+                    let subagent_state_root = config
+                        .subagent_state_root
+                        .clone()
+                        .unwrap_or_else(|| config.workspace.clone());
+                    new_shared_subagent_manager_with_state_root_and_timeout(
+                        config.workspace.clone(),
+                        subagent_state_root,
+                        config.max_subagents,
+                        config.max_admitted_subagents,
+                        config.subagent_heartbeat_timeout,
+                        config.launch_concurrency,
+                        // #5324: defaults are captured operator config, not call fields.
+                        api_config.subagent_default_max_steps(),
+                        api_config
+                            .subagent_default_wall_time_secs()
+                            .map(std::time::Duration::from_secs),
+                    )
+                },
+                |host| Arc::clone(host.subagent_manager()),
+            )
+        });
         // The OS wrappers below only cover child processes. Codewhale's own
         // `read_file`/`read`/`read_media` tools read in-process, so the same
         // deny-list is installed process-wide for them to consult (S1).
@@ -2263,6 +2326,7 @@ impl Engine {
             session,
             repl_kernel: None,
             subagent_manager,
+            subagent_execution_limits,
             shared_auto_review_policy,
             shell_manager,
             file_read_tracker,
@@ -2283,6 +2347,7 @@ impl Engine {
             constitution_block: None,
             profile_constitution_fallback_noticed: false,
             repeated_upstream_failure: None,
+            live_header: crate::prompt_zones::new_live_header_cell(),
             api_provider,
             api_provider_identity,
             active_route_limits,
@@ -2342,6 +2407,10 @@ impl Engine {
             compaction_cancellation,
             turn_heartbeat: Arc::clone(&engine.turn_heartbeat),
             subagent_manager: Arc::clone(&engine.subagent_manager),
+            terminal_worker_events: engine
+                .subagent_execution_limits
+                .as_ref()
+                .map(|limits| limits.terminal_events.clone()),
         };
 
         (engine, handle)
@@ -2351,6 +2420,7 @@ impl Engine {
     /// client. The event loop, prompt assembly, tool registry/execution,
     /// cancellation, and session projection are unchanged; only the model I/O
     /// boundary is replaced.
+    #[cfg(test)]
     pub fn new_with_model_client(
         config: EngineConfig,
         api_config: &Config,
@@ -3837,15 +3907,24 @@ impl Engine {
                         self.config.subagent_api_timeout = Duration::from_secs(api_timeout_secs);
                         self.config.subagent_heartbeat_timeout =
                             Duration::from_secs(heartbeat_timeout_secs);
-                        let launch_gate_applied = {
-                            let mut manager = self.subagent_manager.write().await;
-                            manager.update_runtime_limits(
-                                self.config.max_subagents,
-                                self.config.max_admitted_subagents,
-                                self.config.subagent_heartbeat_timeout,
-                                self.config.launch_concurrency,
-                            )
-                        };
+                        let launch_gate_applied =
+                            if let Some(limits) = self.subagent_execution_limits.as_mut() {
+                                limits.update(
+                                    self.config.max_subagents,
+                                    self.config.max_admitted_subagents,
+                                    self.config.subagent_heartbeat_timeout,
+                                    self.config.launch_concurrency,
+                                );
+                                true
+                            } else {
+                                let mut manager = self.subagent_manager.write().await;
+                                manager.update_runtime_limits(
+                                    self.config.max_subagents,
+                                    self.config.max_admitted_subagents,
+                                    self.config.subagent_heartbeat_timeout,
+                                    self.config.launch_concurrency,
+                                )
+                            };
                         let launch_note = if launch_gate_applied {
                             ""
                         } else {
@@ -4305,7 +4384,13 @@ impl Engine {
 
     async fn emit_session_updated(&self) {
         if let Some(job) = self.child_job()
-            && let Err(error) = job.project(&self.session.messages, job.steps()).await
+            && let Err(error) = job
+                .project(
+                    &self.session.messages,
+                    job.steps(),
+                    self.session.system_prompt.as_ref(),
+                )
+                .await
         {
             self.cancel_token.cancel();
             tracing::error!(%error, "child Session projection failed; turn stopped");
@@ -5506,6 +5591,7 @@ impl Engine {
                 tool_context.clone(),
                 self.tx_subagent_completion.clone(),
                 SubAgentForkContext {
+                    live_header: crate::prompt_zones::new_live_header_cell(),
                     messages: self.messages_with_turn_metadata(),
                     structured_state_block: None,
                     work_source: Some(self.todo_source()),
@@ -5552,6 +5638,7 @@ impl Engine {
             )
             .await;
             Some(SubAgentForkContext {
+                live_header: Arc::clone(&self.live_header),
                 messages: self.messages_with_turn_metadata(),
                 structured_state_block: state.to_system_block(),
                 // Resolve at spawn time so a todo_write earlier in this turn
@@ -5659,6 +5746,7 @@ impl Engine {
                 .with_locale_tag(route.locale_tag.clone())
                 .with_role_models(route.role_models.clone())
                 .with_api_config((*route.api_config).clone())
+                .with_execution_limits(self.subagent_execution_limits.clone())
                 .with_auto_model(route.auto_model)
                 .with_reasoning_effort(route.reasoning_effort.clone(), route.reasoning_effort_auto)
                 .with_agent_tool_surface_options(
@@ -5839,6 +5927,18 @@ impl Engine {
         );
         if let Some(child) = self.child_host.as_ref() {
             Self::narrow_child_surface(&child.authority, &mut surface);
+            let prefix = &child.fork_cache_prefix;
+            surface.catalog.sort_by_key(|tool| {
+                prefix
+                    .iter()
+                    .position(|name| name == &tool.name)
+                    .unwrap_or(prefix.len())
+            });
+            surface.active = tool_catalog::active_tools_for_request(
+                &surface.catalog,
+                &surface.active_names,
+                surface.strict_tool_mode,
+            );
         }
         TurnToolBuild {
             surface,
@@ -7127,6 +7227,7 @@ impl Engine {
         .with_locale_tag(self.config.locale_tag.clone())
         .with_role_models(self.subagent_role_models())
         .with_api_config(self.api_config.clone())
+        .with_execution_limits(self.subagent_execution_limits.clone())
         .with_auto_model(self.session.auto_model)
         .with_reasoning_effort(
             self.session.reasoning_effort.clone(),
@@ -7580,7 +7681,7 @@ impl Engine {
     /// Weak between sweeps, but an in-flight handshake holds the pool. Keep
     /// its abort handle so a boundary stops that work and queued diagnoses.
     fn ensure_mcp_supervisor(&mut self) {
-        if self.mcp_supervisor_rx.is_some() {
+        if self.child_host.is_some() || self.mcp_supervisor_rx.is_some() {
             return;
         }
         let Some(pool) = self.mcp_pool.as_ref() else {
@@ -7681,8 +7782,9 @@ impl Engine {
 
     fn mcp_connecting_names(pool: &McpPool, errors: &HashMap<String, String>) -> Vec<String> {
         // The pool tracks spawned-but-unresolved connects (#6033). Inferring
-        // "connecting" from enabled-minus-connected mislabels every lazy —
-        // configured but never-started — server as mid-handshake.
+        // "connecting" from enabled-minus-connected mislabels every on-demand
+        // server — `lazy = true` or plugin-contributed, never started — as
+        // mid-handshake.
         pool.connecting_servers()
             .into_iter()
             .filter(|name| !errors.contains_key(name))
@@ -8129,12 +8231,12 @@ impl Engine {
     /// selects their tools; `mcp_tools` snapshots whatever is already ready.
     ///
     /// Returns the event generation the pass owns, or `Ok(0)` when nothing
-    /// was started (the feature gate skipped a session boot). Progress and
-    /// the finished receipt flow as `Event::McpSessionBoot` updates under
-    /// that generation.
+    /// was started (the feature gate, or a child engine sharing its parent's
+    /// pool, skipped a session boot). Progress and the finished receipt flow
+    /// as `Event::McpSessionBoot` updates under that generation.
     async fn start_mcp_session_boot(&mut self, refresh: McpConnectRefresh) -> anyhow::Result<u64> {
         if matches!(refresh, McpConnectRefresh::IfChanged)
-            && !self.config.features.enabled(Feature::Mcp)
+            && (self.child_host.is_some() || !self.config.features.enabled(Feature::Mcp))
         {
             // Nothing to start. The only caller that reads the generation is
             // the explicit reload, which never takes this branch.
@@ -8331,16 +8433,67 @@ impl Engine {
             .ensure_mcp_pool()
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let prepared = {
+            let mut pool = pool.lock().await;
+            pool.take_retry_connect(name).map(|pending| {
+                (
+                    pending,
+                    pool.connect_timeouts(),
+                    pool.cloned_network_policy(),
+                    pool.current_catalog_generation(),
+                    pool.backend(),
+                )
+            })
+        };
+        let attempt = match prepared {
+            Ok((pending, timeouts, network_policy, generation, backend)) => {
+                let mut connects = McpPool::spawn_pending_connects(
+                    vec![pending],
+                    timeouts,
+                    network_policy,
+                    generation,
+                    backend,
+                );
+                let connection = match connects.join_next().await {
+                    Some(Ok((_, connection))) => connection,
+                    Some(Err(error)) => Err(error.into()),
+                    None => Err(anyhow::anyhow!(
+                        "MCP connection task did not start for {name}"
+                    )),
+                };
+                Ok((generation, connection))
+            }
+            Err(error) => Err(error),
+        };
         let mut pool = pool.lock().await;
+        let result = match attempt {
+            Ok((generation, connection)) => {
+                let stale = pool.current_catalog_generation() != generation;
+                let stored = connection.and_then(|connection| {
+                    let tools = connection.tools().len();
+                    pool.store_ready_connection(name.to_string(), connection)
+                        .map(|()| tools)
+                });
+                if let Err(error) = &stored {
+                    if stale {
+                        pool.cancel_connecting(&HashSet::from([name.to_string()]));
+                    } else {
+                        pool.note_connect_failure(name, error);
+                    }
+                }
+                stored
+            }
+            Err(error) => Err(error),
+        };
         // The outcome is logged here, at the one manager every surface drives,
         // so a panel retry, `/mcp retry`, and the runtime API all leave the
         // same receipt in the session log.
-        match pool.retry_connection(name).await {
-            Ok(connection) => {
+        match result {
+            Ok(tools) => {
                 tracing::info!(
                     target: "mcp",
                     server = %name,
-                    tools = connection.tools().len(),
+                    tools,
                     "MCP server connected on retry"
                 );
                 self.mcp_connection_errors.remove(name);
@@ -9291,6 +9444,8 @@ pub(crate) fn spawn_engine_with_authoritative_route_config(
     host_profile: EngineHostProfile,
     authoritative_route_config: Arc<parking_lot::RwLock<Config>>,
     model_client: Option<SharedModelClient>,
+    subagent_manager: Option<SharedSubAgentManager>,
+    execution_admission: CancellationToken,
 ) -> (EngineHandle, tokio::task::JoinHandle<()>) {
     // `model_client` replaces only the model I/O boundary (see
     // `Engine::new_with_model_client`); hosts pass `None` for the provider
@@ -9300,10 +9455,17 @@ pub(crate) fn spawn_engine_with_authoritative_route_config(
         config.goal_max_steps = None;
         config.subagents_enabled = false;
     }
-    let (mut engine, handle) = match model_client {
-        Some(client) => Engine::new_with_model_client(config, api_config, client),
-        None => Engine::new(config, api_config),
-    };
+    let (mut engine, mut handle) =
+        Engine::new_admitted_with_subagent_manager(config, api_config, None, subagent_manager);
+    if let Some(limits) = engine.subagent_execution_limits.as_mut() {
+        limits.admission = execution_admission;
+    }
+    if let Some(client) = model_client {
+        engine.model_client = Some(client);
+        engine.model_client_injected = true;
+        engine.codewhale_client_error = None;
+        handle.client_preflight_required = false;
+    }
     engine.host_profile = host_profile;
     engine.authoritative_route_config = Some(authoritative_route_config);
 
@@ -9468,6 +9630,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
             std::env::temp_dir(),
             1,
         ),
+        terminal_worker_events: Some(Arc::new(TerminalEventDelivery::default())),
     };
 
     MockEngineHandle {

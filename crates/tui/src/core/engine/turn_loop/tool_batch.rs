@@ -48,6 +48,7 @@ impl Engine {
 
         let tool_exec_lock = self.tool_exec_lock.clone();
         let mcp_pool = if !fleet_report_response
+            && self.config.features.enabled(Feature::Mcp)
             && tool_uses.iter().any(|tool| {
                 McpPool::is_mcp_tool(&tool.name) || tool.name == EXECUTE_TOOLS_TOOL_NAME
             }) {

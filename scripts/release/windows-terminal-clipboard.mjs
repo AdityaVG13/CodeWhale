@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
+import { appendFileSync } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
@@ -71,7 +72,7 @@ async function until(check, label, milliseconds = 60_000) {
   while (Date.now() < deadline) {
     const result = await check();
     if (result) return result;
-    assert.equal(desktop?.exitCode, null, `desktop stopped while waiting for ${label}: ${desktopError}`);
+    assert.ok(!receipt.desktop?.error && desktop?.exitCode === null && desktop?.signalCode === null, `desktop stopped while waiting for ${label}: ${desktopError}`);
     await delay(100);
   }
   throw new Error(`deadline waiting for ${label}: ${desktopError}`);
@@ -121,10 +122,16 @@ try {
   });
   receipt.terminal = { version: '1.25.2733.0', sha256: terminalHash, distribution: 'official portable x64' };
   const script = fileURLToPath(new URL('./windows-terminal-clipboard.ps1', import.meta.url));
+  receipt.desktop = { requestedAt: new Date().toISOString() };
   desktop = spawn('powershell.exe', ['-NoProfile', '-STA', '-File', script, terminal, binary, workspace, baseUrl, title, evidence], { env, windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'] });
-  desktop.stdout.on('data', data => { void fs.appendFile(path.join(evidence, 'desktop.log'), data); });
-  desktop.stderr.on('data', data => { desktopError += data; void fs.appendFile(path.join(evidence, 'desktop-error.log'), data); });
-  desktopExit = new Promise((resolve, reject) => { desktop.once('error', reject); desktop.once('exit', resolve); });
+  desktop.stdout.on('data', data => { try { appendFileSync(path.join(evidence, 'desktop.log'), data); } catch (error) { receipt.desktop.logError = String(error); desktopError += String(error); } });
+  desktop.stderr.on('data', data => { desktopError += data; try { appendFileSync(path.join(evidence, 'desktop-error.log'), data); } catch (error) { receipt.desktop.logError = String(error); desktopError += String(error); } });
+  desktop.once('spawn', () => { receipt.desktop.pid = desktop.pid; receipt.desktop.spawnedAt = new Date().toISOString(); });
+  desktop.once('close', () => { receipt.desktop.closedAt = new Date().toISOString(); });
+  desktopExit = new Promise(resolve => {
+    desktop.once('error', error => { receipt.desktop.error = String(error); desktopError += String(error); resolve(null); });
+    desktop.once('exit', (code, signal) => { receipt.desktop.exit = { code, signal, at: new Date().toISOString() }; resolve(code); });
+  });
   await until(() => exists('ready.json'), 'Windows Terminal composer readiness', 120_000);
   receipt.readyAt = new Date().toISOString();
   await until(() => exists('pasted.json'), 'actual clipboard paste');
@@ -147,7 +154,13 @@ try {
 } catch (error) {
   receipt.error = String(error); process.exitCode = 1;
 } finally {
-  if (desktop && desktop.exitCode === null) { desktop.kill(); await desktopExit.catch(() => {}); }
+  if (desktop) {
+    receipt.desktop.beforeCleanup = { exitCode: desktop.exitCode, signalCode: desktop.signalCode, at: new Date().toISOString() };
+    if (desktop.exitCode === null && desktop.signalCode === null) {
+      receipt.desktop.killRequestedAt = new Date().toISOString(); desktop.kill();
+    }
+    await desktopExit;
+  }
   server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   await fs.writeFile(path.join(evidence, 'receipt.json'), JSON.stringify(receipt, null, 2));
   console.log(JSON.stringify(receipt));

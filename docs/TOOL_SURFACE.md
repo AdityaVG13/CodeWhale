@@ -167,8 +167,21 @@ Code mode is on by default (`[features] code_mode = true`), which makes
 stay available either way. Set `code_mode = false` (or run with
 `--disable code_mode`) to go back to deferring `execute_tools` behind
 `tool_search`. The flag is session configuration, so the prompt prefix stays
-stable within a session. Without an engine turn (sub-agents), a program keeps
-the conservative profile: read-only, auto-approved native calls only, no MCP.
+stable within a session.
+
+Sub-agents get `execute_tools` on the same terms, unless their role is limited
+to the read-only evidence tools or an explicit tool list leaves it out. A
+child's nested call is planned by the child's own gate, so its grant and its
+approval path apply as for its direct calls, and it is admitted at execution
+against the child's write-scope claim and live peers. A child's program also
+stops at the child's tool timeout (time waiting on approvals is not counted)
+or its work deadline, and still returns the receipt. A program in which no
+nested call ran does not count as progress for the child's permission-denial
+guard, but the guard does not yet count a refused nested call as a denial
+either; only the child's step and time budgets end a loop of denied calls
+retried inside programs. Without an engine turn
+(a direct unit call), a program keeps the conservative profile: read-only,
+auto-approved native calls only, no MCP.
 
 ### Conversation toolbox cache
 
@@ -362,3 +375,8 @@ The provider-free receipt must report the twelve default-active names listed
 above. A separate repository-wide tool count may include deferred, dynamic,
 feature-gated, and compatibility-only registrations; it is not the number of
 tools placed in the first-turn model catalog.
+
+
+### Source navigation receipts
+
+Source reads may include a bounded pod/symbol/link footer. Edits retain their unified diff in metadata and can name affected declarations and confirmed same-directory callers. File-name search and grep report matched directory pods; project maps can report bounded key-file symbols. Sounding content uses the same denied-read and credential exclusions plus protected regular-file handles. Caller content scans at most32 deterministic candidates at256KiB each; candidates outside that budget are reported as unscanned, never as additional known callers. Key-file content is capped at8MiB. Enumeration itself and platform I/O latency are not wall-clock bounded.

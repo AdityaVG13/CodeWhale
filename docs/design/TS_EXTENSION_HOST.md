@@ -83,10 +83,10 @@ remains outstanding; programmable pre-execute proposals do not implement it.
   checks the caller matches its own). The turn loop attaches one when a
   registry spec says `extension_caller()` (a `ToolSpec` method, default
   `None`), in `execute_tools_with_nested_gate`, the same function that serves an
-  `execute_tools` program's gate. A sub-agent, a test, and a tool nested in
-  `execute_tools` (whose invoker takes the gate from the nested context) have
-  none, nor does any command, timer or activation: the tool gets no `exec.core`
-  and a forged request finds no ticket.
+  `execute_tools` program's gate, in a sub-agent's turn as in the session's. A
+  test and a tool nested in `execute_tools` (whose invoker takes the gate from
+  the nested context) have none, nor does any command, timer or activation: the
+  tool gets no `exec.core` and a forged request finds no ticket.
 - **One gate, one executor.** The turn loop serves the request with
   `gate_nested_call`, now parameterised by who is asking
   (`ToolCallSource::Extension`), so planning is `plan_tool_calls` unchanged

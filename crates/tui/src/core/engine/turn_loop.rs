@@ -1002,6 +1002,9 @@ impl Engine {
         catalog: &mut Vec<Tool>,
         active: &mut std::collections::HashSet<String>,
     ) {
+        if !self.config.features.enabled(Feature::Mcp) {
+            return;
+        }
         let Some(pool) = self.mcp_pool.as_ref() else {
             return;
         };
