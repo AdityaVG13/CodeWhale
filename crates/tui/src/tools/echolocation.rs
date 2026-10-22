@@ -39,10 +39,11 @@
 //! on-disk target, so they forge only when both coincide.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use ignore::{Match as IgnoreMatch, gitignore::Gitignore};
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -341,6 +342,7 @@ const MAX_LINKS: usize = 8;
 const MAX_CALLERS: usize = 8;
 /// Mate files bigger than this are not scanned for callers.
 const MAX_CALLER_SCAN_BYTES: u64 = 256 * 1024;
+const MAX_CALLER_SCAN_FILES: usize = 32;
 /// Tracked pod reads before the next read there enters the buzz.
 pub(crate) const BUZZ_VISIT_THRESHOLD: usize = 2;
 /// Max touched symbols named per edit echo before "+N more".
@@ -394,6 +396,7 @@ pub(crate) struct EchoChart {
     link_total: usize,
     callers: Vec<String>,
     caller_total: usize,
+    caller_candidates_omitted: usize,
 }
 
 /// Shorten workspace-relative links to bare names when they live in
@@ -431,34 +434,76 @@ fn pod_relative_names(workspace: &Path, file_path: &Path, links: Vec<String>) ->
 /// `file_path` is the resolved path (for the sibling sounding); `text`
 /// is the full decoded buffer (for symbols, imports, and links); `buzz`
 /// adds the callers section when the model is closing in on this pod.
+/// Ready navigation supplies symbols from this same admitted source snapshot,
+/// bypassing the legacy symbol scan.
 /// Never fails: anything unreadable is omitted from the chart rather
 /// than failing the read.
-pub fn sound_echolocation(workspace: &Path, file_path: &Path, text: &str, buzz: bool) -> EchoChart {
-    let (_, mut podmates) = sound_podmates(file_path);
+pub(crate) fn sound_echolocation(
+    workspace: &Path,
+    file_path: &Path,
+    text: &str,
+    buzz: bool,
+    navigation: Option<&SourceNavigation>,
+) -> EchoChart {
+    // Share only this chart's visible-entry snapshot. Caller candidates still
+    // pass their current path, credential, and secure-open checks below.
+    let entries = file_path
+        .parent()
+        .and_then(list_dir_entries)
+        .unwrap_or_default();
+    let (_, mut podmates) = sound_podmates(file_path, &entries);
     let podmate_total = podmates.len();
     podmates.truncate(MAX_PODMATES);
-    let (mut symbols, mut import_roots, mut links, link_total, mut callers, caller_total) =
-        if let Some(lang) = detect_lang(file_path) {
-            let (links, link_total) = sound_links(workspace, file_path, text, lang);
-            let (callers, caller_total) = if buzz {
-                sound_callers(workspace, file_path)
-            } else {
-                (Vec::new(), 0)
-            };
-            (
-                sound_symbols(text, lang),
-                sound_import_roots(text, lang)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-                links,
-                link_total,
-                callers,
-                caller_total,
-            )
+    let navigation = navigation.filter(|navigation| navigation.status == "ready");
+    let (
+        mut symbols,
+        mut import_roots,
+        mut links,
+        link_total,
+        mut callers,
+        caller_total,
+        caller_candidates_omitted,
+    ) = if let Some(lang) = detect_lang(file_path) {
+        let mut import_roots = BTreeSet::new();
+        let (links, link_total) = sound_links(
+            workspace,
+            file_path,
+            text,
+            lang,
+            Some(&mut import_roots),
+            None,
+        );
+        let (callers, caller_total, caller_candidates_omitted) = if buzz {
+            sound_callers(workspace, file_path, Some(entries))
         } else {
-            (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new(), 0)
+            (Vec::new(), 0, 0)
         };
-    let symbol_total = symbols.len();
+        (
+            if navigation.is_some() {
+                Vec::new()
+            } else {
+                sound_symbols(text, lang)
+            },
+            import_roots.into_iter().collect::<Vec<_>>(),
+            links,
+            link_total,
+            callers,
+            caller_total,
+            caller_candidates_omitted,
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new(), 0, 0)
+    };
+    let symbol_total = if let Some(navigation) = navigation {
+        symbols = navigation
+            .symbols
+            .iter()
+            .map(|symbol| format!("fn {}:{}", symbol.name, symbol.read.offset))
+            .collect();
+        symbols.len() + navigation.symbols_omitted
+    } else {
+        symbols.len()
+    };
     symbols.truncate(MAX_SYMBOLS);
     // Squeeze, all lossless: same-pod links and callers render bare
     // (the pod frame disambiguates), and import roots a shown link
@@ -502,6 +547,7 @@ pub fn sound_echolocation(workspace: &Path, file_path: &Path, text: &str, buzz: 
         link_total,
         callers,
         caller_total,
+        caller_candidates_omitted,
     }
 }
 
@@ -515,7 +561,11 @@ pub fn sound_miss_echo(file_path: &Path) -> Option<String> {
     if echo_off("mates") {
         return None;
     }
-    let (pod_dir, mut mates) = sound_podmates(file_path);
+    let entries = file_path
+        .parent()
+        .and_then(list_dir_entries)
+        .unwrap_or_default();
+    let (pod_dir, mut mates) = sound_podmates(file_path, &entries);
     if mates.is_empty() {
         return None;
     }
@@ -536,23 +586,10 @@ impl EchoChart {
         self.render_footer_with_budget(POD_FOOTER_MAX_BYTES)
     }
 
-    pub(crate) fn render_with_navigation(
-        &mut self,
-        navigation: Option<&SourceNavigation>,
-    ) -> String {
+    pub(crate) fn render_with_navigation(&self, navigation: Option<&SourceNavigation>) -> String {
         let Some(navigation) = navigation else {
             return self.render_footer();
         };
-        if navigation.status == "ready" {
-            // Consume the syntax producer instead of publishing conflicting
-            // line-scanner lookalikes beside its qualified observations.
-            self.symbols = navigation
-                .symbols
-                .iter()
-                .map(|symbol| format!("fn {}:{}", symbol.name, symbol.read.offset))
-                .collect();
-            self.symbol_total = self.symbols.len() + navigation.symbols_omitted;
-        }
         let footer = navigation.render_footer();
         self.render_footer_with_budget(POD_FOOTER_MAX_BYTES - footer.len()) + &footer
     }
@@ -604,6 +641,15 @@ impl EchoChart {
                 render_capped(&self.callers, self.caller_total)
             ));
         }
+        if !echo_off("callers") && self.caller_candidates_omitted > 0 {
+            if !sounding.is_empty() {
+                sounding.push_str("; ");
+            }
+            sounding.push_str(&format!(
+                "{} caller candidates unscanned",
+                self.caller_candidates_omitted
+            ));
+        }
         if !sounding.is_empty() {
             out.push_str(&format!("\n\n[Sound: {sounding}]"));
         }
@@ -636,19 +682,19 @@ fn detect_lang(file_path: &Path) -> Option<SoundLang> {
 /// Sibling entries of the file's directory: sorted display names (current
 /// file marked, directories suffixed) plus the short directory display.
 /// A directory that cannot be listed degrades to an empty pod, silently.
-fn sound_podmates(file_path: &Path) -> (Option<String>, Vec<String>) {
+fn sound_podmates(file_path: &Path, mates: &[(String, String)]) -> (Option<String>, Vec<String>) {
     let parent = match file_path.parent() {
         Some(parent) => parent,
         None => return (None, Vec::new()),
     };
-    let mates = list_dir_entries(parent).unwrap_or_default();
     let current = file_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned());
     let display = mates
-        .into_iter()
-        .map(|(raw, mut shown)| {
-            if Some(&raw) == current.as_ref() {
+        .iter()
+        .map(|(raw, shown)| {
+            let mut shown = shown.clone();
+            if Some(raw) == current.as_ref() {
                 shown.push_str(" (this file)");
             }
             shown
@@ -671,6 +717,32 @@ pub(crate) struct PodVisibility<'a> {
 }
 
 impl PodVisibility<'_> {
+    fn allows_entry(&self, abs: &Path, is_dir: bool) -> bool {
+        if abs
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            || crate::sandbox::read_guard::active().check(abs).is_err()
+        {
+            return false;
+        }
+        let rel = abs
+            .strip_prefix(self.glob_root)
+            .unwrap_or(abs)
+            .to_string_lossy()
+            .replace('\\', "/");
+        !self
+            .exclude
+            .iter()
+            .any(|pat| super::search::matches_glob(&rel, pat))
+            && (is_dir
+                || ((self.include.is_empty()
+                    || self
+                        .include
+                        .iter()
+                        .any(|pat| super::search::matches_glob(&rel, pat)))
+                    && (self.extensions.is_empty()
+                        || super::file_search::extension_matches(abs, self.extensions))))
+    }
     /// Directed-read visibility: no search gates, denylist still on.
     fn directed(glob_root: &Path) -> PodVisibility<'_> {
         PodVisibility {
@@ -692,55 +764,30 @@ fn list_dir_entries(dir: &Path) -> Option<Vec<(String, String)>> {
 
 /// [`list_dir_entries`] plus the caller's search gates: denylist,
 /// excludes, includes/extensions (files only, like the walks), and
-/// optional gitignore stacking.
+/// optional parent/global/repository ignore rules.
 fn list_dir_entries_filtered(dir: &Path, vis: &PodVisibility<'_>) -> Option<Vec<(String, String)>> {
-    let ignores = vis
-        .gitignore
-        .then(|| IgnoreStack::for_dir(vis.glob_root, dir));
+    let mut builder = WalkBuilder::new(dir);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .require_git(false)
+        .max_depth(Some(1))
+        .parents(vis.gitignore)
+        .ignore(vis.gitignore)
+        .git_ignore(vis.gitignore)
+        .git_global(vis.gitignore)
+        .git_exclude(vis.gitignore);
+    let mut entries = builder.build();
+    let root = entries.next()?.ok()?;
+    if !root.file_type().is_some_and(|kind| kind.is_dir()) {
+        return None;
+    }
     let mut mates = Vec::new();
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    for entry in entries.flatten() {
         let raw = entry.file_name().to_string_lossy().into_owned();
-        if raw.starts_with('.') {
-            continue;
-        }
         let abs = entry.path();
-        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        // Denylist first: a pod listing is enumeration, not a directed
-        // read — denied names stay hidden even as siblings.
-        if crate::sandbox::read_guard::active().check(&abs).is_err() {
-            continue;
-        }
-        let rel = abs
-            .strip_prefix(vis.glob_root)
-            .unwrap_or(&abs)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if vis
-            .exclude
-            .iter()
-            .any(|pat| super::search::matches_glob(&rel, pat))
-        {
-            continue;
-        }
-        if !is_dir {
-            if !vis.include.is_empty()
-                && !vis
-                    .include
-                    .iter()
-                    .any(|pat| super::search::matches_glob(&rel, pat))
-            {
-                continue;
-            }
-            if !vis.extensions.is_empty()
-                && !super::file_search::extension_matches(&abs, vis.extensions)
-            {
-                continue;
-            }
-        }
-        if ignores
-            .as_ref()
-            .is_some_and(|stack| stack.is_ignored(&abs, is_dir))
-        {
+        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+        if !vis.allows_entry(abs, is_dir) {
             continue;
         }
         let mut display = raw.clone();
@@ -751,58 +798,6 @@ fn list_dir_entries_filtered(dir: &Path, vis: &PodVisibility<'_>) -> Option<Vec<
     }
     mates.sort();
     Some(mates)
-}
-
-/// Global gitignore + `.gitignore` + `.ignore` matchers stacked
-/// shallow → deep from `glob_root` down to the listed dir. Last
-/// decisive match wins, mirroring git precedence (repo rules beat the
-/// global file). Known residual: `.git/info/exclude` is not stacked,
-/// so a name hidden only there still charts — the calling walk is the
-/// only other surface that reads it, and directed reads bypass ignore
-/// rules entirely, so no boundary is crossed.
-struct IgnoreStack {
-    matchers: Vec<Gitignore>,
-}
-
-impl IgnoreStack {
-    fn for_dir(glob_root: &Path, dir: &Path) -> Self {
-        // Global first (lowest precedence); a missing/unreadable global
-        // file yields an empty matcher, never an error.
-        let mut matchers = vec![Gitignore::global().0];
-        let mut chain = Vec::new();
-        let mut current = Some(dir);
-        // Never climb above the glob root (a stray absolute dir must not
-        // inherit ignore rules from unrelated ancestors).
-        while let Some(layer) = current.filter(|layer| layer.starts_with(glob_root)) {
-            chain.push(layer);
-            if layer == glob_root {
-                break;
-            }
-            current = layer.parent();
-        }
-        chain.reverse();
-        for layer in chain {
-            for file in [".gitignore", ".ignore"] {
-                let candidate = layer.join(file);
-                if candidate.is_file() {
-                    matchers.push(Gitignore::new(&candidate).0);
-                }
-            }
-        }
-        Self { matchers }
-    }
-
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        let mut ignored = false;
-        for matcher in &self.matchers {
-            match matcher.matched(path, is_dir) {
-                IgnoreMatch::Ignore(_) => ignored = true,
-                IgnoreMatch::Whitelist(_) => ignored = false,
-                IgnoreMatch::None => {}
-            }
-        }
-        ignored
-    }
 }
 
 /// One sounded pod for a grep result: the matched directory and its
@@ -886,12 +881,11 @@ fn sound_one_match_pod(
                 shown
             })
             .collect(),
-        // Dotfiles stay skipped here too, exactly like the listed
-        // path: the match itself is still in the result set, so no
-        // information is lost, only the redundant mark.
+        // The fallback repeats matched names through the same visibility
+        // gates as enumeration; it never discovers additional siblings.
         None => matched
             .iter()
-            .filter(|name| !name.starts_with('.'))
+            .filter(|name| vis.allows_entry(&full.join(name), false))
             .map(|name| format!("{name} (match)"))
             .collect(),
     };
@@ -923,7 +917,7 @@ pub(crate) fn sound_key_files(
     let omitted = sorted.len().saturating_sub(MAX_MAP_SOUNDINGS);
     let mut soundings = BTreeMap::new();
     for name in sorted.into_iter().take(MAX_MAP_SOUNDINGS) {
-        if let Some(sounding) = sound_file_symbols(&root.join(name)) {
+        if let Some(sounding) = sound_file_symbols(root, &root.join(name)) {
             soundings.insert(name.to_string(), sounding);
         }
     }
@@ -932,12 +926,27 @@ pub(crate) fn sound_key_files(
 
 /// Sound one line of symbols for a single file: `N symbols: a, b, …`.
 /// `None` when unreadable, oversized, non-Rust, or symbol-free.
-fn sound_file_symbols(path: &Path) -> Option<String> {
+fn sound_file_symbols(root: &Path, path: &Path) -> Option<String> {
     let lang = detect_lang(path)?;
-    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_SOUNDING_BYTES) {
+    super::file::enforce_read_denylist(path, "read").ok()?;
+    let selected_path = path.canonicalize().ok()?;
+    workspace_relative(root, &selected_path)?;
+    if super::file::is_codewhale_credential_path(&selected_path) {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    super::file::enforce_read_denylist(&selected_path, "read").ok()?;
+    let file = crate::external_credentials::open_secure_regular_file(&selected_path, false).ok()?;
+    crate::plugins::registry::validate_opened_regular_file(&selected_path, &file).ok()?;
+    if file.metadata().ok()?.len() > MAX_SOUNDING_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_SOUNDING_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_SOUNDING_BYTES {
+        return None;
+    }
     let mut symbols = sound_symbols(&text, lang);
     let total = symbols.len();
     if total == 0 {
@@ -997,11 +1006,10 @@ fn sound_numbered_symbols(text: &str, lang: SoundLang) -> Vec<(usize, String)> {
     }
 }
 
-/// Changed new-side spans as (1-based start, new-line count). Pure
-/// deletions contribute their insertion point with length 0. Reuses
-/// the `similar` diff the unified-diff builder already depends on,
-/// under a hard timeout.
-fn changed_spans(before: &str, after: &str) -> Vec<(usize, usize)> {
+/// Changed old/new-side spans as (old side, 1-based start, line count).
+/// Deletions use the old side; replacements attribute both sides. Reuses
+/// the existing diff under its hard timeout and span budget.
+fn changed_spans(before: &str, after: &str) -> Vec<(bool, usize, usize)> {
     if before == after {
         return Vec::new();
     }
@@ -1010,21 +1018,35 @@ fn changed_spans(before: &str, after: &str) -> Vec<(usize, usize)> {
         .diff_lines(before, after)
         .ops()
         .iter()
-        .filter_map(|op| match op {
-            similar::DiffOp::Equal { .. } => None,
-            similar::DiffOp::Delete { new_index, .. } => Some((new_index + 1, 0)),
+        .flat_map(|op| match op {
+            similar::DiffOp::Equal { .. } => vec![],
+            similar::DiffOp::Delete {
+                old_index, old_len, ..
+            } => {
+                vec![(true, old_index + 1, *old_len)]
+            }
             similar::DiffOp::Insert {
                 new_index, new_len, ..
-            } => Some((new_index + 1, *new_len)),
+            } => {
+                vec![(false, new_index + 1, *new_len)]
+            }
             similar::DiffOp::Replace {
-                new_index, new_len, ..
-            } => Some((new_index + 1, *new_len)),
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                vec![
+                    (true, old_index + 1, *old_len),
+                    (false, new_index + 1, *new_len),
+                ]
+            }
         })
         .take(MAX_EDIT_SPANS)
         .collect()
 }
 
-/// Symbols the mutation touched, in file order: declarations born
+/// Symbols the mutation touched, in diff order: declarations born
 /// inside a changed span, else the nearest declaration above it (the
 /// edit landed inside that symbol's body). Returns the shown names
 /// plus the distinct total for the "+N more" tail.
@@ -1033,29 +1055,28 @@ fn touched_symbols(file_path: &Path, before: &str, after: &str) -> (Vec<String>,
     let Some(lang) = detect_lang(file_path) else {
         return empty;
     };
-    let symbols = sound_numbered_symbols(after, lang);
-    if symbols.is_empty() {
-        return empty;
-    }
+    let old_symbols = sound_numbered_symbols(before, lang);
+    let new_symbols = sound_numbered_symbols(after, lang);
     let mut touched: Vec<String> = Vec::new();
-    let mut touched_lines: Vec<usize> = Vec::new();
-    for (start, len) in changed_spans(before, after) {
+    for (old_side, start, len) in changed_spans(before, after) {
+        let symbols = if old_side { &old_symbols } else { &new_symbols };
         let mut born_inside = false;
-        for (line, name) in &symbols {
+        for (line, name) in symbols {
             if *line >= start && line.saturating_sub(start) < len {
                 born_inside = true;
-                if !touched_lines.contains(line) {
-                    touched_lines.push(*line);
-                    touched.push(format!("{name}:{line}"));
+                let symbol = format!("{name}:{line}");
+                if !touched.contains(&symbol) {
+                    touched.push(symbol);
                 }
             }
         }
         if !born_inside
             && let Some((line, name)) = symbols.iter().rev().find(|(line, _)| *line <= start)
-            && !touched_lines.contains(line)
         {
-            touched_lines.push(*line);
-            touched.push(format!("{name}:{line}"));
+            let symbol = format!("{name}:{line}");
+            if !touched.contains(&symbol) {
+                touched.push(symbol);
+            }
         }
     }
     let total = touched.len();
@@ -1086,10 +1107,13 @@ pub fn sound_edit_echo(
         }
     }
     if !echo_off("callers") {
-        let (callers, total) = sound_callers(workspace, file_path);
+        let (callers, total, omitted) = sound_callers(workspace, file_path, None);
         if total > 0 {
             let shown = &callers[..callers.len().min(MAX_EDIT_CALLERS)];
             halves.push(format!("heard by {}", render_capped(shown, total)));
+        }
+        if omitted > 0 {
+            halves.push(format!("{omitted} caller candidates unscanned"));
         }
     }
     if halves.is_empty() {
@@ -1099,24 +1123,6 @@ pub fn sound_edit_echo(
         &format!("[Edit echo: {}]", halves.join("; ")),
         EDIT_ECHO_MAX_BYTES,
     ))
-}
-
-/// Distinct import roots, sorted, per language.
-fn sound_import_roots(text: &str, lang: SoundLang) -> BTreeSet<String> {
-    match lang {
-        SoundLang::Rust => code_lines(text)
-            .filter_map(|(_, line)| parse_use_root(line))
-            .collect(),
-        SoundLang::Python => py_code_lines(text)
-            .flat_map(|(_, line)| parse_py_import_roots(line))
-            .collect(),
-        SoundLang::JavaScript => code_lines(text)
-            .filter_map(|(_, line)| parse_js_import_root(line))
-            .collect(),
-        SoundLang::Go => code_lines(text)
-            .filter_map(|(_, line)| parse_go_import_root(line))
-            .collect(),
-    }
 }
 
 /// Source lines with `//` lines and `/* */` spans removed. Crude on
@@ -1138,7 +1144,9 @@ fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
         if line.starts_with("//") {
             return None;
         }
-        if let Some(start) = line.find("/*") {
+        if line.as_bytes().contains(&b'/')
+            && let Some(start) = line.find("/*")
+        {
             let after_open = &line[start + 2..];
             match after_open.find("*/") {
                 Some(end) => {
@@ -1294,43 +1302,77 @@ fn parse_use_root(line: &str) -> Option<String> {
 /// files (`x.rs` / `x/mod.rs`) resolve — single items living directly
 /// in a root file, external crates, and `#[path]` remaps are left to
 /// the import roots rather than guessed.
+/// A membership-only caller may stop at an admitted target; in that mode
+/// the other links and total are partial and must not be rendered.
 fn sound_links(
     workspace: &Path,
     file_path: &Path,
     text: &str,
     lang: SoundLang,
+    mut import_roots: Option<&mut BTreeSet<String>>,
+    stop_at: Option<&str>,
 ) -> (Vec<String>, usize) {
     let mut links = BTreeSet::new();
     match lang {
         SoundLang::Rust => {
             for (_, line) in code_lines(text) {
-                if let Some(segments) = parse_use_segments(line) {
-                    if let Some(link) = resolve_use_link(workspace, file_path, &segments) {
-                        links.insert(link);
-                    }
-                } else if let Some(child) = parse_mod_decl(line)
-                    && let Some(link) = resolve_child_module(workspace, file_path, &child)
-                {
+                // code_lines left-trims after tracking comments; only these
+                // initial bytes can introduce use/pub/mod for the parsers below.
+                if !matches!(line.as_bytes().first(), Some(b'u' | b'p' | b'm')) {
+                    continue;
+                }
+                if let Some(roots) = import_roots.as_deref_mut() {
+                    roots.extend(parse_use_root(line));
+                }
+                let link = if let Some(segments) = parse_use_segments(line) {
+                    resolve_use_link(workspace, file_path, &segments)
+                } else {
+                    parse_mod_decl(line)
+                        .and_then(|child| resolve_child_module(workspace, file_path, &child))
+                };
+                if let Some(link) = link {
+                    let found = stop_at == Some(link.as_str());
                     links.insert(link);
+                    if found {
+                        break;
+                    }
                 }
             }
         }
         SoundLang::Python => {
-            for (_, line) in py_code_lines(text) {
+            'lines: for (_, line) in py_code_lines(text) {
+                if let Some(roots) = import_roots.as_deref_mut() {
+                    roots.extend(parse_py_import_roots(line));
+                }
                 for link in resolve_py_links(workspace, file_path, line) {
+                    let found = stop_at == Some(link.as_str());
                     links.insert(link);
+                    if found {
+                        break 'lines;
+                    }
                 }
             }
         }
         SoundLang::JavaScript => {
             for (_, line) in code_lines(text) {
+                if let Some(roots) = import_roots.as_deref_mut() {
+                    roots.extend(parse_js_import_root(line));
+                }
                 if let Some(link) = resolve_js_link(workspace, file_path, line) {
+                    let found = stop_at == Some(link.as_str());
                     links.insert(link);
+                    if found {
+                        break;
+                    }
                 }
             }
         }
         // Go imports name packages (dirs), not files: nothing to link.
-        SoundLang::Go => {}
+        SoundLang::Go => {
+            if let Some(roots) = import_roots {
+                roots.extend(code_lines(text).filter_map(|(_, line)| parse_go_import_root(line)));
+            }
+        }
     }
     if let Some(own) = workspace_relative(workspace, file_path) {
         links.remove(&own);
@@ -1439,8 +1481,24 @@ fn resolve_module_file(workspace: &Path, base: &Path, rest: &[String]) -> Option
             base.join(format!("{joined}.rs")),
             base.join(&joined).join("mod.rs"),
         ] {
-            if candidate.is_file() {
-                return workspace_relative(workspace, &candidate);
+            // Reject impossible links cheaply; this is not read admission.
+            // Existing candidates still pass every guard below.
+            if !candidate.is_file() {
+                continue;
+            }
+            if super::file::enforce_read_denylist(&candidate, "read").is_err() {
+                continue;
+            }
+            let Ok(selected_path) = candidate.canonicalize() else {
+                continue;
+            };
+            if super::file::is_codewhale_credential_path(&selected_path)
+                || super::file::enforce_read_denylist(&selected_path, "read").is_err()
+            {
+                continue;
+            }
+            if selected_path.is_file() {
+                return workspace_relative(workspace, &selected_path);
             }
         }
     }
@@ -1742,8 +1800,22 @@ fn py_candidates(workspace: &Path, base: &Path, segments: &[&str]) -> Vec<String
         base.join(&joined).join("__init__.py"),
     ]
     .into_iter()
-    .filter(|candidate| candidate.is_file())
-    .filter_map(|candidate| workspace_relative(workspace, &candidate))
+    .filter_map(|candidate| {
+        if !candidate.is_file() {
+            return None;
+        }
+        super::file::enforce_read_denylist(&candidate, "read").ok()?;
+        let selected_path = candidate.canonicalize().ok()?;
+        if super::file::is_codewhale_credential_path(&selected_path)
+            || super::file::enforce_read_denylist(&selected_path, "read").is_err()
+        {
+            return None;
+        }
+        selected_path
+            .is_file()
+            .then(|| workspace_relative(workspace, &selected_path))
+            .flatten()
+    })
     .collect()
 }
 
@@ -1928,8 +2000,22 @@ fn resolve_js_link(workspace: &Path, file_path: &Path, line: &str) -> Option<Str
         candidates.push(target.join(format!("index.{ext}")));
     }
     for candidate in candidates {
-        if candidate.is_file() {
-            return workspace_relative(workspace, &candidate).map(|rel| dot_clean(&rel));
+        if !candidate.is_file() {
+            continue;
+        }
+        if super::file::enforce_read_denylist(&candidate, "read").is_err() {
+            continue;
+        }
+        let Ok(selected_path) = candidate.canonicalize() else {
+            continue;
+        };
+        if super::file::is_codewhale_credential_path(&selected_path)
+            || super::file::enforce_read_denylist(&selected_path, "read").is_err()
+        {
+            continue;
+        }
+        if selected_path.is_file() {
+            return workspace_relative(workspace, &selected_path).map(|rel| dot_clean(&rel));
         }
     }
     None
@@ -2022,40 +2108,81 @@ fn parse_go_import_root(line: &str) -> Option<String> {
 /// The echo coming back. Exact by construction (reuses the link
 /// resolver, no name guessing) and bounded (same-dir mates only,
 /// oversized mates skipped, visibility-filtered like the pod itself).
-fn sound_callers(workspace: &Path, file_path: &Path) -> (Vec<String>, usize) {
+fn sound_callers(
+    workspace: &Path,
+    file_path: &Path,
+    entries: Option<Vec<(String, String)>>,
+) -> (Vec<String>, usize, usize) {
     let own = match workspace_relative(workspace, file_path) {
         Some(own) => own,
-        None => return (Vec::new(), 0),
+        None => return (Vec::new(), 0, 0),
     };
     let parent = match file_path.parent() {
         Some(parent) => parent,
-        None => return (Vec::new(), 0),
+        None => return (Vec::new(), 0, 0),
     };
-    let mates = list_dir_entries(parent).unwrap_or_default();
+    let mates: Vec<_> = entries
+        .unwrap_or_else(|| list_dir_entries(parent).unwrap_or_default())
+        .into_iter()
+        .filter_map(|(raw, _)| {
+            let path = parent.join(raw);
+            let lang = detect_lang(&path)?;
+            (path != file_path).then_some((path, lang))
+        })
+        .collect();
+    let omitted = mates.len().saturating_sub(MAX_CALLER_SCAN_FILES);
     let mut callers = BTreeSet::new();
-    for (raw, _) in mates {
-        let mate_path = parent.join(&raw);
-        let Some(mate_lang) = detect_lang(&mate_path) else {
-            continue;
-        };
-        if mate_path.as_path() == file_path {
+    for (mate_path, mate_lang) in mates.into_iter().take(MAX_CALLER_SCAN_FILES) {
+        if super::file::enforce_read_denylist(&mate_path, "read").is_err() {
             continue;
         }
-        if std::fs::metadata(&mate_path).is_ok_and(|meta| meta.len() > MAX_CALLER_SCAN_BYTES) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&mate_path) else {
+        let Ok(selected_path) = mate_path.canonicalize() else {
             continue;
         };
-        let (links, _) = sound_links(workspace, &mate_path, &text, mate_lang);
+        if workspace_relative(workspace, &selected_path).is_none() {
+            continue;
+        }
+        if super::file::is_codewhale_credential_path(&selected_path)
+            || super::file::enforce_read_denylist(&selected_path, "read").is_err()
+        {
+            continue;
+        }
+        let Ok(file) = crate::external_credentials::open_secure_regular_file(&selected_path, false)
+        else {
+            continue;
+        };
+        if crate::plugins::registry::validate_opened_regular_file(&selected_path, &file).is_err()
+            || !file
+                .metadata()
+                .is_ok_and(|meta| meta.len() <= MAX_CALLER_SCAN_BYTES)
+        {
+            continue;
+        }
+        let mut text = String::new();
+        if file
+            .take(MAX_CALLER_SCAN_BYTES + 1)
+            .read_to_string(&mut text)
+            .is_err()
+            || text.len() as u64 > MAX_CALLER_SCAN_BYTES
+        {
+            continue;
+        }
+        let (links, _) = sound_links(
+            workspace,
+            &selected_path,
+            &text,
+            mate_lang,
+            None,
+            Some(&own),
+        );
         if links.iter().any(|link| link == &own)
-            && let Some(rel) = workspace_relative(workspace, &mate_path)
+            && let Some(rel) = workspace_relative(workspace, &selected_path)
         {
             callers.insert(rel);
         }
     }
     let total = callers.len();
-    (callers.into_iter().collect(), total)
+    (callers.into_iter().collect(), total, omitted)
 }
 
 fn truncate_name(head: &str) -> String {
@@ -2102,6 +2229,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{Duration, Instant};
+
+    fn sound_import_roots(text: &str, lang: SoundLang) -> BTreeSet<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut roots = BTreeSet::new();
+        sound_links(
+            dir.path(),
+            &dir.path().join("probe.rs"),
+            text,
+            lang,
+            Some(&mut roots),
+            None,
+        );
+        roots
+    }
 
     fn open_visibility(glob_root: &Path) -> PodVisibility<'_> {
         PodVisibility {
@@ -2243,6 +2384,7 @@ define nothing;
             &dir.path().join("main.rs"),
             "fn main() {}\n",
             false,
+            None,
         );
         assert_eq!(chart.podmate_total, 5);
         assert_eq!(
@@ -2263,7 +2405,13 @@ define nothing;
         for index in 0..20 {
             fs::write(dir.path().join(format!("file-{index:02}.rs")), "x").expect("fixture");
         }
-        let chart = sound_echolocation(dir.path(), &dir.path().join("file-00.rs"), "x\n", false);
+        let chart = sound_echolocation(
+            dir.path(),
+            &dir.path().join("file-00.rs"),
+            "x\n",
+            false,
+            None,
+        );
         assert_eq!(chart.podmate_total, 20);
         assert_eq!(chart.podmates.len(), MAX_PODMATES);
         let footer = chart.render_footer();
@@ -2281,8 +2429,8 @@ define nothing;
         }
         fs::write(dir.path().join("big.rs"), &text).expect("fixture");
         let path = dir.path().join("big.rs");
-        let first = sound_echolocation(dir.path(), &path, &text, false).render_footer();
-        let second = sound_echolocation(dir.path(), &path, &text, false).render_footer();
+        let first = sound_echolocation(dir.path(), &path, &text, false, None).render_footer();
+        let second = sound_echolocation(dir.path(), &path, &text, false, None).render_footer();
         assert_eq!(first, second);
         assert!(first.len() <= POD_FOOTER_MAX_BYTES, "{}", first.len());
         assert!(first.starts_with("\n\n[Pod ("), "{first}");
@@ -2297,6 +2445,7 @@ define nothing;
             &dir.path().join("notes.txt"),
             "fn not_rust() {}\n",
             false,
+            None,
         )
         .render_footer();
         assert!(footer.contains("[Pod ("), "{footer}");
@@ -2305,7 +2454,7 @@ define nothing;
 
     #[test]
     fn unlistable_non_source_renders_empty() {
-        let chart = sound_echolocation(Path::new("."), Path::new("lonely"), "hello\n", false);
+        let chart = sound_echolocation(Path::new("."), Path::new("lonely"), "hello\n", false, None);
         assert_eq!(chart.render_footer(), "");
     }
 
@@ -2314,8 +2463,9 @@ define nothing;
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("lib.rs"), SAMPLE).expect("fixture");
         fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("fixture");
-        let footer = sound_echolocation(dir.path(), &dir.path().join("lib.rs"), SAMPLE, false)
-            .render_footer();
+        let footer =
+            sound_echolocation(dir.path(), &dir.path().join("lib.rs"), SAMPLE, false, None)
+                .render_footer();
         assert!(footer.contains("12 symbols"), "{footer}");
         assert!(footer.contains("fn swim"), "{footer}");
         assert!(
@@ -2481,8 +2631,14 @@ define nothing;
              use super::server::serve;\n\
              use tokio::fs::File;\n\
              use crate::missing::Thing;\n";
-        let (links, total) =
-            sound_links(root, &root.join("src/net/http.rs"), text, SoundLang::Rust);
+        let (links, total) = sound_links(
+            root,
+            &root.join("src/net/http.rs"),
+            text,
+            SoundLang::Rust,
+            None,
+            None,
+        );
         // crate::net::http resolves to the file itself: dropped as a self-link.
         assert_eq!(total, 2);
         assert_eq!(links, ["src/config.rs", "src/net/server.rs"]);
@@ -2492,6 +2648,8 @@ define nothing;
             &root.join("src/net/mod.rs"),
             "use self::http::Handler;\nmod server;\nmod absent;\n",
             SoundLang::Rust,
+            None,
+            None,
         );
         assert_eq!(links, ["src/net/http.rs", "src/net/server.rs"]);
         // mod decl from a plain file resolves under <stem>/.
@@ -2502,6 +2660,8 @@ define nothing;
             &root.join("src/net/http.rs"),
             "mod router;\nmod nope;\n",
             SoundLang::Rust,
+            None,
+            None,
         );
         assert_eq!(links, ["src/net/http/router.rs"]);
     }
@@ -2520,6 +2680,8 @@ define nothing;
             &root.join("src/config.rs"),
             "use crate::config::Config;\nmod tests {\n}\n",
             SoundLang::Rust,
+            None,
+            None,
         );
         assert_eq!(total, 0);
         assert!(links.is_empty());
@@ -2536,6 +2698,7 @@ define nothing;
             &root.join("src/main.rs"),
             "use crate::config::Config;\nfn main() {}\n",
             false,
+            None,
         )
         .render_footer();
         // config.rs does not exist: imports show, links stay silent.
@@ -2547,6 +2710,7 @@ define nothing;
             &root.join("src/main.rs"),
             "use crate::config::Config;\nfn main() {}\n",
             false,
+            None,
         )
         .render_footer();
         assert!(footer.contains("links: config.rs"), "{footer}");
@@ -2561,7 +2725,8 @@ define nothing;
         fs::write(root.join("a.py"), "x = 1\n").expect("fixture");
         fs::create_dir(root.join("pkg")).expect("mkdir");
         fs::write(root.join("pkg/__init__.py"), "y = 2\n").expect("fixture");
-        let footer = sound_echolocation(root, &root.join("main.py"), text, false).render_footer();
+        let footer =
+            sound_echolocation(root, &root.join("main.py"), text, false, None).render_footer();
         // Both roots are named by their links: file stem (`a` under
         // `a.py`) and package path (`pkg` under `pkg/__init__.py`).
         // Sounded paths are `/`-separated on every OS; vacuous on
@@ -2608,9 +2773,19 @@ define nothing;
             "use super::server::serve;\nfn connect() {}\n",
         )
         .expect("fixture");
-        let (callers, total) = sound_callers(root, &root.join("src/net/server.rs"));
+        let (callers, total, omitted) = sound_callers(root, &root.join("src/net/server.rs"), None);
+        assert_eq!(omitted, 0);
         assert_eq!(total, 2);
         assert_eq!(callers, ["src/net/client.rs", "src/net/mod.rs"]);
+        for n in 0..=MAX_CALLER_SCAN_FILES {
+            fs::write(root.join(format!("src/net/z{n:03}.rs")), "fn spare() {}\n")
+                .expect("fixture");
+        }
+        let (bounded, bounded_total, omitted) =
+            sound_callers(root, &root.join("src/net/server.rs"), None);
+        assert_eq!(bounded, callers);
+        assert_eq!(bounded_total, total);
+        assert_eq!(omitted, 3);
     }
 
     #[test]
@@ -2627,7 +2802,8 @@ define nothing;
         .expect("fixture");
         // server.rs links to config.rs, but lives in another pod:
         // same-pod callers stay silent rather than half-answer.
-        let (callers, total) = sound_callers(root, &root.join("src/config.rs"));
+        let (callers, total, omitted) = sound_callers(root, &root.join("src/config.rs"), None);
+        assert_eq!(omitted, 0);
         assert_eq!(total, 0);
         assert!(callers.is_empty());
     }
@@ -2641,13 +2817,13 @@ define nothing;
         fs::write(root.join("src/net/mod.rs"), "pub mod server;\n").expect("fixture");
         let text = "fn serve() {}\n";
         fs::write(root.join("src/net/server.rs"), text).expect("fixture");
-        let plain =
-            sound_echolocation(root, &root.join("src/net/server.rs"), text, false).render_footer();
+        let plain = sound_echolocation(root, &root.join("src/net/server.rs"), text, false, None)
+            .render_footer();
         assert!(!plain.contains("heard by"), "{plain}");
-        let first =
-            sound_echolocation(root, &root.join("src/net/server.rs"), text, true).render_footer();
-        let second =
-            sound_echolocation(root, &root.join("src/net/server.rs"), text, true).render_footer();
+        let first = sound_echolocation(root, &root.join("src/net/server.rs"), text, true, None)
+            .render_footer();
+        let second = sound_echolocation(root, &root.join("src/net/server.rs"), text, true, None)
+            .render_footer();
         assert_eq!(first, second);
         assert!(first.contains("heard by: mod.rs"), "{first}");
     }
@@ -2727,6 +2903,8 @@ define_not_a_keyword = True
             &root.join("app.py"),
             "import util\nfrom pkg.sub import thing\nimport os\n",
             SoundLang::Python,
+            None,
+            None,
         );
         assert_eq!(links, ["pkg/sub/__init__.py", "util.py"]);
         // Relative: `from . import sib` + `from .. import x`.
@@ -2735,6 +2913,8 @@ define_not_a_keyword = True
             &root.join("pkg/sub/deep.py"),
             "from . import sib\nfrom .. import mod\nfrom ... import nowhere\n",
             SoundLang::Python,
+            None,
+            None,
         );
         assert_eq!(links, ["pkg/mod.py"]);
     }
@@ -2807,6 +2987,8 @@ if (x) { y(); }
             &root.join("src/app.ts"),
             "import { s } from './server';\nimport { U } from './ui';\nimport _ from 'lodash';\n",
             SoundLang::JavaScript,
+            None,
+            None,
         );
         assert_eq!(links, ["src/server.ts", "src/ui/index.tsx"]);
     }
@@ -2869,6 +3051,8 @@ func main() {
             &dir.path().join("x.go"),
             GO_SAMPLE,
             SoundLang::Go,
+            None,
+            None,
         );
         assert_eq!(total, 0);
         assert!(links.is_empty());
@@ -2932,8 +3116,8 @@ func main() {
         let path = dir.path().join("big.rs");
         fs::write(&path, &big).expect("fixture");
         let start = Instant::now();
-        let first = sound_echolocation(dir.path(), &path, &big, true).render_footer();
-        let second = sound_echolocation(dir.path(), &path, &big, true).render_footer();
+        let first = sound_echolocation(dir.path(), &path, &big, true, None).render_footer();
+        let second = sound_echolocation(dir.path(), &path, &big, true, None).render_footer();
         assert_eq!(first, second);
         assert!(first.len() <= POD_FOOTER_MAX_BYTES, "{}", first.len());
         // Absurdly generous: catches hangs and super-linear blowups,
@@ -2958,8 +3142,8 @@ func main() {
         ] {
             let path = root.join(rel);
             let text = fs::read_to_string(&path).expect("repo file");
-            let first = sound_echolocation(root, &path, &text, true).render_footer();
-            let second = sound_echolocation(root, &path, &text, true).render_footer();
+            let first = sound_echolocation(root, &path, &text, true, None).render_footer();
+            let second = sound_echolocation(root, &path, &text, true, None).render_footer();
             assert_eq!(first, second, "{rel}");
             assert!(first.len() <= POD_FOOTER_MAX_BYTES, "{rel}");
             sounded += 1;
@@ -2972,8 +3156,14 @@ func main() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("swim.py"), PY_SAMPLE).expect("fixture");
         fs::write(dir.path().join("other.py"), "x = 1\n").expect("fixture");
-        let footer = sound_echolocation(dir.path(), &dir.path().join("swim.py"), PY_SAMPLE, false)
-            .render_footer();
+        let footer = sound_echolocation(
+            dir.path(),
+            &dir.path().join("swim.py"),
+            PY_SAMPLE,
+            false,
+            None,
+        )
+        .render_footer();
         assert!(footer.contains("[Pod ("), "{footer}");
         assert!(footer.contains("def swim"), "{footer}");
         assert!(footer.contains("imports:"), "{footer}");
@@ -2996,6 +3186,8 @@ func main() {
             &dir.path().join("lib.rs"),
             &text,
             SoundLang::Rust,
+            None,
+            None,
         );
         assert!(links.contains(&"pod.rs".to_string()), "{links:?}");
         assert!(links.contains(&"song/mod.rs".to_string()), "{links:?}");
@@ -3071,7 +3263,7 @@ func main() {
         fs::write(&target, "fn target() {}\n").expect("fixture");
         let text = fs::read_to_string(&target).expect("read");
         let start = Instant::now();
-        let chart = sound_echolocation(dir.path(), &target, &text, true);
+        let chart = sound_echolocation(dir.path(), &target, &text, true, None);
         let footer = chart.render_footer();
         let elapsed = start.elapsed();
         assert!(footer.len() <= POD_FOOTER_MAX_BYTES);
@@ -3167,6 +3359,24 @@ func main() {
         let echo =
             sound_edit_echo(dir.path(), &dir.path().join("solo.rs"), before, after).expect("echo");
         assert_eq!(echo, "[Edit echo: touched fn main:1]");
+        let deleted = touched_symbols(
+            &dir.path().join("solo.rs"),
+            "fn survivor() {}\nfn removed() {}\n",
+            "fn survivor() {}\n",
+        );
+        assert_eq!(deleted, (vec!["fn removed:2".to_string()], 1));
+        let replaced = touched_symbols(
+            &dir.path().join("solo.rs"),
+            "fn removed() {}\n",
+            "fn added() {}\n",
+        );
+        assert_eq!(
+            replaced,
+            (
+                vec!["fn removed:1".to_string(), "fn added:1".to_string()],
+                2
+            )
+        );
     }
 
     #[test]

@@ -1540,7 +1540,7 @@ pub(super) async fn run_child_agent(
         &assignment,
         &agent_type,
         &system,
-        fork.as_ref(),
+        fork,
     );
     let initial = seed
         .pop()

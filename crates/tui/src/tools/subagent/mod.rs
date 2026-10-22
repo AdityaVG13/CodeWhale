@@ -13552,7 +13552,7 @@ fn build_initial_subagent_messages(
         assignment,
         agent_type,
         &system_prompt,
-        fork_context,
+        fork_context.cloned(),
     )
 }
 
@@ -13563,13 +13563,13 @@ fn build_initial_subagent_messages_with_system(
     assignment: &SubAgentAssignment,
     agent_type: &FleetRole,
     subagent_system_prompt: &str,
-    fork_context: Option<&SubAgentForkContext>,
+    fork_context: Option<SubAgentForkContext>,
 ) -> Vec<Message> {
-    let mut messages = fork_context
-        .map(|context| context.messages.clone())
-        .unwrap_or_default();
+    let mut messages = Vec::new();
 
     if let Some(context) = fork_context {
+        // Resolution already made this child's isolated copy of the parent.
+        messages = context.messages;
         if let Some(state) = context
             .structured_state_block
             .as_deref()

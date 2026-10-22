@@ -32,7 +32,9 @@ use codewhale_models::{
 
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
-use super::wire::{extract_sse_data_value, flush_sse_line, push_sse_event_data, take_sse_line};
+use super::wire::{
+    extract_sse_data_value, flush_sse_line, push_sse_event_data, take_sse_line_from_slice,
+};
 use super::{
     CodewhaleClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
     SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer,
@@ -1547,8 +1549,9 @@ impl CodewhaleClient {
                 // a `\n` so an HTTP/2 DATA split mid-character cannot become
                 // U+FFFD; genuine invalid bytes fail closed.
                 let mut lines_processed = 0usize;
+                let mut remaining = byte_buf.as_slice();
                 loop {
-                    let line = match take_sse_line(&mut byte_buf) {
+                    let line = match take_sse_line_from_slice(&mut remaining) {
                         Ok(Some(line)) => line,
                         Ok(None) => break,
                         Err(err) => {
@@ -1637,6 +1640,9 @@ impl CodewhaleClient {
                         tokio::task::yield_now().await;
                     }
                 }
+                // Move the unterminated tail once per chunk, not once per line.
+                let consumed = byte_buf.len() - remaining.len();
+                byte_buf.drain(..consumed);
             }
 
             // Flush a final SSE frame that arrived without a terminating blank

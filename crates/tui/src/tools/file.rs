@@ -562,8 +562,9 @@ pub(crate) fn enforce_read_denylist(path: &Path, tool: &str) -> Result<(), ToolE
 pub(crate) fn is_codewhale_credential_path(path: &Path) -> bool {
     let candidate = canonical_path_for_credential_guard(path);
 
-    if let Ok(active_config) = codewhale_config::resolve_config_path(None)
-        && is_config_or_backup(&candidate, &active_config)
+    let active_config = codewhale_config::resolve_config_path(None).ok();
+    if let Some(active_config) = &active_config
+        && is_config_or_backup(&candidate, active_config)
     {
         return true;
     }
@@ -579,11 +580,24 @@ pub(crate) fn is_codewhale_credential_path(path: &Path) -> bool {
     let mut roots: Vec<PathBuf> = Vec::with_capacity(3);
     roots.extend(codewhale_config::codewhale_home().ok());
     roots.extend(codewhale_config::legacy_deepseek_home().ok());
-    roots.extend(
-        codewhale_paths::user_home().map(|home| home.join(codewhale_config::CODEWHALE_APP_DIR)),
-    );
+    // Without `CODEWHALE_HOME`, `codewhale_home()` already returned this exact
+    // ambient root, so pushing it again only re-canonicalizes identical
+    // config/backup/secrets paths. Keep it only when it adds a distinct root.
+    if let Some(ambient) =
+        codewhale_paths::user_home().map(|home| home.join(codewhale_config::CODEWHALE_APP_DIR))
+        && !roots.contains(&ambient)
+    {
+        roots.push(ambient);
+    }
     for root in roots {
-        if is_config_or_backup(&candidate, &root.join(codewhale_config::CONFIG_FILE_NAME)) {
+        let config_path = root.join(codewhale_config::CONFIG_FILE_NAME);
+        // Only skip the exact config/backup pair already checked above.
+        // Distinct spellings still canonicalize; every secrets root is checked.
+        if active_config
+            .as_ref()
+            .is_none_or(|active| active.as_os_str() != config_path.as_os_str())
+            && is_config_or_backup(&candidate, &config_path)
+        {
             return true;
         }
 
@@ -1088,7 +1102,10 @@ impl ReadFileTool {
                 "Offset {requested_offset} is beyond end of file ({line_count} lines total)"
             )));
         }
-        let start_byte = if start == 0 {
+        let selected_lines = limit.unwrap_or(usize::MAX).min(line_count - start);
+        // An empty selection slices `""` whatever the range start is, so it
+        // needs a valid boundary, not the walked one: skip the prefix scan.
+        let start_byte = if start == 0 || selected_lines == 0 {
             0
         } else {
             text.match_indices('\n')
@@ -1097,7 +1114,6 @@ impl ReadFileTool {
                 .0
                 + 1
         };
-        let selected_lines = limit.unwrap_or(usize::MAX).min(line_count - start);
         let end_byte = if selected_lines == 0 {
             start_byte
         } else {
@@ -1197,9 +1213,14 @@ impl ReadFileTool {
                         )
                     })
             });
-            let echo =
-                crate::tools::echolocation::sound_echolocation(&workspace, &echo_path, &text, buzz)
-                    .render_with_navigation(navigation.as_ref());
+            let echo = crate::tools::echolocation::sound_echolocation(
+                &workspace,
+                &echo_path,
+                &text,
+                buzz,
+                navigation.as_ref(),
+            )
+            .render_with_navigation(navigation.as_ref());
             (echo, navigation)
         })
         .await
@@ -2097,6 +2118,9 @@ struct ResolvedContractEdit {
 }
 
 fn normalize_contract_line_endings(text: &str) -> String {
+    if !text.as_bytes().contains(&b'\r') {
+        return text.to_owned();
+    }
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 

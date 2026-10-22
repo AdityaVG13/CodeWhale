@@ -333,14 +333,17 @@ impl ToolSpec for GrepFilesTool {
             // Build result. When context_lines == 1, return the single context
             // line as a string instead of a one-item array. That keeps the common
             // "show just the adjacent line" case easy for model callers to read.
-            let mut output = json!({
-                "matches": matches_json,
-                "total_matches": total_matches,
-                "files_searched": files_searched,
-                "truncated": truncated,
-                "pods": pods_json,
-                "pods_omitted": pods_omitted,
-            });
+            // json! would to_value() these already-built arrays and deep-copy
+            // every match and pod. Insert them by move; key order matches the
+            // previous object because serde_json preserves insertion order.
+            let mut built = serde_json::Map::new();
+            built.insert("matches".to_owned(), Value::Array(matches_json));
+            built.insert("total_matches".to_owned(), Value::from(total_matches));
+            built.insert("files_searched".to_owned(), Value::from(files_searched));
+            built.insert("truncated".to_owned(), Value::from(truncated));
+            built.insert("pods".to_owned(), Value::Array(pods_json));
+            built.insert("pods_omitted".to_owned(), Value::from(pods_omitted));
+            let mut output = Value::Object(built);
             if truncated {
                 output["max_results"] = json!(max_results);
             }

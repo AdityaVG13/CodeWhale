@@ -1,6 +1,6 @@
 //! Project mapping tool for understanding codebase structure.
 
-use crate::utils::{is_key_file, project_tree, summarize_project};
+use crate::utils::{is_key_file, project_tree, summarize_key_files, summarize_project};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -64,9 +64,9 @@ fn generate_project_map(
     follow_symlinks: bool,
 ) -> Result<ProjectMap, ToolError> {
     let tree = project_tree(root, max_depth, follow_symlinks);
-    let summary = summarize_project(root);
 
-    // For key_files, we can just do a quick scan since summarize_project doesn't return them directly anymore
+    // Reuse this observation for the summary only when both walks have the
+    // same symlink policy.
     let mut key_files = Vec::new();
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -85,6 +85,14 @@ fn generate_project_map(
             key_files.push(rel.to_string_lossy().to_string());
         }
     }
+
+    // `follow_symlinks == true` keeps the original non-follow summary walk so
+    // symlinked key files never leak into the summary.
+    let summary = if follow_symlinks {
+        summarize_project(root)
+    } else {
+        summarize_key_files(key_files.clone())
+    };
 
     // Echolocation sounding: one line of symbols per key file (sorted,
     // capped), so the map says what lives where, not just what exists.

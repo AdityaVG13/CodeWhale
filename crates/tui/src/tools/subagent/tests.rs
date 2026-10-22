@@ -12711,7 +12711,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         &assignment,
         &FleetRole::Reviewer,
         &system,
-        Some(&fork_context),
+        Some(fork_context),
     );
     assert!(
         forked
