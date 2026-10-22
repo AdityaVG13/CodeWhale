@@ -1559,7 +1559,10 @@ fn extract_paths_from_text(text: &str) -> Vec<String> {
     }
 
     let re = path_regex();
-    re.find_iter(text)
+    // Matches cannot cross line endings, and every arm needs a dot or separator.
+    text.lines()
+        .filter(|line| line.contains('/') || line.contains('\\') || line.contains('.'))
+        .flat_map(|line| re.find_iter(line))
         .map(|m| m.as_str().to_string())
         .filter(|s| looks_like_path(s))
         .collect()

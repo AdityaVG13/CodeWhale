@@ -1,12 +1,97 @@
 # Echolocation
 
-Stateless, index-free navigation soundings. File tools echo their
-surroundings fresh from source — no index to build, no background work,
-no new dependencies. Every sounding is deterministic (sorted, capped,
-hard-budgeted, `/`-separated paths on every OS), so a repeated call is
-byte-identical and cache-friendly, and soundings never enter the
-session-pinned prefix: they ride tool results (append-only history)
-only.
+## Product definition and direction
+
+**Echolocation is Codewhale's native, feedback-driven code navigation: use each
+observation to narrow the next action, obtain sufficient source evidence, and
+reach a correct result with less searching, rereading, and execution overhead.**
+It is not merely a footer, a repository summary, or a cache-hit percentage.
+
+This section defines the product target. It does not claim that all of the
+adaptive behavior below is implemented; the current mechanisms and limits are
+recorded separately below.
+
+### The navigation loop
+
+Borrow the useful principle of echolocation: broad orientation, a more focused
+observation, then precise work near the target. More detail is useful when it
+changes the next action, not simply because it is available.
+
+1. **Orient cheaply.** Use the query, path, requested range, and existing evidence
+   to identify plausible files or regions without dumping the repository.
+2. **Focus.** Make observations actionable: qualified source windows and explicit
+   relationships, rather than names that require another search to locate.
+3. **Inspect enough to act.** Return the relevant body and necessary context, such
+   as its imports or a directly involved helper. A tiny snippet that forces a
+   whole-module reread is not a successful reduction.
+4. **Follow useful relationships.** Increase detail around the selected target
+   when a caller, callee, test, or configuration edge answers the task's question.
+   Label lexical, syntax-derived, and semantic evidence distinctly. Unresolved
+   relationships stay unresolved; same-directory proximity is not a call edge.
+5. **Reobserve changes and stop expanding.** Changed source invalidates affected
+   references. Once there is sufficient evidence for the requested action, avoid
+   unrelated exploration. A host observation is not proof a model received it.
+
+The model still selects actions through the existing Engine and tools. Use
+available request and conversation signals before inventing another planning
+call or control loop. The current visit-count buzz is a starting heuristic, not
+an adequate definition of task relevance.
+
+### Make both the navigation and its machinery efficient
+
+- **Avoid unnecessary model round trips.** A search result should lead directly
+  to useful evidence. Reuse existing tool composition for bounded dependent
+  steps when the next step is mechanical, not a new reasoning decision.
+- **Avoid repeated host work.** Where contracts permit, one admitted byte
+  snapshot should serve range selection, source analysis, and echoes. Reuse
+  derived facts for identical source rather than scanning, parsing, or
+  serializing them again unnecessarily.
+- **Pay only for useful observations.** Small output alone does not imply small
+  execution cost. Bound analysis and relationship traversal, not just rendering;
+  expensive optional detail must earn its cost in the current operation.
+- **Keep reuse honest.** Freshness and current access checks remain mandatory.
+  Do not replace current-byte validation with an mtime-only shortcut, or confuse
+  host analysis reuse, provider prefix reuse, and model-visible delivery.
+- **Stay native, index-free, and bounded.** Echolocation is the backend for the
+  existing Codewhale tools. Extend their Engine, read/search/edit and LSP paths
+  and bounded observations; do not build a repository index, indexing service,
+  daemon, or parallel navigation system.
+
+### First implementation direction and acceptance
+
+Start with the existing Rust read-to-reference-to-focused-read path, not a new
+repository-wide navigation framework. Profile cold, repeated, and post-edit
+reads; distinguish source I/O and validation, line selection, syntax analysis,
+neighbor traversal, serialization, and model wait time. Choose the first change
+from measured avoidable work, and keep that change separate from new behavior.
+
+The first backend optimization passes ready Rust syntax observations into
+`sound_echolocation`, avoiding the legacy symbol scan whose results were previously
+replaced during rendering. Unavailable syntax observations still use the legacy
+scanner. Import roots are now collected during the existing link scan rather
+than a separate whole-source traversal; reverse-link callers skip unused import
+extraction. Link targets are still resolved against the filesystem on each call.
+Repeated whole-source loading, hashing, and line scanning for narrow reads remain
+investigation targets, not permission to weaken freshness.
+
+Judge improvements by correct completed tasks first, then time to useful source
+evidence, end-to-end completion time, model round trips, tool latency, source
+bytes read, delivered context, and total token cost. Include cold-start,
+invalidation, memory, and cancellation costs. Keep unsuccessful runs. A faster
+read that causes more searches, wrong answers, or excessive retained state is not
+a win. The existing fixed-task benchmark is a regression anchor, not the whole
+product definition; each new capability needs a task that genuinely exercises it.
+
+## Current implementation
+
+Bounded navigation soundings. File tools echo their surroundings fresh
+from admitted source bytes -- no repository-wide index, background work,
+or new dependencies. Soundings are deterministic for the same source,
+visibility gates, and buzz state: sorted, capped, byte-budgeted, and
+`/`-separated on every OS. They ride tool results (append-only history),
+never the session-pinned prefix. Repeating a result later in a transcript
+does not itself earn a prefix-cache hit: reuse requires the same preceding
+request bytes, tool order, and provider route.
 
 ## What each surface emits
 
@@ -122,3 +207,10 @@ metadata remains available to programs and still uses the syntax producer.
   cost of a sounding is bounded by one directory listing plus a
   bounded re-read of small mates.
 - No `patch` (multi-file) echoes yet; single-file write/edit only.
+
+
+## Source and scan limits
+
+Callers are inspected from at most 32 sorted visible language-file candidates. Each accepted caller body is at most 256 KiB; one extra byte detects overflow. Unscanned candidates are reported explicitly. Key-file body sounding accepts at most 8 MiB and detects overflow the same way. Reads use the existing protected regular-file handle and reject unsafe file shapes before parsing. Directory name enumeration and platform/kernel read latency remain outside these body caps. Delete attribution uses the old-side range; replacement attribution uses both old and new ranges. These source rules do not qualify Windows behavior or provider cache savings.
+
+Search pod enumeration reuses the depth-one ignore walker: parent ignore files, global rules, repository gitignore and info/exclude are honored when requested. Symlinks are not followed. Include/exclude/extension and deny guards remain applied, and the unlistable-directory fallback only repeats already matched non-dotfile names. Directed reads bypass ignore filtering while retaining denial and protected-read guards.
