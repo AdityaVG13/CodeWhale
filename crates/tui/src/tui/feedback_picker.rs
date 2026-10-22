@@ -17,6 +17,7 @@ use crate::tui::views::{
     centered_modal_area, render_modal_footer, render_modal_surface,
 };
 use codewhale_palette as palette;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy)]
 struct FeedbackOption {
@@ -183,12 +184,21 @@ impl ModalView for FeedbackPickerView {
                 Style::default().fg(palette::TEXT_MUTED)
             };
             let pointer = crate::tui::glyphs::selection_marker(is_selected);
+            let lead = format!("{pointer} {}. ", option.number);
+            let description_width = usize::from(content.width).saturating_sub(
+                UnicodeWidthStr::width(lead.as_str()) + UnicodeWidthStr::width(option.label) + 4,
+            );
+            let description = codewhale_ratatui::text::truncate_words(
+                option.description,
+                description_width,
+                crate::tui::color_compat::ascii_safe_enabled(),
+            );
 
             lines.push(Line::from(vec![
-                Span::styled(format!("{pointer} {}. ", option.number), row_style),
+                Span::styled(lead, row_style),
                 Span::styled(option.label, row_style),
                 Span::raw("    "),
-                Span::styled(option.description, desc_style),
+                Span::styled(description, desc_style),
             ]));
         }
 

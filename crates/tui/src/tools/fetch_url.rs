@@ -15,7 +15,7 @@ use super::spec::{
 use super::web::extract::{DocumentKind, ExtractedDocument, decode_response_body};
 use super::web::fetch::{
     DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchAttempt, FetchOptions, HARD_MAX_BYTES,
-    HARD_MAX_TIMEOUT, fetch_readable,
+    HARD_MAX_TIMEOUT, Readable, fetch_readable,
 };
 use super::web::overflow::bound_text as bound_web_text;
 #[cfg(test)]
@@ -62,6 +62,10 @@ struct FetchResponse {
     content_type: String,
     content: String,
     truncated: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    partial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
     receipt: FetchReceipt,
     #[serde(skip_serializing_if = "Option::is_none")]
     artifact: Option<String>,
@@ -176,7 +180,8 @@ impl ToolSpec for FetchUrlTool {
         // moving the field list into its first future.
         let requested_fields = &requested_fields;
         // A 2xx that extracts to nothing is re-fetched once past every cache
-        // before it becomes an error; the receipt keeps both attempts (#5904).
+        // before it becomes a partial page or an error; the receipt keeps both
+        // attempts (#5904).
         let readable = fetch_readable(
             &url,
             &FetchOptions::new(Duration::from_millis(timeout_ms), max_bytes, FETCH_ACCEPT),
@@ -206,6 +211,7 @@ impl ToolSpec for FetchUrlTool {
                         &fetched.url,
                         &fetched.content_type,
                         &fetched.bytes,
+                        fetched.truncated,
                         is_success,
                         body_text.as_deref(),
                         PdfTextCommand::system(Some(context)),
@@ -218,9 +224,13 @@ impl ToolSpec for FetchUrlTool {
         .await?;
         let super::web::fetch::ReadableFetch {
             payload: fetched,
-            document: (extracted, fields),
+            document,
             attempts,
         } = readable;
+        let ((extracted, fields), note) = match document {
+            Readable::Document(document) => (document, None),
+            Readable::Partial(page) => ((page.document, None), Some(page.note)),
+        };
         let is_success = (200..300).contains(&fetched.status);
 
         let citation_title = extracted.title.clone();
@@ -250,6 +260,8 @@ impl ToolSpec for FetchUrlTool {
             content_type: fetched.content_type,
             content: processed,
             truncated: fetched.truncated,
+            partial: note.is_some(),
+            note,
             receipt: FetchReceipt {
                 cache_hit: fetched.cache_hit,
                 retries: fetched.retries,
@@ -289,6 +301,7 @@ async fn extract_fetched_document(
     url: &str,
     content_type: &str,
     bytes: &[u8],
+    truncated: bool,
     is_success: bool,
     decoded_body: Option<&str>,
     pdf_command: PdfTextCommand<'_>,
@@ -310,6 +323,7 @@ async fn extract_fetched_document(
             url,
             Some(content_type),
             bytes,
+            truncated,
             pdf_command,
         )
         .await

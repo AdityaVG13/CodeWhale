@@ -209,9 +209,9 @@ fn expand_model_alias_for_provider(provider: ProviderKind, name: &str) -> String
     let lower = trimmed.to_ascii_lowercase();
     if matches!(provider, ProviderKind::XiaomiMimo) {
         return match lower.as_str() {
-            "pro" | "mimo" => "mimo-v2.5-pro".to_string(),
+            "pro" | "mimo" => "mimo-v2.6-pro".to_string(),
             "ultraspeed" | "pro-ultraspeed" => "mimo-v2.5-pro-ultraspeed".to_string(),
-            "text" | "omni" | "v2.5-omni" => "mimo-v2.5".to_string(),
+            "text" | "omni" | "v2.5-omni" => "mimo-v2.6-flash".to_string(),
             "tts" | "speech" | "mimo-tts" => "mimo-v2.5-tts".to_string(),
             "voicedesign" | "voice-design" | "mimo-voice-design" => {
                 "mimo-v2.5-tts-voicedesign".to_string()
@@ -227,7 +227,7 @@ fn expand_model_alias_for_provider(provider: ProviderKind, name: &str) -> String
 
     match lower.as_str() {
         "pro" | "v4-pro" => "deepseek-v4-pro".to_string(),
-        "flash" | "v4-flash" => "deepseek-v4-flash".to_string(),
+        "flash" | "v4-flash" => "deepseek-flash".to_string(),
         // Not a shorthand: keep the id as typed (case preserved for opaque
         // model tags on passthrough providers like Ollama/HuggingFace).
         _ => trimmed.to_string(),
@@ -413,8 +413,8 @@ mod tests {
         for (input, expected) in [
             ("xiaomi-mimo pro-ultraspeed", "mimo-v2.5-pro-ultraspeed"),
             ("xiaomi-mimo ultraspeed", "mimo-v2.5-pro-ultraspeed"),
-            ("xiaomi-mimo omni", "mimo-v2.5"),
-            ("xiaomi-mimo v2.5-omni", "mimo-v2.5"),
+            ("xiaomi-mimo omni", "mimo-v2.6-flash"),
+            ("xiaomi-mimo v2.5-omni", "mimo-v2.6-flash"),
         ] {
             let result = provider(&mut app, Some(input));
             match result.action {
@@ -537,7 +537,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Siliconflow.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -550,7 +550,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::SiliconflowCN.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -576,7 +576,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Together.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -589,7 +589,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Sglang.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -602,7 +602,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Vllm.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -651,7 +651,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::NvidiaNim.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
         }
@@ -677,7 +677,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Deepseek.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
         }

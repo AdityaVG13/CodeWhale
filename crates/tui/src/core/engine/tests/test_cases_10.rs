@@ -1,18 +1,17 @@
 #[test]
 fn default_active_contract_keeps_discovery_and_core_tools_eager() {
-    const EXPECTED_NATIVE: [&str; 12] = [
+    // Token diet: agent+workflow (21KB of schema) and get/update_goal
+    // (meaningless without an active goal) stay searchable by default.
+    const EXPECTED_NATIVE: [&str; 9] = [
         "read",
         "write",
         "edit",
         "file_search",
         "bash",
-        "agent",
-        "workflow",
         "todo_write",
-        "create_goal",
-        "get_goal",
-        "update_goal",
+        "task_shell_wait",
         "load_skill",
+        "create_goal",
     ];
     assert_eq!(
         default_active_native_tool_names(),
@@ -52,15 +51,8 @@ fn default_active_contract_keeps_discovery_and_core_tools_eager() {
 #[test]
 fn non_yolo_mode_retains_default_defer_policy() {
     let always_load = HashSet::new();
-    for core in [
-        "read",
-        "write",
-        "edit",
-        "bash",
-        "agent",
-        "todo_write",
-        "load_skill",
-    ] {
+    // Token diet: agent stays searchable even on wide surfaces.
+    for core in ["read", "write", "edit", "bash", "todo_write", "load_skill"] {
         assert!(!should_default_defer_tool(core, &always_load));
     }
     for searchable in [
@@ -451,17 +443,18 @@ async fn measure_production_mode_tool_catalogs() -> serde_json::Value {
     let _userprofile = EnvVarGuard::set("USERPROFILE", &home);
     let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale"));
     // Interpreter-backed advanced tools are intentionally excluded from this
-    // cross-platform built-in profile. The production planner still owns that
-    // decision; a deliberately nonexistent PATH root makes its real dependency
-    // probes return absent without inheriting the developer or CI host.
+    // cross-platform built-in profile. Pin host capabilities because Windows
+    // system-directory lookup can find interpreters outside PATH. Keep the
+    // nonexistent PATH root for the canonical shell spelling below.
+    let _host_tools = crate::dependencies::pin_recorded_host_tools(Vec::new());
     let _path = EnvVarGuard::set("PATH", tmp.path().join("no-host-interpreters"));
     // Shell syntax is part of the tool schema. A bare name plus the empty
     // PATH resolves to the same `bash` spelling on Unix and Windows without
     // executing or requiring that interpreter. Do not inherit the host shell.
     let _shell = EnvVarGuard::set("SHELL", "bash");
-    // The macOS Vision OCR probe is a framework check that ignores PATH, so
-    // the profile neutralizes it explicitly: every host presents no local OCR
-    // capability here, matching the no-host-interpreters PATH pin above.
+    // Keep the explicit OCR-unavailable environment for framework probes that
+    // ignore PATH; the host capability pin above also excludes local OCR from
+    // this profile.
     let _ocr = EnvVarGuard::set("CODEWHALE_LOCAL_OCR_UNAVAILABLE", "1");
 
     let api_config = Config {
@@ -516,6 +509,7 @@ async fn measure_production_mode_tool_catalogs() -> serde_json::Value {
                 McpAccess::PassiveSnapshot,
                 route,
                 "",
+                None,
             )
             .await;
         let active = build.surface.active.clone().unwrap_or_default();
@@ -558,6 +552,7 @@ async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
         "create_goal",
         "get_goal",
         "update_goal",
+        "task_shell_wait",
         "edit",
         "file_search",
         "read",
@@ -588,15 +583,19 @@ async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
             assert!(!full.contains(hidden), "{mode} must hide {hidden}");
         }
         // #6562: `[features] code_mode` defaults on, so Act/Operate promote
-        // `execute_tools` into the request head. Plan hides it entirely.
+        // `execute_tools` into the request head. Plan hides it entirely and
+        // registers only the foreground shell surface, so Plan omits
+        // `task_shell_wait`.
         let mut expected_mode_active = expected_active.clone();
         if mode != "plan" {
             expected_mode_active.insert("execute_tools");
+        } else {
+            expected_mode_active.remove("task_shell_wait");
         }
         assert_eq!(
             metric_tool_names(&payload, mode, "active"),
             expected_mode_active,
-            "{mode} must keep the same request head including goal controls"
+            "{mode} must expose the expected request head"
         );
     }
 

@@ -145,8 +145,9 @@ The Runtime execution ledger persists the worker's own event stream rather than
 a separate, simulated taxonomy. Compatibility APIs and types still expose this
 through the `Fleet...` prefix. `codewhale exec --output-format stream-json`
 emits
-`{"type": "content" | "tool_use" | "tool_result" | "sandbox_denied" |
-"workflow_event" | "session_capture" | "turn_usage" | "metadata" | "done" |
+`{"type": "content" | "tool_use" | "tool_result" | "agent_spawned" |
+"sandbox_denied" | "workflow_event" | "session_capture" | "service_released" |
+"turn_usage" | "metadata" | "status" | "request_image_window" | "done" |
 "error"}` lines, which map onto the Runtime ledger's compatibility type
 `FleetWorkerEventPayload` (`RunningTool`, `WorkflowEvent`, `Running`,
 `Completed`, `Failed`, …). `workflow_event` carries the typed
@@ -212,6 +213,8 @@ request (turn-step) when the provider reported usage for that call:
   `completion_tokens_details` / Responses `output_tokens_details`; Anthropic
   does not report a thinking-token count). `reasoning_replay_tokens` is a
   client-side estimate for DeepSeek V4 interleaved-thinking replays.
+- `finish_reason` is the provider's stop reason for that step (for example
+  `stop`, `tool_calls`, or `length`), omitted when the provider reported none.
 - When a provider reports no usage at all for a call, the whole event is
   skipped for that call. Latency/convergence analysis should sum
   `turn_usage` events instead of inferring per-step tokens from wall time;

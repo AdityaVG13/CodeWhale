@@ -52,7 +52,7 @@
     {
       "kind": "DeepseekAnthropic",
       "id": "deepseek-anthropic",
-      "label": "DeepSeek",
+      "label": "DeepSeek (Anthropic API)",
       "base_url": "https://api.deepseek.com/anthropic",
       "default_model": "deepseek-flash",
       "env_vars": [
@@ -377,7 +377,7 @@
       "id": "xiaomi-mimo",
       "label": "Xiaomi MiMo",
       "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
-      "default_model": "mimo-v2.5-pro",
+      "default_model": "mimo-v2.6-pro",
       "env_vars": [
         "XIAOMI_MIMO_TOKEN_PLAN_API_KEY",
         "MIMO_TOKEN_PLAN_API_KEY",
@@ -1214,7 +1214,7 @@
     {
       "kind": "MinimaxAnthropic",
       "id": "minimax-anthropic",
-      "label": "MiniMax",
+      "label": "MiniMax (Anthropic API)",
       "base_url": "https://api.minimax.io/anthropic",
       "default_model": "MiniMax-M3",
       "env_vars": [
@@ -1896,7 +1896,7 @@
     {
       "kind": "ModelstudioTokenPlanAnthropic",
       "id": "modelstudio-token-plan-anthropic",
-      "label": "Alibaba Cloud Model Studio",
+      "label": "Alibaba Cloud Model Studio (Token Plan, Anthropic API)",
       "base_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
       "default_model": "qwen3.8-max",
       "env_vars": [
@@ -1933,7 +1933,7 @@
     {
       "kind": "ModelstudioCodingPlan",
       "id": "modelstudio-coding-plan",
-      "label": "Alibaba Cloud Model Studio",
+      "label": "Alibaba Cloud Model Studio (Coding Plan)",
       "base_url": "https://coding-intl.dashscope.aliyuncs.com/v1",
       "default_model": "qwen3.8-max",
       "env_vars": [
@@ -1970,7 +1970,7 @@
     {
       "kind": "ModelstudioCodingPlanAnthropic",
       "id": "modelstudio-coding-plan-anthropic",
-      "label": "Alibaba Cloud Model Studio",
+      "label": "Alibaba Cloud Model Studio (Coding Plan, Anthropic API)",
       "base_url": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
       "default_model": "qwen3.8-max",
       "env_vars": [
@@ -2225,6 +2225,21 @@
         "sense-nova",
         "meituan-sensenova",
         "meituan-sensenova-cn"
+      ]
+    },
+    {
+      "id": "standardcompute",
+      "label": "Standard Compute",
+      "wire": "openai-compatible",
+      "base_url": "https://api.stdcmpt.com/v1",
+      "api_key_env": "STANDARDCOMPUTE_API_KEY",
+      "default_model": "standardcompute",
+      "discovery": "models_endpoint",
+      "docs_url": "https://docs.standardcompute.com/quickstart",
+      "credential_url": "https://standardcompute.com/dashboard/api-keys",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models). The standardcompute model id routes each request across models and providers; vendor-prefixed ids such as deepseek/deepseek-v4-pro pin one model. Live /v1/models is the model authority. Store STANDARDCOMPUTE_API_KEY, not a raw key.",
+      "aliases": [
+        "standard-compute"
       ]
     },
     {

@@ -5693,6 +5693,7 @@ model = "gpt-5.5"
             saved_provider_model: None,
             base_url_override: None,
             limit_overrides: Vec::new(),
+            wire_override: None,
         })
         .expect("documented Zen model must resolve");
     assert_eq!(route.protocol(), crate::route::RequestProtocol::Responses);
@@ -6040,7 +6041,7 @@ mode = "token-plan-usa"
 fn xiaomi_mimo_aliases_resolve_to_canonical_models() {
     assert_eq!(
         normalize_model_for_provider(ProviderKind::XiaomiMimo, "omni"),
-        "mimo-v2.5"
+        "mimo-v2.6-flash"
     );
     assert_eq!(
         normalize_model_for_provider(ProviderKind::XiaomiMimo, "pro-ultraspeed"),

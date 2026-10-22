@@ -34,6 +34,7 @@ fn raw_pdf_production_path_preserves_exact_bytes_without_extractor() {
             "https://example.com/raw.pdf",
             "application/pdf",
             bytes,
+            false,
             true,
             None,
             PdfTextCommand::test(missing.as_os_str(), Duration::from_millis(50), None),
@@ -92,6 +93,7 @@ fn raw_pdf_spoofs_and_contradictory_media_mime_create_no_artifact() {
                 url,
                 content_type,
                 bytes,
+                false,
                 true,
                 None,
                 request,
@@ -114,6 +116,7 @@ async fn fetched_pdf_missing_helper_is_a_failed_typed_outcome() {
         "https://example.com/document.pdf",
         "application/pdf",
         b"%PDF-1.7\n%%EOF",
+        false,
         true,
         None,
         PdfTextCommand::test(missing.as_os_str(), Duration::from_secs(1), None),
@@ -167,6 +170,7 @@ async fn fetched_pdf_host_text_matches_default_and_raw_bypasses_host() {
             "https://example.com/fixture.pdf",
             "application/pdf",
             bytes,
+            false,
             true,
             None,
             PdfTextCommand::test(binary.as_os_str(), Duration::from_secs(10), None)
@@ -179,6 +183,7 @@ async fn fetched_pdf_host_text_matches_default_and_raw_bypasses_host() {
             "https://example.com/fixture.pdf",
             "application/pdf",
             bytes,
+            false,
             true,
             None,
             PdfTextCommand::test(binary.as_os_str(), Duration::from_secs(10), None)
@@ -207,6 +212,7 @@ async fn fetched_pdf_host_text_matches_default_and_raw_bypasses_host() {
         "https://example.com/fixture.pdf",
         "application/pdf",
         bytes,
+        false,
         true,
         None,
         PdfTextCommand::test(missing.as_os_str(), Duration::from_secs(1), None).with_context(&host),
@@ -235,7 +241,7 @@ async fn raw_and_non_success_catches_do_not_hide_a_selected_host_failure() {
     flags.enable(crate::features::Feature::WebExtractHost);
     let context = ToolContext::new(root.path()).with_features(flags);
     for (format, success) in [(Format::Raw, true), (Format::Text, false)] {
-        let error=extract_fetched_document(format,"https://example.com/private", "text/html",b"<body><main>Five meaningful words survive this valid complete document content.</main></body>",success,None,PdfTextCommand::system(Some(&context))).await.unwrap_err();
+        let error=extract_fetched_document(format,"https://example.com/private", "text/html",b"<body><main>Five meaningful words survive this valid complete document content.</main></body>",false,success,None,PdfTextCommand::system(Some(&context))).await.unwrap_err();
         assert!(
             !error.content(),
             "operational Host failure cannot become raw decoded text"

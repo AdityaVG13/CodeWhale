@@ -68,7 +68,8 @@ before starting a change; preserve any local work when updating your branch.
 
 - Write tests for new functionality
 - Run the tests near your change (see [Fast local loop](#fast-local-loop));
-  CI runs the whole suite on every pull request
+  your pull request runs the Linux workspace suite and a Windows build for
+  you (see [What happens after you open a pull request](#what-happens-after-you-open-a-pull-request))
 - Colocate unit tests beside the code they cover (standard Rust `#[cfg(test)]`
   modules), and add integration tests under the owning crate's `tests/`
   directory (for example `crates/tui/tests/` or `crates/state/tests/`). The
@@ -76,36 +77,24 @@ before starting a change; preserve any local work when updating your branch.
 
 ### Pre-push verification
 
-These are the commands CI runs on every pull request. You do not need all
-of them before every push: run `cargo fmt`, then check and test the crates
-you touched (see [Fast local loop](#fast-local-loop)). Run the full set
-locally when a change spans many crates, or let CI run it for you:
+These are the Rust commands your pull request runs on Linux (the `Lint` and
+`Test (ubuntu-latest)` checks). You do not need all of them before every
+push: run `cargo fmt`, then check and test the crates you touched (see
+[Fast local loop](#fast-local-loop)). Run the full set locally when a change
+spans many crates, or let the pull request run it for you:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-features --locked -- \
-  -D warnings \
-  -A clippy::uninlined_format_args \
-  -A clippy::too_many_arguments \
-  -A clippy::unnecessary_map_or \
-  -A clippy::collapsible_if \
-  -A clippy::assertions_on_constants
-cargo test --workspace --all-features --locked
-```
-
-The release lane runs a stricter clippy that also lints test, bench, and
-example targets. Use this form for release-bound work, because
-`--all-features` alone skips lints that will fail the release lane later:
-
-```bash
 cargo clippy --workspace --all-targets --all-features --locked -- \
   -D warnings \
   -A clippy::uninlined_format_args \
   -A clippy::too_many_arguments \
-  -A clippy::unnecessary_map_or \
-  -A clippy::collapsible_if \
-  -A clippy::assertions_on_constants
+  -A clippy::unnecessary_map_or
+cargo test --workspace --all-features --locked
 ```
+
+Clippy lints test, bench and example targets too (`--all-targets`), and the
+three allowances above are the only ones CI and the release lane accept.
 
 #### Fast local loop
 
@@ -129,7 +118,7 @@ cargo install cargo-nextest --locked      # once
 scripts/dev-test.sh tui
 scripts/dev-cargo.sh nextest run --workspace --all-features --locked
 
-# 4. The authoritative gate, exactly as CI runs it on your PR:
+# 4. The Linux suite your PR runs:
 cargo test --workspace --all-features --locked
 ```
 
@@ -244,43 +233,66 @@ body. An auto-close workflow watches for this pattern and closes the
 referenced PR with credit so the contributor gets a clear signal that
 their work shipped.
 
+## What happens after you open a pull request
+
+Opening a pull request against `main` starts the checks below. They run on
+GitHub's hosted runners with no repository secrets. GitHub may ask a
+maintainer to approve the first run for a brand-new GitHub account.
+
+| Check | What it runs | When it is red |
+| --- | --- | --- |
+| `Lint` (required) | `cargo fmt --check`, clippy on every target, and the fast drift checks (locales, READMEs, provider registry, dead-code and blocking-call budgets) | Run `cargo fmt --all` and the clippy command in [Pre-push verification](#pre-push-verification); the log names the file and the check |
+| `Test (ubuntu-latest)` | The whole workspace suite on Linux with `cargo nextest`, plus doctests | Re-run the named test locally, for example `scripts/dev-test.sh tui <test name>` |
+| `Test (windows-latest)` (required) | Compiles every workspace target for Windows with warnings denied, and the installer PATH helper tests | Usually a `cfg(windows)` path or an import only Windows sees; the log has the compiler error |
+| `npm wrapper smoke (ubuntu-latest)` (required) | Builds `codewhale` and installs it through the npm wrapper | The log shows the failing install or entrypoint step |
+| `Safety gate` | The sandbox, authorization and auto-review tests | Treat it as a real regression in a trust boundary |
+| `Version drift` | Version files, the `feat:` release-note rule, release helper tests and contributor credit | The credit step only reports: a maintainer adds your credit when the PR merges |
+| `PR closes an issue` | Your description has `Closes #N`, `Refs #N` or `No-Issue: <reason>` | Edit the description, then re-run the check |
+| `DCO` | Lists commits without `Signed-off-by` | Advisory; it never blocks |
+| `Contribution gate` | Labels PRs from authors not yet in `.github/APPROVED_CONTRIBUTORS` | A label, not a judgement; see [Contribution Gate](#contribution-gate) |
+
+Smaller checks cover MSRV, the VS Code extension, integrations, the extension
+host and plugin conversion, plus workflow lint when you change
+`.github/workflows`. A documentation-only change skips the Rust builds but
+still reports the required checks, so it can merge. The Linux test suite took
+45 minutes on a recent pull request; the other checks run alongside it.
+
+Your pull request does not run the macOS and Windows test suites, the slow
+runtime-contract and persistence-backlog measurements, the dependency audits
+or the OpenHarmony build. Maintainers run those once per release, on the exact
+commit being released. If that run finds a problem your change introduced, we
+fix it on `main`; we will not ask you to chase it.
+
 ## How Your Contribution Lands
 
-We follow a deliberate "land what's useful, credit the contributor" model
-that occasionally surprises new contributors. Two paths:
+**Your pull request merges as itself.** That is the default for every
+contribution: a maintainer, or an agent working for one, reviews it and merges
+it, so your commits reach `main` with you as their author.
 
-### Path 1 — Direct merge
+Before merging, a maintainer may:
 
-If your PR is well-scoped, passes CI, doesn't touch the trust-boundary
-surface (auth / sandbox / publishing / branding), and doesn't conflict
-with main, a maintainer merges it directly. This is the most common
-outcome for small bug fixes and well-tested feature additions.
+- ask questions or request changes in review;
+- push small fixes, or a merge of current `main`, to your branch when GitHub
+  allows edits by maintainers, instead of asking you to rebase around our churn;
+- write the `CHANGELOG.md` entry and your credit in `docs/CONTRIBUTORS.md` on
+  `main` when the PR merges. You do not edit those files in your PR.
 
-### Path 2 — Harvest
+### Fallback — harvest
 
-If your PR is large, mixes scope, conflicts with main, or needs polish
-that's faster for the maintainer to apply than to round-trip with the
-contributor, the maintainer may **harvest** the useful commits or hunks
-into a new commit on `main` rather than merging the PR directly. This is
-**not a rejection** — it means your code landed.
+Rarely, a branch cannot merge in reasonable time, for example when it is in a
+fork we cannot push to and the conflicts cannot be resolved there. Then a
+maintainer may **harvest** the useful commits into `main` instead. This is
+**not a rejection**: your code landed, and your credit is kept mechanically.
 
-When this happens:
-
-- The harvested commit's message includes `Harvested from PR #N by
-  @your-handle`. This is the contract: that line is your credit and the
-  signal that your contribution shipped.
-- If the maintainer copies or adapts your code, the harvested commit also
-  keeps attribution with the original author identity when possible: either by
-  preserving the commit author on a cherry-pick or by adding a
-  `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer. This is
-  what lets GitHub's contribution surfaces recognize more than prose credit.
-  Maintainers should use `.github/AUTHOR_MAP`, or run
+- You stay the author of the harvested commit, with your GitHub-linked address
+  from `.github/AUTHOR_MAP` or
   `gh api users/<login> --jq '"\(.id)+\(.login)@users.noreply.github.com"'`,
-  rather than copying raw, `.local`, or old-style noreply emails from a
-  contributor's machine.
+  never a raw, `.local` or old-style noreply email from your machine.
+- The commit body includes `Harvested from PR #N by @your-handle`. That line is
+  the contract: it is your credit and the signal that your work shipped.
 - The `CHANGELOG.md` entry for the next release credits you by handle.
-- The auto-close workflow closes your PR with a templated thank-you and
-  a link to the commit on `main`.
+- `auto-close-harvested.yml` closes your PR with a thank-you and a link to the
+  commit on `main`.
 
 When a maintainer closes a harvested PR by hand, the closing comment
 follows this template (the pattern set on PR #2634):
@@ -297,17 +309,14 @@ PRs where their work landed, and — when the PR contained more than what
 landed — a tracking issue for the remainder. A harvested PR is never
 closed with a bare "superseded".
 
-To make a future contribution land via the faster Direct-Merge path
-instead of the Harvest path, the highest-leverage things you can do are:
+To help your PR merge quickly as itself:
 
 1. **Keep PRs single-purpose.** One bug fix per PR; one feature per PR.
    Don't mix a refactor with a feature.
-2. **Rebase onto current `main` before opening the PR**, and after CI
-   feedback. Conflicts force the harvest path even when the change is
-   small.
-3. **Include tests** with new behavior. The maintainer often harvests
-   PRs without tests because adding the test is faster than asking the
-   contributor for one.
+2. **Start from current `main`.** If `main` moves while your PR is in review,
+   you do not need to rebase; we resolve conflicts our changes caused.
+3. **Include tests** with new behavior. A PR with tests needs fewer review
+   round trips.
 4. **Avoid the trust-boundary surface** without prior maintainer
    sign-off. That includes auth/credential flows, sandbox policy,
    publishing/release plumbing, and `prompts/` content. PRs that touch
@@ -334,12 +343,9 @@ dependent layers. For those changes, use this workflow:
 6. Use `Closes #...` only when the slice fully satisfies an issue. Use
    `Refs #...` with a short `(partial)` note when the PR advances a broad issue
    but leaves follow-up work.
-7. Structured commits are fine during review. Maintainers may squash or harvest
-   at merge time, with contributor credit preserved through authorship,
-   co-author trailers, changelog entries, or PR/issue comments. When the merge
-   commit itself carries a `Harvested from PR #N by @author` line, that PR is
-   merged with rebase or a merge commit rather than squashed, so the line
-   reaches `main` intact and the auto-close credit fires.
+7. Structured commits are fine during review. Maintainers merge the PR itself
+   (merge commit, squash or rebase) with you as the author. If a layer has to
+   be harvested instead, the [fallback](#fallback--harvest) rules apply.
 
 Before asking for merge review on a layered PR, check that it is:
 
@@ -347,7 +353,8 @@ Before asking for merge review on a layered PR, check that it is:
 - marked ready for review, not draft
 - focused to one behavior boundary
 - backed by local command evidence in the PR body
-- green in CI, or has any remaining red lane clearly explained
+- green in its pull-request checks, or has any remaining red check clearly
+  explained
 - covered by round-trip or migration-preservation tests when it changes config
   or schema behavior
 - referencing broad issues as partial unless it really closes them
@@ -370,32 +377,26 @@ version of this guide pointed layered refactors at `codex/v0.9.0-stewardship`;
 that branch no longer exists, so please ignore any instruction you find
 elsewhere to base work on it.
 
-For a multi-PR series or anything that will collide with other in-flight work,
-maintainers may land your branch on an `integration/<topic>-<pr>-<date>` branch
-first and merge from there. That is our bookkeeping, not extra work for you —
-you still open the PR against `main`, and your commits reach `main` with their
-history and authorship intact.
-
 **We do not expect you to rebase around our churn.** If your PR conflicts only
 because `main` moved while it was in review, say so and a maintainer resolves
-it. If your branch is in a fork we cannot push to, we land the resolved merge
-on an integration branch rather than asking you to redo the work.
+it on your branch. If your branch is in a fork we cannot push to, we ask on the
+PR first; harvesting is the last resort.
 
 ## Contribution Gate
 
 Codewhale uses a maintainer-managed contribution gate for the community front
 door. Maintainers and collaborators bypass this gate automatically. The gate
-workflows default to dry-run / comment-only mode so maintainers can observe the
-signal before changing contributor flow.
+workflows run in dry-run mode and only add labels, so maintainers can observe
+the signal before changing contributor flow.
 
 The maintainer posture is documented in
 [docs/AGENT_ETHOS.md](docs/AGENT_ETHOS.md): automation should reduce load while
 keeping good-faith contributors seen, credited, and able to keep helping.
 
 Issues are never auto-closed by the contribution gate. Unapproved external
-issues receive a short welcome note that asks for reproduction details and then
-remain open for maintainer triage. Codewhale depends on real edge cases from
-real users, so issue intake should stay warm and open.
+issues receive a triage label and remain open for maintainers. Codewhale
+depends on real edge cases from real users, so issue intake should stay warm
+and open.
 
 Pull requests are different because they can touch code, CI, release plumbing,
 auth, sandboxing, provider policy, and other trust-boundary surfaces. The PR
@@ -445,6 +446,36 @@ specific reproduction, a minimal diff, focused checks, and a PR description that
 explains the trade-off. Do not use an agent to touch auth, credentials, sandbox
 policy, publishing/release plumbing, provider policy, telemetry, sponsorship,
 branding, or global prompts without prior maintainer sign-off.
+
+## How maintainers and agents ship
+
+Maintainers, and the agents working for them, do not open pull requests. They
+land verified work directly on `main` with the local checks they ran and their
+counts in the commit message. A push to `main` starts no GitHub build or test
+workflow: GitHub only mirrors `main` to CNB and GitCode and closes harvested
+PRs. CNB then runs its own Linux gates on the mirror and reports them on CNB,
+not on GitHub. Do not write `[skip ci]`; nothing needs skipping, and it would
+also skip the mirrors and the harvest auto-close.
+
+The exhaustive gate runs once, at the final release step, from one dispatch on
+the frozen candidate commit:
+
+```bash
+git fetch origin main
+candidate_sha="$(git rev-parse origin/main)"
+gh workflow run ci.yml --repo codewhale-hq/CodeWhale --ref main \
+  -f expected_sha="${candidate_sha}"
+```
+
+It stops if `main` no longer resolves to that commit. Otherwise it runs every
+CI gate on Linux, macOS and Windows, the budget measurements, the
+documentation build, `cargo-deny`, the cargo and npm audits and the
+OpenHarmony build. Publishing also needs a green `release-candidate.yml` run
+on the same commit, which `release.yml` checks; the full sequence is in
+[docs/RELEASE_RUNBOOK.md](docs/RELEASE_RUNBOOK.md).
+
+Contributor pull requests still merge as pull requests, as described in
+[How Your Contribution Lands](#how-your-contribution-lands).
 
 ## Project Structure
 
@@ -515,7 +546,8 @@ verification.
 - Keep PRs focused on a single change
 - Update documentation if needed
 - Add tests for new functionality
-- Ensure CI passes before requesting review
+- Get the pull-request checks green before requesting review, or say in the
+  PR why one is red
 
 ## Shape of a Typical PR
 

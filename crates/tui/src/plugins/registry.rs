@@ -847,7 +847,7 @@ fn load_state(path: &Path) -> Result<PluginStateFile, String> {
 }
 
 /// Maximum bytes read from the plugin state file.
-const MAX_PLUGIN_STATE_BYTES: u64 = 1024 * 1024;
+const MAX_PLUGIN_STATE_BYTES: u64 = 16 * 1024 * 1024;
 
 fn load_state_unlocked(path: &Path) -> Result<PluginStateFile, String> {
     let Some(file) = open_existing_regular_file(path, false)? else {
@@ -859,8 +859,9 @@ fn load_state_unlocked(path: &Path) -> Result<PluginStateFile, String> {
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     if raw.len() as u64 > MAX_PLUGIN_STATE_BYTES {
         return Err(format!(
-            "plugin state {} exceeds the 1 MiB limit",
-            path.display()
+            "plugin state {} exceeds the {} MiB limit",
+            path.display(),
+            MAX_PLUGIN_STATE_BYTES / (1024 * 1024)
         ));
     }
     let state: PluginStateFile = serde_json::from_str(&raw)
@@ -1195,7 +1196,7 @@ pub(crate) fn open_existing_regular_file(
 }
 
 #[cfg(unix)]
-fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
+pub(crate) fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = file
@@ -1211,7 +1212,7 @@ fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), Stri
 }
 
 #[cfg(windows)]
-fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
+pub(crate) fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let metadata = file
         .metadata()
@@ -1231,7 +1232,7 @@ fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), Stri
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
+pub(crate) fn validate_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), String> {
     let metadata = file
         .metadata()
         .map_err(|e| format!("failed to inspect opened {}: {e}", path.display()))?;

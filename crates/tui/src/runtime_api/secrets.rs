@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::time::Instant;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use codewhale_config::ConfigStore;
@@ -336,30 +339,7 @@ pub(super) async fn set_provider_key(
     // `GET /v1/providers` would keep reporting the provider as missing its
     // credential until the next process start. Only marker fields are
     // mirrored; the key itself never enters the runtime config.
-    {
-        let mut config = state.config.write();
-        // Match the shared writer: the root marker belongs only to the
-        // active provider, while an inactive provider keeps its own marker.
-        config
-            .verify_provider_identity(&provider_owned)
-            .map_err(ApiError::conflict)?;
-        if config.active_provider_identity().as_ref().ok() == Some(&provider_owned) {
-            config.auth_mode = Some("api_key".to_string());
-        }
-        {
-            let entry = config
-                .provider_config_for_mut(&provider_owned)
-                .map_err(|error| ApiError::conflict(error.to_string()))?;
-            entry.auth_mode = Some("api_key".to_string());
-            entry.external_credentials = None;
-            entry.api_key = None;
-            if provider_owned.provider == ProviderKind::Xai {
-                entry.oauth_credential_generation = None;
-            }
-        }
-        // No model is mirrored: saving a key never changes which model runs
-        // (see `prepare_provider_api_key_metadata`).
-    }
+    mirror_saved_key_markers(&mut state.config.write(), &provider_owned)?;
 
     let credential_state: ProviderCredentialState =
         crate::provider_readiness::credential_state_for_provider(
@@ -375,6 +355,252 @@ pub(super) async fn set_provider_key(
         "credentialState": credential_state,
         "configPath": saved_config_path,
     })))
+}
+
+fn mirror_saved_key_markers(
+    config: &mut crate::config::Config,
+    identity: &crate::config::ProviderIdentity,
+) -> Result<(), ApiError> {
+    // Match the shared writer: the root marker belongs only to the
+    // active provider, while an inactive provider keeps its own marker.
+    config
+        .verify_provider_identity(identity)
+        .map_err(ApiError::conflict)?;
+    if config.active_provider_identity().as_ref().ok() == Some(identity) {
+        config.auth_mode = Some("api_key".to_string());
+    }
+    let entry = config
+        .provider_config_for_mut(identity)
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    entry.auth_mode = Some("api_key".to_string());
+    entry.external_credentials = None;
+    entry.api_key = None;
+    if identity.provider == ProviderKind::Xai {
+        entry.oauth_credential_generation = None;
+    }
+    // No model is mirrored: saving a key never changes which model runs
+    // (see `prepare_provider_api_key_metadata`).
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ProviderConnect(Arc<parking_lot::Mutex<Option<ConnectAttempt>>>);
+
+struct ConnectAttempt {
+    id: String,
+    status: Arc<parking_lot::Mutex<ConnectStatus>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectStatus {
+    Waiting,
+    Exchanging,
+    Connected,
+    Declined,
+    Expired,
+    Cancelled,
+    Failed(&'static str),
+}
+
+impl ConnectStatus {
+    fn parts(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Waiting | Self::Exchanging => ("waiting", None),
+            Self::Connected => ("connected", None),
+            Self::Declined => ("declined", None),
+            Self::Expired => ("expired", None),
+            Self::Cancelled => ("cancelled", None),
+            Self::Failed(reason) => ("failed", Some(reason)),
+        }
+    }
+}
+
+impl ConnectAttempt {
+    fn cancel(&self) -> ConnectStatus {
+        let mut status = self.status.lock();
+        if *status == ConnectStatus::Waiting {
+            *status = ConnectStatus::Cancelled;
+        }
+        *status
+    }
+
+    fn receipt(&self, status: ConnectStatus) -> Value {
+        let (label, reason) = status.parts();
+        let mut receipt = json!({ "attemptId": self.id, "status": label });
+        if let Some(reason) = reason {
+            receipt["reason"] = json!(reason);
+        }
+        receipt
+    }
+}
+
+fn connect_provider_kind(id: &str) -> Result<(), ApiError> {
+    let row = codewhale_config::descriptors::compatibility_for_selector(id)
+        .ok_or_else(|| ApiError::bad_request(format!("Unknown provider id '{id}'")))?;
+    if row.id != row.kind.as_str() || row.kind != ProviderKind::Orcarouter {
+        return Err(ApiError::bad_request(
+            "Browser connect is available only for 'orcarouter'.",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn start_provider_connect(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    connect_provider_kind(&id)?;
+    let identity = writable_provider(&state, &id)?;
+    let (listeners, request, auth_base) = tokio::task::spawn_blocking(|| {
+        let inputs = crate::oauth::OrcaLoginInputs::from_env();
+        let listeners = crate::oauth::bind_orcarouter_callback()?;
+        let request = crate::oauth::start_orcarouter_auth_request(&listeners, &inputs)?;
+        Ok::<_, anyhow::Error>((listeners, request, inputs.auth_base))
+    })
+    .await
+    .map_err(|_| ApiError::internal("OrcaRouter connect could not start."))?
+    .map_err(|_| ApiError::internal("OrcaRouter connect could not open its local callback."))?;
+
+    let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+    let status = Arc::new(parking_lot::Mutex::new(ConnectStatus::Waiting));
+    let authorize_url = request.authorize_url.clone();
+    let deadline = Instant::now() + crate::oauth::CALLBACK_TIMEOUT;
+    let worker_state = state.clone();
+    let worker_status = status.clone();
+    std::thread::Builder::new()
+        .name("orcarouter-connect".to_string())
+        .spawn(move || {
+            let finished = run_provider_connect(
+                &worker_state,
+                &identity,
+                listeners,
+                request,
+                &auth_base,
+                deadline,
+                &worker_status,
+            );
+            *worker_status.lock() = finished;
+            let (status, reason) = finished.parts();
+            tracing::info!(
+                target: "codewhale::oauth",
+                status,
+                reason = reason.unwrap_or(""),
+                "OrcaRouter connect attempt finished"
+            );
+        })
+        .map_err(|_| ApiError::internal("OrcaRouter connect could not start."))?;
+
+    let mut current = state.provider_connect.0.lock();
+    if let Some(previous) = current.take() {
+        previous.cancel();
+    }
+    *current = Some(ConnectAttempt {
+        id: attempt_id.clone(),
+        status,
+    });
+    Ok(Json(json!({
+        "attemptId": attempt_id,
+        "authorizeUrl": authorize_url,
+        "expiresIn": crate::oauth::CALLBACK_TIMEOUT.as_secs(),
+    })))
+}
+
+fn run_provider_connect(
+    state: &RuntimeApiState,
+    identity: &crate::config::ProviderIdentity,
+    listeners: Vec<std::net::TcpListener>,
+    request: crate::oauth::BrowserAuthRequest,
+    auth_base: &str,
+    deadline: Instant,
+    status: &parking_lot::Mutex<ConnectStatus>,
+) -> ConnectStatus {
+    let cancelled = || *status.lock() == ConnectStatus::Cancelled;
+    let callback = crate::oauth::wait_for_orcarouter_callback(
+        &listeners,
+        &request.state,
+        deadline,
+        &cancelled,
+    );
+    drop(listeners);
+    let code = match callback {
+        Ok(crate::oauth::OrcaCallback::Code(code)) => code,
+        Ok(crate::oauth::OrcaCallback::Declined) => return ConnectStatus::Declined,
+        Ok(crate::oauth::OrcaCallback::Refused) => {
+            return ConnectStatus::Failed("authorization_error");
+        }
+        Ok(crate::oauth::OrcaCallback::Stopped) if cancelled() => {
+            return ConnectStatus::Cancelled;
+        }
+        Ok(crate::oauth::OrcaCallback::Stopped) => return ConnectStatus::Expired,
+        Err(_) => return ConnectStatus::Failed("callback_failed"),
+    };
+    if !credential_writeability(&state.config.read(), identity).writable {
+        return ConnectStatus::Failed("not_writable");
+    }
+    {
+        let mut current = status.lock();
+        if *current == ConnectStatus::Cancelled {
+            return ConnectStatus::Cancelled;
+        }
+        *current = ConnectStatus::Exchanging;
+    }
+    let Ok(credential) = crate::oauth::exchange_orcarouter_code(
+        &crate::oauth::ReqwestOAuthFormClient,
+        auth_base,
+        &code,
+        &request.pkce.verifier,
+    ) else {
+        return ConnectStatus::Failed("exchange_failed");
+    };
+    drop(code);
+    drop(request);
+    if !credential.scope_satisfies_purpose() {
+        return ConnectStatus::Failed("scope_refused");
+    }
+    if crate::oauth::activate_orcarouter_credential(&credential, state.config_path.as_deref())
+        .is_err()
+    {
+        return ConnectStatus::Failed("key_not_saved");
+    }
+    if mirror_saved_key_markers(&mut state.config.write(), identity).is_err() {
+        tracing::warn!(
+            target: "codewhale::oauth",
+            "OrcaRouter key saved; the running config picks it up on reload"
+        );
+    }
+    ConnectStatus::Connected
+}
+
+fn current_connect_attempt<'a>(
+    current: &'a Option<ConnectAttempt>,
+    attempt_id: &str,
+) -> Result<&'a ConnectAttempt, ApiError> {
+    current
+        .as_ref()
+        .filter(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| ApiError::not_found("No current OrcaRouter connect attempt has that id."))
+}
+
+pub(super) async fn get_provider_connect(
+    State(state): State<RuntimeApiState>,
+    Path((id, attempt_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    connect_provider_kind(&id)?;
+    let current = state.provider_connect.0.lock();
+    let attempt = current_connect_attempt(&current, &attempt_id)?;
+    let status = *attempt.status.lock();
+    Ok(Json(attempt.receipt(status)))
+}
+
+pub(super) async fn cancel_provider_connect(
+    State(state): State<RuntimeApiState>,
+    Path((id, attempt_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    connect_provider_kind(&id)?;
+    let current = state.provider_connect.0.lock();
+    let attempt = current_connect_attempt(&current, &attempt_id)?;
+    let status = attempt.cancel();
+    Ok(Json(attempt.receipt(status)))
 }
 
 /// Where the credential for a route comes from, as a *class* and never as a

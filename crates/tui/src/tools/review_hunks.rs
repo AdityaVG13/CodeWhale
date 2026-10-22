@@ -99,6 +99,11 @@ impl DiffHunks {
         Self { files }
     }
 
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     /// True when the diff touches `path` at all (post-image path match).
     #[must_use]
     pub fn touches_path(&self, path: &str) -> bool {

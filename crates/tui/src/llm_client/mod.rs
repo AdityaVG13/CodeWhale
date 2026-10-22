@@ -58,6 +58,13 @@ pub trait LlmClient: Send + Sync {
     /// Returns the model identifier being used
     fn model(&self) -> &str;
 
+    fn wire_format(&self) -> Option<codewhale_config::provider::WireFormat> {
+        None
+    }
+    fn cache_route_receipt(&self) -> Option<crate::route_receipt::TurnRouteReceipt> {
+        None
+    }
+
     /// Creates a non-streaming message completion
     fn create_message(
         &self,
@@ -468,15 +475,33 @@ impl LlmError {
     /// - Status code (429 = rate limit, 401/403 = auth, 499/5xx = transient upstream error)
     /// - Response body keywords (`context_length`, `content_policy`, safety, etc.)
     pub fn from_http_response(status: u16, body: &str) -> Self {
-        if let Some(error) = explicit_quota_code(body)
-            .or_else(|| explicit_quota_code_marker(body))
+        Self::from_http_response_with_retry_hints(
+            status,
+            body,
+            None,
+            retry_delay_from_error_body(body),
+        )
+    }
+
+    pub(crate) fn from_http_response_with_retry_hints(
+        status: u16,
+        body: &str,
+        retry_after: Option<Duration>,
+        body_retry_after: Option<Duration>,
+    ) -> Self {
+        let body_retry_after = body_retry_after.filter(|delay| *delay <= PROVIDER_RETRY_HINT_MAX);
+        let quota_code = explicit_quota_code(body).or_else(|| explicit_quota_code_marker(body));
+        if let Some(error) = quota_code
             .as_deref()
             .and_then(Self::from_subscription_sharing_error_code)
         {
             return error;
         }
         // xAI refuses an exhausted account with a 403, not a 402/429.
-        if matches!(status, 400 | 402 | 403 | 429) && has_explicit_quota_evidence(body) {
+        if matches!(status, 400 | 402 | 403 | 429)
+            && (quota_code.is_some()
+                || has_explicit_quota_phrase(body, status == 429 && body_retry_after.is_some()))
+        {
             return LlmError::QuotaExhausted(QuotaExhaustionError::from_http_message(
                 body.to_string(),
             ));
@@ -485,7 +510,7 @@ impl LlmError {
         match status {
             429 => LlmError::RateLimited {
                 message: body.to_string(),
-                retry_after: None,
+                retry_after: retry_after.or(body_retry_after),
             },
             401 => Self::authentication_error(body),
             403 => {
@@ -631,23 +656,6 @@ impl LlmError {
         }
     }
 
-    /// Constructs an `LlmError` from HTTP status code, body, and optional Retry-After header.
-    pub fn from_http_response_with_retry_after(
-        status: u16,
-        body: &str,
-        retry_after: Option<Duration>,
-    ) -> Self {
-        let mut error = Self::from_http_response(status, body);
-        if let LlmError::RateLimited {
-            retry_after: ref mut ra,
-            ..
-        } = error
-        {
-            *ra = retry_after;
-        }
-        error
-    }
-
     /// Constructs an `LlmError` from a reqwest error.
     pub fn from_reqwest(err: &reqwest::Error) -> Self {
         if err.is_timeout() {
@@ -786,13 +794,94 @@ pub(crate) fn is_context_length_message(lower: &str) -> bool {
     .any(|phrase| lower.contains(phrase))
 }
 
-/// Quota exhaustion is a durable account state, not a generic rate-limit
-/// synonym. Accept only explicit provider evidence at the HTTP/parser boundary;
-/// callers holding a stringified error must never promote it to this type.
-fn has_explicit_quota_evidence(body: &str) -> bool {
-    explicit_quota_code(body).is_some()
-        || explicit_quota_code_marker(body).is_some()
-        || has_explicit_quota_phrase(body)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImageCountRejection {
+    pub limit: Option<usize>,
+}
+
+pub(crate) fn image_count_rejection(lower: &str) -> Option<ImageCountRejection> {
+    if is_context_length_message(lower) {
+        return None;
+    }
+    let phrase = [
+        "too many images",
+        "maximum number of images",
+        "max number of images",
+        "max images",
+        "maximum images",
+        "images per request",
+        "images per prompt",
+        "images per message",
+        "image(s) may be provided",
+        "images may be provided",
+        "images can be provided",
+    ]
+    .iter()
+    .find_map(|phrase| lower.find(*phrase));
+    let number_of_images = lower.find("number of images").filter(|_| {
+        ["exceed", "more than", "at most", "limit"]
+            .iter()
+            .any(|word| lower.contains(*word))
+    });
+    let bounded_images = ["at most ", "maximum of ", "max of ", "up to "]
+        .iter()
+        .find_map(|marker| {
+            lower.match_indices(*marker).find_map(|(index, marker)| {
+                let rest = &lower[index + marker.len()..];
+                let digits =
+                    rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+                (digits > 0 && rest[digits..].trim_start().starts_with("image")).then_some(index)
+            })
+        });
+    let start = phrase.or(number_of_images).or(bounded_images)?;
+    let clause_start = lower[..start]
+        .rfind(['.', '\n', '{', '"', ';'])
+        .map_or(0, |index| index + 1);
+    let clause_end = lower[start..]
+        .find(['\n', '}', '"', ';'])
+        .map_or(lower.len(), |index| start + index);
+    let clause = &lower[clause_start..clause_end];
+    let sentence = &lower[clause_start
+        ..lower[start..clause_end]
+            .find('.')
+            .map_or(clause_end, |index| start + index)];
+    let read = |text: &str, marker: &str| {
+        text.match_indices(marker).find_map(|(index, marker)| {
+            let rest = text[index + marker.len()..].trim_start();
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let unit = ["mb", "kb", "gb", "px", "pixel", "token", "byte", "%", ">"]
+                .iter()
+                .any(|unit| rest[digits..].trim_start().starts_with(unit));
+            if digits == 0 || unit {
+                return None;
+            }
+            rest[..digits].parse::<usize>().ok()
+        })
+    };
+    let limit = [
+        "at most ",
+        "maximum of ",
+        "max of ",
+        "max is ",
+        "maximum is ",
+        "limit is ",
+        "limit of ",
+        "up to ",
+        "allowed: ",
+        "allowed ",
+        "maximum: ",
+        "max: ",
+        "max ",
+        "maximum ",
+    ]
+    .iter()
+    .find_map(|marker| read(clause, marker))
+    .or_else(|| {
+        [": ", " is "]
+            .iter()
+            .find_map(|marker| read(sentence, marker))
+    });
+    Some(ImageCountRejection { limit })
 }
 
 fn explicit_quota_code(body: &str) -> Option<String> {
@@ -848,7 +937,7 @@ fn explicit_quota_code_marker(body: &str) -> Option<String> {
     is_explicit_quota_code(code).then(|| code.to_string())
 }
 
-fn has_explicit_quota_phrase(body: &str) -> bool {
+fn has_explicit_quota_phrase(body: &str, bounded_rate_limit_hint: bool) -> bool {
     let lower = body.to_ascii_lowercase();
     let current_quota_exhausted = lower.contains("exceeded your current quota")
         || lower.contains("current quota has been exceeded");
@@ -889,7 +978,7 @@ fn has_explicit_quota_phrase(body: &str) -> bool {
         || lower.contains("credit balance exhausted")
         || lower.contains("credit balance is exhausted")
         || durable_scope_exhausted
-        || (current_quota_exhausted && plan_and_billing_guidance)
+        || (current_quota_exhausted && plan_and_billing_guidance && !bounded_rate_limit_hint)
 }
 
 fn extract_json_error_message(body: &str) -> Option<String> {

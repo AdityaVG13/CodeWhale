@@ -18,11 +18,12 @@ Put issue numbers here rather than in `feat:` commit messages: CI requires a
 ## How I tested it
 
 <!-- Commands you ran and what they showed. Test what you changed, for example
-`scripts/dev-test.sh tui <filter>`; CI runs the full suite for you.
+`scripts/dev-test.sh tui <filter>`; the PR checks run fmt, clippy, the Linux
+suite and a Windows build for you (CONTRIBUTING.md lists them).
 For visible UI changes, add a screenshot or recording. -->
 
 ## Checklist
 
-- [ ] One focused change, rebased on current `main`
+- [ ] One focused change, started from current `main` (no need to rebase when `main` moves)
 - [ ] `cargo fmt --all` passes, and tests cover new or changed behavior
 - [ ] If this adds or changes a user-facing feature, I updated its docs and its row in `docs/features.toml` (`cargo test -p codewhale-tui --test feature_registry` checks it)

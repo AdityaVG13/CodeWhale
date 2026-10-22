@@ -519,7 +519,7 @@ fn agent_arrow_hints_show_at_zero_and_one_use_and_clear_at_two() {
 /// notice used to read `Rewound to previous user message` and said nothing
 /// about files.
 #[test]
-fn rewind_notice_states_the_file_fact_first_and_names_undo_when_it_fits() {
+fn rewind_notice_states_the_file_fact_first_and_names_restore_when_it_fits() {
     use crate::tui::history::HistoryCell;
     let mut app = session_app();
     app.add_message(HistoryCell::User {
@@ -540,11 +540,11 @@ fn rewind_notice_states_the_file_fact_first_and_names_undo_when_it_fits() {
     };
     assert_eq!(
         shown(&mut app, 80).as_deref(),
-        Some("Files not changed. /undo puts them back.")
+        Some("Files not changed. Use /restore.")
     );
     assert_eq!(
         shown(&mut app, 124).as_deref(),
-        Some("Files not changed. /undo puts them back. Conversation rewound.")
+        Some("Files not changed. Use /restore. Conversation rewound.")
     );
 }
 

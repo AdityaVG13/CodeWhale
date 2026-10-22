@@ -92,7 +92,7 @@ fn agent_tool_contexts_follow_the_published_posture() {
     assert_eq!(after.shell_policy, crate::worker_profile::ShellPolicy::None);
     assert_eq!(
         after.elevated_sandbox_policy,
-        Some(crate::sandbox::SandboxPolicy::ReadOnly)
+        Some(crate::sandbox::SandboxPolicy::read_only())
     );
 }
 

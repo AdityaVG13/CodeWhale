@@ -34,6 +34,7 @@ const {
   explicitReleaseBase,
   firstPartyReleaseSources,
   githubReleaseBaseUrl,
+  openHarmonyDirections,
   releaseAssetUrl,
   releaseAssetUrlFromBase,
   releaseBinaryDirectory,
@@ -1702,6 +1703,16 @@ async function run(options = {}) {
   const version = resolvePackageVersion(pkg, env);
   const repo = resolveRepo(env);
   const paths = options.paths || binaryPaths();
+  if (
+    isInstallContext(context) &&
+    (options.platform || os.platform()) === "openharmony" &&
+    !isQuietInstall(env)
+  ) {
+    process.stderr.write(
+      `codewhale: warning: installing ${paths.codewhale.asset}, the Linux build, which is untested on native HarmonyOS/OpenHarmony.\n` +
+        `${openHarmonyDirections()}\n`,
+    );
+  }
   const releaseDir = options.releaseDir || releaseBinaryDirectory();
   await mkdir(releaseDir, { recursive: true });
 

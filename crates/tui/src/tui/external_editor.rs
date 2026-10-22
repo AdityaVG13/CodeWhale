@@ -326,9 +326,11 @@ fn suspend_tui_child_modes<W: Write>(
 
 fn disable_mouse_capture_for_child<W: Write>(writer: &mut W) {
     // Crossterm's mouse-capture command takes a WinAPI path on Windows and
-    // does not emit bytes into PTY-style terminals such as mintty. External
-    // editors inherit the PTY state, so send the xterm reset sequences
-    // directly here.
+    // does not emit bytes into PTY-style terminals such as mintty. Release
+    // the WinAPI state before resetting the inherited PTY state so resume
+    // can re-enable capture through a real console-mode transition.
+    #[cfg(windows)]
+    let _ = execute!(writer, crossterm::event::DisableMouseCapture);
     const DISABLE_MOUSE_CAPTURE: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
     if let Err(err) = writer.write_all(DISABLE_MOUSE_CAPTURE) {
         tracing::debug!(?err, "DisableMouseCapture direct reset ignored");

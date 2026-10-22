@@ -464,6 +464,7 @@ impl From<&ModelsDevLimit> for RouteLimits {
             context_tokens: limit.context,
             input_tokens: limit.input,
             output_tokens: limit.output,
+            output_declared: false,
         }
     }
 }
@@ -519,7 +520,7 @@ fn context_tier_type() -> String {
 }
 
 impl ModelsDevCost {
-    fn validate(&self) -> serde_json::Result<()> {
+    pub(crate) fn validate(&self) -> serde_json::Result<()> {
         if [
             self.input,
             self.output,
@@ -578,9 +579,7 @@ impl ModelsDevCost {
     #[must_use]
     pub fn context_tiers(&self) -> Vec<ModelsDevCostTier> {
         let mut tiers = self.tiers.clone().unwrap_or_default();
-        if !tiers
-            .iter()
-            .any(|tier| tier.tier.kind == "context" && tier.tier.size == 200_000)
+        if self.tiers.is_none()
             && let Some(cost) = &self.context_over_200k
         {
             tiers.push(ModelsDevCostTier {

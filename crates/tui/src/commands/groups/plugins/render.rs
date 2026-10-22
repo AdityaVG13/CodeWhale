@@ -321,16 +321,7 @@ pub(crate) fn escape_review_path(path: &Path) -> String {
 pub(crate) fn escape_review_text(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch.is_control()
-            || matches!(
-                ch,
-                '\u{061c}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            )
-        {
+        if ch.is_control() || codewhale_sanitize::sanitize::is_bidi_control(ch) {
             let _ = write!(escaped, "\\u{{{:x}}}", ch as u32);
         } else if matches!(
             ch,

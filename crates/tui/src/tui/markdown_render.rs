@@ -75,8 +75,13 @@ pub enum Block {
     HeadingRule,
     /// A standalone `---` / `***` / `___` horizontal rule.
     HorizontalRule,
-    /// A bullet (`-`/`*`) or ordered (`1.`) list item with its prefix and body.
-    ListItem { bullet: String, text: String },
+    /// A bullet (`-`/`*`) or ordered (`1.`) list item with its source
+    /// indent, prefix and body.
+    ListItem {
+        indent: usize,
+        bullet: String,
+        text: String,
+    },
     /// A `>` quote line with its nesting depth (1 = single `>`). The text has
     /// the quote markers stripped; depth is capped at [`MAX_QUOTE_DEPTH`].
     Quote { depth: usize, text: String },
@@ -607,6 +612,7 @@ fn push_parsed_line(
 
     if let Some((bullet, text)) = parse_list_item(trimmed) {
         blocks.push(Block::ListItem {
+            indent: raw_line[..raw_line.len() - trimmed.len()].chars().count(),
             bullet,
             text: text.to_string(),
         });
@@ -776,9 +782,14 @@ pub(crate) fn render_parsed_tagged_with_palette(
                     copy_separator_after: CopyLineSeparator::Newline,
                 });
             }
-            Block::ListItem { bullet, text } => {
+            Block::ListItem {
+                indent,
+                bullet,
+                text,
+            } => {
                 let bullet_style = Style::default().fg(palette::WHALE_ACTION);
                 out.extend(render_list_line_tagged(
+                    *indent,
                     bullet,
                     text,
                     width,
@@ -1369,13 +1380,14 @@ fn render_wrapped_code_spans_tagged(
 }
 
 fn render_list_line_tagged(
+    indent: usize,
     bullet: &str,
     text: &str,
     width: usize,
     bullet_style: Style,
     text_style: Style,
 ) -> Vec<RenderedMarkdownLine> {
-    let bullet_prefix = format!("{bullet} ");
+    let bullet_prefix = format!("{}{bullet} ", " ".repeat(indent.min(width / 2)));
     let bullet_width = bullet_prefix.width();
     let available = width.saturating_sub(bullet_width).max(1);
     let wrapped = render_line_with_links_tagged(text, available, text_style, link_style());
@@ -3047,7 +3059,7 @@ mod tests {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                Block::ListItem { bullet, text } => Some((bullet.as_str(), text.as_str())),
+                Block::ListItem { bullet, text, .. } => Some((bullet.as_str(), text.as_str())),
                 _ => None,
             })
             .collect();

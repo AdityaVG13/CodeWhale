@@ -135,6 +135,13 @@ impl ShellKind {
             ShellKind::Cmd | ShellKind::Sh | ShellKind::Bash => false,
         }
     }
+
+    pub fn is_zsh(&self) -> bool {
+        matches!(self, ShellKind::Custom { binary, .. } if Path::new(binary)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("zsh")))
+    }
 }
 
 /// Multiline, nested-quote, or non-ASCII PowerShell scripts are safer as a
@@ -409,6 +416,18 @@ impl ShellDispatcher {
         }
         let args = if matches!(self.kind, ShellKind::Cmd) {
             vec!["/C".to_string(), shell_command.to_string()]
+        } else if self.kind.is_zsh() {
+            Vec::from(
+                [
+                    "+o",
+                    "nomatch",
+                    "+o",
+                    "equals",
+                    self.kind.command_flag(),
+                    shell_command,
+                ]
+                .map(str::to_string),
+            )
         } else {
             vec![
                 self.kind.command_flag().to_string(),

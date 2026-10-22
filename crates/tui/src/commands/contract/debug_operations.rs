@@ -36,8 +36,14 @@ impl CommandDebugReceiptsContext for DebugOperationsAdapter<'_> {
             started_at: Some(app.session_started_at),
             updated_at: None,
         };
-        crate::receipts::session_receipt(source, &app.api_messages, &approvals, turn)
-            .map_err(|error| DebugReceiptError::Build(error.to_string()))
+        crate::receipts::session_receipt(
+            source,
+            &app.api_messages,
+            &approvals,
+            &app.session_turn_outcomes,
+            turn,
+        )
+        .map_err(|error| DebugReceiptError::Build(error.to_string()))
     }
 }
 
@@ -45,7 +51,7 @@ impl CommandDebugChangeContext for DebugOperationsAdapter<'_> {
     fn change_projection(&self) -> DebugChangeProjection {
         let app = self.host.app.borrow();
         DebugChangeProjection {
-            changelog: include_str!("../../../CHANGELOG.md"),
+            changelog: crate::whats_new::BUNDLED_CHANGELOG,
             is_english: app.ui_locale == codewhale_localization::Locale::En,
             translation_available: !app.offline_mode && !app.onboarding_needs_api_key,
             translation_target: app.ui_locale.translation_target_name(),
@@ -248,8 +254,8 @@ fn request_prompts(app: &App) -> Vec<Option<String>> {
 
 type RequestPositionResult = Result<Option<bool>, Box<DebugUndoOutcome>>;
 
-/// Match only lossless, unique prompt labels. Display snippets are not durable
-/// request identities: repeated, multiline, truncated or multipart prompts cannot
+/// Match only unique prompt snippets. Display snippets are not durable
+/// request identities: repeated snippets or multipart prompts cannot
 /// authorize a combined file/conversation rollback. `/restore` remains explicit.
 fn request_is_last(
     requests: &[Option<String>],
@@ -269,17 +275,21 @@ fn request_is_last(
             .to_string(),
         ))
     };
-    // A held request with missing or shortened text could be the candidate
-    // even when its display label appears to name an older request.
-    if requests.iter().any(|prompt| {
-        prompt.as_deref().is_none_or(|prompt| {
-            prompt.is_empty() || snapshot_label_prompt_snippet(prompt).as_deref() != Some(prompt)
-        })
-    }) {
+    if requests.iter().any(Option::is_none) {
         return Err(refusal());
     }
+    let requests: Vec<_> = requests
+        .iter()
+        .map(|prompt| {
+            prompt
+                .as_deref()
+                .and_then(snapshot_label_prompt_snippet)
+                .map(|snippet| snippet.trim_end().to_string())
+                .filter(|snippet| !snippet.is_empty())
+        })
+        .collect();
     let request = parse_snapshot_label(label).prompt_snippet;
-    let Some(prompt) = request.as_deref().filter(|prompt| {
+    let Some(prompt) = request.as_deref().map(str::trim_end).filter(|prompt| {
         !prompt.is_empty() && snapshot_label_prompt_snippet(prompt).as_deref() == Some(*prompt)
     }) else {
         return Err(refusal());
@@ -291,7 +301,7 @@ fn request_is_last(
     if matches != 1
         || owned_request_snippets
             .iter()
-            .filter(|candidate| candidate.as_deref() == Some(prompt))
+            .filter(|candidate| candidate.as_deref().map(str::trim_end) == Some(prompt))
             .count()
             > 1
     {
@@ -299,7 +309,9 @@ fn request_is_last(
         // prompts would still confuse an older occurrence with the latest.
         return Err(refusal());
     }
-    Ok(Some(requests.last() == Some(&request)))
+    Ok(Some(
+        requests.last().and_then(Option::as_deref) == Some(prompt),
+    ))
 }
 
 /// Deepest fork chain [`snapshot_owners`] follows. A chain this long is

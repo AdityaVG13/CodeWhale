@@ -59,7 +59,7 @@ fn enforced_readonly_refuses_an_unenforced_or_writable_prepared_environment() {
         env: HashMap::new(),
         timeout: Duration::from_secs(1),
         sandbox_type: SandboxType::None,
-        policy: ExecutionSandboxPolicy::ReadOnly,
+        policy: ExecutionSandboxPolicy::read_only(),
     };
     assert!(require_native_readonly_execution(&environment).is_err());
     #[cfg(target_os = "macos")]
@@ -200,9 +200,10 @@ async fn enforced_readonly_native_python_cannot_reach_a_loopback_listener() {
     // #6305: the sandbox replaces /tmp with a fresh tmpfs, so a fixture
     // rooted there vanishes before --chdir reaches it.
     let tmp = crate::test_support::sandbox_visible_tempdir();
-    let Some(context) = native_context(tmp.path()) else {
+    let Some(mut context) = native_context(tmp.path()) else {
         return;
     };
+    context.elevated_sandbox_policy = Some(ExecutionSandboxPolicy::default());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();

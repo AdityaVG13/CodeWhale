@@ -285,6 +285,12 @@ pub fn session_artifacts_dir(sessions_dir: &Path, session_id: &str) -> io::Resul
     }
 }
 
+pub(crate) fn export_recovery_hint(session_id: &str) -> String {
+    format!(
+        "To keep its history without that provider, run `codewhale sessions export {session_id}`."
+    )
+}
+
 /// Default archive file name for a session:
 /// `codewhale-session-<short-id>.tar.xz`.
 pub fn default_archive_file_name(metadata: &SessionMetadata) -> String {

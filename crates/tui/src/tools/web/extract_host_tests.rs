@@ -30,8 +30,8 @@ async fn real_host_complete_html_region_selection_preserves_all_document_bytes()
         "Meaningful 漢字 words remain complete. ".repeat(40_000)
     );
     for html in ["<body><article>short</article><main>Five meaningful words survive this complete main-region extraction path.</main></body>".to_owned(),"<body><article>Five meaningful words stay in first article region.</article><main>Other valid words live in the second main region.</main></body>".into(),large] {
-        let expected=extract_document("https://example.com/docs/page",Some("text/html"),html.as_bytes(),Some(&rust)).await.unwrap();
-        let actual=extract_document("https://example.com/docs/page",Some("text/html"),html.as_bytes(),Some(&host)).await.unwrap();
+        let expected=extract_document("https://example.com/docs/page",Some("text/html"),html.as_bytes(),false,Some(&rust)).await.unwrap();
+        let actual=extract_document("https://example.com/docs/page",Some("text/html"),html.as_bytes(),false,Some(&host)).await.unwrap();
         assert_eq!(actual.text,expected.text);assert_eq!(actual.markdown,expected.markdown);assert_eq!(actual.cleaned_html,expected.cleaned_html);assert_eq!(actual.title,expected.title);
         if html.contains("END_SENTINEL"){assert!(actual.text.contains("END_SENTINEL"));assert!(actual.markdown.len()>1024*1024);}
     }
@@ -39,6 +39,7 @@ async fn real_host_complete_html_region_selection_preserves_all_document_bytes()
         "https://example.com/shell",
         Some("text/html"),
         b"<body><div id='root'></div></body>",
+        false,
         Some(&host),
     )
     .await

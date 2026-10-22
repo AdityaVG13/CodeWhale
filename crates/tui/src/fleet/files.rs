@@ -116,7 +116,26 @@ impl WorkspaceFile {
         };
         // Use the established credential/artifact openat pattern, without
         // touching credentials or creating a second filesystem store.
+        //
+        // The anchor and every intermediate component are only pinned, never
+        // read, and the final `openat` on the filename applies the real
+        // access mode. On Linux, `O_PATH` pins a directory without read
+        // permission, which keeps this working on Android: SELinux grants
+        // apps search but not read on `/` and mount-point directories, so
+        // `open("/", O_RDONLY|O_DIRECTORY)` fails with EACCES there and
+        // every confined read/write was denied (#6980). O_PATH|O_DIRECTORY
+        // still refuses non-directories (ENOTDIR), so the per-component type
+        // check below is unchanged. Other Unixes have no O_PATH and keep the
+        // readable-directory anchor.
         // SAFETY: static path and immediate ownership of a successful fd.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let fd = unsafe {
+            libc::open(
+                c"/".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let fd = unsafe {
             libc::open(
                 c"/".as_ptr(),
@@ -138,6 +157,13 @@ impl WorkspaceFile {
                     return Err(invalid_path());
                 };
                 let name = std::ffi::CString::new(name.as_bytes())?;
+                // Pin only: the caller opens the entry for real through
+                // this directory fd; intermediate components need neither
+                // read permission nor access to their contents. The flags
+                // still reject non-directories on every platform.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
                 // SAFETY: directory pins the parent; name is one component.
                 let mut fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
@@ -161,6 +187,27 @@ impl WorkspaceFile {
                 // SAFETY: fd is freshly owned.
                 directory = unsafe { File::from_raw_fd(fd) };
             }
+        }
+        // The walk above pinned every component O_PATH, and O_PATH fds cannot
+        // be fsynced (EBADF) or read. Reopen the file's immediate parent with
+        // real access flags through the pinned walk so `sync_all`, `renameat`
+        // and every other use of `directory` keeps working. This open cannot
+        // follow a link or escape: it resolves "." inside the pinned parent
+        // itself, and O_NOFOLLOW is irrelevant for an exact "." entry.
+        {
+            use std::os::fd::AsRawFd;
+            let real_fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    c".".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if real_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fd is freshly owned; the O_PATH fd it replaces is dropped.
+            directory = unsafe { File::from_raw_fd(real_fd) };
         }
         Ok(Self {
             directory,

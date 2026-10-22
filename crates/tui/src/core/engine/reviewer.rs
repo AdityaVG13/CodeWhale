@@ -119,6 +119,9 @@ pub(crate) async fn consult_reviewer(
             None,
         );
     }
+    let deepseek = client.provider_name() == crate::config::ProviderKind::Deepseek.as_str();
+    let reasoning_effort = deepseek.then(|| "low".to_string());
+    let temperature = reasoning_effort.is_none().then_some(0.0);
     let request = MessageRequest {
         model: client.model().to_string(),
         messages: vec![Message {
@@ -134,9 +137,9 @@ pub(crate) async fn consult_reviewer(
         tool_choice: None,
         metadata: None,
         thinking: None,
-        reasoning_effort: None,
+        reasoning_effort,
         stream: Some(false),
-        temperature: Some(0.0),
+        temperature,
         top_p: None,
     };
     if cancel_token.is_cancelled() {

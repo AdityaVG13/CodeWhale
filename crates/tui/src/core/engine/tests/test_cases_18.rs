@@ -866,6 +866,7 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
     let cancel_token = CancellationToken::new();
     let handle = EngineHandle {
         goal_state: new_shared_goal_state(),
+        sandbox_enforcement: crate::sandbox::policy::SandboxEnforcement::Unavailable,
         tx_op,
         rx_event: Arc::new(RwLock::new(mpsc::channel::<Event>(1).1)),
         cancel_token: Arc::new(StdMutex::new(cancel_token)),
@@ -892,6 +893,8 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
             std::env::temp_dir(),
             1,
         ),
+        terminal_worker_events: None,
+        mcp_pool_slot: Arc::default(),
     };
 
     // Fill the op channel with one message (capacity = 1).
@@ -1180,6 +1183,7 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
             McpAccess::Connect,
             route,
             "",
+            None,
         );
         tokio::pin!(build);
         std::future::poll_fn(|cx| {
@@ -1700,6 +1704,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             McpAccess::Connect,
             route,
             "discovery",
+            None,
         )
         .await;
     (engine, build.surface, tmp, model)

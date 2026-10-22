@@ -32,7 +32,9 @@ use codewhale_models::{
 
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
-use super::wire::{extract_sse_data_value, flush_sse_line, push_sse_event_data, take_sse_line};
+use super::wire::{
+    extract_sse_data_value, flush_sse_line, push_sse_event_data, take_sse_line_from_slice,
+};
 use super::{
     CodewhaleClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
     SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer,
@@ -1213,9 +1215,9 @@ pub(crate) fn build_chat_wire_body(
             body["tools"] = json!(chat_tools);
         }
     }
-    if should_send_tool_choice_for_chat(provider, request.reasoning_effort.as_deref())
-        && let Some(choice) = request.tool_choice.as_ref()
+    if let Some(choice) = request.tool_choice.as_ref()
         && let Some(mapped) = map_tool_choice_for_chat(choice)
+        && should_send_tool_choice_for_chat(provider, request.reasoning_effort.as_deref(), &mapped)
     {
         if matches!(provider, crate::config::ProviderKind::Moonshot)
             && let Some(name) = mapped.pointer("/function/name").and_then(Value::as_str)
@@ -1335,36 +1337,25 @@ impl CodewhaleClient {
         url: &str,
         body: &Value,
     ) -> Result<(reqwest::Response, Duration)> {
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize JSON request body")?;
         let open_req = self.stream_open_request();
         let idle_timeout = open_req.idle_timeout;
-        let response = super::stream_entry::open_sse_response(&open_req, |policy| async move {
-            match policy {
-                // The prebuilt HTTP/1.1 twin carries the same default
-                // headers/auth; send once, without the JSON retry loop
-                // (matching the pre-seam H1-pin behavior).
-                super::stream_entry::StreamHttpPolicy::Http1Only => {
-                    let client = super::stream_entry::client_for_policy(
-                        &self.http_client,
-                        self.http1_fallback_client(),
-                        policy,
-                    );
-                    Ok(self
-                        .authorize_plugin_request(
-                            client
-                                .post(url)
-                                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                .json(body),
-                        )
-                        .await?
-                        .send()
-                        .await?)
-                }
-                super::stream_entry::StreamHttpPolicy::DualWithH1Fallback => {
-                    // Stream open, not a JSON retry: the response body outlives
-                    // the open, so this path must not carry any total deadline
-                    // (`open_stream_json_with_retry`, not `send_json_with_retry`).
-                    self.open_stream_json_with_retry(url, body).await
-                }
+        let response = super::stream_entry::open_sse_response(&open_req, |policy| {
+            let request_body = request_body.clone();
+            async move {
+                let client = super::stream_entry::client_for_policy(
+                    &self.http_client,
+                    self.http1_fallback_client(),
+                    policy,
+                );
+                self.send_stream_open_with_retry(|| {
+                    client
+                        .post(url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(request_body.clone())
+                })
+                .await
             }
         })
         .await?;
@@ -1388,7 +1379,19 @@ impl CodewhaleClient {
         } = prepared;
         let url = endpoint.url;
 
-        let (response, stream_idle_timeout) = self.open_chat_stream_response(&url, &body).await?;
+        let (response, stream_idle_timeout) =
+            match self.open_chat_stream_response(&url, &body).await {
+                Ok(opened) => opened,
+                Err(error) => {
+                    // If DeepSeek rejected for missing reasoning_content despite the
+                    // sanitizer, dump the offending indices so we can diagnose where
+                    // they came from on the next failure.
+                    if format!("{error:#}").contains("reasoning_content") {
+                        log_thinking_mode_violations(&body);
+                    }
+                    return Err(error);
+                }
+            };
 
         let status = response.status();
         crate::client::record_provider_response(self.api_provider, status.as_u16());
@@ -1399,13 +1402,11 @@ impl CodewhaleClient {
                 status.as_u16(),
                 &raw_error_text,
             );
-            // If DeepSeek rejected for missing reasoning_content despite the
-            // sanitizer, dump the offending indices so we can diagnose where
-            // they came from on the next failure.
-            if error_text.contains("reasoning_content") {
-                log_thinking_mode_violations(&body);
-            }
-            anyhow::bail!("SSE stream request failed: HTTP {status}: {error_text}");
+            return Err(crate::llm_client::LlmError::from_http_response(
+                status.as_u16(),
+                &error_text,
+            )
+            .into());
         }
 
         let api_provider = self.api_provider;
@@ -1548,8 +1549,9 @@ impl CodewhaleClient {
                 // a `\n` so an HTTP/2 DATA split mid-character cannot become
                 // U+FFFD; genuine invalid bytes fail closed.
                 let mut lines_processed = 0usize;
+                let mut remaining = byte_buf.as_slice();
                 loop {
-                    let line = match take_sse_line(&mut byte_buf) {
+                    let line = match take_sse_line_from_slice(&mut remaining) {
                         Ok(Some(line)) => line,
                         Ok(None) => break,
                         Err(err) => {
@@ -1638,6 +1640,9 @@ impl CodewhaleClient {
                         tokio::task::yield_now().await;
                     }
                 }
+                // Move the unterminated tail once per chunk, not once per line.
+                let consumed = byte_buf.len() - remaining.len();
+                byte_buf.drain(..consumed);
             }
 
             // Flush a final SSE frame that arrived without a terminating blank
@@ -1827,7 +1832,6 @@ impl<'a> PromptBuilder<'a> {
             ),
             false,
         );
-        dump_system_prompt_if_requested(&messages);
         if provider == ProviderKind::Arcee {
             apply_arcee_waf_safe_message_encoding(&mut messages);
         }
@@ -1907,38 +1911,82 @@ const SYSTEM_PROMPT_DUMP_BEGIN: &str = "<<<CODEWHALE_SYSTEM_PROMPT_BEGIN>>>";
 const SYSTEM_PROMPT_DUMP_END: &str = "<<<CODEWHALE_SYSTEM_PROMPT_END>>>";
 const ARCEE_WAF_TEXT_SPLIT_TRIGGERS: &[(&str, &str, &str)] = &[("python -c", "python ", "-c")];
 
-fn dump_system_prompt_if_requested(messages: &[Value]) {
+/// Dump the wire prefix (system region + tools array) when the
+/// system-prompt dump flag is set, so prefix-token audits can measure the
+/// catalog beside the prompt. Called once from
+/// [`PreparedOutboundRequest::new`](super::prepared::PreparedOutboundRequest::new),
+/// the single funnel for all three wire dialects, so the bytes are the
+/// exact-final-body bytes. Debug-only, zero production impact.
+pub(crate) fn dump_wire_prefix_if_requested(body: &Value) {
     let Ok(flag) = std::env::var(SYSTEM_PROMPT_DUMP_ENV) else {
         return;
     };
     if !matches!(flag.trim(), "1" | "true" | "TRUE" | "yes" | "YES") {
         return;
     }
-    let Some(prompt) = messages.iter().find_map(system_message_text) else {
-        return;
-    };
     let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_BEGIN}");
-    let _ = writeln!(stderr, "{prompt}");
-    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_END}");
+    if let Some(prompt) = wire_system_text(body) {
+        let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_BEGIN}");
+        let _ = writeln!(stderr, "{prompt}");
+        let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_END}");
+    }
+    if let Some(tools) = body.get("tools") {
+        let _ = writeln!(stderr, "<<<CODEWHALE_WIRE_TOOLS_BEGIN>>>");
+        let _ = writeln!(stderr, "{tools}");
+        let _ = writeln!(stderr, "<<<CODEWHALE_WIRE_TOOLS_END>>>");
+    }
 }
 
-fn system_message_text(message: &Value) -> Option<String> {
-    if message.get("role").and_then(Value::as_str) != Some("system") {
-        return None;
+/// Best-effort system-region text across the three wire dialects:
+/// Anthropic `system` (string or blocks), Responses `instructions`, and
+/// chat `messages[]` with a system/developer role.
+fn wire_system_text(body: &Value) -> Option<String> {
+    if let Some(system) = body.get("system") {
+        return Some(match system {
+            Value::String(text) => text.clone(),
+            Value::Array(parts) => {
+                let text = parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.is_empty() {
+                    system.to_string()
+                } else {
+                    text
+                }
+            }
+            _ => system.to_string(),
+        });
     }
-    match message.get("content")? {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(parts) => {
-            let text = parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("");
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+        return Some(instructions.to_string());
     }
+    body.get("messages")?
+        .as_array()?
+        .iter()
+        .find_map(|message| {
+            if !matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            ) {
+                return None;
+            }
+            match message.get("content")? {
+                Value::String(text) => Some(text.clone()),
+                Value::Array(parts) => {
+                    // Same "\n" block join as the Anthropic arm above, so
+                    // the audit text is dialect-consistent.
+                    let text = parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.is_empty()).then_some(text)
+                }
+                _ => None,
+            }
+        })
 }
 
 fn apply_arcee_waf_safe_message_encoding(messages: &mut [Value]) {
@@ -3223,11 +3271,15 @@ fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
     }
 }
 
-fn should_send_tool_choice_for_chat(provider: ProviderKind, effort: Option<&str>) -> bool {
+fn should_send_tool_choice_for_chat(
+    provider: ProviderKind,
+    effort: Option<&str>,
+    choice: &Value,
+) -> bool {
     if !matches!(provider, ProviderKind::Deepseek) {
         return true;
     }
-    !reasoning_effort_enables_thinking(effort)
+    !reasoning_effort_enables_thinking(effort) || choice.as_str() == Some("none")
 }
 
 fn reasoning_effort_enables_thinking(effort: Option<&str>) -> bool {
@@ -3733,6 +3785,18 @@ fn parse_chat_message_for_route(
     provider: ProviderKind,
     base_url: &str,
 ) -> Result<MessageResponse> {
+    let payload = match (
+        payload.get("choices"),
+        payload.get("success"),
+        payload.get("data"),
+    ) {
+        (None, Some(Value::Bool(true)), Some(data))
+            if data.get("choices").is_some_and(Value::is_array) =>
+        {
+            data
+        }
+        _ => payload,
+    };
     let id = payload
         .get("id")
         .and_then(Value::as_str)
@@ -3762,6 +3826,7 @@ fn parse_chat_message_for_route(
         content_blocks.push(ContentBlock::Thinking {
             signature: None,
             state: None,
+            redacted_data: None,
             thinking: reasoning.to_string(),
         });
     }
@@ -3775,6 +3840,7 @@ fn parse_chat_message_for_route(
             signature: None,
             state: None,
             thinking,
+            redacted_data: None,
         });
     }
     if let Some(text) = mistral_text.filter(|s| !s.trim().is_empty()) {
@@ -4490,15 +4556,24 @@ mod stream_diagnostics_tests {
     }
 
     #[test]
-    fn deepseek_thinking_omits_tool_choice() {
+    fn deepseek_thinking_sends_only_none_tool_choice() {
+        let required = json!("required");
+        let named = json!({
+            "type": "function",
+            "function": { "name": "read_file" }
+        });
         for effort in [Some("high"), Some("max"), Some("medium"), Some("")] {
             assert!(
-                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort),
-                "DeepSeek thinking rejects explicit tool_choice for {effort:?}"
+                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort, &required),
+                "DeepSeek thinking rejects required tool_choice for {effort:?}"
             );
             assert!(
-                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort),
-                "DeepSeek CN thinking rejects explicit tool_choice for {effort:?}"
+                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort, &named),
+                "DeepSeek thinking rejects named tool_choice for {effort:?}"
+            );
+            assert!(
+                should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort, &json!("none")),
+                "DeepSeek thinking accepts tool_choice none for {effort:?}"
             );
         }
 
@@ -4511,12 +4586,14 @@ mod stream_diagnostics_tests {
         ] {
             assert!(should_send_tool_choice_for_chat(
                 ProviderKind::Deepseek,
-                effort
+                effort,
+                &required
             ));
         }
         assert!(should_send_tool_choice_for_chat(
             ProviderKind::Openrouter,
-            Some("high")
+            Some("high"),
+            &required
         ));
     }
 
@@ -4683,6 +4760,7 @@ mod minimax_reasoning_replay_tests {
                         thinking: "Inspect tool state".to_string(),
                         signature: None,
                         state: None,
+                        redacted_data: None,
                     },
                     ContentBlock::Text {
                         text: "Done.".to_string(),
@@ -4783,6 +4861,7 @@ mod minimax_reasoning_replay_tests {
                         thinking: "stale thinking from the prior turn".to_string(),
                         signature: None,
                         state: None,
+                        redacted_data: None,
                     },
                     ContentBlock::Text {
                         text: "I'll read the widget first.".to_string(),
@@ -7316,6 +7395,7 @@ mod mistral_reasoning_tests {
                                 .to_string(),
                             signature: None,
                             state: None,
+                            redacted_data: None,
                         },
                         ContentBlock::Text {
                             text: "I will inspect it now.".to_string(),

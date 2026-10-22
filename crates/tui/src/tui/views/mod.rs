@@ -122,7 +122,11 @@ pub(crate) fn render_modal_surface(area: Rect, popup_area: Rect, buf: &mut Buffe
 
     Clear.render(popup_area, buf);
     Block::default()
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .render(popup_area, buf);
 }
 
@@ -146,7 +150,11 @@ pub(crate) fn render_underwater_surface(
     };
     Clear.render(area, buf);
     Block::default()
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .render(area, buf);
     // Ratatui clips long block titles at the border edge without signalling
     // that anything is missing. Reserve the corner cells and semantic-ellipsis
@@ -162,7 +170,11 @@ pub(crate) fn render_underwater_surface(
         )))
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .padding(Padding::new(1, 1, u16::from(area.height >= 24), 0));
     let inner = block.inner(surface);
     block.render(surface, buf);
@@ -1185,6 +1197,9 @@ pub enum ViewAction {
 
 pub trait ModalView: std::any::Any {
     fn kind(&self) -> ModalKind;
+    fn input_context_id(&self) -> usize {
+        0
+    }
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction;
     /// Returns `true` if the modal consumed the paste; `false` to let the
     /// host route the text elsewhere (e.g. drop it because a modal is open,
@@ -1250,10 +1265,10 @@ pub struct ViewStack {
     /// Theme snapshot for the texture pass, set alongside the mode each
     /// frame. `None` (e.g. tests that never opt in) disables the texture.
     focus_texture_theme: Option<codewhale_palette::UiTheme>,
-    /// When the view now on top became the top view — pushed, or revealed
-    /// by closing or removing the views above it. A key observed before
+    /// When the input context on top became visible — pushed, advanced, or
+    /// revealed by closing or removing the views above it. A key observed before
     /// this instant was typed at something else and must never answer an
-    /// approval or elevation card that only then became visible (approvals M2).
+    /// approval, elevation or question prompt that only then became visible.
     top_since: Option<std::time::Instant>,
 }
 
@@ -1275,16 +1290,19 @@ impl ViewStack {
         }
     }
 
-    /// Identity of the top view, for noticing when a different view becomes
-    /// the top one.
-    fn top_identity(&self) -> Option<*const ()> {
-        self.views
-            .last()
-            .map(|view| std::ptr::from_ref::<dyn ModalView>(view.as_ref()).cast::<()>())
+    /// Identity of the top view and input context, for noticing when a
+    /// different view or question becomes the top one.
+    fn top_identity(&self) -> Option<(*const (), usize)> {
+        self.views.last().map(|view| {
+            (
+                std::ptr::from_ref::<dyn ModalView>(view.as_ref()).cast::<()>(),
+                view.input_context_id(),
+            )
+        })
     }
 
     /// Restamp `top_since` when the top view changed since `before`.
-    fn note_top_change(&mut self, before: Option<*const ()>) {
+    fn note_top_change(&mut self, before: Option<(*const (), usize)>) {
         if self.top_identity() != before {
             self.top_since = Some(std::time::Instant::now());
         }
@@ -1376,13 +1394,14 @@ impl ViewStack {
     }
 
     /// Whether a key observed at `observed_at` predates the moment the
-    /// approval or elevation card on top became visible — raised, or revealed
-    /// by closing the card above it — i.e. it was typed ahead and must not
-    /// answer that card. Two quick answers cannot confirm the card beneath.
+    /// approval, elevation or question prompt on top became visible — raised,
+    /// advanced, or revealed by closing the card above it — i.e. it was typed
+    /// ahead and must not answer that prompt. Two quick answers cannot confirm
+    /// the next prompt.
     pub fn key_predates_top_approval(&self, observed_at: std::time::Instant) -> bool {
         matches!(
             self.top_kind(),
-            Some(ModalKind::Approval | ModalKind::Elevation)
+            Some(ModalKind::Approval | ModalKind::Elevation | ModalKind::UserInput)
         ) && self
             .top_since
             .is_some_and(|top_since| observed_at < top_since)
@@ -1478,11 +1497,13 @@ impl ViewStack {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<ViewEvent> {
+        let top = self.top_identity();
         let action = self
             .views
             .last_mut()
             .map(|view| view.handle_key(key))
             .unwrap_or(ViewAction::None);
+        self.note_top_change(top);
         self.apply_action(action)
     }
 
@@ -4367,6 +4388,7 @@ impl ModalView for ConfigView {
 
         let inner =
             render_underwater_surface(area, buf, self.tr(MessageId::ConfigModalTitle).to_string());
+        let mut choice_rail = None;
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
             *self.last_choice_hitboxes.borrow_mut() = Vec::new();
             *self.last_editor_controls.borrow_mut() = Vec::new();
@@ -4463,6 +4485,21 @@ impl ModalView for ConfigView {
                     .min(max_start);
                 let end = (start + visible_options).min(choices.len());
                 let mut hitboxes = Vec::new();
+                let scrolls = visible_options < choices.len();
+                if scrolls {
+                    choice_rail = Some((
+                        Rect {
+                            x: inner.x,
+                            y: inner.y.saturating_add(lines.len() as u16),
+                            width: inner.width,
+                            height: u16::try_from(visible_options).unwrap_or(u16::MAX),
+                        },
+                        choices.len(),
+                        start,
+                        visible_options,
+                    ));
+                }
+                let label_width = usize::from(inner.width).saturating_sub(8 + usize::from(scrolls));
 
                 for (choice_idx, choice) in choices.iter().enumerate().take(end).skip(start) {
                     let selected = choice_idx == edit.selected_choice;
@@ -4473,7 +4510,7 @@ impl ModalView for ConfigView {
                         Rect {
                             x: inner.x,
                             y: line_y,
-                            width: inner.width,
+                            width: inner.width.saturating_sub(u16::from(scrolls)),
                             height: 1,
                         },
                         choice_idx,
@@ -4481,7 +4518,7 @@ impl ModalView for ConfigView {
                     let mut line = Line::from(format!(
                         "  {marker} {:>2}. {}",
                         choice_idx + 1,
-                        truncate_view_text(&label, usize::from(inner.width).saturating_sub(8))
+                        truncate_view_text(&label, label_width)
                     ));
                     line.style = if selected {
                         menu_style::selected_row_style()
@@ -4547,6 +4584,9 @@ impl ModalView for ConfigView {
             .style(Style::default().fg(palette::TEXT_PRIMARY))
             .scroll((0, 0))
             .render(body, buf);
+        if let Some((rail, total, offset, visible)) = choice_rail {
+            render_panel_scroll_rail(rail, buf, total, offset, visible, true);
+        }
         if content.height > 0 {
             self.render_editor_controls(
                 Rect {
@@ -5300,25 +5340,26 @@ impl ConfigView {
         let context_percent = self.snapshot.context_budget.as_ref().map_or(0, |budget| {
             u8::try_from(budget.percent_basis_points / 100).unwrap_or(100)
         });
-        let mode = value_of("default_mode").unwrap_or_else(|| "agent".to_string());
-        let mode_ink = match mode.as_str() {
-            "plan" => palette::ChromeInk::PolicyPlan,
-            "operate" => palette::ChromeInk::PolicyOperate,
-            _ => palette::ChromeInk::PolicyAct,
-        };
-        let permission = value_of("approval_mode")
+        let mode = value_of("default_mode").map_or(codewhale_config::AppMode::Agent, |value| {
+            codewhale_config::AppMode::from_setting(&value)
+        });
+        let approval = value_of("approval_mode")
             .or_else(|| value_of("permission_posture"))
-            .unwrap_or_else(|| "ask".to_string());
-        let permission_ink = match permission.as_str() {
-            "auto-review" => palette::ChromeInk::PermissionAutoReview,
-            "full-access" => palette::ChromeInk::PermissionFullAccess,
-            _ => palette::ChromeInk::PermissionAsk,
-        };
+            .and_then(|value| codewhale_execpolicy::ApprovalMode::from_config_value(&value))
+            .unwrap_or(codewhale_execpolicy::ApprovalMode::Suggest);
+        let mode_label = crate::tui::underwater::mode_label(self.locale, mode);
+        let permission = crate::core::authority::permission_label_for(self.locale, mode, approval);
         let footer = crate::tui::phase_strip::TidelineFooter::new(
             &theme,
-            (permission.as_str(), permission_ink),
+            (
+                permission.as_ref(),
+                crate::tui::underwater::header_permission_ink(approval),
+            ),
         )
-        .mode_chip(Some((mode.as_str(), mode_ink)))
+        .mode_chip(Some((
+            mode_label.as_ref(),
+            crate::tui::underwater::header_mode_ink(mode),
+        )))
         .context_percent(context_percent);
         crate::tui::phase_strip::render_tideline_footer(
             Rect {

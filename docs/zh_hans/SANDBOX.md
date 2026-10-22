@@ -34,7 +34,10 @@ Seatbelt profile。
 
 - 大范围的文件系统读取；
 - 写入受所选策略限制，范围包括工作区，以及受支持工具所需的特定运行时/缓存路径；
-- 只有在策略允许时才放开网络访问。
+- 只有在策略允许时才放开网络访问。带网络的 `read-only` 策略（智能体的
+  `read_only: true` shell 模式）只获得出站 IPv4 和系统 DNS 解析器。IPv6 以及本机
+  自己的地址（包括回环地址）都被拒绝，只有 `HTTP_PROXY`、`HTTPS_PROXY` 或
+  `ALL_PROXY` 指定的本地代理服务器端口例外；其他本地套接字仍被拒绝。
 
 探测失败，或 `sandbox-exec` 不可用时，Codewhale 会报告未启用操作系统沙箱，
 直接启动命令，不套 Seatbelt 包装器。这条回退路径上也不会打任何 Seatbelt 标记。
@@ -84,7 +87,10 @@ prefer_bwrap = false
 
 在 `read-only` 下没有任何可写绑定，所以工作目录仍留在只读根视图里。
 `--unshare-all` 默认隔离网络命名空间；只有当策略中的 `network_access` 为 true
-时，Codewhale 才补上 `--share-net`。`danger-full-access` 和 `external-sandbox`
+时，Codewhale 才补上 `--share-net`。智能体的 `read_only: true` shell 模式只在 Full
+Access（完全访问）下开启网络（见 [子智能体](SUBAGENTS.md)）；此时它与联网的
+`workspace-write` shell 一样共享主机网络命名空间，包括回环地址和抽象 unix 套接字，
+bubblewrap 对两者都不做过滤。`danger-full-access` 和 `external-sandbox`
 完全绕过本地包装器。
 
 如果用户选择退出，或者 `/usr/bin/bwrap` 不存在、不可执行、或实际上无法
@@ -154,6 +160,10 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 
 - 只有当对应的包装器被选中且可用时，`read-only` 和 `workspace-write` 才由
   Seatbelt 或 bubblewrap 强制执行。
+- 配置值只能收窄权限模式选定的沙箱：Full Access（`yolo`）不套包装器，Ask 和
+  Auto-Review 使用 `workspace-write`，Plan 使用 `read-only`。因此配置的
+  `danger-full-access` 或 `external-sandbox` 只在 Full Access 下生效，绝不会放宽
+  Ask 或 Auto-Review。
 - `danger-full-access` 有意绕过本地操作系统包装器。在 Linux 上，它还会在启动时
   跳过 `PR_SET_NO_NEW_PRIVS` 进程加固标志，让 `sudo`/setuid 工作流继续可用
   （#5723）；见上面的进程加固一节。

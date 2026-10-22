@@ -313,6 +313,20 @@ mod tests {
     }
 
     #[test]
+    fn standard_compute_is_a_descriptor_row() {
+        let row = provider_descriptor("standard-compute").expect("standardcompute");
+        assert_eq!(row.id, "standardcompute");
+        assert_eq!(row.wire, DescriptorWire::OpenaiCompatible);
+        assert_eq!(row.base_url, "https://api.stdcmpt.com/v1");
+        assert_eq!(row.api_key_env, "STANDARDCOMPUTE_API_KEY");
+        assert_eq!(row.default_model, "standardcompute");
+        assert_eq!(
+            provider_descriptor("standard_compute").map(|row| row.id.as_str()),
+            Some("standardcompute")
+        );
+    }
+
+    #[test]
     fn descriptors_do_not_embed_model_rosters() {
         let raw = DESCRIPTORS_JSON;
         assert!(
@@ -404,6 +418,6 @@ mod tests {
         // reusing its name; compatible-host lookup remains separately scoped.
         assert!(provider_descriptor("openai").is_none());
         assert!(provider_descriptor("deepseek").is_none());
-        assert_eq!(bundled_provider_descriptors().len(), 10);
+        assert_eq!(bundled_provider_descriptors().len(), 11);
     }
 }

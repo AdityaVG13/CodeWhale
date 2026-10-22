@@ -29,7 +29,7 @@ Codewhale 有多个指令层级（instruction surfaces）。它们刻意保持�
 - **内置全局宪章(Bundled global Constitution)**——编译进二进制的基础规则。它是每个会话的默认底线。
 - **用户全局宪章(User-global constitution)**——常规引导式设置的产物。用 `/constitution` 或 `/setup` 管理；Codewhale 把结构化数据存放在 `$CODEWHALE_HOME/constitution.json`(默认 `~/.codewhale/constitution.json`)，并渲染成独立的 `<codewhale_user_constitution>` 散文块（prose block）。它可以表达偏好和停止条件，但不会改变运行时审批策略、沙箱、shell、网络、信任或 MCP 权限。
 - **仓库本地宪章(Repo-local constitution)**——可选的 `.codewhale/constitution.json` 项目策略，见下文。
-- **`AGENTS.md`**——跨智能体**项目指令**(散文)。这是"智能体应如何在这个仓库工作"的规范文件。运行 `/init` 生成一份。`CLAUDE.md` 和 `.claude/instructions.md` 作为兼容回退被读取。
+- **`AGENTS.md`**——跨智能体**项目指令**(散文)。这是"智能体应如何在这个仓库工作"的规范文件。运行 `/init` 生成一份。为其他工具编写的指令文件(`CLAUDE.md`、`.claude/instructions.md`、`.cursorrules`、`.github/copilot-instructions.md` 等)只有在你通过顶层配置项 `project_instruction_imports` 选择导入时才会被读取，例如 `["claude"]`、`["cursor"]` 或 `["all"]`(见 `config.example.toml`)；发现未加载的此类文件时，Codewhale 会给出提示。
 - **记忆与交接(Memory and handoffs)**——被召回的状态。有用，但权威低于宪章和项目指令。
 
 ### 管理用户全局宪章(`/setup` 和 `/constitution`)
@@ -193,29 +193,18 @@ allow_shell = true
 
 ### 账号提供商密钥
 
-Codewhale 账号的直接好处是：**在一个地方管理模型提供商的 API 密钥**。
-[注册](https://app.codewhale.net/register)或[登录](https://app.codewhale.net/login)后，
-可以在[提供商设置](https://app.codewhale.net/providers)中添加、更换或移除密钥，
-也可以使用终端：
+新的 Codewhale 账号暂未开放，本指南也不建议把提供商密钥保存在账号中。请用 `/provider`
+或 `codewhale auth set --provider <provider>` 把密钥保存在你自己的机器上；使用本地密钥或
+本地模型从不需要账号。
+
+如果你已经有账号，以下命令用于管理保存在账号中的密钥：
 
 ```bash
-codewhale login                         # 浏览器登录；也可用 account login
-codewhale account keys set deepseek      # 隐藏输入，添加或更换密钥
-codewhale account keys list              # 只显示配置状态，不显示密钥
-codewhale --provider codewhale           # 使用账号的模型通道
+codewhale account keys list              # configured status, never secret values
+codewhale account keys remove deepseek   # remove the account's saved key
 ```
 
-账号密钥保存在服务端，用于经过账号通道的请求。在另一台设备上登录并在
-`/provider` 中选择 Codewhale，即可使用这些密钥，无需再次粘贴。`/models`
-列出该账号可用的模型。更换账号中保存的密钥会影响此通道的后续请求，但不会改变
-独立的本地副本，也不会撤销提供商侧的密钥。`codewhale account keys remove deepseek`
-移除账号中保存的密钥。
-
-登录**不会**自动上传已有的本地密钥。若希望复制本地密钥，请明确使用
-`codewhale account keys set deepseek --from-local`。本地提供商仍通过
-`codewhale auth set --provider <provider>` 配置；使用本地密钥或本地模型不需要
-Codewhale 账号。登录会保留显式选择或已配置的本地提供商；需要切换到账号通道时，
-使用 `--provider codewhale`。
+登录绝不会上传本地密钥；移除账号中的密钥不会改变本地副本，也不会撤销提供商侧的密钥。
 
 账号会话与提供商密钥分开保存。`codewhale account status` 查看会话；
 `codewhale account logout` 移除所选 `--profile` 的账号会话，不删除提供商密钥。
@@ -490,6 +479,26 @@ update_uri = "https://internal.mirror.example/codewhale/releases/latest"
 ```
 
 未设置 `update_uri` 时，启动检查在回退到官方 GitHub API 端点之前，会遵循 `CODEWHALE_RELEASE_BASE_URL` 这样的 release 镜像环境变量。如果配置的 `update_uri` 无法获取或解析，且设置了 release 镜像环境变量，TUI 会回退到该镜像，而不是让启动失败。
+
+#### 更新后的新内容提示
+
+Codewhale 版本升级后第一次启动时，会提示一次，并链接到 codewhale.net 上该版本的发布说明：
+
+```text
+已更新到 0.10.2。包含 12 项新功能、31 项修复和 8 项其他改动。
+发布说明：https://codewhale.net/zh/changelog/0.10.2
+```
+
+数量来自编译进二进制的更新日志。Added 或 New 下的条目计为新功能；Fixed、Security 和 Latest fixes 计为修复；Contributors、Thanks、Community 以及 Known limits/issues 不计入；其余各节计为其他改动。链接使用你的界面语言(中文为 `zh`)，网站没有该语言时使用英文。
+
+TUI 在启动卡片上显示该提示，卡片离开时把它移入对话记录(从 `--resume`、`--continue` 或提示词打开会话时立即移入)，并附上 `/change <version>` 以便在应用内阅读。`doctor`、`models`、`sessions`、`receipts`、`setup`、`init`、`install`、`features`、`integrations`、`mcp`、`config`、`model`、`metrics`、`providers`、`account`、`login`、`logout` 和 `update` 命令在 stdout 和 stderr 都是终端且未请求 JSON 输出时，把它打印到 stderr。`exec`、服务器、JSON 输出和非终端运行从不显示；之后第一次能显示它的启动会显示。
+
+全新安装或降级后不会显示任何内容。最近一次启动的版本记录在 `~/.codewhale/last-launch.json`。该提示只读取本地文件，所以与 `check_for_updates` 无关。要关闭它：
+
+```toml
+[update]
+show_whats_new = false
+```
 
 ## Workshop 输出预算
 
@@ -1139,7 +1148,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 | 数量 | 含义 | 允许驱动 |
 |---|---|---|
 | 活动请求输入估算 | 下一个请求实时系统提示和转录负载的保守估算。 | 头部/底部上下文百分比、自动压缩触发、选择加入 Flash seam 触发、紧急溢出预检。 |
-| 预留响应裕量 | 每条路由上的有效请求上限加 `1024` 安全 token。常规无覆盖请求从 `65536` 开始；更小的路由/provider 上限收窄该值，显式输出覆盖只在解析后的路由窗口和输出上限内提高它。同一上限到达线路并驱动预检；思考强度不会增加第二个隐藏预留。单独发布的路由输入上限独立钳制可花费输入预算。 | 仅紧急溢出预算检查。 |
+| 预留响应裕量 | 有效请求上限加 `1024` 安全 token。常规无覆盖请求从 `65536` 开始；更小的路由/provider 上限收窄该值，显式输出覆盖只在解析后的路由窗口和输出上限内提高它。同一上限到达线路并驱动预检；例外是声明的输出上限超过已知上下文窗口一半且没有显式输出覆盖的路由：压缩以保留窗口的四分之一为目标（最多 `65536`，且不超过请求上限），预检只在剩余输出不足 `128` token 时拒绝请求，每个请求的 `max_tokens` 是窗口减去该请求的估计输入和 `1024` 安全 token 后剩余的部分，且不超过请求上限。思考强度不会增加第二个隐藏预留。单独发布的路由输入上限独立钳制可花费输入预算。 | 仅紧急溢出预算检查。 |
 | 累计 API 用量 | provider 报告的输入加输出 token 跨已完成 API 调用求和；多工具回合可能多次计入同一稳定前缀。 | 仅会话用量和近似成本遥测。 |
 | 提示缓存命中/未命中 | 可用时最近一次调用的 provider 缓存遥测。 | 仅缓存命中显示和成本估算；从不触发压缩或 seam。 |
 | 上下文百分比 | 活动请求输入估算除以模型上下文窗口。 | 仅显示；它镜像上下文防护所用的活动输入基础。 |
@@ -1152,7 +1161,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 如果你从更旧的版本升级：
 
 - 旧：`/codewhale` 新：`/links`(别名：`/dashboard`、`/api`)
-- 旧：`/set model deepseek-reasoner` 新：`/config` 并把 `model` 行编辑为 `deepseek-v4-pro` 或 `deepseek-v4-flash`
+- 旧：`/set model deepseek-reasoner` 新：`/config` 并把 `model` 行编辑为 `deepseek-v4-pro` 或 `deepseek-flash`
 - 旧：可见 `Normal` 模式或 `default_mode = "normal"` 新：使用 `Agent` / `default_mode = "agent"`；旧 `normal` 仍映射到 `agent`
 - 旧：在斜杠 UX/帮助中发现 `/set` 新：编辑用 `/config`，只读检查用 `/settings`
 
@@ -1199,7 +1208,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
 - `insecure_skip_tls_verify`(bool，可选的 provider 表键)：旧兼容键，默认禁用。活动 provider 表上为 true 时，provider 客户端拒绝该配置，而不是跳过 TLS 证书验证。企业或私有 CA 包用 `SSL_CERT_FILE`；`codewhale doctor` 报告此设置的过期使用。
 
-- `default_text_model`（字符串，可选）：DeepSeek 和 `deepseek-anthropic` 默认 `deepseek-flash`，OpenAI 是 `gpt-5.6`，xAI 是 `grok-4.6`，NVIDIA NIM 是 `deepseek-ai/deepseek-v4-pro`，AtlasCloud 是 `deepseek-ai/deepseek-v4-flash`，Wanjie Ark 是 `deepseek-reasoner`，火山方舟是 `DeepSeek-V4-Pro`，OpenRouter 和 Novita 是 `deepseek/deepseek-v4-pro`，小米 MiMo 是 `mimo-v2.5-pro`，Fireworks 是 `accounts/fireworks/models/deepseek-v4-pro`，SiliconFlow 和 DeepInfra 是 `deepseek-ai/DeepSeek-V4-Pro`，Arcee AI 是 `trinity-large-thinking`，Moonshot 是 `kimi-k2.7-code`，MiniMax 是 `MiniMax-M3`，Z.ai 是 `GLM-5.3`，StepFun 是 `step-3.7-flash`，千帆是 `ernie-4.0-turbo-8k`，Sakana AI 是 `fugu`，SGLang/vLLM 是 `deepseek-ai/DeepSeek-V4-Pro`，本地 Ollama 没有固定 id（Codewhale 会从实时本地目录中选用一个支持聊天的标签——优先选 coder 或支持工具的标签，然后是上下文最大的——绝不会选嵌入模型或重排序模型），Ollama Cloud 是 `gpt-oss:120b`。Hugging Face 和 Together AI 都默认 `deepseek-ai/DeepSeek-V4-Pro`；`openai-codex` 默认 `gpt-5.6`；`anthropic` 默认 `claude-sonnet-4-6`；`openmodel` 默认 `deepseek-v4-flash`。当前公开的 DeepSeek ID 包括 `deepseek-v4-pro` 和 `deepseek-flash`（V4.1 Flash，以不带版本号的 id 发布），两者都是 1M 上下文窗口、384K 最大输出、默认启用思考模式。DeepSeek 的实时定价/模型页现在把 Pro 后端标为 `DeepSeek-V4-Pro-0813`；可调用的 API ID 仍是 `deepseek-v4-pro`，所以 Codewhale 不发送后端标签，也不发送 Claude Code 特有的 `deepseek-v4-pro[1m]` 选择器。DeepSeek 于 2026 年 7 月 24 日退役 `deepseek-chat` 和 `deepseek-reasoner`；直连官方路由把两者都迁移到 `deepseek-v4-flash`，省略推理设置时保留它们此前的不思考（`off`）和思考（`high`）意图。显式的 `reasoning_effort` 优先，Wanjie Ark、聚合器、自托管运行时和自定义端点上由 provider 自己拥有的 id 不会被全局改写。SiliconFlow 保留自己的映射：`deepseek-reasoner` 和 `deepseek-r1` 选择其 Pro 模型，而 `deepseek-chat` 和 `deepseek-v3` 选择 Flash。各 provider 特有的映射在受支持之处把 `deepseek-v4-pro` / `deepseek-v4-flash` 翻译成该 provider 的模型 ID。OpenRouter 还识别最近的大模型 ID，如 `arcee-ai/trinity-large-thinking`、`minimax/minimax-m3`、`minimax/minimax-m2.7`、`xiaomi/mimo-v2.5-pro`、`qwen/qwen3.6-flash`、`qwen/qwen3.6-35b-a3b`、`qwen/qwen3.6-max-preview`、`qwen/qwen3.6-27b`、`qwen/qwen3.6-plus`、`qwen/qwen3.7-max`、`google/gemma-4-31b-it`、`moonshotai/kimi-k2.7-code`、`moonshotai/kimi-k2.6`、`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` 和 `nvidia/nemotron-3-ultra-550b-a55b`；直连 Arcee 使用 `trinity-large-thinking` 和 `trinity-large-preview` 这样的裸 ID；直连 Moonshot 识别 `kimi-k3`、`kimi-k2.7-code` 和 `kimi-k2.6`。确切的 Kimi Code 端点识别 K3 的裸 `k3` 和 K2.7 的 `kimi-for-coding`；这些会员 ID 与直连 Moonshot 的 ID 不同，绝不会跨路由改写。直连 MiniMax 识别 `MiniMax-M3` 和有文档记录的 M2.x 聊天模型 ID；直连 Z.ai 识别 `GLM-5.3`（默认）、`GLM-5.2`、`GLM-5.1` 和 `GLM-5-Turbo`，OpenRouter 识别对应的 `z-ai/glm-5.1`、`z-ai/glm-5.2`、`z-ai/glm-5.3` 和 `z-ai/glm-5-turbo` ID——`GLM-5.3` 自 2026-08-13 起已在 Z.ai Coding Plan 上线；在 Z.ai 发布独立的 5.3 数据之前，它继承 `GLM-5.2` 的目录元数据且不带价格，而显式选择 `GLM-5.2` 会保留它自己的 id；直连 Sakana 识别 `fugu` 和 `fugu-ultra-20260615`；直连小米 MiMo 识别聊天 ID `mimo-v2.5-pro`、`mimo-v2.5-pro-ultraspeed` 和 `mimo-v2.5`，而 TTS ID 通过 `codewhale speech` / `tts` 选择。通用 `openai`、`atlascloud`、`wanjie-ark`、`xiaomi-mimo`、`arcee`、`moonshot`、`minimax`、`openmodel`、`zai`、`stepfun`、`qianfan`、`sakana`、本地 Ollama 和 Ollama Cloud 的模型 ID，在已知别名规范化之后原样透传。带自定义 `base_url` 的 OpenRouter 和 SiliconFlow provider 配置也保留显式的模型值，这样 OpenAI 兼容网关就能接受裸模型 ID。用 `/models` 或 `codewhale models` 从你配置的端点发现实时 ID。`CODEWHALE_MODEL` 为单个进程覆盖它；`DEEPSEEK_MODEL` 是旧别名。
+- `default_text_model`（字符串，可选）：DeepSeek 和 `deepseek-anthropic` 默认 `deepseek-flash`，OpenAI 是 `gpt-5.6`，xAI 是 `grok-4.6`，NVIDIA NIM 是 `deepseek-ai/deepseek-v4-pro`，AtlasCloud 是 `deepseek-ai/deepseek-v4-flash`，Wanjie Ark 是 `deepseek-reasoner`，火山方舟是 `DeepSeek-V4-Pro`，OpenRouter 和 Novita 是 `deepseek/deepseek-v4-pro`，小米 MiMo 是 `mimo-v2.6-pro`，Fireworks 是 `accounts/fireworks/models/deepseek-v4-pro`，SiliconFlow 和 DeepInfra 是 `deepseek-ai/DeepSeek-V4-Pro`，Arcee AI 是 `trinity-large-thinking`，Moonshot 是 `kimi-k2.7-code`，MiniMax 是 `MiniMax-M3`，Z.ai 是 `GLM-5.3`，StepFun 是 `step-3.7-flash`，千帆是 `ernie-4.0-turbo-8k`，Sakana AI 是 `fugu`，SGLang/vLLM 是 `deepseek-ai/DeepSeek-V4-Pro`，本地 Ollama 没有固定 id（Codewhale 会从实时本地目录中选用一个支持聊天的标签——优先选 coder 或支持工具的标签，然后是上下文最大的——绝不会选嵌入模型或重排序模型），Ollama Cloud 是 `gpt-oss:120b`。Hugging Face 和 Together AI 都默认 `deepseek-ai/DeepSeek-V4-Pro`；`openai-codex` 默认 `gpt-5.6`；`anthropic` 默认 `claude-sonnet-4-6`；`openmodel` 默认 `deepseek-v4-flash`。当前公开的 DeepSeek ID 包括 `deepseek-v4-pro` 和 `deepseek-flash`（V4.1 Flash，以不带版本号的 id 发布），两者都是 1M 上下文窗口、384K 最大输出、默认启用思考模式。DeepSeek 的实时定价/模型页现在把 Pro 后端标为 `DeepSeek-V4-Pro-0813`；可调用的 API ID 仍是 `deepseek-v4-pro`，所以 Codewhale 不发送后端标签，也不发送 Claude Code 特有的 `deepseek-v4-pro[1m]` 选择器。DeepSeek 已于 2026 年 7 月 24 日退役 `deepseek-chat` 和 `deepseek-reasoner`；直连官方路由把两者都迁移到 `deepseek-flash`，省略推理设置时保留它们此前的不思考（`off`）和思考（`high`）意图。DeepSeek 也已退役 `deepseek-v4-flash` 和 `deepseek-v4-flash-vision-exp` 模型：两个名称仍被接受，由 V4.1 Flash 提供服务，并按 `deepseek-flash` 的价格计费；Codewhale 对 2026-09-10 04:00 UTC 起的回合采用该价格。`flash`、`deepseek-v4flash`、`flash-vision` 和 `deepseek-v4flashvisionexp` 简写选择 `deepseek-flash`。显式的 `reasoning_effort` 优先，Wanjie Ark、聚合器、自托管运行时和自定义端点上由 provider 自己拥有的 id 不会被全局改写。SiliconFlow 保留自己的映射：`deepseek-reasoner` 和 `deepseek-r1` 选择其 Pro 模型，而 `deepseek-chat` 和 `deepseek-v3` 选择 Flash。各 provider 特有的映射在受支持之处把 `deepseek-v4-pro` / `deepseek-v4-flash` 翻译成该 provider 的模型 ID。OpenRouter 还识别最近的大模型 ID，如 `arcee-ai/trinity-large-thinking`、`minimax/minimax-m3`、`minimax/minimax-m2.7`、`xiaomi/mimo-v2.5-pro`、`qwen/qwen3.6-flash`、`qwen/qwen3.6-35b-a3b`、`qwen/qwen3.6-max-preview`、`qwen/qwen3.6-27b`、`qwen/qwen3.6-plus`、`qwen/qwen3.7-max`、`google/gemma-4-31b-it`、`moonshotai/kimi-k2.7-code`、`moonshotai/kimi-k2.6`、`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` 和 `nvidia/nemotron-3-ultra-550b-a55b`；直连 Arcee 使用 `trinity-large-thinking` 和 `trinity-large-preview` 这样的裸 ID；直连 Moonshot 识别 `kimi-k3`、`kimi-k2.7-code` 和 `kimi-k2.6`。确切的 Kimi Code 端点识别 K3 的裸 `k3` 和 K2.7 的 `kimi-for-coding`；这些会员 ID 与直连 Moonshot 的 ID 不同，绝不会跨路由改写。直连 MiniMax 识别 `MiniMax-M3` 和有文档记录的 M2.x 聊天模型 ID；直连 Z.ai 识别 `GLM-5.3`（默认）、`GLM-5.2`、`GLM-5.1` 和 `GLM-5-Turbo`，OpenRouter 识别对应的 `z-ai/glm-5.1`、`z-ai/glm-5.2`、`z-ai/glm-5.3` 和 `z-ai/glm-5-turbo` ID——`GLM-5.3` 自 2026-08-13 起已在 Z.ai Coding Plan 上线；在 Z.ai 发布独立的 5.3 数据之前，它继承 `GLM-5.2` 的目录元数据且不带价格，而显式选择 `GLM-5.2` 会保留它自己的 id；直连 Sakana 识别 `fugu` 和 `fugu-ultra-20260615`；直连小米 MiMo 识别聊天 ID `mimo-v2.6-pro`、`mimo-v2.6-flash` 和 `mimo-v2.5-pro-ultraspeed`（已停用的 `mimo-v2.5-pro` 和 `mimo-v2.5` 会以 `mimo-v2.6-pro` 和 `mimo-v2.6-flash` 发送），而 TTS ID 通过 `codewhale speech` / `tts` 选择。通用 `openai`、`atlascloud`、`wanjie-ark`、`xiaomi-mimo`、`arcee`、`moonshot`、`minimax`、`openmodel`、`zai`、`stepfun`、`qianfan`、`sakana`、本地 Ollama 和 Ollama Cloud 的模型 ID，在已知别名规范化之后原样透传。带自定义 `base_url` 的 OpenRouter 和 SiliconFlow provider 配置也保留显式的模型值，这样 OpenAI 兼容网关就能接受裸模型 ID。用 `/models` 或 `codewhale models` 从你配置的端点发现实时 ID。`CODEWHALE_MODEL` 为单个进程覆盖它；`DEEPSEEK_MODEL` 是旧别名。
 - TelecomJS 只把 `deepseek-v4-pro` 用作刷新前的保守回退。其 key 作用域的 `/models` 目录可用后，选择器使用那些实时行；Codewhale 在该路由上省略不受支持的推理请求字段。
 
 - `reasoning_effort`（字符串，可选）：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`ultra`（`ultracode` 是 `ultra` 的别名）或 `max`；默认取已配置的 UI 档位。DeepSeek Platform 收到顶层 `thinking` / `reasoning_effort` 字段。Ollama Cloud 的 OpenAI 兼容 Chat Completions 路由保留其有文档记录的 `none` / `low` / `medium` / `high` / `max` 阶梯（`off` 作为 `none` 发送；`xhigh` 和 `ultracode` 规范化为 `max`）。确切 `https://api.x.ai/v1` 上的直连 xAI `grok-4.7` 和 `grok-4.6` 收到顶层 `reasoning_effort = "low" | "medium" | "high" | "xhigh"`（阶梯来自内置目录行；`grok-4.5` 把 `xhigh` 映射为 `high`，没有文档记录 effort 的行，如 `grok-4.3`，则不发送该字段）；Grok 的推理无法关闭，因此 `off` 规范化为 `high`，`max`/`ultracode` 规范化为 `xhigh`，`auto` 让该字段省略，从而使用 xAI 文档记录的默认值 `high`。自定义的 xAI 兼容 `base_url` 不继承该方言。确切 `https://api.moonshot.ai/v1` 上的直连 Moonshot `kimi-k3` 始终思考，只收到顶层 `reasoning_effort = "low" | "high" | "max"`；`off` 规范化为 `low`，`medium` 规范化为 `high`。确切 `https://api.kimi.com/coding/v1` 上的 Kimi Code 会员 `k3` 则收到嵌套的 `thinking.effort`，其 `off` 设置同样规范化为启用的 `low`。正常调度的 `auto` 使用 Codewhale 的自动推理选择器，发送一个具体的、按路由规范化后的档位；只有省略推理设置时，才由 provider 的默认值控制。相邻的网关以及其他模型/端点组合保留通用的 Moonshot 契约。OpenAI Codex 把过期的 `off` 规范化为 `low`，并把 `max` / `ultracode` 作为 Responses 的 `xhigh` 发送。Z.ai 收到有文档记录的 `thinking` 控制，并把启用的思考视为 GLM coding 的 high/max 通道。NVIDIA NIM 通过 `chat_template_kwargs` 收到等效设置。
@@ -1228,7 +1237,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   timeout_seconds = 300
   ```
 
-- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 默认在 `/usr/bin/bwrap` 已安装且探测证明它能限制子进程时使用 bubblewrap；`prefer_bwrap = false` 退出并报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
+- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。配置值只能收窄权限模式选定的沙箱（Full Access 不套包装器；Ask 和 Auto-Review 使用 `workspace-write`；Plan 使用 `read-only`），因此 `danger-full-access` 和 `external-sandbox` 只在 Full Access（`yolo`）下生效。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 默认在 `/usr/bin/bwrap` 已安装且探测证明它能限制子进程时使用 bubblewrap；`prefer_bwrap = false` 退出并报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
 - 模式准入、hooks、已注册工具的要求、类型化规则、Auto-Review、仓库保护规则、人工审批和执行沙箱之间的跨层关系，定义在[授权顺序](../AUTHORIZATION_ORDER.md)中。
 - **读取拒绝列表。** 每一种沙箱档位——包括 `read-only`——都授予对整个文件系统的读取权限；这些档位的区别在于它们可以*写入*什么，以及能否访问网络。读取拒绝列表会收窄这一点：
   - `sandbox_read_denylist_defaults`（bool，默认 `true`）：应用内置的凭据存储集合——`~/.ssh`、`~/.gnupg`、云凭据目录（`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.kube` 等）、`~/.netrc`、`~/.npmrc`、`~/.git-credentials`、macOS 钥匙串、浏览器配置文件、Codewhale 自己的机密存储，以及 `.env` 文件（但不包括 `.env.example` 之类）。普通源码、`Cargo.toml`、`~/.gitconfig`、`~/.cargo` 和 `~/.npm` 保持可读，因此构建和测试仍能工作。设为 `false` 可恢复 0.9.12 之前的整盘读取行为。
@@ -1266,7 +1275,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   action = "session.compact"
   ```
 
-- `[auto_review]`(表，可选)：工具调用审查策略——确定性底线加模型守卫层。这一层位于现有权限档位之上；它可以拦住或阻断工具调用，但不是自动推送、自动合并或托管审查服务。先检查阻断规则，然后是内置安全底线，再是允许规则。在 Ask 中，安全拦阻打开审批；在 Auto-Review、Full Access 或非交互 `never` 档位中，它作为硬阻断失败关闭。即使 allow 规则匹配，安全底线仍覆盖类似发布的动作和破坏性的后台/无头动作。
+- `[auto_review]`(表，可选)：工具调用审查策略——确定性底线加模型守卫层。这一层位于现有权限档位之上；它可以拦住或阻断工具调用，但不是自动推送、自动合并或托管审查服务。先检查阻断规则，然后是内置安全底线，再是允许规则。在 Ask 中，安全拦阻打开审批，会话授权或 allow 规则都无法应答它；在 Auto-Review 或非交互 `never` 档位中，它作为硬阻断失败关闭。Full Access 跳过内置底线。即使 allow 规则匹配，安全底线仍覆盖类似发布的动作、破坏性的后台/无头动作，以及请求体携带凭据文件或名称表明是机密的变量、或读取由这两者或 `env`/`printenv` 送入的 stdin 的 `curl`/`wget` 上传；超过 64 KiB 或 4,096 个词、且文本中任意位置含有 `curl` 或 `wget` 的 shell 命令、shell 输入或校验器，以及嵌套过深而无法读取的调用，同样会被拦住。在 Full Access 之外，它还会在每个档位拒绝含有隐藏 Unicode 字符（双向控制符、零宽及其他不可见字符、标签字符、孤立的变体选择符，以及 shell 输入中 ASCII 控制键之外的终端控制字符）的 shell 命令、shell 输入或校验器，并写出该码位及其位置。
 
   ```toml
   [[auto_review.allow]]
@@ -1318,7 +1327,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
   `/config subagents status` 打印全局值和活动 provider 的解析 profile，这样速率限制调整在 TUI 中可见。`[subagents.models]` 接受小写的 Fleet 角色键，如 `worker`、`scout`、`planner`、`reviewer`、`builder` 和 `verifier`；旧类型键在 v0.9.x 期间仍被接受。值在派生时对照活动 provider 验证；直接 DeepSeek 需要 DeepSeek ID，而 OpenAI 兼容/自定义 provider 路由把显式模型 ID 透传给该 provider。要把子智能体路由到不同于父会话的 provider，保存带显式 `provider` 和 `model` 字段的 Fleet/AgentProfile(包括 `lm-studio` 这样的用户命名自定义 provider)，并调用 `agent(profile: "...")`；见 [SUBAGENTS.md](SUBAGENTS.md)。
 
-- `skills_dir`(字符串，可选)：默认 `~/.codewhale/skills`(每个技能是包含 `SKILL.md` 的目录)。存在时优先使用工作区本地的 `.agents/skills` 或 `./skills`；运行时还发现全局 agentskills.io 兼容的 `~/.agents/skills` 和更广的 Claude 生态系统 `~/.claude/skills`。首次启动为常见工作流安装带版本的捆绑技能，包括技能创建、委派、MCP/插件脚手架、文档、演示文稿、电子表格、PDF 和飞书/Lark。只有 CodeWhale 自有的根(`<workspace>/.codewhale/skills` 和 `~/.codewhale/skills`)是可写安装/导入目标；兼容 harness 根保持只读。裸 `/skills` 打开技能管理器(仅自有，零网络)。管理器、审计状态、来源标记和变更规则见 [SKILLS.md](SKILLS.md)，可移植 `SKILL.md` 包与 Claude Code 插件运行时之间的受支持边界见 [CLAUDE_PLUGIN_COMPAT.md](../CLAUDE_PLUGIN_COMPAT.md)。
+- `skills_dir`(字符串，可选)：默认 `~/.codewhale/skills`(每个技能是包含 `SKILL.md` 的目录)。工作区获得信任后，项目技能优先于全局技能，其中 `.codewhale/skills` 优先于 `.agents/skills` 等兼容目录。顶层 `./skills` 需要显式设置 `[skills] flat_workspace_root = true` 或 `skills_dir` 才会加载。运行时还发现全局 agentskills.io 兼容的 `~/.agents/skills` 和更广的 Claude 生态系统 `~/.claude/skills`。首次启动为常见工作流安装带版本的捆绑技能，包括技能创建、委派、MCP/插件脚手架、文档、演示文稿、电子表格、PDF 和飞书/Lark。只有 CodeWhale 自有的根(`<workspace>/.codewhale/skills` 和 `~/.codewhale/skills`)是可写安装/导入目标；兼容 harness 根保持只读。裸 `/skills` 打开 Extensions → Skills(仅自有，零网络)；`/skills manage` 打开技能管理器。管理器、审计状态、来源标记和变更规则见 [SKILLS.md](SKILLS.md)，可移植 `SKILL.md` 包与 Claude Code 插件运行时之间的受支持边界见 [CLAUDE_PLUGIN_COMPAT.md](../CLAUDE_PLUGIN_COMPAT.md)。
 
 - `[skills].scan_codewhale_only`(bool，默认 `false`)：为 `true` 时，会话技能发现忽略跨工具根，如 `.claude/skills`、`.opencode/skills`、`.cursor/skills` 和 `~/.agents/skills`。Codewhale 仍扫描 `<workspace>/.codewhale/skills`、`~/.codewhale/skills` 和任何显式 `skills_dir` 覆盖。技能管理器仍可独立于这个运行时旋钮切换本地兼容审计扫描——见 [SKILLS.md](SKILLS.md)。
 
@@ -1357,7 +1366,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   - `[retry].jitter_factor`（float，默认 `0.1`，即 ±10%；钳制到 `0.0..=1.0`）
   - `[retry].respect_retry_after`（bool，默认 `true`）：按服务器的 `Retry-After` 响应头等待，而不是使用计算出的退避延迟
 
-  `[retry]` 安排客户端内部的 HTTP 请求重试。位于其上一层的流级预算——一个回合对流未能打开或中途断掉的请求重新发起多少次——是下面的 `tui.stream_max_*` 键。
+  `[retry]` 安排客户端内部的 HTTP 请求重试。流式请求打开时，其重试、退避以及遵循的 `Retry-After` 等待，在每次协议尝试中共享一个 `stream.open_timeout_secs` 时间窗，所以这个时间窗决定了打开过程能用到多少次 `max_retries`。在默认的 HTTP/2 客户端上，时间窗到期会被视为响应头停滞，然后改用 HTTP/1.1 以新的时间窗和重试计划再试一次；固定使用 HTTP/1.1 时只有一个时间窗。`Retry-After` 若长于剩余时间窗，打开会以响应头超时结束；调大 `stream.open_timeout_secs` 可以等过它。位于其上一层的流级预算——一个回合对流未能打开或中途断掉的请求重新发起多少次——是下面的 `tui.stream_max_*` 键。
 
 - `[notifications]`：通知的投递、注意力、类别和声音共用同一套策略。`quiet = true`、`method = "off"`、`condition = "never"` 以及被禁用的类别，会同时抑制横幅和 Codewhale 所选的声音。
 - `notifications.method`：`auto`（默认）、`osc9`、`kitty`、`ghostty`、`bel`、`off`。
@@ -1799,7 +1808,9 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 - `native = true`：即使固定了 provider，原生搜索也优先；
 - `native = false`：从不使用原生搜索。
 
-原生搜索的回答完整返回；过大的工具输出会溢出到会话 artifact，模型可以分页取回。
+原生搜索的引用在返回前会做链接检查。每个被引用的 URL 都经过与 `Web` fetch 相同的受保护抓取（SSRF、DNS 与重定向检查，以及 `[network]` 策略）：先发 `HEAD`，`HEAD` 被拒绝时再发一个只取一个字节的范围 `GET`，同时最多四个，每个五秒。请求使用该地址在 `results` 中呈现的形式，不含 userinfo、片段和类似凭据的查询参数；查询字符串里重复了搜索词的地址不会被请求，其引用会被移除。只有返回 2xx 状态的来源才会留在 `results` 中；回执把每个被移除的引用记为 `citation_unverified` 并写明原因。如果没有任何引用通过检查，或者查询要求 `recency`（没有原生搜索工具能强制时间窗口），搜索会回落到已配置的 provider。`[network]` 策略拒绝的主机，其引用会被移除；策略需要你确认的主机不会被请求，其引用保留在 `results` 中，回执记为 `citation_unchecked`，直到你允许该主机。
+
+provider 的文字回答完整放在单独的 `unverified_synthesis` 字段中：它是 provider 模型自己的总结，其中的论断和链接都未经检查。过大的工具输出会溢出到会话 artifact，模型可以分页取回。
 
 **时效与区域。** `recency` 和 `locale` 会在后端 API 支持时转发，搜索回执会报告每一项是否生效：
 
@@ -1809,6 +1820,8 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 | Tavily | `time_range` | 不发送（Tavily 使用国家全名） |
 | SearXNG | `time_range` | `language`，原样发送 |
 | Serply | 不发送（文档未说明） | `hl` 语言，`gl` 国家 |
+| DeepSeek | 不发送 | 不发送（`localization` 需要 IP 地址） |
+| Provider 原生 | 拒绝；搜索回落到已配置的 provider | 不发送 |
 
 时效会向上取整到后端最接近的窗口（天、周、月、年），所以 `recency = 10` 会搜索最近一个月。其他后端忽略这两项，并在回执中说明。
 
@@ -1841,11 +1854,13 @@ Codewhale 按 `score` 从高到低排序返回行，再对排序结果应用 `ma
 
 **Serply**([serply.io](https://serply.io))返回 Google 自然搜索结果，包含标题、URL 和摘要片段。把 `[search] api_key` 设为你的 Serply key，或用 `SERPLY_API_KEY` 环境变量。这只是搜索工具后端；它不添加 Serply 模型 provider。
 
+**DeepSeek**([docs](https://api-docs.deepseek.com/guides/search))使用 `POST https://api.deepseek.com/v1/tools/search`。设置 `provider = "deepseek"`（也接受 `deep-seek` 和 `deepseek-search`），并依次从 `[search] api_key` 或 `DEEPSEEK_API_KEY` 环境变量读取 key。此搜索后端不复用已保存的 DeepSeek 模型 provider key。查询截断为 128 个 Unicode 字符。后端把数量限制在 1–50；共享搜索工具目前每次最多请求 10 条结果。`site:`、`lang:`、`after:`、`before:` 等查询运算符原样传递；`recency` 和 `locale` 两项被忽略。结果包含标题、URL 和摘要片段；摘要片段为空时回退到 summary。
+
 **Tavily**([tavily.com](https://tavily.com))在存在 Tavily key 且没有固定 provider 时自动选中：设置了 `TAVILY_API_KEY`，或 `[search] api_key` / `CODEWHALE_SEARCH_API_KEY` 属于 `tvly-` 家族。doctor 会把这种情况报告为 `source: tavily key`。自动检测只在运行时生效——Codewhale 不会为它写入 `[search] provider`，也不会把 `TAVILY_API_KEY` 合并进 `[search] api_key`。显式的 `[search] provider` 或 `CODEWHALE_SEARCH_PROVIDER` 始终优先，所以即使环境里有 Tavily key，`provider = "firecrawl"` 仍然是 Firecrawl。固定为 `tavily` 时接受任何非空的 `[search] api_key`，由该 key 或 `TAVILY_API_KEY` 提供配置；两者都为空时直接失败关闭。
 
 ```toml
 [search]
-provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
+provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply | deepseek
 # base_url = "https://search.example/" # provider = "duckduckgo" 时可选;"searxng" 时必填
 # api_key = "YOUR_KEY" # firecrawl 可选;其他 API 提供商必填
 # native = false # provider 原生搜索:不设置 = 仅在未配置 provider 时使用
@@ -1880,7 +1895,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
 
 `codewhale doctor` 遵循与 TUI 其余部分相同的配置解析规则。这意味着 `--config`、`CODEWHALE_CONFIG_PATH` 和旧 `DEEPSEEK_CONFIG_PATH` 都被尊重，MCP/skills 检查使用解析出的 `mcp_config_path` / `skills_dir`(含环境覆盖)。
 
-要引导缺失的 MCP/skills 路径，运行 `codewhale setup --all`。你也可以运行 `codewhale setup --skills --local` 创建工作区本地的 `./skills` 目录。
+要引导缺失的 MCP/skills 路径，运行 `codewhale setup --all`。你也可以运行 `codewhale setup --skills --local` 创建自有的项目目录 `.codewhale/skills`。项目技能在工作区获得信任后加载。
 
 普通 `codewhale doctor` 和 `doctor --json` 都是结构性的，默认离线。它们不检查 release 服务、托管 provider API、本地 provider 端点或 MCP 进程，也不加载工作区凭据 `.env`。用 `--check-updates`、`--probe-api`、`--probe-local` 或 `--probe-mcp` 选择加入对应的实时边界；`--probe-local` 可能启动 Ollama 这样的桌面托管服务。只有显式 API/local 探测路径可以加载工作区凭据 `.env` 值。实时标志与 `--json` 冲突，所以机器可读 doctor 输出总是离线。顶层键包括 `version`、`paths`、`secret_backend`、`config_path`、`config_present`、`workspace`、`api_key.source`、`api_key.availability`、`base_url`、`default_text_model`、`mcp`、`skills`、`tools`、`plugins`、`sandbox`、`platform`、`api_connectivity` 和 `capability`。CI 消费者应依赖 `api_key.source`(`config_declared`/`env_declared`/`external_auth_declared`/`secret_store_unprobed`/`secret_store_unavailable`/`oauth_unprobed`/`external_consent`/`none`/`local_runtime`/`unknown`)和 `api_key.availability`(`present`/`not_required`/`not_probed`/`unavailable`/`unknown`)，而不是解析人类可读的 `doctor` 文本。Source 是声明元数据，不是凭据存在或工作的证明。只有非空、非哨兵的字面配置值才在结构上 `present`；无认证和本地路由是 `not_required`。环境、外部认证、OAuth、consent 和 secret-store 声明保持 `not_probed`，不能让结构 Setup 或 Fleet 就绪成为真。被禁止使用共享存储的命名/自定义端点上的 secret-store 哨兵是 `secret_store_unavailable`/`unavailable`，而 `unknown` 保留给缺乏受支持结构结论的情况。确切和空白包裹的旧哨兵从不被当作字面凭据。结构加载器仍遵循安全环境路由/模型/策略字段，但从不物化环境 HTTP 头、沙箱 API key 或搜索 API key；只有显式 API/local 探测切换到正常凭据加载路径。选择加入的更新检查也只发出类型化通用失败：不可信 release 元数据和传输错误不被回显。
 

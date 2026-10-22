@@ -63,6 +63,7 @@ pub(crate) fn install_offline_queue_transition(
         app.clear_input();
     }
     app.queued_messages.clear();
+    app.held_restored_queue = 0;
     app.current_session_id = Some(transition.lease.session_id().to_string());
     app.offline_queue_lease = Some(transition.lease);
     transition
@@ -143,6 +144,7 @@ pub(crate) fn restore_matching_offline_queue_state(
         .into_iter()
         .map(queued_session_to_ui)
         .collect();
+    app.held_restored_queue = app.queued_messages.len();
     if let Some(draft) = state.draft.map(queued_session_to_ui) {
         app.input.clone_from(&draft.display);
         app.cursor_position = app.input.chars().count();
@@ -692,6 +694,21 @@ pub(crate) fn persist_offline_queue_state(app: &App) {
         .as_ref()
         .filter(|lease| app.current_session_id.as_deref() == Some(lease.session_id()))
     else {
+        let lease_owner = app
+            .offline_queue_lease
+            .as_ref()
+            .map(|lease| lease.session_id());
+        if lease_owner.is_some() || !app.queued_messages.is_empty() || app.queued_draft.is_some() {
+            tracing::warn!(
+                target: "persistence",
+                what = "offline-queue",
+                session_id = app.current_session_id.as_deref().unwrap_or("none"),
+                lease_owner = lease_owner.unwrap_or("none"),
+                queued = app.queued_messages.len(),
+                draft = app.queued_draft.is_some(),
+                "offline queue not persisted: this window holds no queue lease for the current session",
+            );
+        }
         return;
     };
     if app.queued_messages.is_empty() && app.queued_draft.is_none() {
@@ -716,6 +733,9 @@ pub(crate) fn restore_queued_message(app: &mut App, index: Option<usize>, messag
     if let Some(index) = index
         && index <= app.queued_messages.len()
     {
+        if index < app.held_restored_queue {
+            app.held_restored_queue += 1;
+        }
         app.queued_messages.insert(index, message);
     } else {
         app.queue_message(message);
@@ -867,6 +887,8 @@ pub(crate) fn begin_launch_session(
     }
     app.current_session_id = Some(session_id.clone());
     app.current_session_metadata = None;
+    app.window_title = None;
+    app.composer_color = None;
     app.session_title = Some(app.tr(MessageId::SessionsNewSessionTitle).into_owned());
     app.launch.dismiss();
     app.launch.status = None;
@@ -914,9 +936,7 @@ pub(crate) async fn switch_workspace(
     apply_workspace_runtime_state(app, config, workspace.clone());
     sync_runtime_workspace_state(task_manager, workspace.clone()).await;
 
-    let _ = engine_handle.send(Op::Shutdown).await;
-    let engine_config = build_engine_config(app, config);
-    *engine_handle = spawn_tui_engine(engine_config, config);
+    replace_tui_engine(app, config, engine_handle).await;
     if !app.api_messages.is_empty() {
         let _ = engine_handle
             .send(Op::SyncSession {
@@ -1222,8 +1242,12 @@ pub(crate) fn restore_loaded_session_provider(
         let requested = app
             .reasoning_effort_preference
             .unwrap_or(app.reasoning_effort);
-        app.reasoning_effort =
-            requested.normalize_for_route(provider, &config.active_route_base_url(), &app.model);
+        app.reasoning_effort = requested.normalize_for_route_identity(
+            provider,
+            identity.key.as_str(),
+            &config.active_route_base_url(),
+            &app.model,
+        );
     }
     app.set_active_context_window_override(config, &identity);
     app.active_route_limits = app.context_window_override_limits();

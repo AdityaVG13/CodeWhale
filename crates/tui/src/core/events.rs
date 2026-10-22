@@ -208,6 +208,16 @@ pub enum Event {
         omitted_tool_count: usize,
     },
 
+    RequestImageWindow {
+        provider: String,
+        model: String,
+        total: usize,
+        elided: usize,
+        cap: usize,
+        cap_source: String,
+        message: String,
+    },
+
     /// Workspace snapshots (undo) could not be enabled for this workspace.
     /// Emitted once per session/workspace so another session cannot consume
     /// its notice. The disabled state also remains visible in `/status` (#5930).
@@ -324,6 +334,17 @@ pub enum Event {
 
     /// The turn is complete (no more tool calls)
     TurnComplete {
+        /// Actual started turn, captured by its producer; absent on preflight
+        /// rejection.
+        turn_id: Option<String>,
+        /// Original host submission, also echoed when it fails before
+        /// `TurnStarted`. Runtime self-starts and non-message operations never
+        /// borrow a pending host id.
+        submission_id: Option<String>,
+        /// Manual compaction operation id. Mutually exclusive with the two
+        /// fields above; auto compaction closes its enclosing model turn
+        /// instead.
+        compaction_id: Option<String>,
         /// Total usage for session/goal/token metrics, including programmatic
         /// child calls performed inline during this turn.
         usage: Usage,
@@ -367,6 +388,7 @@ pub enum Event {
         /// measured (for example an aggregate REPL child receipt). This is
         /// the denominator for effective session-average throughput.
         request_ms: Option<u64>,
+        finish_reason: Option<String>,
     },
 
     /// Usage telemetry for a programmatic provider call whose cost is carried
@@ -778,7 +800,7 @@ pub fn bounded_tool_projection_warning_names(omitted_tool_names: &[String]) -> V
         .map(|name| {
             let cleaned: String = name
                 .chars()
-                .filter(|c| !c.is_control() && !is_bidi_format_control(*c))
+                .filter(|c| !c.is_control() && !codewhale_sanitize::sanitize::is_bidi_control(*c))
                 .collect();
             let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
             let collapsed = if collapsed.is_empty() {
@@ -1003,7 +1025,7 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     const MAX_CHARS: usize = 220;
     let cleaned: String = reason
         .chars()
-        .filter(|c| !c.is_control() && !is_bidi_format_control(*c))
+        .filter(|c| !c.is_control() && !codewhale_sanitize::sanitize::is_bidi_control(*c))
         .collect();
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= MAX_CHARS {
@@ -1012,13 +1034,6 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     let mut out: String = collapsed.chars().take(MAX_CHARS - 1).collect();
     out.push('…');
     out
-}
-
-pub(crate) fn is_bidi_format_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-    )
 }
 
 #[cfg(test)]

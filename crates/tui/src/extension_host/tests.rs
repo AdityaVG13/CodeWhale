@@ -1441,6 +1441,11 @@ async fn killed_host_fails_calls_once_and_replays_with_fresh_owners() {
     engine.sync().await.unwrap();
     assert_eq!(manager.spawn_attempts(), 1);
     let pid = manager.host_pid().unwrap();
+    let generation = manager
+        .shared
+        .ready_host(HostTier::Plugin)
+        .unwrap()
+        .generation;
     let tool = host_tool(&engine, fixture.workspace(), "slow_wait");
     let context = ToolContext::new(fixture.workspace()).with_plugin_registry(engine.plugin_view());
     let call = tokio::spawn(async move { tool.execute(json!({}), &context).await });
@@ -1471,7 +1476,14 @@ async fn killed_host_fails_calls_once_and_replays_with_fresh_owners() {
     })
     .await;
     assert!(matches!(manager.status(), HostStatus::Ready { .. }));
-    assert_ne!(manager.host_pid(), Some(pid));
+    assert!(
+        manager
+            .shared
+            .ready_host(HostTier::Plugin)
+            .unwrap()
+            .generation
+            > generation
+    );
     assert_eq!(
         manager
             .shared

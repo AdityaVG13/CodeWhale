@@ -221,6 +221,7 @@ mod tests {
                 None,
                 None,
             )],
+            unverified_synthesis: None,
             receipt: SearchReceipt {
                 backend: BackendId::DuckDuckGo,
                 backend_detail: None,

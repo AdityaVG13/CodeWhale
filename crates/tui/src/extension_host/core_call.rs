@@ -13,14 +13,14 @@
 //! **When it exists.** An invocation ticket is minted only for an extension
 //! tool call that runs under a nested-call gate the turn loop is serving *for
 //! that tool* (`NestedCallGate::extension`, set by the turn loop when the model
-//! called the tool directly). A sub-agent's call, a tool run from inside
-//! `execute_tools` (code mode hands nested specs no gate), a command, a timer,
-//! activation code and every test without a turn have none, so their
-//! `core/call`s are refused ("out of turn"). The ticket lives exactly as long
-//! as the invocation: it is revoked when the `tool/call` ends (answered,
-//! failed, timed out or dropped), when its owner is revoked and when its host
-//! exits, and each of those withdraws the invocation's pending core calls and
-//! any approval card one is waiting on.
+//! called the tool directly, in a sub-agent's turn as in the session's). A tool
+//! run from inside `execute_tools` (code mode hands nested specs no gate), a
+//! command, a timer, activation code and every test without a turn have none,
+//! so their `core/call`s are refused ("out of turn"). The ticket lives exactly
+//! as long as the invocation: it is revoked when the `tool/call` ends
+//! (answered, failed, timed out or dropped), when its owner is revoked and when
+//! its host exits, and each of those withdraws the invocation's pending core
+//! calls and any approval card one is waiting on.
 //!
 //! **What is refused outright** ([`refusal`], checked before planning on the
 //! name the host sent and again by the turn loop on the name planning resolved

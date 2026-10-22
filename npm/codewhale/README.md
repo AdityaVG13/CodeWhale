@@ -84,13 +84,21 @@ versions whose matching GitHub Release publishes both assets, and remains
 preview support pending real-device QA. See the support table in
 [docs/INSTALL.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md).
 
-HarmonyOS PC (`openharmony`) is treated as `linux`, so it gets the Linux
-binaries matching your CPU architecture (x64 or arm64). Linux riscv64 prebuilts
-are temporarily paused while the locked `rquickjs-sys` dependency lacks
-`riscv64gc-unknown-linux-gnu` bindings. Other platform/architecture combinations
-(FreeBSD, Linux riscv64, …) aren't shipped as prebuilts. Unsupported platforms,
-checksum failures, and glibc compatibility problems still fail with a clear
-error pointing you at the full
+On a HarmonyOS PC, install inside the Linux subsystem (融合开发引擎, openEuler),
+where the wrapper sees `linux` and installs the Linux arm64 binaries. In a native
+HarmonyOS or OpenHarmony terminal (`openharmony`), the wrapper still installs the
+static Linux build matching your CPU architecture (x64 or arm64) as a best
+effort. That build is untested on native HarmonyOS. If the binary cannot start,
+`codewhale` prints directions to use the Linux subsystem or build
+`aarch64-unknown-linux-ohos` from source. The install script also prints a
+warning, which npm 7 and later show only with `--foreground-scripts`. See
+[docs/HarmonyOS.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/HarmonyOS.md).
+
+Linux riscv64 prebuilts are temporarily paused while the locked `rquickjs-sys`
+dependency lacks `riscv64gc-unknown-linux-gnu` bindings. Other
+platform/architecture combinations (FreeBSD, Linux riscv64, …) aren't shipped
+as prebuilts. Unsupported platforms, checksum failures, and glibc compatibility
+problems still fail with a clear error pointing you at the full
 [docs/INSTALL.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md)
 guide.
 

@@ -663,7 +663,7 @@ pub fn build_purge_tool() -> Tool {
 /// and for replacing the session message list with `PurgeResult.messages`.
 pub async fn run_purge(
     client: &impl LlmClient,
-    _provider: ProviderKind,
+    provider: ProviderKind,
     session_id: &str,
     messages: &[Message],
     model: &str,
@@ -685,6 +685,22 @@ pub async fn run_purge(
 
     // 3. Build the tool definition and the request.
     let purge_tool = build_purge_tool();
+    let max_tokens = crate::route_budget::request_output_cap_for_input(
+        provider,
+        model,
+        client.route_limits(),
+        max_tokens,
+        u64::try_from(crate::compaction::estimate_request_input_tokens(
+            &request_messages,
+            None,
+            Some(std::slice::from_ref(&purge_tool)),
+        ))
+        .unwrap_or(u64::MAX),
+    )
+    .ok_or_else(|| {
+        "Purge request does not fit this model's context window; the conversation was not changed"
+            .to_string()
+    })?;
     let request = MessageRequest {
         model: model.to_string(),
         messages: request_messages,
@@ -1117,6 +1133,7 @@ mod tests {
                     signature: None,
                     state: None,
                     thinking: "let me think...".to_string(),
+                    redacted_data: None,
                 },
                 ContentBlock::Text {
                     text: "done".to_string(),

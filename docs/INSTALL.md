@@ -27,28 +27,12 @@ version (for example a v0.10.2 source candidate before its tag). A
 prebuilt candidate is available through the official installer only after its
 tag, checksums and release assets exist. Contributors can build `main` now.
 
-## One account for your provider keys
+## No account needed
 
-[Register](https://app.codewhale.net/register) or [sign in](https://app.codewhale.net/login)
-to keep your model providers' API keys in one place. Add, replace or remove
-keys in your account's [Providers settings](https://app.codewhale.net/providers),
-or use the terminal commands below. On another device, sign in and select the
-Codewhale model route to use the same account keys without pasting them again.
-
-```bash
-codewhale login
-codewhale account keys set deepseek  # asks for the key without echoing it
-codewhale account keys list         # shows status, never the key itself
-codewhale --provider codewhale      # use your account's model route
-```
-
-The account setup here describes the 0.10.1 source candidate. Signing in does
-not upload existing local keys. To copy one deliberately, use
-`codewhale account keys set deepseek --from-local`. Account keys stay on the
-service; they are used for account-routed requests, not downloaded into each
-device's local key store. You can keep using local keys or a local model
-without an account. See [account key settings](CONFIGURATION.md#account-provider-keys)
-for updating keys and switching between these options.
+Codewhale needs no account. Keys you save with `/provider` or
+`codewhale auth set` stay on your machine; see
+[API keys and providers](#8-api-keys-and-providers). New Codewhale accounts
+are not open, so this guide does not cover account key storage.
 
 ## Test and contribute to current source
 
@@ -796,8 +780,10 @@ codewhale exec --json "…"                               # summary JSON (provid
 codewhale exec --auto --output-format stream-json "…"   # one JSON event per line
 ```
 
-`--auto` auto-approves shell commands, so use it only in a repo or sandbox you
-trust.
+`--auto` enables Full Access by default: tools run without approval, shell
+commands have no Codewhale sandbox, and trust mode permits file tools to write
+outside the workspace. Add `--sandbox workspace-write` to keep the shell
+sandbox and file-tool workspace restrictions, with trust mode off.
 
 Plain `exec` offers the model no tools. Only `--auto`, `--yolo`,
 `--allowed-tools` or resuming a session opens a tool surface; limits such as
@@ -817,9 +803,12 @@ codewhale exec --continue "…"     # headless follow-up to the latest session
 codewhale exec --resume <id> "…"
 ```
 
-In v0.10.0, only **TUI sessions** and **`--output-format stream-json`** exec
-runs are saved. A plain `codewhale exec`/`exec --auto` run is *not* saved, so a
-following `exec --continue` fails with `No saved sessions found for workspace`.
+TUI sessions, resumed exec sessions, and exec runs that offer tools (including
+`exec --auto`) are saved in every output format. `--output-format stream-json`
+also saves answer-only runs. Use `codewhale receipts --last` for a saved run's
+receipt. Other answer-only text and `--json` runs are saved only if conversation
+compaction starts; without that, they create no session for `exec --continue`
+or a receipt.
 
 ---
 
@@ -948,8 +937,10 @@ You installed with npm, Cargo or Homebrew. Update with that tool instead.
 Run `sudo apt-get install -y libdbus-1-dev pkg-config`.
 
 **`error: No saved sessions found for workspace …` (from `exec --continue`).**
-The previous run was plain-text `exec`, which isn't saved. Use the TUI, or
-`--output-format stream-json`.
+No session has been saved in this workspace. Fresh answer-only text and `--json`
+exec runs are saved only if conversation compaction starts; use
+`--output-format stream-json` to always save them.
+TUI sessions and exec runs that offer tools are saved in every output format.
 
 **zsh completion suggests the wrong things after the first word.**
 Known v0.10.0 bug. bash and fish are fine.
@@ -1301,6 +1292,9 @@ Known limits of the winget route:
 
 #### Windows NSIS Installer
 
+For the OS/terminal compatibility targets and current evidence, see
+[Windows support and release qualification](ENVIRONMENTS.md#windows-support-and-release-qualification).
+
 A standalone NSIS-based installer is available starting with v0.8.50 for
 Windows users who prefer a traditional double-click setup (no npm, no Scoop, no
 Cargo required).
@@ -1384,7 +1378,7 @@ source-build target, not a prebuilt asset.
 
 The release asset uses `aarch64-unknown-linux-musl` and is built on a native ARM
 runner. If you want to build a GNU-linked ARM64 Linux binary on an x64 Linux
-host (e.g. for a HarmonyOS / openEuler ARM64 thin-and-light), use
+host (e.g. for the openEuler Linux subsystem on a HarmonyOS PC), use
 [`cross`](https://github.com/cross-rs/cross), which wraps the official Rust
 cross-targets in a Docker container:
 

@@ -8,21 +8,24 @@
 //! tool is engine-injected, never registered, and dispatched in
 //! `core::engine::tool_execution`.
 //!
-//! Authority stays entirely in Rust, and there is one gate. In a main-session
-//! turn the engine hands the program a [`NestedCallGate`]; every nested call —
-//! native, plugin, or MCP — is sent back to the turn loop and planned by the
-//! same `plan_tool_calls` a direct call goes through (deny/allow lists,
-//! preparation, hooks, ask-rules, Auto-Review, repo law, the worker authority
-//! envelope, the K1 Computer Use refusal), with the source tagged as code mode
-//! so a nested call never activates a deferred schema. A nested call that
-//! needs approval suspends the program: the engine raises the normal
-//! approval request (`request_tool_approval`, same receipt log, same card) and
-//! the program resumes on allow; on deny only that nested call fails, as an
-//! exception the program can catch. Approving the program itself therefore
-//! grants nothing, and `execute_tools` is prepared as auto-approved.
+//! Authority stays entirely in Rust, and there is one gate. In a session turn,
+//! a sub-agent's included, the engine hands the program a [`NestedCallGate`];
+//! every nested call — native, plugin, or MCP — is sent back to the turn loop
+//! and planned by the same `plan_tool_calls` a direct call goes through
+//! (deny/allow lists, preparation, hooks, ask-rules, Auto-Review, repo law, the
+//! worker authority envelope, a sub-agent's grant, the K1 Computer Use
+//! refusal), with the source tagged as code mode so a nested call never
+//! activates a deferred schema. A nested call that needs approval suspends the
+//! program: the engine raises the normal approval request
+//! (`request_tool_approval`, same receipt log, same card) and the program
+//! resumes on allow; on deny only that nested call fails, as an exception the
+//! program can catch. Approving the program itself therefore grants nothing,
+//! and `execute_tools` is prepared as auto-approved. A sub-agent's nested call
+//! is then admitted at execution like its direct call
+//! (`ToolRegistry::admit_child_call`: write-scope claim and live peers).
 //!
-//! Without a gate (sub-agents, direct unit calls) the program keeps the
-//! Phase-1 profile: read-only, auto-approved native calls only, no MCP.
+//! Without a gate (a direct unit call, or a dispatch with no per-call context)
+//! the program runs read-only, auto-approved native calls only, no MCP.
 //!
 //! Receipts (#6509): the host records every nested call when it starts, so a
 //! program that hits its deadline still reports what finished, what was
@@ -52,7 +55,9 @@
 //! - Rich content blocks (images) from nested results are dropped; text and
 //!   JSON payloads pass through bounded.
 //! - Hidden from Plan mode and refused under a worker authority envelope,
-//!   like the other execution surfaces.
+//!   like the other execution surfaces. Also hidden from a sub-agent whose
+//!   grant refuses it (the evidence surface, or an explicit tool list that
+//!   leaves it out).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,11 +88,12 @@ const EXECUTE_TOOLS_TOOL_TYPE: &str = "execute_tools_20260918";
 
 /// Maximum program source accepted, in bytes.
 const MAX_CODE_BYTES: usize = 64 * 1024;
-/// Run deadline when no engine turn serves the program (sub-agents, direct
-/// unit calls). Those callers bound the whole call themselves (the sub-agent
-/// tool timeout), so this is an hour-long backstop rather than an invented
-/// short cap. A gated run takes the remaining turn wall clock instead, which
-/// is unbounded unless `[tui].turn_wall_clock_secs` is set.
+/// Run deadline when no engine turn serves the program (a direct unit call,
+/// or a dispatch with no per-call context). This is an hour-long backstop
+/// rather than an invented short cap. A gated run takes the remaining turn
+/// wall clock instead, which is unbounded unless `[tui].turn_wall_clock_secs`
+/// is set. A sub-agent's program also stops at the sub-agent's tool timeout
+/// or work deadline, and still returns its receipt.
 const FALLBACK_RUN_DEADLINE: Duration = Duration::from_secs(3_600);
 /// How often the run watchdog re-checks while the program is paused on the
 /// gate (approval card, hook, review). Bounds the overrun after a pause.
@@ -554,11 +560,12 @@ impl<T> Drop for AbortOnDrop<T> {
 
 /// [`ToolInvoker`] over a snapshot of the parent turn's registry.
 ///
-/// The snapshot (spec Arcs plus a cloned [`ToolContext`]) is taken at
-/// dispatch so the invoker is `'static` for the VM thread. Nested calls run
-/// on the engine's runtime (captured at dispatch), not the VM thread's.
+/// The snapshot (a registry of the spec Arcs under a cloned [`ToolContext`])
+/// is taken at dispatch so the invoker is `'static` for the VM thread. Nested
+/// calls run on the engine's runtime (captured at dispatch), not the VM
+/// thread's.
 pub(crate) struct CodemodeInvoker {
-    specs: Vec<Arc<dyn ToolSpec>>,
+    registry: Arc<ToolRegistry>,
     context: ToolContext,
     gate: Option<NestedCallGate>,
     runtime: Option<tokio::runtime::Handle>,
@@ -639,8 +646,10 @@ impl CodemodeInvoker {
         spill_prefix: String,
         extra_refusal: Option<ExtraRefusal>,
     ) -> Self {
+        let mut registry = ToolRegistry::new(context.clone());
+        registry.register_all(specs);
         Self {
-            specs,
+            registry: Arc::new(registry),
             context,
             gate,
             runtime: tokio::runtime::Handle::try_current().ok(),
@@ -731,14 +740,14 @@ impl CodemodeInvoker {
         }
     }
 
-    /// Phase-1 admission when no engine gate serves the program.
+    /// Admission when no engine gate serves the program.
     fn ungated_admission(&self, name: &str, input: &Value) -> Result<(), String> {
         if McpPool::is_mcp_tool(name) {
             return Err(format!(
-                "`{name}` is an MCP tool; this program has no session permission gate (sub-agent or host without a turn), so call it directly"
+                "`{name}` is an MCP tool; no engine turn serves this program's session permission gate, so call it directly"
             ));
         }
-        let Some(spec) = self.specs.iter().find(|spec| spec.name() == name) else {
+        let Some(spec) = self.registry.get(name) else {
             return Err(format!(
                 "unknown tool `{name}`; discover names with tool_search before writing the program"
             ));
@@ -759,25 +768,13 @@ impl CodemodeInvoker {
 
     /// Execute an admitted call on the engine runtime: MCP through the
     /// session pool (same dispatcher as a direct call), everything else
-    /// through its registry spec under the turn's authority envelope.
+    /// through the registry under the turn's authority envelope. Either way a
+    /// sub-agent's call is first admitted against its grant, as its direct
+    /// call is.
     async fn execute(&self, name: &str, input: Value) -> Result<RichToolResult, ToolError> {
+        use crate::core::engine::tool_execution::OperationSpanGuard;
         let action_id = super::activity::action_id(name, &input);
-        let activity_kind = if McpPool::is_mcp_tool(name) {
-            if let Some(pool) = self.gate.as_ref().and_then(|gate| gate.mcp_pool.as_ref()) {
-                pool.lock()
-                    .await
-                    .resolved_tool_servers()
-                    .get(name)
-                    .map(|server| super::activity::mcp_activity_kind(server))
-            } else {
-                None
-            }
-        } else {
-            super::activity::registry_activity_kind(name, &input)
-        };
-        let future: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<RichToolResult, ToolError>> + Send>,
-        > = if McpPool::is_mcp_tool(name) {
+        let mcp = if McpPool::is_mcp_tool(name) {
             let Some(gate) = self.gate.as_ref() else {
                 return Err(ToolError::not_available(format!(
                     "MCP tool `{name}` needs the session MCP pool"
@@ -788,37 +785,22 @@ impl CodemodeInvoker {
                     "MCP is not connected for this turn, so `{name}` cannot run"
                 )));
             };
-            let tx_event = gate.tx_event.clone();
-            let disallowed = self.context.disallowed_tools.clone();
-            let name = name.to_string();
-            Box::pin(async move {
-                crate::core::engine::Engine::execute_mcp_tool_with_pool(
-                    pool,
-                    &tx_event,
-                    &name,
-                    input,
-                    &disallowed,
-                    // Calls a program makes never carry a person's decision.
-                    None,
-                )
-                .await
-            })
+            Some((pool, gate.tx_event.clone()))
         } else {
-            let Some(spec) = self.specs.iter().find(|spec| spec.name() == name).cloned() else {
-                return Err(ToolError::not_available(format!(
-                    "tool `{name}` is not registered"
-                )));
-            };
-            enforce_tool_authority(name, &input, spec.as_ref(), &self.context)?;
-            let context = self.context.clone();
-            crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
-                .map_err(ToolError::not_available)?;
-            Box::pin(async move {
-                crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
-                    .map_err(ToolError::not_available)?;
-                spec.execute_rich(input, &context).await
-            })
+            None
         };
+        let activity_kind = match mcp.as_ref() {
+            Some((pool, _)) => pool
+                .lock()
+                .await
+                .resolved_tool_servers()
+                .get(name)
+                .map(|server| super::activity::mcp_activity_kind(server)),
+            None => super::activity::registry_activity_kind(name, &input),
+        };
+        let registry = Arc::clone(&self.registry);
+        let context = self.context.clone();
+        let name = name.to_string();
         let tx = self.gate.as_ref().map(|gate| gate.tx_event.clone());
         let cancel = self.context.cancel_token.clone();
         let call_id = self
@@ -832,7 +814,7 @@ impl CodemodeInvoker {
             }
             let span = match (tx.as_ref(), activity_kind) {
                 (Some(tx), Some(kind)) => Some(
-                    crate::core::engine::tool_execution::OperationSpanGuard::start(
+                    OperationSpanGuard::reserve(
                         tx,
                         &call_id,
                         kind,
@@ -846,13 +828,36 @@ impl CodemodeInvoker {
             if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
                 return Err(ToolError::cancelled("Nested dispatch admission cancelled."));
             }
-            let outcome = future.await;
+            let Some((pool, tx_event)) = mcp else {
+                return registry
+                    .execute_rich_full_with_context(&name, input, Some(&context), || {
+                        Ok(span.map(OperationSpanGuard::activate))
+                    })
+                    .await;
+            };
+            let child = registry.admit_child_call(&name, &input, &context).await?;
+            let span = span.map(OperationSpanGuard::activate);
+            let outcome = crate::core::engine::Engine::execute_mcp_tool_with_pool(
+                pool,
+                &tx_event,
+                &name,
+                input,
+                &context.disallowed_tools,
+                // Calls a program makes never carry a person's decision.
+                None,
+            )
+            .await;
             if let Some(span) = span {
                 span.complete(super::activity::operation_outcome(
                     &outcome,
                     cancel.as_ref().is_some_and(CancellationToken::is_cancelled),
                 ))
                 .await;
+            }
+            if outcome.as_ref().is_ok_and(|result| result.result.success)
+                && let Some((authority, writes)) = child
+            {
+                authority.record_settled_writes(writes).await;
             }
             outcome
         };
@@ -1059,7 +1064,7 @@ impl CodemodeInvoker {
 
         if let Some(note) = refusal_before_gate(&tool, &input, self.gate.is_some()).or_else(|| {
             self.extra_refusal
-                .and_then(|refuse| refuse(&self.specs, &tool, &input))
+                .and_then(|refuse| refuse(&self.registry.all(), &tool, &input))
         }) {
             return Err(self.refused(seq, started, NestedDecision::Refused, note));
         }
@@ -1254,6 +1259,7 @@ fn receipt_payload(
     driver: &CodemodeDriver,
 ) -> ToolResult {
     let calls = invoker.drain();
+    let ran = calls.iter().any(|call| call.status != CallStatus::Refused);
     let content = json!({
         "success": success,
         "body": body,
@@ -1265,7 +1271,7 @@ fn receipt_payload(
     ToolResult {
         content,
         success,
-        metadata: None,
+        metadata: (!ran).then(|| json!({ "executed": false })),
     }
 }
 
@@ -1299,17 +1305,31 @@ pub async fn execute_tools_tool(
         invoker.clone(),
         cancel.clone(),
     ));
-    let outcome = loop {
-        let Some(remaining) = invoker.remaining(deadline) else {
-            break None;
-        };
-        tokio::select! {
-            result = &mut run => break Some(result),
-            () = tokio::time::sleep(remaining) => {}
+    let watchdog = async {
+        loop {
+            let Some(remaining) = invoker.remaining(deadline) else {
+                return Err(format!(
+                    "its {}s run deadline (time waiting on approvals is not counted)",
+                    deadline.as_secs()
+                ));
+            };
+            tokio::select! {
+                result = &mut run => return Ok(result),
+                () = tokio::time::sleep(remaining) => {}
+            }
         }
     };
+    let outcome = match context.child_host.as_ref() {
+        Some(child) => child
+            .run_tool_bounded(async { Ok::<_, ToolError>(watchdog.await) })
+            .await
+            .unwrap_or_else(|_| {
+                Err("the sub-agent's tool timeout (time waiting on approvals is not counted) or work deadline".to_string())
+            }),
+        None => watchdog.await,
+    };
     let program_result = match outcome {
-        None => {
+        Err(stopped_at) => {
             // Stop the VM (and with it every in-flight nested call) before
             // reading the receipt, so the listed state is final.
             cancel.cancel();
@@ -1318,8 +1338,7 @@ pub async fn execute_tools_tool(
                 false,
                 json!({
                     "error": format!(
-                        "execute_tools stopped at its {}s run deadline (time waiting on approvals is not counted). Calls with status ok/failed/refused finished; calls still in_flight were cancelled and may have partially run.",
-                        deadline.as_secs()
+                        "execute_tools stopped at {stopped_at}. Calls with status ok/failed/refused finished; calls still in_flight were cancelled and may have partially run."
                     ),
                     "timed_out": true,
                 }),
@@ -1327,7 +1346,7 @@ pub async fn execute_tools_tool(
                 &driver,
             ));
         }
-        Some(Err(err)) => {
+        Ok(Err(err)) => {
             return Ok(receipt_payload(
                 false,
                 json!({ "error": err.to_string() }),
@@ -1335,7 +1354,7 @@ pub async fn execute_tools_tool(
                 &driver,
             ));
         }
-        Some(Ok(value)) => value,
+        Ok(Ok(value)) => value,
     };
     let spill_id = format!("{}-return", invoker.spill_prefix);
     let (bounded, truncated) = bound_json(program_result, RETURN_CAP_BYTES, &spill_id);
@@ -1503,6 +1522,97 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, DriverError::Rejected(_)), "{name}: {err:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn native_navigation_resolves_real_source_and_refuses_stale_or_escaped_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "const LURE: &str = r#\"\nfn forged() {}\n\"#;\npub fn wanted() -> &'static str {\n    \"NAV_BODY\"\n}\nfn sibling() {}\n";
+        std::fs::write(dir.path().join("nav.rs"), source).unwrap();
+        let context = ToolContext::new(dir.path());
+        let registry = ToolRegistryBuilder::new()
+            .with_tool(Arc::new(ReadTool))
+            .build(context.clone());
+        let code = "const r = await tools.call('read', {path: 'nav.rs', limit: 1}); return r.metadata.navigation || null;";
+        let result = execute_tools_tool(&json!({"code": code}), &registry, &context)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.content);
+        let body: Value = serde_json::from_str(&result.content).unwrap();
+        let navigation = &body["body"]["return"];
+        assert_eq!(
+            navigation["producer"], "rust_syntax_v1",
+            "read must publish revision-qualified syntax evidence"
+        );
+        let symbols = navigation["symbols"].as_array().unwrap();
+        assert!(
+            !symbols.iter().any(|symbol| symbol["name"] == "forged"),
+            "a function-looking raw string is not a declaration"
+        );
+        let reference = symbols
+            .iter()
+            .find(|symbol| symbol["name"] == "wanted")
+            .unwrap()["read"]
+            .clone();
+        assert_eq!(reference["path"], "nav.rs");
+        assert_eq!(reference["offset"], 4);
+        assert_eq!(reference["limit"], 3);
+        let wanted = ReadTool.execute(reference.clone(), &context).await.unwrap();
+        assert!(
+            wanted
+                .content
+                .starts_with("pub fn wanted() -> &'static str {\n    \"NAV_BODY\"\n}"),
+            "{}",
+            wanted.content
+        );
+        assert!(
+            !wanted
+                .content
+                .split("\n\n[")
+                .next()
+                .unwrap()
+                .contains("fn sibling")
+        );
+
+        let child = context.clone().with_state_namespace("navigation-child");
+        let child_read = ReadTool.execute(reference.clone(), &child).await.unwrap();
+        assert_eq!(
+            child_read.metadata.as_ref().unwrap()["navigation"],
+            *navigation,
+            "shared physical knowledge is revision-stable, not parent delivery state"
+        );
+        let child_workspace = dir.path().join("child");
+        std::fs::create_dir(&child_workspace).unwrap();
+        let restricted =
+            ToolContext::new(&child_workspace).with_runtime_services(context.runtime.clone());
+        let mut escaped = reference.clone();
+        escaped["path"] = json!("../nav.rs");
+        assert!(
+            matches!(
+                ReadTool.execute(escaped, &restricted).await,
+                Err(ToolError::PathEscape { .. })
+            ),
+            "a warmed shared cache must not grant workspace access"
+        );
+
+        std::fs::write(
+            dir.path().join("nav.rs"),
+            source.replace("NAV_BODY", "NAV_EDIT"),
+        )
+        .unwrap();
+        let stale = ReadTool
+            .execute(reference, &child)
+            .await
+            .expect_err("same-size external edit must invalidate the reference");
+        assert!(stale.to_string().contains("stale"), "{stale}");
+        let refreshed = ReadTool
+            .execute(json!({"path": "nav.rs", "limit": 1}), &child)
+            .await
+            .unwrap();
+        assert_ne!(
+            refreshed.metadata.as_ref().unwrap()["navigation"]["source_revision"],
+            navigation["source_revision"]
+        );
     }
 
     #[tokio::test]

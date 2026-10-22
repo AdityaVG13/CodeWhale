@@ -1,0 +1,5 @@
+Contact: https://github.com/codewhale-hq/Codewhale/security/advisories/new
+Expires: 2027-10-19T00:00:00.000Z
+Preferred-Languages: en, zh
+Canonical: https://codewhale.net/.well-known/security.txt
+Policy: https://github.com/codewhale-hq/Codewhale/blob/main/SECURITY.md

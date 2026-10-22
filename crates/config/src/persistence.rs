@@ -64,6 +64,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to set permissions for {}", path.display()))?;
     }
 
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync temp file for {}", path.display()))?;
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("failed to persist {}", path.display()))?;

@@ -1857,6 +1857,7 @@ impl SnapshotRepo {
     }
 
     fn prune_older_than_locked(&self, max_age: Duration) -> io::Result<usize> {
+        self.repair_broken_head()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| io_other(format!("clock error: {e}")))?
@@ -2415,7 +2416,7 @@ fn run_bounded_git(cmd: &mut std::process::Command, subcommand: &str) -> io::Res
     run_bounded_git_with_timeout(cmd, subcommand, GIT_COMMAND_TIMEOUT)
 }
 
-fn run_bounded_git_with_timeout(
+pub(crate) fn run_bounded_git_with_timeout(
     cmd: &mut std::process::Command,
     subcommand: &str,
     timeout: Duration,

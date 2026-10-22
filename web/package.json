@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Community site for Codewhale \u2014 codewhale.net",
+  "description": "Community site for Codewhale — codewhale.net",
   "scripts": {
     "dev": "node scripts/opennext-config.mjs && node scripts/derive-facts.mjs && node scripts/derive-changelog.mjs && node scripts/derive-install.mjs && next dev",
     "prebuild": "node scripts/derive-facts.mjs && node scripts/derive-changelog.mjs && node scripts/derive-install.mjs",
@@ -53,7 +53,7 @@
     "postcss": "^8.5.18",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
-    "vitest": "^4.1.11",
+    "vitest": "^5.0.5",
     "wrangler": "4.147.0"
   },
   "overrides": {

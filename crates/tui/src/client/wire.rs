@@ -111,6 +111,25 @@ pub(crate) fn parse_usage(usage: Option<&Value>) -> Usage {
         reasoning_tokens,
         reasoning_replay_tokens: None,
         server_tool_use,
+
+        input_audio_tokens: usage
+            .and_then(|usage| {
+                usage
+                    .pointer("/prompt_tokens_details/audio_tokens")
+                    .or_else(|| usage.pointer("/input_tokens_details/audio_tokens"))
+            })
+            .and_then(Value::as_u64)
+            .map(saturating_u32),
+        output_audio_tokens: usage
+            .and_then(|usage| {
+                usage
+                    .pointer("/completion_tokens_details/audio_tokens")
+                    .or_else(|| usage.pointer("/output_tokens_details/audio_tokens"))
+            })
+            .and_then(Value::as_u64)
+            .map(saturating_u32),
+
+        request_usages: Vec::new(),
     }
 }
 
@@ -178,9 +197,19 @@ fn decode_sse_line_bytes(bytes: &[u8]) -> Result<&str, SseLineError> {
 /// Genuine invalid bytes fail closed (`Err(SseLineError)`); we do not
 /// substitute U+FFFD.
 pub(super) fn take_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, SseLineError> {
+    let mut remaining = buffer.as_slice();
+    let decoded = take_sse_line_from_slice(&mut remaining);
+    let consumed = buffer.len() - remaining.len();
+    buffer.drain(..consumed);
+    decoded
+}
+
+/// Advance over one complete line without moving the remaining bytes. Chunk
+/// consumers can drain the consumed prefix once after processing all its lines.
+pub(super) fn take_sse_line_from_slice(buffer: &mut &[u8]) -> Result<Option<String>, SseLineError> {
     let line_end = buffer.iter().position(|&b| b == b'\n');
     if line_end.unwrap_or(buffer.len()) > MAX_SSE_LINE_BYTES {
-        buffer.clear();
+        *buffer = &[];
         return Err(SseLineError::TooLong);
     }
     let Some(line_end) = line_end else {
@@ -192,7 +221,7 @@ pub(super) fn take_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, SseL
         end -= 1;
     }
     let decoded = decode_sse_line_bytes(&buffer[..end]).map(|text| text.trim().to_string());
-    buffer.drain(..=line_end);
+    *buffer = &buffer[line_end + 1..];
     decoded.map(Some)
 }
 

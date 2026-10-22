@@ -1,7 +1,7 @@
 [
   {
     "name": "bash",
-    "description": "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is the seconds to wait in the foreground (default 30 seconds); a command still running then is never killed for time: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id, so long builds and tests need no special timeout. Find task_shell_wait with tool_search to read more or wait for it. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user.",
+    "description": "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is the seconds to wait in the foreground (default 30 seconds); a command still running then is never killed for time: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id, so long builds and tests need no special timeout. Call task_shell_wait directly with that task_id to read more or wait for it; do not sleep-poll with bash. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -18,7 +18,7 @@
           "type": "string"
         },
         "read_only": {
-          "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation.",
+          "description": "Set true to run analysis code (including Python/SQLite) or a network fetch (curl) with mandatory native filesystem read-only isolation. Outbound network is on only in Full Access when the session sandbox, the network policy and your network grant allow it. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation.",
           "type": "boolean"
         },
         "sandbox_permissions": {
@@ -30,7 +30,7 @@
           "type": "string"
         },
         "timeout": {
-          "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Find task_shell_wait with tool_search to read more or wait for it.",
+          "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Call task_shell_wait directly with that task_id to read more or wait for it; do not sleep-poll with bash.",
           "type": "number"
         }
       },
@@ -216,6 +216,54 @@
       },
       "required": [
         "path"
+      ],
+      "type": "object"
+    },
+    "allowed_callers": [
+      "direct"
+    ],
+    "defer_loading": false
+  },
+  {
+    "name": "task_shell_wait",
+    "description": "Poll a background shell task without blocking the agent indefinitely, or stop it with cancel=true. Completion is delivered automatically; use this only for early output, explicit barriers, or gate evidence. If `gate` is supplied and the shell task has completed, records structured gate evidence on the active durable task.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "cancel": {
+          "description": "Stop (kill) the task instead of polling; not valid with gate.",
+          "type": "boolean"
+        },
+        "command": {
+          "description": "Original command, used when recording gate evidence.",
+          "type": "string"
+        },
+        "gate": {
+          "enum": [
+            "fmt",
+            "check",
+            "clippy",
+            "test",
+            "custom"
+          ],
+          "type": "string"
+        },
+        "task_id": {
+          "description": "Background shell task id.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "maximum": 600000,
+          "minimum": 1000,
+          "type": "integer"
+        },
+        "wait": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "task_id"
       ],
       "type": "object"
     },

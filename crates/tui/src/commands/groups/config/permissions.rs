@@ -235,26 +235,17 @@ fn escape_field(value: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
-            character if character.is_control() || is_bidi_format_control(character) => {
+            character
+                if character.is_control()
+                    || codewhale_sanitize::sanitize::is_bidi_control(character)
+                    || matches!(character, '\u{2028}' | '\u{2029}') =>
+            {
                 escaped.extend(character.escape_unicode());
             }
             character => escaped.push(character),
         }
     }
     escaped
-}
-
-fn is_bidi_format_control(character: char) -> bool {
-    matches!(
-        character,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
 }
 
 #[cfg(test)]

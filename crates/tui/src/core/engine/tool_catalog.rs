@@ -51,16 +51,25 @@ pub(crate) fn is_tool_search_tool(name: &str) -> bool {
 #[rustfmt::skip]
 pub(crate) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     // Core work controls are eager; specialized tools stay searchable.
-    "read", "write", "edit", "file_search", "bash", "agent", "workflow", "todo_write",
+    "read", "write", "edit", "file_search", "bash", "todo_write",
     // Continuation instructions require these controls. Hiding them behind
     // discovery leaves a model unable to stop the work it was asked to run.
-    "create_goal", "get_goal", "update_goal",
+    "task_shell_wait",
     // The pinned `## Skills` index tells the model to call `load_skill`, so
     // the tool has to be on the wire for that instruction to be true. Behind
     // `tool_search` it cost a discovery hop plus a `change:tool_surface`
     // re-pin every time a skill was used, against ~134 pinned bytes to have
     // it eager beside the index the prefix already carries.
     "load_skill",
+    // create_goal is eager: it is the entry point. Token diet: agent and
+    // workflow stay deferred despite being core-adjacent — their schemas
+    // cost ~21KB/turn and BM25 discovery (`tool_search`) finds them
+    // reliably when delegation is actually wanted (cued-delegation probe:
+    // discovered and executed; uncued sessions behave identically).
+    // get/update_goal cannot succeed without an active goal, so they ride
+    // `always_load` only while one exists (see the catalog build in
+    // `engine.rs`) instead of taxing every goalless turn.
+    "create_goal",
 ];
 
 const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
@@ -446,23 +455,6 @@ pub(crate) fn remove_evicted_cache_activations(
     }
 }
 
-/// Promote a successfully executed deferred tool only when this conversation
-/// had already activated it. Execution can update recency, never grant a name.
-pub(crate) fn touch_cached_tool_after_execution(
-    catalog: &[Tool],
-    active: &mut HashSet<String>,
-    cache: &mut ToolActivationCache,
-    name: &str,
-) -> bool {
-    if !cache.names().any(|cached| cached == name) {
-        return false;
-    }
-    let delta = cache.activate(catalog, &[name.to_string()]);
-    remove_evicted_cache_activations(catalog, active, delta.evicted);
-    active.extend(delta.admitted);
-    true
-}
-
 /// Make the recovery schema visible on the next provider step when a tool
 /// result actually publishes retrievable evidence. The initial toolbox stays
 /// small, while a receipt never advertises a deferred route that merely asks
@@ -478,7 +470,8 @@ pub(crate) fn activate_result_dependencies(
         .as_ref()
         .and_then(|metadata| metadata.get("evidence_available"))
         .and_then(Value::as_bool)
-        == Some(true);
+        == Some(true)
+        || super::context::offers_retrieval(result.metadata.as_ref());
     if !needs_retrieval {
         return false;
     }
@@ -565,7 +558,12 @@ impl ToolSurfacePolicy {
         // explicit command gate.
         catalog.retain(|tool| {
             !tool_denied(disallowed_tools.as_deref(), &tool.name)
-                && tool_allowed(allowed_tools.as_deref(), &tool.name)
+                && (tool_allowed(allowed_tools.as_deref(), &tool.name)
+                    || retrieval_available_beside_an_allowlist(
+                        allowed_tools.as_deref(),
+                        disallowed_tools.as_deref(),
+                        &tool.name,
+                    ))
         });
         for tool in &mut catalog {
             if let Some(actions) = tool
@@ -613,6 +611,11 @@ impl ToolSurfacePolicy {
 
     pub(super) fn passes_allow_list(&self, name: &str) -> bool {
         tool_allowed(self.allowed_tools.as_deref(), name)
+            || retrieval_available_beside_an_allowlist(
+                self.allowed_tools.as_deref(),
+                self.disallowed_tools.as_deref(),
+                name,
+            )
     }
 
     /// A configured-server handshake may only serve this captured turn's
@@ -644,6 +647,25 @@ pub(super) fn tool_allowed(allowed_tools: Option<&[String]>, tool_name: &str) ->
         return true;
     };
     tool_matches_any_rule(allowed_tools, tool_name)
+}
+
+/// Retrieval stays off the initial `tools` field but must survive an allow-list
+/// narrowing, or a result that names a saved copy advertises a route the turn
+/// cannot call.
+///
+/// This is deliberately not a branch inside [`tool_allowed`]: that answer is
+/// "does this name match the allow-list", and an empty allow-list means no
+/// tools, which `exec` relies on. Keeping the tool in the catalog lets
+/// [`activate_result_dependencies`] admit it later, only after a result really
+/// publishes retrievable evidence, and an explicit deny still removes it.
+fn retrieval_available_beside_an_allowlist(
+    allowed_tools: Option<&[String]>,
+    disallowed_tools: Option<&[String]>,
+    tool_name: &str,
+) -> bool {
+    tool_name == TOOL_RESULT_RETRIEVAL_NAME
+        && disallowed_tools.is_none_or(|rules| !tool_denied(Some(rules), tool_name))
+        && allowed_tools.is_some_and(|rules| !rules.is_empty())
 }
 
 pub(crate) fn tool_denied(disallowed_tools: Option<&[String]>, tool_name: &str) -> bool {
@@ -937,7 +959,12 @@ fn discover_tools_with_regex(
     let regex = compile_user_regex(query)
         .map_err(|err| ToolError::invalid_input(format!("Invalid regex query: {err}")))?;
 
-    let mut matches = Vec::new();
+    // Name matches outrank haystack matches: a regex that hits the tool's
+    // own name is the strongest possible signal, and catalog (alphabetical)
+    // order otherwise lets an incidental mention evict the literal target
+    // from the bounded activation cache.
+    let mut name_matches = Vec::new();
+    let mut hay_matches = Vec::new();
     let mut scratch = ToolSearchScratch::default();
     for tool in catalog {
         // tool_search loads definitions omitted from the current request. An
@@ -947,15 +974,19 @@ fn discover_tools_with_regex(
         if !tool.defer_loading.unwrap_or(false) || is_tool_search_tool(&tool.name) {
             continue;
         }
+        // Lowercased, like the haystack path below: `Agent` must hit `agent`.
+        if regex.is_match(&tool.name.to_lowercase()) {
+            name_matches.push(tool.name.clone());
+            continue;
+        }
         scratch.load(tool);
         if regex.is_match(&scratch.hay) {
-            matches.push(tool.name.clone());
-        }
-        if matches.len() >= max_results {
-            break;
+            hay_matches.push(tool.name.clone());
         }
     }
-    Ok(matches)
+    name_matches.extend(hay_matches);
+    name_matches.truncate(max_results);
+    Ok(name_matches)
 }
 
 fn discover_tools_with_bm25_like(catalog: &[Tool], query: &str, max_results: usize) -> Vec<String> {
@@ -1543,10 +1574,18 @@ fn execute_tool_search_inner(
     };
 
     let mut cache_rejected = Vec::new();
+    let mut cache_held = Vec::new();
+    let mut evicted = Vec::new();
     if let Some(cache) = cache {
         let delta = cache.activate(catalog, &discovered);
-        remove_evicted_cache_activations(catalog, active_tools, delta.evicted);
+        remove_evicted_cache_activations(catalog, active_tools, delta.evicted.iter().cloned());
+        evicted = delta
+            .evicted
+            .into_iter()
+            .filter(|name| !active_tools.contains(name))
+            .collect();
         cache_rejected = delta.rejected;
+        cache_held = delta.held;
         discovered = delta.admitted;
     }
     for name in &discovered {
@@ -1574,20 +1613,51 @@ fn execute_tool_search_inner(
             "reason": "The tool schema exceeds the bounded conversation toolbox (8 cached tools, 16KiB of added serialized schemas). Narrow the search or use a smaller matching tool."
         })
     }));
+    unavailable_references.extend(cache_held.iter().map(|name| {
+        json!({
+            "type": "unavailable_tool_reference",
+            "tool_name": name,
+            "reason": "Not loaded: tools used in this or the previous turn fill this conversation's bounded toolbox (8 cached tools, 16KiB of added serialized schemas). Call tool_search with tool_search_input to load it on its own.",
+            "tool_search_input": readmission_search_input(name),
+        })
+    }));
 
-    let payload = json!({
+    let mut payload = json!({
         "type": "tool_search_tool_search_result",
         "tool_references": references,
         "unavailable_tool_references": unavailable_references.clone(),
     });
+    let mut metadata = json!({
+        "tool_references": discovered,
+        "unavailable_tool_references": unavailable_references,
+    });
+    if !evicted.is_empty() {
+        payload["evicted_tool_references"] = evicted
+            .iter()
+            .map(|name| {
+                json!({
+                    "type": "evicted_tool_reference",
+                    "tool_name": name,
+                    "reason": "Evicted from this conversation's bounded toolbox (8 cached tools, 16KiB of added serialized schemas) because it was not used in this or the previous turn, so it is not callable now. Call tool_search with tool_search_input to load it again.",
+                    "tool_search_input": readmission_search_input(name),
+                })
+            })
+            .collect();
+        metadata["evicted_tool_references"] = json!(evicted);
+    }
 
     Ok(ToolResult {
         content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
         success: true,
-        metadata: Some(json!({
-            "tool_references": discovered,
-            "unavailable_tool_references": unavailable_references,
-        })),
+        metadata: Some(metadata),
+    })
+}
+
+fn readmission_search_input(name: &str) -> Value {
+    json!({
+        "query": format!("^{}\\n", regex::escape(&name.to_lowercase())),
+        "match": "regex",
+        "max_results": 1,
     })
 }
 

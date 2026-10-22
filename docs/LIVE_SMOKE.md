@@ -171,7 +171,8 @@ From the `stream-json` metadata receipt:
 | `route_source` | records *why* that route was chosen |
 | `reasoning_tokens` | present when the receipt reports reasoning; absence can reflect model/provider behavior, configuration, or a harness omission and needs corroboration |
 | `tool_catalog_sha256` | present when a tool surface was offered |
-| `approval_posture`, `sandbox_posture` | match the flags you passed |
+| `approval_posture` | `auto_tools` for the `--auto` command above |
+| `sandbox_posture` | the policy and its enforcement: Full Access by default with `--auto`; restrictive policies say `local OS sandbox applied` or `policy only; no execution sandbox available`; external execution backends identify filesystem/network isolation as unverified by Codewhale |
 | `duration_ms`, `input_tokens`, `output_tokens` | present for a completed run |
 
 Report the receipt fields. Do **not** paste the credential, the key file, or

@@ -31,6 +31,44 @@ mod network_policy;
 /// capped body reader is needed, so only that file is included.
 #[path = "../../src/utils/response_body.rs"]
 mod utils;
+mod tools {
+    pub mod web {
+        pub mod guard {
+            pub type DnsPin = Option<(String, std::net::IpAddr)>;
+
+            pub fn fetch_target_host(url: &reqwest::Url) -> anyhow::Result<String> {
+                url.host_str()
+                    .map(str::to_ascii_lowercase)
+                    .ok_or_else(|| anyhow::anyhow!("URL must include a host"))
+            }
+
+            pub fn guarded_reqwest_client_builder() -> reqwest::ClientBuilder {
+                codewhale_release::tls::reqwest_client_builder().no_proxy()
+            }
+
+            pub async fn validate_fetch_destination(
+                _host: String,
+                _decider: Option<&crate::network_policy::NetworkPolicyDecider>,
+                _tool: &str,
+                _resolve: bool,
+            ) -> anyhow::Result<DnsPin> {
+                Ok(None)
+            }
+        }
+    }
+}
+mod mcp {
+    pub fn configured_mcp_proxy<F>(
+        _url: &reqwest::Url,
+        _disallow_ambient_proxy: bool,
+        _read_environment: F,
+    ) -> anyhow::Result<Option<reqwest::Proxy>>
+    where
+        F: FnMut(&str) -> std::result::Result<String, std::env::VarError>,
+    {
+        Ok(None)
+    }
+}
 /// `network_policy.rs` resolves its audit file through `crate::audit`. The
 /// harness has no audit module, so it gets a per-process scratch log: like the
 /// production cfg(test) path (#6534), a test never appends to the real

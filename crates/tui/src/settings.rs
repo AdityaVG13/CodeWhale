@@ -375,7 +375,7 @@ pub struct Settings {
     pub composer_vim_mode: String,
     /// Transcript spacing rhythm: compact, comfortable, spacious
     pub transcript_spacing: String,
-    /// Default mode: "agent" (Act), "plan", or "operate". Legacy permission
+    /// Default mode: "agent" (Work), "plan", or "operate". Legacy permission
     /// shorthands are accepted for migration but never advertised as modes.
     pub default_mode: String,
     /// Legacy sidebar width as percentage of terminal width. Load-only
@@ -585,7 +585,7 @@ impl Default for Settings {
             composer_border: true,
             composer_multiline_mode: false,
             composer_vim_mode: "normal".to_string(),
-            transcript_spacing: "comfortable".to_string(),
+            transcript_spacing: "spacious".to_string(),
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
             sidebar_focus: "auto".to_string(),
@@ -1704,14 +1704,14 @@ impl Settings {
                 self.workspace_follow_symlinks = parse_bool(value)?;
             }
             "default_mode" | "mode" => {
-                // Act (wire: agent), Plan, and Operate are valid startup modes.
+                // Work (wire: agent), Plan, and Operate are valid startup modes.
                 // yolo remains a permission-migration alias, not a mode write.
                 self.default_mode = match value.trim().to_ascii_lowercase().as_str() {
                     "agent" | "normal" | "act" | "work" | "edit" => "agent".to_string(),
                     "plan" => "plan".to_string(),
                     "operate" | "operation" | "ops" => "operate".to_string(),
                     _ => anyhow::bail!(
-                        "Failed to update setting: invalid mode '{value}'. Expected: act (agent), plan, or operate."
+                        "Failed to update setting: invalid mode '{value}'. Expected: work (agent), plan, or operate."
                     ),
                 };
             }
@@ -2885,7 +2885,7 @@ fn normalize_composer_density(value: &str) -> &str {
 fn normalize_transcript_spacing(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "compact" | "tight" => "compact",
-        "comfortable" | "default" | "normal" => "comfortable",
+        "comfortable" | "default" | "normal" => "spacious",
         "spacious" | "loose" => "spacious",
         _ => value,
     }
@@ -3602,7 +3602,7 @@ mod tests {
             load_error: None,
             fancy_animations: true,
             show_tool_details: true,
-            transcript_spacing: "comfortable".to_string(),
+            transcript_spacing: "spacious".to_string(),
             ..Settings::default()
         }
     }
@@ -3634,13 +3634,13 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_use_comfortable_transcript_spacing() {
+    fn default_settings_use_spacious_transcript_spacing() {
         let settings = Settings::default();
         assert!(settings.calm_mode);
         assert!(!settings.show_tool_details);
         assert!(!settings.low_motion);
         assert!(settings.fancy_animations);
-        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert_eq!(settings.transcript_spacing, "spacious");
         assert_eq!(settings.tool_collapse_mode, "compact");
         // Thinking is opt-in so the transcript stays focused on the chat.
         assert!(!settings.show_thinking);
@@ -3859,7 +3859,7 @@ mod tests {
             "underwater presentation is the default"
         );
         assert!(!settings.low_motion);
-        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert_eq!(settings.transcript_spacing, "spacious");
     }
 
     #[test]
@@ -4531,6 +4531,11 @@ zai = ["GLM-5.2", "GLM-5.3"]
     #[test]
     fn ghostty_term_program_keeps_full_motion_without_the_legacy_30_fps_cap() {
         let _g = term_program_test_guard();
+        let _tmux = crate::test_support::EnvVarGuard::remove("TMUX");
+        let _sty = crate::test_support::EnvVarGuard::remove("STY");
+        let _tilix_id = crate::test_support::EnvVarGuard::remove("TILIX_ID");
+        let _terminator_uuid = crate::test_support::EnvVarGuard::remove("TERMINATOR_UUID");
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
@@ -4559,6 +4564,11 @@ zai = ["GLM-5.2", "GLM-5.3"]
     #[test]
     fn ghostty_term_fallback_keeps_full_motion_without_the_legacy_30_fps_cap() {
         let _g = term_program_test_guard();
+        let _tmux = crate::test_support::EnvVarGuard::remove("TMUX");
+        let _sty = crate::test_support::EnvVarGuard::remove("STY");
+        let _tilix_id = crate::test_support::EnvVarGuard::remove("TILIX_ID");
+        let _terminator_uuid = crate::test_support::EnvVarGuard::remove("TERMINATOR_UUID");
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
@@ -4592,6 +4602,7 @@ zai = ["GLM-5.2", "GLM-5.3"]
     #[test]
     fn non_vscode_term_program_does_not_force_low_motion() {
         let _g = term_program_test_guard();
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         let prev = std::env::var_os("TERM_PROGRAM");
         let prev_term = std::env::var_os("TERM");
         let prev_ssh_client = std::env::var_os("SSH_CLIENT");
@@ -4659,6 +4670,7 @@ zai = ["GLM-5.2", "GLM-5.3"]
     #[test]
     fn tilix_and_terminator_cap_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
+        let _no_animations = crate::test_support::EnvVarGuard::remove("NO_ANIMATIONS");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
@@ -5256,7 +5268,7 @@ zai = ["GLM-5.2", "GLM-5.3"]
             .set("default_mode", "yolo")
             .expect_err("yolo remains a permission migration alias, not a mode write");
         assert!(
-            err.to_string().contains("act (agent), plan, or operate"),
+            err.to_string().contains("work (agent), plan, or operate"),
             "{err}"
         );
     }

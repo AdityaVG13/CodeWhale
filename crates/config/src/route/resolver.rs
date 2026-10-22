@@ -41,7 +41,7 @@ use super::errors::RouteError;
 use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
 use super::offering::{ProviderModelOffering, RouteLimits, bundled_offerings};
 use crate::catalog::{CatalogOffering, bundled_catalog_offerings};
-use crate::provider::WirePolicy;
+use crate::provider::{WireFormat, WirePolicy};
 use crate::{ProviderKind, opencode_go_model_id, provider_preserves_custom_base_url_model};
 
 /// A request to resolve into an executable route.
@@ -63,6 +63,13 @@ pub struct RouteRequest {
     /// for adjusting a route's effective limits: the candidate itself is
     /// immutable once minted.
     pub limit_overrides: Vec<SourcedLimitOverride>,
+    /// Wire override for a custom provider table, honored ONLY for
+    /// `ProviderKind::Custom` (built-ins keep their descriptor policy). The
+    /// tui route layer populates it from the resolved identity's
+    /// `[providers.<name>] wire` dialect so a table saying
+    /// `wire = "responses"` mints a wire-true candidate instead of Custom's
+    /// backward-compatible static Chat policy.
+    pub wire_override: Option<WireFormat>,
 }
 
 /// Resolves [`RouteRequest`]s into [`ReadyRouteCandidate`]s.
@@ -129,6 +136,25 @@ impl RouteResolver {
     #[must_use]
     pub fn new() -> Self {
         Self::from_offerings(default_offerings())
+    }
+
+    /// The process-wide resolver built from the committed bundled asset.
+    ///
+    /// [`Self::new`] re-projects the entire bundled Models.dev asset — every
+    /// text-chat row, the corrections pass, and the de-duplication maps — on
+    /// every call. Callers that only need to resolve against that bundled
+    /// layer should share this one instead: the asset is a committed constant,
+    /// so the projection is identical for the life of the process, and a
+    /// route-validity check that runs once per model row otherwise pays a full
+    /// catalog rebuild per row.
+    ///
+    /// Returns a shared reference, so the caller cannot mutate it. Use
+    /// [`Self::new`] or [`Self::with_configured_models`] when the resolver
+    /// needs route-specific configured offerings added.
+    #[must_use]
+    pub fn bundled() -> &'static Self {
+        static BUNDLED: std::sync::OnceLock<RouteResolver> = std::sync::OnceLock::new();
+        BUNDLED.get_or_init(Self::new)
     }
 
     /// Construct a resolver from a provider-scoped offering catalog.
@@ -290,6 +316,14 @@ impl RouteResolver {
         let descriptor = ProviderDescriptor::for_kind(provider_kind);
         let provider_id = descriptor.id();
         let default_offering = self.default_offering(&provider_id);
+        // Bound once so the endpoint-key consumers below cannot desync from
+        // the protocol stamp: only a custom table may override the descriptor
+        // policy, and a `chat` / unknown dialect arrives as `None` (the
+        // static policy applies).
+        let custom_wire_override = match (provider_kind, req.wire_override) {
+            (ProviderKind::Custom, Some(protocol)) => Some(protocol),
+            _ => None,
+        };
 
         // 2. Determine the logical selector from explicit choice, then the
         //    saved-model fallback, then the provider default.
@@ -414,7 +448,10 @@ impl RouteResolver {
                 })
         {
             selected.canonical_model = None;
-            selected.limits = offering.limits;
+            selected.limits = RouteLimits {
+                output_declared: offering.limits.output_tokens.is_some(),
+                ..offering.limits
+            };
             selected.capabilities = offering.capabilities;
             selected.pricing = offering.pricing.clone();
             for (field, value) in [
@@ -478,8 +515,8 @@ impl RouteResolver {
             }
         }
 
-        let protocol = descriptor
-            .protocol_for_endpoint(&selected.endpoint_key)
+        let protocol = custom_wire_override
+            .or_else(|| descriptor.protocol_for_endpoint(&selected.endpoint_key))
             .ok_or_else(|| RouteError::UnsupportedModelProtocol {
                 provider: provider_id.clone(),
                 model: selected.wire_model_id.as_str().to_string(),
@@ -513,7 +550,12 @@ impl RouteResolver {
             match limit_override.field {
                 LimitField::ContextTokens => limits.context_tokens = limit_override.value,
                 LimitField::InputTokens => limits.input_tokens = limit_override.value,
-                LimitField::OutputTokens => limits.output_tokens = limit_override.value,
+                LimitField::OutputTokens => {
+                    limits.output_tokens = limit_override.value;
+                    limits.output_declared = limit_override.source
+                        == super::OverrideSource::UserModelMetadata
+                        && limit_override.value.is_some();
+                }
             }
         }
 
@@ -610,6 +652,8 @@ impl RouteResolver {
             && matches!(provider_kind, ProviderKind::Deepseek | ProviderKind::Zai);
         let mut casefold_match = None;
         let mut casefold_ambiguous = false;
+        let mut suffix_match = None;
+        let mut suffix_ambiguous = false;
         for offering in &self.offerings {
             if offering.provider != *provider_id {
                 continue;
@@ -622,6 +666,33 @@ impl RouteResolver {
             if matches_canonical || matches_wire {
                 return Ok(ResolvedOffering::from_offering(offering));
             }
+            // Aggregator wire ids carry an org namespace (`deepseek/<id>`)
+            // while saved selectors and canonical joins use the bare logical
+            // id. A bare selector that uniquely names the last segment of
+            // one wire id owned by THIS provider resolves to that offering;
+            // ambiguity stays unmatched rather than guessing.
+            let wire_tail = offering
+                .wire_model_id
+                .as_str()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+            let canonical_tail = offering
+                .canonical_model
+                .as_ref()
+                .map(|model| model.as_str().rsplit('/').next().unwrap_or_default());
+            if class == ProviderClass::Aggregator
+                && !raw.contains('/')
+                && (wire_tail == raw || canonical_tail == Some(raw))
+            {
+                match suffix_match {
+                    None => suffix_match = Some(offering),
+                    Some(first) if first.wire_model_id != offering.wire_model_id => {
+                        suffix_ambiguous = true;
+                    }
+                    Some(_) => {}
+                }
+            }
             if allow_casefold_wire_match
                 && offering.wire_model_id.as_str().eq_ignore_ascii_case(raw)
             {
@@ -631,6 +702,9 @@ impl RouteResolver {
                     casefold_match = Some(offering);
                 }
             }
+        }
+        if !suffix_ambiguous && let Some(offering) = suffix_match {
+            return Ok(ResolvedOffering::from_offering(offering));
         }
         if !casefold_ambiguous && let Some(offering) = casefold_match {
             return Ok(ResolvedOffering::from_offering(offering));

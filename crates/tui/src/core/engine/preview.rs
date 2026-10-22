@@ -313,6 +313,7 @@ impl Engine {
                 McpAccess::PassiveSnapshot,
                 route_context.clone(),
                 "",
+                prompt_context.goal_objective.as_deref(),
             )
             .await;
 
@@ -465,7 +466,7 @@ impl Engine {
                 system_prompt.as_ref(),
             );
 
-        let request = prepare_primary_turn_request(PrimaryTurnRequest {
+        let mut request = prepare_primary_turn_request(PrimaryTurnRequest {
             model: model.clone(),
             messages: outbound_messages,
             max_tokens: effective_max_output_tokens_for_route(provider, &model, limits),
@@ -474,6 +475,19 @@ impl Engine {
             tool_choice: tool_choice.clone(),
             reasoning_effort: effective_reasoning_effort,
         });
+        let (image_input, image_cap) = self.request_image_policy(
+            route.identity.key.as_str(),
+            &model,
+            route_context.capabilities.image_input,
+        );
+        crate::image_attach::strip_images_when_unsupported(
+            &mut request.messages,
+            image_input,
+            &model,
+        );
+        if let Some(cap) = image_cap {
+            crate::image_attach::cap_request_images(&mut request.messages, cap);
+        }
 
         let prepared = match route.client.prepare_outbound_request(request, true) {
             Ok(prepared) => {

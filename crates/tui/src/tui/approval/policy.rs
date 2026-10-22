@@ -39,6 +39,9 @@ pub fn classify_stakes(
     risk: RiskLevel,
     params: &Value,
 ) -> ApprovalStakes {
+    if !crate::core::authority::auto_review::credential_upload_texts(tool_name, params).is_empty() {
+        return ApprovalStakes::Critical;
+    }
     if matches!(risk, RiskLevel::Benign) {
         return ApprovalStakes::Routine;
     }

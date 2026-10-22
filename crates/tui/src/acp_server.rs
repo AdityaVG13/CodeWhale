@@ -31,6 +31,7 @@ pub async fn run_acp_server(
     config_path: Option<PathBuf>,
     config_profile: Option<String>,
 ) -> Result<()> {
+    ensure_acp_approval_posture(&config)?;
     crate::runtime_api::run_http_server(
         config,
         default_cwd,
@@ -64,6 +65,7 @@ pub(crate) fn capture_frontend(
     config_path: Option<PathBuf>,
     config_profile: Option<String>,
 ) -> Result<Arc<CapturedAcpFrontend>> {
+    ensure_acp_approval_posture(&config)?;
     Ok(Arc::new(CapturedAcpFrontend {
         config,
         model,
@@ -252,8 +254,18 @@ impl AcpServer {
             }
             match self.handle_request(method, params).await {
                 Ok(AcpDispatch::Response(result)) => {
-                    if let Some(id) = response_id {
-                        write_jsonrpc_result(writer, id, result).await?;
+                    let replayed = match result.get("sessionId").and_then(Value::as_str) {
+                        Some(session) if method == "session/load" => {
+                            self.replay_history(writer, session).await
+                        }
+                        _ => Ok(()),
+                    };
+                    match (replayed, response_id) {
+                        (Ok(()), Some(id)) => write_jsonrpc_result(writer, id, result).await?,
+                        (Ok(()), None) => {}
+                        (Err(error), id) => {
+                            write_jsonrpc_error(writer, id, -32603, error.to_string()).await?
+                        }
                     }
                 }
                 Ok(AcpDispatch::Shutdown) => {
@@ -472,14 +484,7 @@ impl AcpServer {
             &id,
             crate::runtime_api::sessions::ResumeSessionRequest {
                 model: None,
-                mode: Some(
-                    if acp_mode(&self.config) == AppMode::Plan {
-                        "plan"
-                    } else {
-                        saved.metadata.mode.as_deref().unwrap_or("agent")
-                    }
-                    .to_string(),
-                ),
+                mode: (acp_mode(&self.config) == AppMode::Plan).then(|| "plan".to_string()),
             },
             (self.config_path.as_deref(), self.config_profile.as_deref()),
             Some(self.shell_allowed()),
@@ -509,6 +514,116 @@ impl AcpServer {
             .latest_seq;
         self.remember(id.clone(), resumed.thread_id, cursor);
         self.session_configuration(&id).await
+    }
+    async fn replay_history<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        session_id: &str,
+    ) -> Result<()> {
+        use codewhale_models::ContentBlock;
+        let saved = crate::session_manager::SessionManager::new(self.sessions_dir.clone())?
+            .load_session(session_id)?;
+        let secrets = crate::runtime_threads::receipt_secret_values(self.config.clone()).await?;
+        let mut calls = HashMap::new();
+        for message in &saved.messages {
+            let kind = match message.role.as_str() {
+                "user" => Some("user_message_chunk"),
+                "assistant" => Some("agent_message_chunk"),
+                _ => None,
+            };
+            if let Some(kind) = kind
+                && !crate::runtime_handoff::is_internal_runtime_handoff(message)
+                && crate::runtime_handoff::restored_subagent_checkpoint_display(message).is_none()
+            {
+                let mut chunks = Vec::<String>::new();
+                let mut coalesce = false;
+                for (index, block) in message.content.iter().enumerate() {
+                    match block {
+                        ContentBlock::Text { text, .. } => {
+                            if crate::runtime_handoff::is_turn_metadata_block(message, index, text)
+                            {
+                                continue;
+                            }
+                            if text.starts_with("[tool_history_repair]")
+                                || (message.role == "assistant"
+                                    && crate::runtime_handoff::archived_context_parts(text)
+                                        .is_some())
+                            {
+                                coalesce = false;
+                                continue;
+                            }
+                            if coalesce {
+                                if let Some(chunk) = chunks.last_mut() {
+                                    if !chunk.is_empty() {
+                                        chunk.push('\n');
+                                    }
+                                    chunk.push_str(text);
+                                }
+                            } else {
+                                chunks.push(text.clone());
+                            }
+                            coalesce = true;
+                        }
+                        ContentBlock::Thinking { thinking, .. }
+                            if thinking != "(reasoning omitted)" =>
+                        {
+                            coalesce = false;
+                        }
+                        ContentBlock::ToolUse { name, .. } if name == "update_plan" => {
+                            coalesce = false;
+                        }
+                        _ => {}
+                    }
+                }
+                for text in chunks {
+                    write_json_line(
+                        writer,
+                        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}}),
+                    )
+                    .await?;
+                }
+            }
+            for block in &message.content {
+                let Some(key) = block.tool_call_key().map(|key| key.as_str().to_string()) else {
+                    continue;
+                };
+                match block {
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        let call = PendingToolCall {
+                            execution_id: key.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        };
+                        write_tool_call_start(writer, session_id, &call).await?;
+                        calls.insert(key, call);
+                    }
+                    ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => {
+                        if let Some(call) = calls.remove(&key) {
+                            let status = if is_error.unwrap_or(false) {
+                                "failed"
+                            } else {
+                                "completed"
+                            };
+                            let detail = crate::runtime_threads::tool_receipt_detail(
+                                &call.name, content, &secrets,
+                            );
+                            write_tool_call_update(
+                                writer,
+                                session_id,
+                                &call,
+                                status,
+                                Some(&detail),
+                            )
+                            .await?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
     fn permission_value(&self) -> &'static str {
         match acp_approval_mode(&self.config) {
@@ -722,7 +837,7 @@ impl AcpServer {
         Ok(self.current_model())
     }
 }
-const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale --approval-policy full-access serve --acp`, or set approval_policy = \"full-access\" in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
+const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale --yolo serve --acp`, or set `yolo = true` in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
 
 fn acp_mode(config: &Config) -> AppMode {
     if config.sandbox_mode.as_deref() == Some("read-only") {
@@ -747,6 +862,14 @@ fn acp_approval_mode(config: &Config) -> ApprovalMode {
             .and_then(ApprovalMode::from_config_value)
             .unwrap_or_default()
     }
+}
+
+fn ensure_acp_approval_posture(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        acp_approval_mode(config) != ApprovalMode::Never,
+        "approval_policy \"never\" is not supported by `codewhale serve --acp`: ACP sessions run under Ask, Auto-Review or Full Access. Set approval_policy = \"on-request\" for this server, or start it with --yolo for Full Access."
+    );
+    Ok(())
 }
 
 /// ACP `kind` hint for a tool call, used by the client to pick an icon/label.
@@ -1785,11 +1908,117 @@ mod tests {
         let bh = serde_json::to_string(&rig.history(&b).await)?;
         assert!(ah.contains("A prompt") && ah.contains("A answer") && !ah.contains("B prompt"));
         assert!(bh.contains("B prompt") && bh.contains("B answer") && !bh.contains("A prompt"));
+        for (session, prompt, answer) in
+            [(&a, "A prompt", "A answer"), (&b, "B prompt", "B answer")]
+        {
+            let mut output = Vec::new();
+            rig.server.replay_history(&mut output, session).await?;
+            let updates = parse_lines(output);
+            let text: Vec<_> = updates
+                .iter()
+                .map(|update| {
+                    (
+                        update["params"]["update"]["sessionUpdate"]
+                            .as_str()
+                            .unwrap(),
+                        update["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                text,
+                vec![
+                    ("user_message_chunk", prompt),
+                    ("agent_message_chunk", answer)
+                ]
+            );
+        }
         let listed = rig
             .server
             .list_sessions(json!({"cwd":rig.workspace}))
             .unwrap();
         assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
+        let store = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?;
+        let mut saved = store.load_session(&a)?;
+        saved.messages = serde_json::from_value(json!([
+            {"role":"user","content":[
+                {"type":"text","text":""},
+                {"type":"text","text":"alpha"},
+                {"type":"text","text":"<turn_meta>hidden middle</turn_meta>"},
+                {"type":"text","text":"beta"},
+                {"type":"thinking","thinking":"(reasoning omitted)"},
+                {"type":"text","text":"gamma"},
+                {"type":"thinking","thinking":"private reasoning"},
+                {"type":"text","text":"delta"},
+                {"type":"tool_use","id":"saved-plan","name":"update_plan","input":{}},
+                {"type":"text","text":"epsilon"},
+                {"type":"text","text":"[tool_history_repair] hidden repair"},
+                {"type":"text","text":"zeta"},
+                {"type":"text","text":"<turn_meta>hidden tail</turn_meta>"}
+            ]},
+            {"role":"assistant","content":[
+                {"type":"text","text":"before archive"},
+                {"type":"text","text":"<archived_context level=\"1\">summary</archived_context>"},
+                {"type":"text","text":"after archive"},
+                {"type":"text","text":"<archived_context</archived_context>"},
+                {"type":"tool_use","id":"saved-read","name":"read","input":{}},
+                {"type":"text","text":"tail"}
+            ]},
+            {"role":"user","content":[
+                {"type":"text","text":"<turn_meta>literal example</turn_meta>"}
+            ]},
+            {"role":"assistant_interrupted","content":[
+                {"type":"text","text":"interrupted answer"}
+            ]}
+        ]))?;
+        saved
+            .messages
+            .push(crate::runtime_handoff::operate_contract_runtime_message());
+        saved
+            .messages
+            .extend(crate::runtime_handoff::project_owned_messages_for_restore(
+                vec![crate::runtime_handoff::subagent_completion_runtime_message(
+                    "{}",
+                )],
+            ));
+        store.save_session(&saved)?;
+        let mut output = Vec::new();
+        rig.server.replay_history(&mut output, &a).await?;
+        let updates = parse_lines(output);
+        let text: Vec<_> = updates
+            .iter()
+            .filter_map(|update| {
+                let kind = update["params"]["update"]["sessionUpdate"].as_str()?;
+                matches!(kind, "user_message_chunk" | "agent_message_chunk").then(|| {
+                    (
+                        kind,
+                        update["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            text,
+            vec![
+                ("user_message_chunk", "alpha\nbeta\ngamma"),
+                ("user_message_chunk", "delta"),
+                ("user_message_chunk", "epsilon"),
+                ("user_message_chunk", "zeta"),
+                ("agent_message_chunk", "before archive"),
+                (
+                    "agent_message_chunk",
+                    "after archive\n<archived_context</archived_context>\ntail"
+                ),
+                (
+                    "user_message_chunk",
+                    "<turn_meta>literal example</turn_meta>"
+                ),
+            ]
+        );
         rig.close().await;
         Ok(())
     }
@@ -1932,6 +2161,7 @@ mod tests {
         let mut rig = Rig::new(
             config,
             vec![
+                canned::tool_call_turn("law-read", "read", r#"{"path":"AGENTS.md"}"#),
                 canned::tool_call_turn(
                     "law-write",
                     "write",
@@ -1949,10 +2179,10 @@ mod tests {
             "new-self-authored-law"
         );
         let requests = rig.mock.captured_requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(
             serde_json::to_vec(&requests[0].system)?,
-            serde_json::to_vec(&requests[1].system)?
+            serde_json::to_vec(&requests[2].system)?
         );
         let prompt = crate::prompts::system_prompt_flat_text(requests[0].system.as_ref().unwrap());
         assert!(prompt.contains(crate::prompts::text::BASE_PROMPT.trim()));

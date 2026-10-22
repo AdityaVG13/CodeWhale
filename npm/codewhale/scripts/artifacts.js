@@ -61,8 +61,8 @@ const ASSET_MATRIX = {
   },
 };
 
-// HarmonyPC (openharmony) is an x86_64 Linux-compatible environment; map it to
-// the linux binary family so npm install succeeds without a separate build target.
+// Native HarmonyOS/OpenHarmony (openharmony) gets the static musl Linux build as
+// a best effort; that build is untested on native HarmonyOS.
 const PLATFORM_ALIASES = {
   openharmony: "linux",
 };
@@ -113,6 +113,17 @@ function unsupportedBuildHint() {
     "",
     "See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md",
     "for cross-compilation, mirror, Linux ARM64, FreeBSD, and winget specifics.",
+  ].join("\n");
+}
+
+function openHarmonyDirections() {
+  return [
+    "On a HarmonyOS PC, install Codewhale inside the Linux subsystem (融合开发引擎, openEuler):",
+    "",
+    "  curl -fsSL https://codewhale.net/install.sh | sh",
+    "",
+    "Or build the native aarch64-unknown-linux-ohos binary from source by following",
+    "\"Cross-Compiling To OpenHarmony\" in docs/HarmonyOS.md of codewhale-hq/CodeWhale.",
   ].join("\n");
 }
 
@@ -294,6 +305,7 @@ module.exports = {
   hasExplicitReleaseBase,
   isCnbSupportedTarget,
   LEGACY_TUI_BRIDGE_ASSET_NAMES,
+  openHarmonyDirections,
   releaseAssetUrl,
   releaseAssetUrlFromBase,
   releaseBaseUrl,

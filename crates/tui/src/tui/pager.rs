@@ -1034,7 +1034,7 @@ fn display_cells<'a>(pieces: impl Iterator<Item = (&'a str, usize)>) -> Vec<(cha
     for (text, tag) in pieces {
         let display: String = text
             .chars()
-            .filter(|&ch| !crate::core::events::is_bidi_format_control(ch))
+            .filter(|&ch| !codewhale_sanitize::sanitize::is_bidi_control(ch))
             .map(|ch| {
                 if ch != '\t' && (ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')) {
                     ' '

@@ -300,6 +300,18 @@ pub enum EventMsg {
         omitted_tool_count: u64,
     },
 
+    RequestImageWindow {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        provider: String,
+        model: String,
+        total: u64,
+        elided: u64,
+        cap: u64,
+        cap_source: String,
+        message: String,
+    },
+
     /// Workspace snapshots (undo) are off for this workspace. `reason` is one
     /// rendered, localized line: the consequence, the gate that refused, and
     /// the recovery that actually lifts *that* gate (the size cap's config key
@@ -438,10 +450,19 @@ pub enum EventMsg {
     TurnComplete {
         thread_id: ThreadId,
         session_id: SessionId,
-        /// The engine's `TurnComplete` carries no turn id; the emitter fills
-        /// it from the envelope when it knows it.
+        /// Actual started turn; absent when a submitted operation fails
+        /// before starting.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        /// Host submission correlation, including preflight rejection. Runtime
+        /// self-starts do not carry a host token. Older producers default to
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
+        /// Manual compaction operation identity, never the surrounding host
+        /// submission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
         status: TurnOutcomeStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -800,6 +821,7 @@ pub struct EventEnvelope {
 /// proves the list and `kind_str` agree.
 pub const EVENT_KINDS: &[&str] = &[
     "tool_projection_warning",
+    "request_image_window",
     "message_started",
     "response_delta",
     "message_complete",
@@ -856,6 +878,7 @@ impl EventMsg {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::ToolProjectionWarning { .. } => "tool_projection_warning",
+            Self::RequestImageWindow { .. } => "request_image_window",
             Self::SnapshotsDisabled { .. } => "snapshots_disabled",
             Self::MessageStarted { .. } => "message_started",
             Self::ResponseDelta { .. } => "response_delta",
@@ -915,6 +938,7 @@ impl EventMsg {
     pub fn thread_id(&self) -> &ThreadId {
         match self {
             Self::ToolProjectionWarning { thread_id, .. }
+            | Self::RequestImageWindow { thread_id, .. }
             | Self::SnapshotsDisabled { thread_id, .. }
             | Self::MessageStarted { thread_id, .. }
             | Self::ResponseDelta { thread_id, .. }
@@ -974,6 +998,7 @@ impl EventMsg {
     pub fn session_id(&self) -> &SessionId {
         match self {
             Self::ToolProjectionWarning { session_id, .. }
+            | Self::RequestImageWindow { session_id, .. }
             | Self::SnapshotsDisabled { session_id, .. }
             | Self::MessageStarted { session_id, .. }
             | Self::ResponseDelta { session_id, .. }
@@ -1081,6 +1106,17 @@ mod tests {
                 omitted_tool_names: vec!["a".into()],
                 omitted_tool_count: 3,
             },
+            EventMsg::RequestImageWindow {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                provider: "vllm".into(),
+                model: "m".into(),
+                total: 6,
+                elided: 3,
+                cap: 3,
+                cap_source: "provider_rejection".into(),
+                message: "m".into(),
+            },
             EventMsg::MessageStarted {
                 thread_id: t.clone(),
                 session_id: s.clone(),
@@ -1168,6 +1204,8 @@ mod tests {
                 route,
             },
             EventMsg::TurnComplete {
+                submission_id: None,
+                compaction_id: None,
                 thread_id: t.clone(),
                 session_id: s.clone(),
                 turn_id: None,
@@ -1557,6 +1595,8 @@ mod tests {
     #[test]
     fn event_msg_roundtrip() {
         let msg = EventMsg::TurnComplete {
+            submission_id: None,
+            compaction_id: None,
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
             turn_id: Some("turn-1".into()),
@@ -1572,6 +1612,49 @@ mod tests {
         let back: EventMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind_str(), "turn_complete");
         assert!(json.contains(r#""status":"completed""#));
+    }
+
+    #[test]
+    fn turn_complete_ownership_is_additive_and_round_trips() {
+        for (turn_id, submission_id, compaction_id) in [
+            (Some("turn-1"), Some("sub-host-1"), None),
+            (None, Some("sub-rejected"), None),
+            (Some("autonomous-turn"), None, None),
+            (None, None, Some("compact-1")),
+            (None, None, None),
+        ] {
+            let msg = EventMsg::TurnComplete {
+                thread_id: ThreadId::new(),
+                session_id: SessionId::new(),
+                turn_id: turn_id.map(str::to_string),
+                submission_id: submission_id.map(str::to_string),
+                compaction_id: compaction_id.map(str::to_string),
+                status: TurnOutcomeStatus::Failed,
+                error: Some("fixture rejection".into()),
+                usage: TokenUsage::default(),
+                parent_route_usage: None,
+                routed_usage_dropped_records: 0,
+                tool_catalog: None,
+                base_url: None,
+            };
+            let value = serde_json::to_value(&msg).unwrap();
+            for (key, expected) in [
+                ("turn_id", turn_id),
+                ("submission_id", submission_id),
+                ("compaction_id", compaction_id),
+            ] {
+                if let Some(expected) = expected {
+                    assert_eq!(value[key], expected);
+                } else {
+                    assert!(value.get(key).is_none(), "{key} must stay absent");
+                }
+            }
+            let back: EventMsg = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                back, msg,
+                "legacy absent fields and owned receipts round-trip"
+            );
+        }
     }
 
     #[test]

@@ -1,13 +1,7 @@
 name: Nightly
 
-# Scheduled nightly artifact build. This used to run on every push to main,
-# rebuilding six release targets per merge; PR CI already builds/tests the
-# same commits on macOS/Windows and CNB covers Linux, so a daily cadence
-# keeps the artifact stream fresh without burning ~28 runner-minutes per
-# merge. Use workflow_dispatch for an on-demand build.
+# Manual artifact build for final release validation.
 on:
-  schedule:
-    - cron: '17 9 * * *'
   workflow_dispatch:
 
 permissions:
@@ -27,7 +21,7 @@ jobs:
   build:
     name: Build ${{ matrix.platform }}
     # Native builds use the same finite cold-build allowance as release/CI.
-    timeout-minutes: 165
+    timeout-minutes: 210
     strategy:
       fail-fast: false
       matrix:

@@ -48,6 +48,7 @@ impl Engine {
 
         let tool_exec_lock = self.tool_exec_lock.clone();
         let mcp_pool = if !fleet_report_response
+            && self.config.features.enabled(Feature::Mcp)
             && tool_uses.iter().any(|tool| {
                 McpPool::is_mcp_tool(&tool.name) || tool.name == EXECUTE_TOOLS_TOOL_NAME
             }) {
@@ -161,6 +162,11 @@ impl Engine {
             }
         }
 
+        if let Some(stop) = turn.auto_review_denials.stop().map(str::to_string) {
+            let _ = self.send_event(Event::status(stop.clone())).await;
+            return PhaseResult::Return((TurnOutcomeStatus::Interrupted, Some(stop)));
+        }
+
         if authority_changed || accepted_steer_after_tools {
             if let Some(guard) = progress.fleet_denial_guard.as_mut() {
                 guard.reset();
@@ -232,6 +238,8 @@ impl Engine {
                 )
                 .await;
         }
+
+        self.deliver_shell_completions("").await;
 
         // A successful tool step is productive progress, not a runaway
         // synthetic resume. Declared per-task tool budgets and max_steps

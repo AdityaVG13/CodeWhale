@@ -208,6 +208,7 @@
             description: "detail".to_string(),
             path: path.map(str::to_string),
             line,
+            ..Default::default()
         }
     }
 
@@ -234,7 +235,7 @@
             summary: "summary".to_string(),
             issues,
             suggestions,
-            overall_assessment: String::new(),
+            ..Default::default()
         }
     }
 
@@ -1506,7 +1507,9 @@
     }
 
     #[test]
-    fn exec_help_separates_agent_mode_from_sandbox_elevation() {
+    fn exec_help_discloses_full_access_and_session_persistence() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _locale = crate::test_support::EnvVarGuard::set("LC_ALL", "en_US.UTF-8");
         let mut cli = Cli::command();
         let help = cli
             .find_subcommand_mut("exec")
@@ -1516,8 +1519,15 @@
         assert!(help.contains("--auto"));
         assert!(help.contains("--sandbox"));
         assert!(help.contains("--allow-sandbox-elevation"));
-        assert!(help.contains("does not change the"));
-        assert!(help.contains("explicitly authorize sandbox elevation"));
+        assert!(help.contains("Full Access"));
+        assert!(help.contains("no shell sandbox"));
+        assert!(help.contains("trust mode on"));
+        assert!(help.contains("--sandbox workspace-write"));
+        assert!(help.contains("Any --sandbox other than danger-full-access"));
+        assert!(help.contains("equivalent sandbox_mode in config"));
+        assert!(help.contains("Put -- before a prompt starting with -"));
+        assert!(help.contains("Runs that offer tools"));
+        assert!(help.contains("codewhale receipts <id>"));
     }
 
     #[test]

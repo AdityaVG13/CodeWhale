@@ -149,6 +149,7 @@ async fn real_host_read_file_and_web_document_use_the_shared_pdf_job() {
         "https://example.com/input.pdf",
         Some("application/pdf"),
         bytes,
+        false,
         Some(&rust),
     )
     .await
@@ -157,6 +158,7 @@ async fn real_host_read_file_and_web_document_use_the_shared_pdf_job() {
         "https://example.com/input.pdf",
         Some("application/pdf"),
         bytes,
+        false,
         Some(&host),
     )
     .await

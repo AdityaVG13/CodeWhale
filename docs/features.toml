@@ -70,7 +70,7 @@ owner = "crates/tui/src/tools/subagent"
 [[feature]]
 id = "web-search"
 name = "Web search"
-summary = "Searches and fetches the web for the agent (web.run, with the web_search alias)."
+summary = "Searches and fetches the web for the agent, including DeepSeek Search (web.run, with the web_search alias)."
 status = "stable"
 surfaces = { tui = "stable" }
 since = "0.1.0"
@@ -286,7 +286,7 @@ owner = "crates/tui/src/sandbox"
 [[feature]]
 id = "providers"
 name = "Providers"
-summary = "First-class provider routes plus bundled OpenAI-compatible host descriptors."
+summary = "Provider routes with endpoint-scoped model facts, explicit limits and sourced price estimates."
 status = "stable"
 surfaces = { tui = "stable", api = "stable" }
 docs = "docs/PROVIDERS.md"
@@ -309,6 +309,15 @@ status = "stable"
 surfaces = { tui = "stable", api = "stable" }
 docs = "docs/FLEET.md"
 owner = "crates/tui/src/fleet"
+
+[[feature]]
+id = "environment-placement"
+name = "Environment-aware Fleet placement"
+summary = "Places Fleet tasks by environment requirements and connects explicitly configured workers through Tailscale."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+docs = "docs/ENVIRONMENTS.md#environment-aware-fleet-placement-preview"
+owner = "crates/tui/src/fleet/placement.rs"
 
 [[feature]]
 id = "workflows"
@@ -522,6 +531,16 @@ docs = "docs/CONFIGURATION.md"
 owner = "crates/config/src/settings_schema.rs"
 
 [[feature]]
+id = "whats-new-notice"
+name = "What's new after an update"
+summary = "Says once, on the first start after an update, what changed and links that version's release notes."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.10.2"
+docs = "docs/CONFIGURATION.md#whats-new-after-an-update"
+owner = "crates/tui/src/whats_new.rs"
+
+[[feature]]
 id = "themes"
 name = "Themes"
 summary = "/theme picks a built-in theme; user themes follow a JSON schema."
@@ -529,6 +548,16 @@ status = "stable"
 surfaces = { tui = "stable" }
 docs = "docs/schemas/user-theme.schema.json"
 owner = "crates/palette"
+
+[[feature]]
+id = "chat-color"
+name = "Chat color"
+summary = "/color gives one chat's composer box its own color, kept with that session."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.10.2"
+docs = "docs/GUIDE.md"
+owner = "crates/tui/src/commands/groups/session/color.rs"
 
 [[feature]]
 id = "localization"
@@ -568,7 +597,7 @@ owner = "crates/tui/src/commands/groups/core/home.rs"
 [[feature]]
 id = "account-login"
 name = "Account login"
-summary = "/login signs in to Codewhale or stores provider keys; plugin providers connect with /connect."
+summary = "/login signs in to an optional Codewhale account; plugin providers connect with /connect."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/commands/groups/config/config.rs"
@@ -579,7 +608,7 @@ name = "Account computer files"
 summary = "Save computer files as account versions, restore with revision checks, and download verified bytes."
 status = "experimental"
 surfaces = { tui = "preview" }
-since = "unreleased"
+since = "0.10.2"
 owner = "crates/cli/src/cloud.rs"
 
 [[feature]]
@@ -628,6 +657,7 @@ name = "Terminal dock"
 summary = "/workbar terminal shows workspace PTYs with live output, human input, session selection and a fresh shell; macOS/Linux."
 status = "stable"
 surfaces = { tui = "stable" }
+since = "0.10.2"
 owner = "crates/tui/src/tui/work_surface/terminal.rs"
 
 # --- Operations and platforms ---
@@ -665,7 +695,7 @@ name = "Sign in with ChatGPT"
 summary = "Uses official OAuth and the selected account catalog for eligible ChatGPT plan requests in the local OSS app."
 status = "experimental"
 surfaces = { tui = "preview", api = "partial", web = "none" }
-since = "unreleased"
+since = "0.10.1"
 docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
 owner = "crates/tui/src/oauth.rs"
 
@@ -675,7 +705,7 @@ name = "Sign in with Claude"
 summary = "Adds Claude subscription sign-in and native Messages routing. Live provider acceptance remains unverified."
 status = "experimental"
 surfaces = { tui = "preview", api = "partial", web = "none" }
-since = "unreleased"
+since = "0.10.2"
 docs = "docs/PROVIDERS.md#sign-in-with-claude"
 owner = "crates/tui/src/oauth.rs"
 
@@ -685,7 +715,7 @@ name = "Reviewed plugin OAuth providers"
 summary = "Reviewed plugins sign in with /connect <id> and out with /disconnect; the host owns PKCE, models and approvals."
 status = "experimental"
 surfaces = { tui = "preview", api = "partial", web = "none" }
-since = "unreleased"
+since = "0.10.1"
 docs = "docs/PLUGIN_PROVIDERS.md"
 owner = "crates/tui/src/plugins/providers.rs"
 
@@ -694,8 +724,8 @@ id = "orcarouter-sign-in"
 name = "Sign in with OrcaRouter"
 summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
 status = "experimental"
-surfaces = { tui = "preview", api = "none", web = "none" }
-since = "unreleased"
+surfaces = { tui = "preview", api = "preview", web = "none" }
+since = "0.10.1"
 docs = "docs/PROVIDERS.md"
 owner = "crates/tui/src/oauth.rs"
 
@@ -716,7 +746,7 @@ name = "Profile constitution"
 summary = "Account preferences are captured per turn and previewed by the Engine."
 status = "experimental"
 surfaces = { tui = "preview", api = "preview" }
-since = "unreleased"
+since = "0.10.1"
 docs = "docs/RUNTIME_API.md#profile-constitution"
 owner = "crates/tui/src/profile_constitution.rs"
 
@@ -726,6 +756,36 @@ name = "Plugin shell installation"
 summary = "codewhale install uses the reviewed bundle installer with local, GitHub and version-pinned npm sources."
 status = "experimental"
 surfaces = { tui = "preview" }
-since = "unreleased"
+since = "0.10.2"
 docs = "docs/PLUGINS.md"
 owner = "crates/tui/src/plugins/mutation.rs"
+
+[[feature]]
+id = "fork-prefix-inheritance"
+name = "Fork prefix inheritance"
+summary = "Allows matching first-level Chat Completions forks to reuse a parent request header."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.2"
+docs = "docs/CACHE.md#fork-prefix-inheritance"
+owner = "crates/tui/src/core/engine/turn_loop/preparation.rs"
+
+[[feature]]
+id = "fork-trial-diagnostics"
+name = "Fork trial diagnostics"
+summary = "Opt-in JSON stderr observations of classified fork decisions and actual first-response cache usage."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.2"
+docs = "docs/CACHE.md#fork-trial-diagnostics"
+owner = "crates/runtime/src/prompt_zones.rs"
+
+[[feature]]
+id = "source-navigation-echoes"
+name = "Source navigation echoes"
+summary = "File and search results include bounded source symbols, neighboring files and change attribution."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.2"
+docs = "docs/ECHOLOCATION.md"
+owner = "crates/tui/src/tools/echolocation.rs"

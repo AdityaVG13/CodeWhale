@@ -45,6 +45,7 @@ pub mod voice;
 mod workflow;
 mod workspace;
 
+pub(crate) use self::core::public_site_locale_segment;
 pub(in crate::commands) use self::core::reset_conversation_state;
 pub(crate) use constitution::open_manager as open_constitution_manager;
 

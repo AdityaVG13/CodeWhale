@@ -94,6 +94,16 @@ const SEATBELT_NETWORK_POLICY: &str = r"
 (allow network-bind)
 ";
 
+const SEATBELT_READ_ONLY_NETWORK_POLICY: &str = r#"
+; Outbound IPv4 network and the system DNS resolver; no loopback, IPv6 or other local sockets
+(allow network-outbound (remote ip))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+(allow system-socket)
+(deny network-outbound (remote ip "localhost:*"))
+(deny network-outbound (remote tcp6 "*:*"))
+(deny network-outbound (remote udp6 "*:*"))
+"#;
+
 /// AppleEvents/LaunchServices allowances for the trusted (full-disk-write)
 /// tier only (#4828).
 ///
@@ -189,7 +199,16 @@ fn generate_policy(
     // Add network policy if enabled
     if policy.has_network_access() {
         full_policy.push('\n');
-        full_policy.push_str(SEATBELT_NETWORK_POLICY);
+        if matches!(policy, SandboxPolicy::ReadOnly { .. }) {
+            full_policy.push_str(SEATBELT_READ_ONLY_NETWORK_POLICY);
+            for port in loopback_proxy_ports() {
+                full_policy.push_str(&format!(
+                    "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+                ));
+            }
+        } else {
+            full_policy.push_str(SEATBELT_NETWORK_POLICY);
+        }
     }
 
     // Trusted tier (#4828): full-disk-write policies also get AppleEvents +
@@ -206,7 +225,7 @@ fn generate_policy(
     // write (same gate as cargo/npm). ReadOnly must not get a cache escape.
     full_policy.push_str("\n\n; Darwin user cache directory\n");
     full_policy.push_str(r#"(allow file-read* (subpath (param "DARWIN_USER_CACHE_DIR")))"#);
-    if !matches!(policy, SandboxPolicy::ReadOnly) {
+    if !matches!(policy, SandboxPolicy::ReadOnly { .. }) {
         full_policy.push('\n');
         full_policy.push_str(r#"(allow file-write* (subpath (param "DARWIN_USER_CACHE_DIR")))"#);
     }
@@ -235,7 +254,7 @@ fn generate_policy(
     if resolve_cargo_home().is_some() {
         full_policy.push_str("\n\n; Cargo home (~/.cargo) — registry/index/git caches\n");
         full_policy.push_str(r#"(allow file-read* (subpath (param "CARGO_HOME")))"#);
-        if !matches!(policy, SandboxPolicy::ReadOnly) {
+        if !matches!(policy, SandboxPolicy::ReadOnly { .. }) {
             full_policy.push('\n');
             full_policy.push_str(r#"(allow file-write* (subpath (param "CARGO_HOME_REGISTRY")))"#);
             full_policy.push('\n');
@@ -253,7 +272,7 @@ fn generate_policy(
     if resolve_npm_cache_dir().is_some() {
         full_policy.push_str("\n\n; npm cache (~/.npm) — npx package downloads\n");
         full_policy.push_str(r#"(allow file-read* (subpath (param "NPM_CACHE_DIR")))"#);
-        if !matches!(policy, SandboxPolicy::ReadOnly) {
+        if !matches!(policy, SandboxPolicy::ReadOnly { .. }) {
             full_policy.push('\n');
             full_policy.push_str(r#"(allow file-write* (subpath (param "NPM_CACHE_DIR")))"#);
         }
@@ -263,6 +282,8 @@ fn generate_policy(
     // last-match-wins, so these rules override every broad read allowance
     // above — including the full-disk `(allow file-read*)` — for the listed
     // subpaths. Metadata reads are denied too so the paths do not enumerate.
+    // A read deny does not stop connect(2) to a socket under the path, so with
+    // network on, unix-socket connects under each path are denied as well.
     if !denied_read_subpaths.is_empty() {
         full_policy.push_str("\n\n; Opt-in read deny-list (user-configured)\n");
         for path in denied_read_subpaths {
@@ -271,6 +292,11 @@ fn generate_policy(
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"");
             full_policy.push_str(&format!("(deny file-read* (subpath \"{escaped}\"))\n"));
+            if policy.has_network_access() {
+                full_policy.push_str(&format!(
+                    "(deny network-outbound (remote unix-socket (subpath \"{escaped}\")))\n"
+                ));
+            }
         }
     }
 
@@ -303,6 +329,38 @@ fn resolve_npm_cache_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".npm"))
 }
 
+fn loopback_proxy_ports() -> Vec<u16> {
+    let mut ports: Vec<u16> = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok())
+    .filter_map(|value| {
+        let value = value.trim();
+        let url = if value.contains("://") {
+            url::Url::parse(value)
+        } else {
+            url::Url::parse(&format!("http://{value}"))
+        }
+        .ok()?;
+        let host = url.host_str()?;
+        if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]" {
+            url.port_or_known_default()
+        } else {
+            None
+        }
+    })
+    .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 /// Generate the write access portion of the Seatbelt policy.
 fn generate_write_policy(policy: &SandboxPolicy, cwd: &Path) -> String {
     // Full disk write access
@@ -311,7 +369,7 @@ fn generate_write_policy(policy: &SandboxPolicy, cwd: &Path) -> String {
     }
 
     // Read-only - no write policy needed
-    if matches!(policy, SandboxPolicy::ReadOnly) {
+    if matches!(policy, SandboxPolicy::ReadOnly { .. }) {
         return String::new();
     }
 
@@ -515,7 +573,7 @@ mod existing_tests {
             "default policy should allow writing the Darwin user cache"
         );
 
-        let read_only_text = generate_policy(&SandboxPolicy::ReadOnly, cwd, &[]);
+        let read_only_text = generate_policy(&SandboxPolicy::read_only(), cwd, &[]);
         assert!(
             read_only_text
                 .contains(r#"(allow file-read* (subpath (param "DARWIN_USER_CACHE_DIR")))"#),
@@ -566,7 +624,7 @@ mod existing_tests {
         assert!(params.iter().any(|(k, _)| k == "CARGO_HOME_GIT"));
 
         // Read-only policy should still emit CARGO_HOME read rule but skip writes.
-        let read_only_text = generate_policy(&SandboxPolicy::ReadOnly, cwd, &[]);
+        let read_only_text = generate_policy(&SandboxPolicy::read_only(), cwd, &[]);
         assert!(
             read_only_text.contains(r#"(allow file-read* (subpath (param "CARGO_HOME")))"#),
             "read-only mode should still allow reading the cargo registry: {read_only_text}"
@@ -666,7 +724,7 @@ mod existing_tests {
         );
 
         // ReadOnly policy: read access allowed, write access must be absent.
-        let read_only_text = generate_policy(&SandboxPolicy::ReadOnly, cwd, &[]);
+        let read_only_text = generate_policy(&SandboxPolicy::read_only(), cwd, &[]);
         assert!(
             read_only_text.contains(r#"(allow file-read* (subpath (param "NPM_CACHE_DIR")))"#),
             "read-only mode should allow reading the npm cache"
@@ -837,7 +895,7 @@ mod existing_tests {
             ),
             (
                 "read-only",
-                generate_policy(&SandboxPolicy::ReadOnly, cwd, &[]),
+                generate_policy(&SandboxPolicy::read_only(), cwd, &[]),
             ),
         ] {
             assert!(

@@ -342,6 +342,20 @@ impl EngineHandle {
         self.client_preflight_required
     }
 
+    pub(crate) fn retire_mcp_for_handoff(&self) -> Option<crate::mcp::McpHandoff> {
+        let mut slot = self
+            .mcp_pool_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.handed_off = true;
+        if let Some(handoff) = slot.handoff.take() {
+            return Some(handoff);
+        }
+        let pool = slot.pool.upgrade()?;
+        let mut pool = pool.try_lock().ok()?;
+        Some(pool.retire_for_handoff())
+    }
+
     /// Send an operation to the engine
     ///
     /// This awaits channel capacity, and the engine drains `rx_op` only

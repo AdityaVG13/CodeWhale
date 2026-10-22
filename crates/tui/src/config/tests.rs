@@ -350,6 +350,46 @@ fn startup_memory_preserves_named_and_custom_endpoint_wire_ids() {
 }
 
 #[test]
+fn named_custom_table_wire_responses_reaches_the_runtime_route() {
+    let _lock = lock_test_env();
+    let _provider = EnvVarGuard::remove("CODEWHALE_PROVIDER");
+    let _legacy_provider = EnvVarGuard::remove("DEEPSEEK_PROVIDER");
+    let config: Config = toml::from_str(
+        "provider = 'relay'\n[providers.relay]\nkind = 'openai-compatible'\nbase_url = 'https://relay.example.test/v1'\nmodel = 'gpt-5.5'\nwire = 'responses'\n",
+    )
+    .unwrap();
+    let identity = config.active_provider_identity().unwrap();
+    let route = crate::route_runtime::resolve_runtime_route_for_identity(&config, &identity, None)
+        .expect("custom table runtime route");
+    assert_eq!(route.identity.provider, ProviderKind::Custom);
+    assert_eq!(
+        route.candidate.protocol(),
+        codewhale_config::provider::WireFormat::Responses,
+        "the table's wire dialect must reach the minted candidate instead of \
+         Custom's static Chat policy"
+    );
+    assert_eq!(
+        route.candidate.endpoint().base_url,
+        "https://relay.example.test/v1"
+    );
+
+    // A table without a wire dialect keeps the backward-compatible static
+    // Chat policy, and an unrecognized dialect degrades to it deliberately.
+    let config: Config = toml::from_str(
+        "provider = 'relay'\n[providers.relay]\nkind = 'openai-compatible'\nbase_url = 'https://relay.example.test/v1'\nmodel = 'gpt-5.5'\nwire = 'respones'\n",
+    )
+    .unwrap();
+    let identity = config.active_provider_identity().unwrap();
+    let route = crate::route_runtime::resolve_runtime_route_for_identity(&config, &identity, None)
+        .expect("typo'd table still resolves");
+    assert_eq!(
+        route.candidate.protocol(),
+        codewhale_config::provider::WireFormat::ChatCompletions,
+        "an unrecognized dialect must degrade to the static policy"
+    );
+}
+
+#[test]
 fn provider_environment_model_outranks_startup_memory() {
     let _lock = lock_test_env();
     let home = tempfile::tempdir().unwrap();
@@ -4470,7 +4510,11 @@ fn save_deepseek_key_uses_isolated_file_store_without_plaintext_config() -> Resu
             .lines()
             .any(|line| line.trim_start().starts_with("api_key ="))
     );
-    assert!(config.contains("auth_mode = \"api_key\""));
+    let parsed: toml::Value = toml::from_str(&config)?;
+    assert_eq!(
+        parsed["providers"]["deepseek"]["auth_mode"].as_str(),
+        Some("api_key")
+    );
     // Saving a key leaves the model to the provider default.
     assert!(!config.contains("default_text_model"), "{config}");
     assert_eq!(
@@ -7545,20 +7589,17 @@ fn normalize_model_name_preserves_v_series_snapshots() {
     );
     assert_eq!(
         normalize_model_name("flash").as_deref(),
-        Some("deepseek-v4-flash")
+        Some("deepseek-flash")
     );
     for alias in ["flash-vision", "deepseek-v4flashvisionexp"] {
-        assert_eq!(
-            canonical_model_name(alias),
-            Some("deepseek-v4-flash-vision-exp")
-        );
+        assert_eq!(canonical_model_name(alias), Some("deepseek-flash"));
         assert_eq!(
             normalize_model_name(alias).as_deref(),
-            Some("deepseek-v4-flash-vision-exp")
+            Some("deepseek-flash")
         );
         assert_eq!(
             normalize_model_name_for_provider(ProviderKind::Deepseek, alias).as_deref(),
-            Some("deepseek-v4-flash-vision-exp")
+            Some("deepseek-flash")
         );
         assert!(validate_route(ProviderKind::Deepseek, alias).is_ok());
     }
@@ -8120,7 +8161,7 @@ fn normalize_model_name_for_provider_maps_recent_openrouter_aliases() {
 fn normalize_xiaomi_mimo_aliases_for_provider() {
     assert_eq!(
         normalize_model_name_for_provider(ProviderKind::XiaomiMimo, "omni").as_deref(),
-        Some("mimo-v2.5")
+        Some("mimo-v2.6-flash")
     );
     assert_eq!(
         normalize_model_name_for_provider(ProviderKind::XiaomiMimo, "tts").as_deref(),
@@ -8142,7 +8183,7 @@ fn model_completion_scenario() {
     // from model_completion_names_for_xiaomi_mimo_include_chat_models
     {
         let models = model_completion_names_for_provider(ProviderKind::XiaomiMimo);
-        for expected in ["mimo-v2.5-pro", "mimo-v2.5"] {
+        for expected in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
             assert!(models.contains(&expected), "missing {expected}");
         }
         for deprecated in ["mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"] {
@@ -8290,10 +8331,6 @@ fn model_completion_scenario_2() {
 
         for expected in [
             DEFAULT_MINIMAX_MODEL,
-            MINIMAX_M2_7_MODEL,
-            MINIMAX_M2_7_HIGHSPEED_MODEL,
-            MINIMAX_M2_5_MODEL,
-            MINIMAX_M2_5_HIGHSPEED_MODEL,
             MINIMAX_M2_1_MODEL,
             MINIMAX_M2_1_HIGHSPEED_MODEL,
             MINIMAX_M2_MODEL,
@@ -8310,7 +8347,7 @@ fn model_completion_scenario_2() {
         let models = model_completion_names_for_provider(ProviderKind::MinimaxAnthropic);
 
         assert!(models.contains(&DEFAULT_MINIMAX_MODEL));
-        assert!(models.contains(&MINIMAX_M2_7_MODEL));
+        assert!(models.contains(&MINIMAX_M2_1_MODEL));
     }
     // from model_completion_names_for_sakana_include_fugu_models
     {
@@ -9222,7 +9259,7 @@ fn xiaomi_mimo_scenario() -> Result<()> {
             config.active_provider_identity().unwrap().provider,
             ProviderKind::XiaomiMimo
         );
-        assert_eq!(config.default_model(), "mimo-v2.5");
+        assert_eq!(config.default_model(), "mimo-v2.6-flash");
         assert_eq!(
             config.active_route_base_url(),
             "https://token-plan-cn.xiaomimimo.com/v1"
@@ -9397,7 +9434,7 @@ default_text_model = "deepseek/deepseek-v4-pro"
 [providers.xiaomi]
 api_key = "mimo-table-key"
 base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
-model = "mimo-v2.5-pro"
+model = "mimo-v2.6-pro"
 "#,
     )?;
 
@@ -9424,7 +9461,7 @@ provider = "xiaomi-mimo"
 [providers.xiaomi_mimo]
 api_key = "tp-test-token-plan-key"
 base_url = "https://api.xiaomimimo.com/v1"
-model = "mimo-v2.5-pro"
+model = "mimo-v2.6-pro"
 "#,
     )?;
 
@@ -12742,7 +12779,7 @@ fn provider_capability_scenario() {
             .as_ref()
             .expect("alias deprecation metadata");
         assert_eq!(deprecation.alias, "deepseek-chat");
-        assert_eq!(deprecation.replacement, "deepseek-v4-flash");
+        assert_eq!(deprecation.replacement, "deepseek-flash");
         assert_eq!(deprecation.retirement_date, "2026-07-24");
         assert_eq!(deprecation.retirement_utc, "2026-07-24T15:59:00Z");
     }
@@ -12762,7 +12799,7 @@ fn provider_capability_scenario() {
             .as_ref()
             .expect("alias deprecation metadata");
         assert_eq!(deprecation.alias, "deepseek-reasoner");
-        assert_eq!(deprecation.replacement, "deepseek-v4-flash");
+        assert_eq!(deprecation.replacement, "deepseek-flash");
     }
     // from provider_capability_deepseek_v4_flash_has_no_alias_deprecation
     {
@@ -12830,7 +12867,7 @@ fn provider_capability_scenario_2() {
     // from provider_capability_xiaomi_mimo_has_thinking_no_cache
     {
         let cap = provider_capability(ProviderKind::XiaomiMimo, DEFAULT_XIAOMI_MIMO_MODEL);
-        assert_eq!(cap.context_window, 1_000_000);
+        assert_eq!(cap.context_window, 1_048_576);
         assert_eq!(cap.max_output, Some(131_072));
         assert!(cap.thinking_supported);
         assert!(!cap.cache_telemetry_supported);
@@ -12839,8 +12876,8 @@ fn provider_capability_scenario_2() {
             RequestPayloadMode::ChatCompletions
         );
 
-        let omni = provider_capability(ProviderKind::XiaomiMimo, XIAOMI_MIMO_V2_5_OMNI_MODEL);
-        assert_eq!(omni.context_window, 1_000_000);
+        let omni = provider_capability(ProviderKind::XiaomiMimo, XIAOMI_MIMO_V2_6_FLASH_MODEL);
+        assert_eq!(omni.context_window, 1_048_576);
         assert_eq!(omni.max_output, Some(131_072));
         assert!(omni.thinking_supported);
         assert!(!omni.cache_telemetry_supported);
@@ -16920,6 +16957,7 @@ mod released_provider_serde {
                 currency: Currency::Usd,
                 provenance: PricingProvenance::UserOverride,
                 cloud_facts: None,
+                pricing_schedule: None,
                 input_per_million: input,
                 output_per_million: output,
                 cache_read_per_million: None,

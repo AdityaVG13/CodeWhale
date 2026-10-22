@@ -2094,7 +2094,7 @@ impl ShellManager {
     /// Prepare a program for a tool that runs workspace code outside
     /// `exec_shell`, under the policy and sandbox configuration a shell
     /// command would get in this session.
-    fn prepare_runner(
+    pub(crate) fn prepare_runner(
         &self,
         program: &str,
         args: Vec<String>,
@@ -2335,7 +2335,7 @@ impl ShellManager {
         };
         let spec = spec.with_policy(policy).with_env(extra_env);
         let exec_env = self.sandbox_manager.prepare(&spec);
-        if matches!(spec.sandbox_policy, ExecutionSandboxPolicy::ReadOnly)
+        if matches!(spec.sandbox_policy, ExecutionSandboxPolicy::ReadOnly { .. })
             && readonly_workspace.is_none()
         {
             // Arbitrary code with a read-only policy needs kernel enforcement;
@@ -2404,6 +2404,9 @@ impl ShellManager {
             .with_policy(policy)
             .with_env(extra_env);
         let exec_env = self.sandbox_manager.prepare(&spec);
+        if matches!(spec.sandbox_policy, ExecutionSandboxPolicy::ReadOnly { .. }) {
+            require_native_readonly_execution(&exec_env)?;
+        }
 
         Self::execute_interactive_sandboxed(command, &work_dir, timeout_ms, &exec_env)
     }
@@ -3121,6 +3124,9 @@ impl ShellManager {
             .get_mut(task_id)
             .ok_or_else(|| anyhow!("Task {task_id} not found"))?;
         wait_while_running(shell, wait, timeout_ms);
+        if shell.status != ShellStatus::Running && shell.owner_agent.is_some() {
+            shell.completion_reported = true;
+        }
 
         let (
             stdout_delta,
@@ -3204,7 +3210,7 @@ impl ShellManager {
         shell.snapshot()
     }
 
-    fn mark_cancel_reported(&mut self, result: &ShellResult) {
+    pub(crate) fn mark_cancel_reported(&mut self, result: &ShellResult) {
         if result.status == ShellStatus::Killed
             && let Some(shell) = result
                 .task_id
@@ -3573,7 +3579,11 @@ impl ShellManager {
             let owned = active_session_id.is_none_or(|session_id| {
                 !session_id.is_empty() && shell.owner_session_id == session_id
             });
-            if owned && shell.status != ShellStatus::Running && !shell.completion_reported {
+            if owned
+                && shell.owner_agent.is_none()
+                && shell.status != ShellStatus::Running
+                && !shell.completion_reported
+            {
                 shell.completion_reported = true;
                 completions.push(shell.completion_evidence());
                 // The bytes are now in the caller's hands (they become a durable
@@ -3750,7 +3760,7 @@ impl ShellManager {
             .map(|(id, shell)| {
                 (
                     id.clone(),
-                    shell.completion_reported,
+                    shell.completion_reported || shell.owner_agent.is_some(),
                     // Oldest by finish, like the age rule in `cleanup`.
                     shell.finished_at.unwrap_or(shell.started_at),
                     shell.retained_output_bytes(),
@@ -3764,7 +3774,8 @@ impl ShellManager {
         if finished.len() <= MAX_FINISHED_SHELL_RECORDS && total_bytes <= MAX_FINISHED_SHELL_BYTES {
             return;
         }
-        // Undelivered completions last, then oldest first.
+        // Undelivered parent completions last, then oldest first. Child-owned
+        // results never reach the parent model, so they rank with delivered.
         finished.sort_by(|a, b| a.1.cmp(&b.1).reverse().then_with(|| a.2.cmp(&b.2)));
         let mut remaining_count = finished.len();
         let mut remaining_bytes = total_bytes;
@@ -3827,9 +3838,9 @@ use crate::tools::spec::{
 };
 use async_trait::async_trait;
 use codewhale_execpolicy::command_safety::{
-    NetworkRead, ReadonlyRejection, SafetyLevel, agent_readonly_verdict, analyze_command,
-    extract_primary_command, is_parallel_readonly_command, normalize_windows_command_paths,
-    readonly_network_reads, split_leading_cd,
+    NetworkRead, ReadonlyRejection, SafetyAnalysis, SafetyLevel, agent_readonly_verdict,
+    analyze_command, extract_primary_command, is_parallel_readonly_command,
+    normalize_windows_command_paths, readonly_network_reads, split_leading_cd,
 };
 use codewhale_execpolicy::toml_rules::{ExecPolicyConfig, RuleDecision};
 use serde_json::json;
@@ -4087,11 +4098,27 @@ fn looks_like_network_blocked_failure(result: &ShellResult) -> bool {
     .any(|pattern| output.contains(pattern))
 }
 
+const READONLY_OFFLINE_NETWORK_HINT: &str = "This read_only run has no network and cannot write files. Read-only commands reach the network only in Full Access, with a session sandbox that allows network, a [network] policy that does not deny by default, and this agent's network grant. Use a web tool if this session has one; otherwise report the source as unreachable.";
+
+fn readonly_offline_network_hint(command: &str, result: &ShellResult) -> Option<&'static str> {
+    if result.sandbox_denied && crate::sandbox::bwrap_setup_failure(&result.stderr).is_some() {
+        return None;
+    }
+    let rest = split_leading_cd(command).map(|(_, rest)| rest);
+    let command = rest.as_deref().unwrap_or(command);
+    (command_likely_needs_network(command)
+        && (result.sandbox_denied || looks_like_network_blocked_failure(result)))
+    .then_some(READONLY_OFFLINE_NETWORK_HINT)
+}
+
 fn shell_network_restricted_hint<'a>(
     context: &'a ToolContext,
     command: &str,
     result: &ShellResult,
 ) -> Option<&'a str> {
+    if result.sandbox_denied && crate::sandbox::bwrap_setup_failure(&result.stderr).is_some() {
+        return None;
+    }
     let hint = context.shell_network_denied_hint.as_deref()?;
     let policy_blocks_network = context
         .elevated_sandbox_policy
@@ -4114,6 +4141,11 @@ fn shell_network_restricted_hint<'a>(
 fn shell_sandbox_denied_hint(context: &ToolContext, result: &ShellResult) -> Option<String> {
     if !result.sandbox_denied {
         return None;
+    }
+    if let Some(error) = crate::sandbox::bwrap_setup_failure(&result.stderr) {
+        return Some(format!(
+            "The Linux sandbox (bubblewrap) could not be set up, so this command did not run and nothing ran outside the sandbox: {error}. Every sandboxed command fails the same way until the cause it names is fixed or removed, or `prefer_bwrap = false` is set to run without the OS sandbox. [sandbox: Ask-only escalation — to run only this command without the sandbox, retry it once with sandbox_permissions \"danger-full-access\" + justification; the approval prompt asks the user]"
+        ));
     }
     let policy = context.elevated_sandbox_policy.as_ref()?;
     Some(format!(
@@ -4212,7 +4244,7 @@ fn enforce_readonly_network_reads(command: &str, context: &ToolContext) -> Resul
     Ok(())
 }
 
-/// This is a request for mandatory filesystem/network isolation, not a claim
+/// This is a request for mandatory filesystem isolation, not a claim
 /// about what the command does. The executor refuses it without a native
 /// enforcing sandbox and checks the prepared environment again before spawn.
 fn enforced_readonly_input(input: &serde_json::Value) -> bool {
@@ -4280,7 +4312,7 @@ pub(crate) fn sandboxed_runner_command(
             timeout,
             context.elevated_sandbox_policy.clone(),
         );
-    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly) {
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly { .. }) {
         require_native_readonly_execution(&exec_env)
             .map_err(|error| ToolError::permission_denied(error.to_string()))?;
     }
@@ -4299,7 +4331,7 @@ pub(crate) fn sandboxed_runner_command(
 }
 
 fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {
-    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly)
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly { .. })
         && is_native_readonly_sandbox(exec_env.sandbox_type)
     {
         Ok(())
@@ -4395,6 +4427,19 @@ pub(crate) fn readonly_enforced_lane_available(context: &ToolContext) -> bool {
                 .configured_sandbox_type()
                 .is_some_and(is_native_readonly_sandbox)
         })
+}
+
+pub(crate) fn readonly_lane_network_access(context: &ToolContext) -> bool {
+    (context.auto_approve || context.approval_mode == codewhale_execpolicy::ApprovalMode::Bypass)
+        && context
+            .elevated_sandbox_policy
+            .as_ref()
+            .is_some_and(ExecutionSandboxPolicy::has_network_access)
+        && context
+            .network_policy
+            .as_ref()
+            .is_none_or(|decider| !decider.denies_by_default())
+        && crate::tools::web::fetch::network_authorized(context)
 }
 
 /// `exec_shell_input_agent_readonly_verdict` is also the gate-side predicate for the
@@ -5353,10 +5398,23 @@ fn finish_contract_bash_result(
     timeout_ms: Option<u64>,
     context: &ToolContext,
     execution_receipt: Option<serde_json::Value>,
+    readonly_network: bool,
+    network_restricted_hint: Option<&str>,
 ) -> Result<ToolResult, ToolError> {
-    let sandbox_denied_hint = shell_sandbox_denied_hint(context, &result);
+    let sandbox_denied_hint = if network_restricted_hint.is_none() {
+        shell_sandbox_denied_hint(context, &result)
+    } else {
+        None
+    };
     let mut output = result.stdout.clone();
     output.push_str(&result.stderr);
+    if let Some(hint) = network_restricted_hint {
+        output = if output.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{hint}\n\n{output}")
+        };
+    }
     if let Some(hint) = sandbox_denied_hint {
         output = if output.is_empty() {
             hint
@@ -5373,6 +5431,13 @@ fn finish_contract_bash_result(
     if let Some(receipt) = execution_receipt {
         metadata["execution_receipt"] = receipt;
     }
+    if readonly_network {
+        metadata["sandbox_network"] = json!(true);
+    }
+    if let Some(hint) = network_restricted_hint {
+        metadata["sandbox_network_restricted"] = json!(true);
+        metadata["sandbox_network_denied_hint"] = json!(hint);
+    }
     if result.status == ShellStatus::Running {
         let task_id = result.task_id.as_deref().unwrap_or("unknown");
         let so_far = if output.trim().is_empty() {
@@ -5381,8 +5446,13 @@ fn finish_contract_bash_result(
             tail_lines(output.trim(), 20)
         };
         let notice = promotion_notice(context, task_id, result.duration_ms / 1_000, &output);
+        let completion = if context.owner_agent_id.is_some() {
+            "Its completion stays in task/status and is not injected into the parent model."
+        } else {
+            "Its completion reaches you as a runtime event before your next step; if you end the turn first, a headless run stops it unseen."
+        };
         return Ok(ToolResult::success(format!(
-            "{notice}\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". To stop it, send the same call with cancel=true. It also stops when the session ends."
+            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion} To see more output or block until it finishes, call `task_shell_wait` directly with task_id=\"{task_id}\"; do not sleep-poll with bash. To stop it, send the same call with cancel=true. It also stops when the session ends."
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
@@ -5428,8 +5498,8 @@ impl ToolSpec for LowercaseBashTool {
             "properties": {
                 "command": { "type": "string", "description": guidance::runtime_command_guidance() },
                 "description": { "type": "string", "description": "Optional few-word summary shown to the user beside the command." },
-                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Find task_shell_wait with tool_search to read more or wait for it." },
-                "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
+                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Call task_shell_wait directly with that task_id to read more or wait for it; do not sleep-poll with bash." },
+                "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) or a network fetch (curl) with mandatory native filesystem read-only isolation. Outbound network is on only in Full Access when the session sandbox, the network policy and your network grant allow it. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
                 "sandbox_permissions": {
                     "type": "string",
                     "enum": ["workspace-write", "danger-full-access"],
@@ -5467,6 +5537,15 @@ impl ToolSpec for LowercaseBashTool {
         self.is_read_only_for(input)
     }
 
+    fn refusal_before_approval(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<ToolResult> {
+        let translated = contract_bash_legacy_input(input).ok()?;
+        BashTool::contract_delegate().refusal_before_approval(&translated, context)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -5477,6 +5556,30 @@ impl ToolSpec for LowercaseBashTool {
             .execute(translated, context)
             .await
     }
+}
+
+fn dangerous_command_block(safety: &SafetyAnalysis) -> Option<ToolResult> {
+    if safety.level != SafetyLevel::Dangerous {
+        return None;
+    }
+    let reasons = safety.reasons.join("; ");
+    let suggestions = if safety.suggestions.is_empty() {
+        String::new()
+    } else {
+        format!("\nSuggestions: {}", safety.suggestions.join("; "))
+    };
+    Some(ToolResult {
+        content: format!(
+            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}\n\nNote: allow_shell=true exposes shell tools, but it does not disable built-in shell safety validation."
+        ),
+        success: false,
+        metadata: Some(json!({
+            "safety_level": "dangerous",
+            "blocked": true,
+            "reasons": safety.reasons,
+            "suggestions": safety.suggestions,
+        })),
+    })
 }
 
 fn contract_bash_legacy_input(input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
@@ -5554,7 +5657,7 @@ pub(crate) fn readonly_bash_input_schema() -> serde_json::Value {
         "properties": {
             "action": { "type": "string", "enum": ["run"] },
             "command": { "type": "string", "description": "A classifier-approved read command, or analysis code with read_only=true" },
-            "read_only": { "type": "boolean", "description": "Require native filesystem read-only and no-network enforcement for analysis code; unavailable sandboxes fail closed." },
+            "read_only": { "type": "boolean", "description": "Require native filesystem read-only enforcement for analysis code or a network fetch (curl); outbound network is on only in Full Access when the session sandbox, the network policy and your network grant allow it. Unavailable sandboxes fail closed." },
             "cwd": { "type": "string", "description": "Workspace-relative working directory" },
             "timeout_ms": { "type": "integer", "description": "Foreground wait in milliseconds (1000-600000). A command still running then moves to the background; it is not killed." }
         },
@@ -5613,7 +5716,7 @@ impl ToolSpec for BashTool {
 
     fn description(&self) -> &'static str {
         if self.read_only {
-            "Inspect with classifier-bounded commands run directly as argv, never through a shell. For analysis code, read_only=true instead requires a native filesystem read-only and no-network sandbox. Only foreground action=run with command, cwd, timeout_ms, and read_only is accepted."
+            "Inspect with classifier-bounded commands run directly as argv, never through a shell. For analysis code or a network fetch (curl), read_only=true instead requires a native filesystem read-only sandbox, with outbound network only in Full Access when the session sandbox, the network policy and your network grant allow it. Only foreground action=run with command, cwd, timeout_ms, and read_only is accepted."
         } else {
             guidance::description()
         }
@@ -5635,7 +5738,7 @@ impl ToolSpec for BashTool {
                     "type": "string",
                     "description": guidance::runtime_command_guidance()
                 },
-                "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only and no-network execution. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
+                "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only execution, with outbound network only in Full Access when the session sandbox, the network policy and your network grant allow it. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
                 "timeout_ms": {
                     "type": "integer",
                     "description": "How long to wait, in milliseconds. action=run: how long the turn waits in the foreground (default 30000, max 600000); a command still running then is NOT killed — it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and task_id. action=wait 30000, action=interact 1000. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
@@ -5770,6 +5873,30 @@ impl ToolSpec for BashTool {
 
     fn starts_detached_for(&self, input: &serde_json::Value) -> bool {
         exec_shell_input_starts_detached(input)
+    }
+
+    fn refusal_before_approval(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<ToolResult> {
+        if context.auto_approve {
+            return None;
+        }
+        let input = if context.shell_policy == ShellPolicy::ReadOnly {
+            normalize_readonly_cd(input)
+        } else {
+            input.clone()
+        };
+        let action = match self.forced_action {
+            Some(forced) => forced,
+            None => optional_str(&input, "action").ok()?.unwrap_or("run"),
+        };
+        if action != "run" {
+            return None;
+        }
+        let command = input.get("command")?.as_str()?;
+        dangerous_command_block(&analyze_command(command))
     }
 
     async fn execute(
@@ -5998,38 +6125,19 @@ impl ToolSpec for BashTool {
 
         // Safety analysis (always run for metadata, but only block when not in YOLO mode)
         let safety = analyze_command(command);
-        if !context.auto_approve {
-            match safety.level {
-                SafetyLevel::Dangerous => {
-                    let reasons = safety.reasons.join("; ");
-                    let suggestions = if safety.suggestions.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\nSuggestions: {}", safety.suggestions.join("; "))
-                    };
-                    return Ok(ToolResult {
-                        content: format!(
-                            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}\n\nNote: allow_shell=true exposes shell tools, but it does not disable built-in shell safety validation."
-                        ),
-                        success: false,
-                        metadata: Some(json!({
-                            "safety_level": "dangerous",
-                            "blocked": true,
-                            "reasons": safety.reasons,
-                            "suggestions": safety.suggestions,
-                        })),
-                    });
-                }
-                SafetyLevel::RequiresApproval | SafetyLevel::Safe | SafetyLevel::WorkspaceSafe => {
-                    // Proceed normally
-                }
-            }
+        if !context.auto_approve
+            && let Some(blocked) = dangerous_command_block(&safety)
+        {
+            return Ok(blocked);
         }
 
         // This explicit mode only narrows the caller's posture. No approval or
         // inherited full-access override can disable the required sandbox.
+        let readonly_network = enforced_readonly && readonly_lane_network_access(context);
         let policy_override = if enforced_readonly {
-            Some(ExecutionSandboxPolicy::ReadOnly)
+            Some(ExecutionSandboxPolicy::ReadOnly {
+                network_access: readonly_network,
+            })
         } else {
             context.elevated_sandbox_policy.clone()
         };
@@ -6442,12 +6550,19 @@ impl ToolSpec for BashTool {
                         },
                     )
                 });
+                let readonly_offline_hint = (enforced_readonly && !readonly_network)
+                    .then(|| readonly_offline_network_hint(command, &result))
+                    .flatten();
                 if self.optional_timeout {
+                    let network_restricted_hint = readonly_offline_hint
+                        .or_else(|| shell_network_restricted_hint(context, command, &result));
                     return finish_contract_bash_result(
                         result,
                         timeout_ms,
                         context,
                         execution_receipt,
+                        readonly_network,
+                        network_restricted_hint,
                     );
                 }
                 let task_id_str = result.task_id.clone().unwrap_or_default();
@@ -6458,8 +6573,9 @@ impl ToolSpec for BashTool {
                 } else {
                     stdout_summary.clone()
                 };
-                let network_restricted_hint =
-                    shell_network_restricted_hint(context, command, &result).map(str::to_string);
+                let network_restricted_hint = readonly_offline_hint
+                    .or_else(|| shell_network_restricted_hint(context, command, &result))
+                    .map(str::to_string);
                 let sandbox_denied_hint = if network_restricted_hint.is_none() {
                     shell_sandbox_denied_hint(context, &result)
                 } else {
@@ -6488,7 +6604,7 @@ impl ToolSpec for BashTool {
                     let completion_contract = if context.owner_agent_id.is_some() {
                         "completion stays in task/status and is not injected into the parent model."
                     } else {
-                        "completion is delivered to the model as an internal runtime event and shown in task/status state."
+                        "completion is delivered to the model as an internal runtime event before its next step and shown in task/status state; if the turn ends first, a headless run stops the task unseen."
                     };
                     if backgrounded_foreground {
                         let seconds = result.duration_ms / 1_000;
@@ -6509,11 +6625,11 @@ impl ToolSpec for BashTool {
                             &format!("{}{}", result.stdout, result.stderr),
                         );
                         format!(
-                            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends."
+                            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `task_shell_wait` directly with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends; do not sleep-poll with bash."
                         )
                     } else {
                         format!(
-                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call `task_shell_wait` directly with task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout. Do not sleep-poll with bash."
                         )
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {
@@ -6621,6 +6737,9 @@ impl ToolSpec for BashTool {
                 if let Some(hint) = network_restricted_hint {
                     metadata["sandbox_network_restricted"] = json!(true);
                     metadata["sandbox_network_denied_hint"] = json!(hint);
+                }
+                if readonly_network {
+                    metadata["sandbox_network"] = json!(true);
                 }
                 if let Some(hint) = sandbox_denied_hint {
                     metadata["sandbox_denied_hint"] = json!(hint);
@@ -7501,22 +7620,36 @@ impl ToolSpec for NoteTool {
         let note_content = required_str(&input, "content")?;
         ensure_notes_target_is_safe(&context.notes_path, &context.workspace).await?;
 
-        // Ensure parent directory exists. Tool handlers run on the Tokio
-        // runtime, so filesystem calls use tokio::fs (blocking-call
-        // convention, #6149).
-        if let Some(parent) = context.notes_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::execution_failed(format!("Failed to create notes directory: {e}"))
-            })?;
-        }
-
-        // Append to notes file
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&context.notes_path)
+        let mut file = if context.notes_path.starts_with(&context.workspace) {
+            let workspace = context.workspace.clone();
+            let notes_path = context.notes_path.clone();
+            let file = tokio::task::spawn_blocking(move || {
+                crate::fs_confined::open_append(&workspace, &notes_path)
+            })
             .await
+            .map_err(|e| ToolError::execution_failed(format!("Failed to open notes file: {e}")))?
             .map_err(|e| ToolError::execution_failed(format!("Failed to open notes file: {e}")))?;
+            tokio::fs::File::from_std(file)
+        } else {
+            // Ensure parent directory exists. Tool handlers run on the Tokio
+            // runtime, so filesystem calls use tokio::fs (blocking-call
+            // convention, #6149).
+            if let Some(parent) = context.notes_path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    ToolError::execution_failed(format!("Failed to create notes directory: {e}"))
+                })?;
+            }
+
+            // Append to notes file
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&context.notes_path)
+                .await
+                .map_err(|e| {
+                    ToolError::execution_failed(format!("Failed to open notes file: {e}"))
+                })?
+        };
 
         use tokio::io::AsyncWriteExt;
         file.write_all(format!("\n---\n{note_content}\n").as_bytes())

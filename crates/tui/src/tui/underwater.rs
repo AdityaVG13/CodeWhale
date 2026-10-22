@@ -687,7 +687,7 @@ impl ShellPhase {
 
 /// Exhaustive on purpose: a new [`AppMode`] must be handed a Policy ink
 /// deliberately rather than inheriting act's by falling through a wildcard.
-fn header_mode_ink(mode: AppMode) -> ChromeInk {
+pub(crate) fn header_mode_ink(mode: AppMode) -> ChromeInk {
     match mode {
         AppMode::Plan => ChromeInk::PolicyPlan,
         AppMode::Operate => ChromeInk::PolicyOperate,
@@ -695,7 +695,7 @@ fn header_mode_ink(mode: AppMode) -> ChromeInk {
     }
 }
 
-fn header_permission_ink(mode: ApprovalMode) -> ChromeInk {
+pub(crate) fn header_permission_ink(mode: ApprovalMode) -> ChromeInk {
     match mode {
         ApprovalMode::Suggest | ApprovalMode::Never => ChromeInk::PermissionAsk,
         ApprovalMode::Auto => ChromeInk::PermissionAutoReview,
@@ -900,7 +900,7 @@ pub(crate) fn phase_marker_with_activity(
     }
 }
 
-fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
+pub(crate) fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
     match mode {
         AppMode::Agent => tr(locale, MessageId::ChipModeAct),
         AppMode::Plan => tr(locale, MessageId::ChipModePlan),
@@ -959,10 +959,10 @@ fn filesystem_scope_notice(app: &App) -> Option<Cow<'static, str>> {
                 | crate::sandbox::SandboxPolicy::ExternalSandbox { .. }
         );
     match policy {
-        crate::sandbox::SandboxPolicy::ReadOnly if unenforced => {
+        crate::sandbox::SandboxPolicy::ReadOnly { .. } if unenforced => {
             Some(Cow::Borrowed("files: read-only (unenforced)"))
         }
-        crate::sandbox::SandboxPolicy::ReadOnly => {
+        crate::sandbox::SandboxPolicy::ReadOnly { .. } => {
             (app.mode != AppMode::Plan).then_some(Cow::Borrowed("files: read-only"))
         }
         // `DangerFullAccess` only ever arises from the Bypass posture
@@ -1492,6 +1492,7 @@ struct LaunchFit {
     context: bool,
     help: bool,
     notice: bool,
+    whats_new: usize,
     /// The "no model connected · run /provider" line (UX-3).
     setup: bool,
     heading: bool,
@@ -1516,6 +1517,7 @@ impl LaunchFit {
             + (self.context as usize)
             + (self.help as usize)
             + (self.notice as usize)
+            + self.whats_new
             + (self.setup as usize)
             + self.blanks * self.gap
             + 1
@@ -1542,6 +1544,7 @@ fn launch_fit(
     recent: usize,
     has_more: bool,
     notice: bool,
+    whats_new: usize,
     mcp: usize,
     setup: bool,
 ) -> LaunchFit {
@@ -1550,6 +1553,7 @@ fn launch_fit(
         context: true,
         help: true,
         notice,
+        whats_new,
         setup,
         heading: recent > 0 || has_more,
         blanks: LAUNCH_SEPARATORS,
@@ -1567,28 +1571,58 @@ fn launch_fit(
             2 => fit.blanks = 0,
             3 => fit.notice = false,
             4 => {
+                while fit.whats_new > 0 && fit.rows() > height {
+                    fit.whats_new -= 1;
+                }
+            }
+            5 => {
                 while fit.mcp > 1 && fit.rows() > height {
                     fit.mcp -= 1;
                 }
             }
-            5 => fit.help = false,
-            6 => fit.context = false,
-            7 => fit.heading = false,
-            8 => fit.brand = false,
-            9 => {
+            6 => fit.help = false,
+            7 => fit.context = false,
+            8 => fit.heading = false,
+            9 => fit.brand = false,
+            10 => {
                 while fit.shown > 0 && fit.rows() > height {
                     fit.shown -= 1;
                     fit.see_all = true;
                 }
             }
-            10 => fit.mcp = 0,
-            11 => fit.see_all = false,
-            12 => fit.setup = false,
+            11 => fit.mcp = 0,
+            12 => fit.see_all = false,
+            13 => fit.setup = false,
             _ => break,
         }
         step += 1;
     }
     fit
+}
+
+fn whats_new_launch_lines(app: &App, text_width: usize) -> Vec<(String, bool)> {
+    let Some(notice) = app.launch.whats_new.as_ref() else {
+        return Vec::new();
+    };
+    if app.launch.return_to_session {
+        return Vec::new();
+    }
+    let headline = notice.headline();
+    let mut lines: Vec<(String, bool)> = if text_display_width(&headline) <= text_width {
+        vec![(headline, false)]
+    } else {
+        let mut rows = crate::tui::onboarding::wrap_words(&notice.updated, text_width);
+        if let Some(counts) = &notice.counts {
+            rows.extend(crate::tui::onboarding::wrap_words(counts, text_width));
+        }
+        rows.into_iter().map(|row| (row, false)).collect()
+    };
+    let notes = [notice.notes_with_command(), notice.notes.clone()]
+        .into_iter()
+        .find(|line| text_display_width(line) <= text_width)
+        .unwrap_or_else(|| notice.url.clone());
+    lines.push((notes, true));
+    lines
 }
 
 pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
@@ -1637,6 +1671,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
     // Built before the fit ladder runs: how many rows the block wants is a
     // fact about this workspace's servers, not about the pane.
     let mcp_block = mcp_launch_lines(app, text_width);
+    let whats_new_lines = whats_new_launch_lines(app, text_width);
     // Brand occupies the header only; recent titles retain the whole reading lane.
     // Scale the canonical raster derivative before sacrificing any controls.
     use crate::tui::mark::MarkSize;
@@ -1657,6 +1692,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         entries.len(),
         has_more,
         app.launch.claude_code_detected,
+        whats_new_lines.len(),
         mcp_block.lines.len(),
         no_model_connected,
     );
@@ -1668,6 +1704,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             entries.len(),
             has_more,
             app.launch.claude_code_detected,
+            whats_new_lines.len(),
             mcp_block.lines.len(),
             no_model_connected,
         );
@@ -1752,6 +1789,17 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         text.push(Some(Line::from(Span::styled(
             semantic_truncate(&line, text_width),
             Style::default().fg(theme.warning),
+        ))));
+    }
+    for (line, muted) in whats_new_lines.iter().take(fit.whats_new) {
+        let ink = if *muted {
+            theme.text_muted
+        } else {
+            theme.text_body
+        };
+        text.push(Some(Line::from(Span::styled(
+            semantic_truncate(line, text_width),
+            Style::default().fg(ink),
         ))));
     }
     // The migration notice, while there is still a question to answer. It
@@ -2353,10 +2401,12 @@ mod launch_card_tests {
         for height in 1usize..=16 {
             for recent in 0usize..=5 {
                 for has_more in [false, true] {
-                    for notice in [false, true] {
+                    for (notice, whats_new) in [(false, 0), (true, 0), (false, 3), (true, 2)] {
                         for mcp in 0usize..=4 {
                             for setup in [false, true] {
-                                let fit = launch_fit(height, recent, has_more, notice, mcp, setup);
+                                let fit = launch_fit(
+                                    height, recent, has_more, notice, whats_new, mcp, setup,
+                                );
                                 assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
                                 assert!(fit.shown <= recent);
                                 assert!(fit.mcp <= mcp);
@@ -2404,9 +2454,9 @@ mod launch_card_tests {
         assert!(text.contains("New session"));
         assert!(!text.contains("Recent"));
         assert!(!text.contains("No recent sessions"));
-        assert!(!launch_fit(24, 0, false, false, 0, false).heading);
-        assert!(launch_fit(24, 0, true, false, 0, false).heading);
-        assert!(launch_fit(24, 0, true, false, 0, false).see_all);
+        assert!(!launch_fit(24, 0, false, false, 0, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, 0, false).see_all);
     }
 
     // --- the row reads as one object -----------------------------------

@@ -25,11 +25,13 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 | Tsubasa | `https://api.tsubasa.sh/v1` | `tsubasa-pro`, `tsubasa-fast`（32,768 token 上下文） | `TSUBASA_API_KEY` |
 | Yolo-Auto | `https://yolo-auto.com/v1` | `qwen3.8-flash`；`yolo` / `yolo-small` | `YOLO_AUTO_API_KEY` |
 | Cheaper Inference | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini`、`claude-sonnet-5`、`gemini-3.1-pro` | `CHEAPER_INFERENCE_API_KEY` |
+| Standard Compute | `https://api.stdcmpt.com/v1` | `standardcompute`（路由）；`deepseek/deepseek-v4-pro`、`anthropic/claude-sonnet-5.5` | `STANDARDCOMPUTE_API_KEY` |
 
 AICraft 的 OpenAI 兼容端点提供 DeepSeek、Anthropic Claude、Google Gemini、Qwen、GLM、MiniMax 和 Doubao 的模型 ID。权威来源是带上你的密钥请求 `GET https://aicraftapi.com/v1/models` 的结果：请从该列表中选择模型，而不是从上表中选。
 Tsubasa 只实现了 `GET /v1/models` 和 Chat Completions。它的两个公开模型 ID 共用 32,768 token 的上下文，小于 Codewhale 对未知模型假定的 128,000 token，因此保存后请在该路由上设置：
 `codewhale config set providers.tsubasa.context_window 32768`。
 Cheaper Inference 是 OpenAI 兼容网关，模型 ID 不带前缀（例如 `gpt-5.4-mini`、`claude-sonnet-5`），以带密钥请求 `GET https://api.cheaperinference.com/v1/models` 的结果为准；价格随模型和路由而变，请以提供商的实时目录为准。
+Standard Compute 提供按月固定套餐和算力预算。默认情况下，预算用尽后请求返回 HTTP 402；符合条件的套餐可启用按量付费，通过额外预付费用继续请求，详见其[预算政策](https://docs.standardcompute.com/budgets-and-limits)。模型 ID `standardcompute` 会在多个模型和提供商之间路由每个请求；带厂商前缀的 ID（例如 `deepseek/deepseek-v4-pro`）则固定使用单个模型，以 `GET https://api.stdcmpt.com/v1/models` 的结果为准。
 OpenCode Zen 和 OpenCode Go 是一等提供商路由，配置方式与下文其他提供商相同；它们不在上表之列。在 `/provider` 中，直接输入即可筛选列表（未绑定行操作的字母）；`Ctrl+T` 探测所选行的 `/models`，只记录可达性（2xx 并不代表模型可用）。
 
 需要保持同步的来源：
@@ -63,6 +65,16 @@ ID `deepseek-cn`、配置叶子 `deepseek_cn`。固有 kind 是 DeepSeek，表�
 
 没有已保存的模型、没有 `default_text_model`，也没有 `CODEWHALE_MODEL` 或提供商专用的模型环境变量时，全新安装会在 DeepSeek 提供商上运行 `deepseek-flash`。优先级依次是：当前提供商已配置的默认值，然后是它的目录默认值——因此显式设置的 `default_text_model` 不会被随附目录中排在最前的模型悄悄覆盖。
 
+### DeepSeek V4.1 Flash
+
+`deepseek-flash` 是 DeepSeek 最新 Flash 模型的 ID。2026-10-17 起，DeepSeek 把它指向 DeepSeek-V4.1-Flash-1017，调用方式和价格不变。Codewhale 0.10.1 及以后的版本默认就用 `deepseek-flash`，所以无需升级即可使用新模型：
+
+1. 在 <https://platform.deepseek.com/api_keys> 创建 API 密钥。
+2. 运行 `codewhale`，打开 `/provider`（或按 `F3`），选择 DeepSeek 并粘贴密钥。也可以设置 `DEEPSEEK_API_KEY`。
+3. 直接开始任务。想显式指定模型时，运行 `codewhale --provider deepseek --model deepseek-flash`，或在会话中输入 `/model deepseek-flash`。
+
+`deepseek-v4-pro` 是 DeepSeek 更大的模型。已退役的 `deepseek-v4-flash` 和 `deepseek-v4-flash-vision-exp` 仍可调用，DeepSeek 用同一个 Flash 模型响应。在这条路由上，`web_search` 会优先使用 DeepSeek 自己的搜索。
+
 无需安装新的 Codewhale 版本即可刷新模型目录：
 
 ```sh
@@ -73,7 +85,7 @@ codewhale models --provider openai --json
 
 `models --update`（也可写作 `--refresh`）会更新共享的 Models.dev 元数据，并用每个已配置提供商各自的凭据调用其现有的 `/models` 端点。`--provider ID` 把刷新限定在该提供商，包括具名的自定义端点。它不发起任何推理请求，也不会更改已保存的提供商或模型。命令行传入的 API 密钥只限于当前提供商；本次调用中其他路由会被报告为已跳过。
 
-不带 `--update` 的 `models` 会列出当前提供商已保存的目录，不发起提供商请求。ChatGPT 路由会先在本地验证所选注册，再读取该账户的缓存目录。刷新成功后，结果保存在 Codewhale 的目录文件夹下，供模型/提供商选择器使用。缓存文件按提供商身份和端点划分；刷新失败时会保留原有行。文本输出报告来源、最近一次成功获取的时间（Unix 秒）和新鲜度。`--update --json` 会额外给出每个来源的回执和汇总计数；部分失败时，会在写完这些回执后返回非零退出码。普通的 `models --json` 仍保持模型数组格式。随附的或已配置的回退项并不能证明账户可以使用列出的每个模型。
+不带 `--update` 的 `models` 会列出当前提供商已保存的目录，不发起提供商请求。ChatGPT 路由会先在本地验证所选注册，再读取该账户的缓存目录。刷新成功后，结果保存在 Codewhale 的目录文件夹下，供模型/提供商选择器使用；账户目录（Codewhale 账户、Baseten 和插件账户目录）除外，它们只保留在读取它们的进程内存中，因此 `exec`、`review` 和工作流工具会在第一次请求前读取一次账户模型列表，读取失败时使用内置限制继续运行。缓存文件按提供商身份和端点划分；刷新失败时会保留原有行。文本输出报告来源、最近一次成功获取的时间（Unix 秒）和新鲜度。`--update --json` 会额外给出每个来源的回执和汇总计数；部分失败时，会在写完这些回执后返回非零退出码。普通的 `models --json` 仍保持模型数组格式。随附的或已配置的回退项并不能证明账户可以使用列出的每个模型。
 
 ### 使用 ChatGPT 登录
 
@@ -244,7 +256,7 @@ provider = "modelstudio-token-plan"
 [providers.modelstudio_token_plan]
 api_key = "YOUR_MODELSTUDIO_API_KEY"
 # base_url 默认为 https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
-model = "qwen3.8-max"   # 或 qwen3.8-max-preview | qwen3.7-plus | qwen3.7-max |
+model = "qwen3.8-max"   # 或 qwen3.7-plus | qwen3.7-max |
                         #    qwen3.6-flash | deepseek-v4-pro | deepseek-v4-flash-0731 |
                         #    glm-5.2
 ```
@@ -278,7 +290,7 @@ model = "qwen3.8-max"
 在 OpenAI 兼容路由上，顶层控制是**路由和模型特定**的，Codewhale 失败关闭：只有当配置的 `base_url` 是官方阿里 Chat Completions 主机（`*.maas.aliyuncs.com/compatible-mode/v1`，包括工作区级主机，或 `coding-intl.dashscope.aliyuncs.com/v1`）时，它们才会被发送。同一提供商 ID 上的自定义 `base_url` 会剥离 `thinking`、`enable_thinking`、`preserve_thinking` 和 `reasoning_effort`，因此任意的 OpenAI 兼容网关永远不会收到阿里的方言。在已验证的主机上：
 
 - **混合模型**（`qwen3.7-*`、`qwen3.6-*`、`deepseek-v4*`、`glm-*`、`kimi-k2.6*`）获得 `enable_thinking`：`off` 时为 `false`，否则为 `true`。
-- **仅思考模型** —— `qwen3.8-max`（编目为 `thinking: always_on`）、`qwen3.8-max-preview`（提供 effort/预算选项，无开关）和 `kimi-k2.7-code` —— 完全没有启用/禁用开关。发送这样的开关，最好的情况也只是被忽略。
+- **仅思考模型** —— `qwen3.8-max`（编目为 `thinking: always_on`）和 `kimi-k2.7-code` —— 完全没有启用/禁用开关。发送这样的开关，最好的情况也只是被忽略。
 - 对文档记录为接受它的模型（`qwen3.7-max`/`-plus`、`qwen3.6-max-preview`/`-plus`/`-flash`、`kimi-k2.6*`、`kimi-k2.7-code`）发送 `preserve_thinking`，这样下一回合会保留助手的思考轨迹。
 - `reasoning_effort` 只对有文档记载的分档（档位阶梯）的两个系列发送 —— `deepseek-v4*` 和 `glm-5`/`5.1`/`5.2` —— 映射到 `high` 或 `max`。
 
@@ -383,7 +395,7 @@ SGLang 的默认端口 30000 与 Codewhale 的 `SGLANG_BASE_URL` 匹配。
 provider = "ollama"       # 或 "vllm" / "sglang"
 
 [providers.ollama]
-model = "qwen3:8b"        # 默认是 deepseek-v4-flash
+model = "qwen3:8b"        # 默认：本地守护进程列出的标签
 # base_url 默认为 http://localhost:11434/v1
 ```
 
@@ -495,7 +507,7 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 
 | 提供商 ID | TOML 表 | 认证环境变量 | Base URL 环境变量和默认值 | 默认或静态模型 | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| `deepseek` | `[providers.deepseek]` | `DEEPSEEK_API_KEY` | `CODEWHALE_BASE_URL` / `DEEPSEEK_BASE_URL`；默认 `https://api.deepseek.com/beta` | `deepseek-flash`（出厂默认；V4.1 Flash，无版本号的 ID）, `deepseek-v4-pro`, `deepseek-v4-flash`，实验性的 `deepseek-v4-flash-vision-exp`；视觉别名 `flash-vision`, `deepseek-v4flashvisionexp`；兼容别名 `deepseek-chat`, `deepseek-reasoner` | 一等默认提供商。线上 Pro 后端标记为 `DeepSeek-V4-Pro-0813`；可调用的 API ID 仍是 `deepseek-v4-pro`。Beta URL 启用严格工具模式、chat 前缀补全和 FIM 补全。文档中记载的 V4 路由可以通过单独的、有界的 Responses 请求使用提供商原生的网页搜索；兼容的自定义端点不会继承这一能力。显式设置 `https://api.deepseek.com` 或 `/v1` 可退出仅限 beta 的功能。出厂默认的 `deepseek-flash` 使用 Responses API（自 2026-07-31 的 Flash 生产环境更新起，这是 DeepSeek 文档中记载的 Codex 式集成路径）；仅适用于 Chat 的控制项（`thinking` 开关和严格工具的 `/beta` 路由）只作用于 Chat Completions 路由，而 `deepseek-v4-pro` 在其已宣布的 Responses 推出之前仍走 Chat Completions。思考强度遵循 DeepSeek 文档中记载的“请求值到实际值”映射：`minimal`/`low` 落到 `low`，`medium`/`xhigh` 落到 `high`，`max`/`ultra` 落到 `max`；`off` 关闭思考（Chat 上为 `thinking: {"type":"disabled"}`，Responses 上为 `reasoning.effort: "none"`）。该实验性视觉 ID 于 2026-08-21 在已认证的 `/models` 名单中被观察到，仅在直连的 Chat Completions 路由上声明支持图像输入。它的限制、推理和工具调用标志暂时继承自 Flash；价格未知，本次发布工作中也没有做过付费的图像往返测试。 |
+| `deepseek` | `[providers.deepseek]` | `DEEPSEEK_API_KEY` | `CODEWHALE_BASE_URL` / `DEEPSEEK_BASE_URL`；默认 `https://api.deepseek.com/beta` | `deepseek-flash`（出厂默认；V4.1 Flash，无版本号的 ID）, `deepseek-v4-pro`, `deepseek-v4-flash`，实验性的 `deepseek-v4-flash-vision-exp`；兼容别名 `deepseek-chat`, `deepseek-reasoner` | 一等默认提供商。线上 Pro 后端标记为 `DeepSeek-V4-Pro-0813`；可调用的 API ID 仍是 `deepseek-v4-pro`。Beta URL 启用严格工具模式、chat 前缀补全和 FIM 补全。文档中记载的 V4 路由可以通过单独的、有界的 Responses 请求使用提供商原生的网页搜索；兼容的自定义端点不会继承这一能力。显式设置 `https://api.deepseek.com` 或 `/v1` 可退出仅限 beta 的功能。出厂默认的 `deepseek-flash` 使用 Responses API（自 2026-07-31 的 Flash 生产环境更新起，这是 DeepSeek 文档中记载的 Codex 式集成路径）；仅适用于 Chat 的控制项（`thinking` 开关和严格工具的 `/beta` 路由）只作用于 Chat Completions 路由，而 `deepseek-v4-pro` 在其已宣布的 Responses 推出之前仍走 Chat Completions。思考强度遵循 DeepSeek 文档中记载的“请求值到实际值”映射：`minimal`/`low` 落到 `low`，`medium`/`xhigh` 落到 `high`，`max`/`ultra` 落到 `max`；`off` 关闭思考（Chat 上为 `thinking: {"type":"disabled"}`，Responses 上为 `reasoning.effort: "none"`）。该实验性视觉 ID 于 2026-08-21 在已认证的 `/models` 名单中被观察到，仅在直连的 Chat Completions 路由上声明支持图像输入。它的限制、推理和工具调用标志暂时继承自 Flash，本次发布工作中也没有做过付费的图像往返测试。DeepSeek 此后已退役 `deepseek-v4-flash` 和该视觉 ID；两者仍被接受，由 V4.1 Flash 提供服务，并按 `deepseek-flash` 的价格计费，Codewhale 从 2026-09-10 04:00 UTC 起采用该价格。`flash`、`deepseek-v4flash`、`flash-vision` 和 `deepseek-v4flashvisionexp` 简写现在选择 `deepseek-flash`。 |
 | `deepseek-anthropic` | `[providers.deepseek_anthropic]` | `DEEPSEEK_API_KEY` | `DEEPSEEK_ANTHROPIC_BASE_URL`；默认 `https://api.deepseek.com/anthropic` | `deepseek-v4-pro`, `deepseek-v4-flash`；兼容别名 `deepseek-chat`, `deepseek-reasoner` | 面向 Anthropic Messages 线协议的 DeepSeek 显式选择加入路由。使用 `/v1/messages`、`x-api-key` 和 `anthropic-version: 2023-06-01`。默认 Chat Completions 路径请保持 `provider = "deepseek"`。 |
 | `nvidia-nim` | `[providers.nvidia_nim]` | `NVIDIA_API_KEY`, `NVIDIA_NIM_API_KEY` | `NVIDIA_NIM_BASE_URL`, `NIM_BASE_URL`, `NVIDIA_BASE_URL`；默认 `https://integrate.api.nvidia.com/v1` | `deepseek-ai/deepseek-v4-pro`, `deepseek-ai/deepseek-v4-flash` | 通过 NVIDIA NIM 托管的 DeepSeek V4。TUI 配置路径接受 `NVIDIA_NIM_MODEL`。 |
 | `openai` | `[providers.openai]` | `OPENAI_API_KEY` | `OPENAI_BASE_URL`；默认 `https://api.openai.com/v1` | `gpt-5.6`（默认）, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | 通用 OpenAI 兼容路由，其内置端点和回退目录均以 OpenAI 原生为准。[GPT-5.6 系列](https://developers.openai.com/api/docs/models/gpt-5.6-sol)使用 OpenAI 文档中记载的 1.05M 上下文、128K 最大输出和推理级别。自定义网关仍可自由选择由网关自己提供的显式模型。接受 `OPENAI_MODEL`。 |
@@ -504,14 +516,14 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `volcengine` | `[providers.volcengine]` | `VOLCENGINE_API_KEY`, `VOLCENGINE_ARK_API_KEY`, `ARK_API_KEY` | `VOLCENGINE_BASE_URL`, `VOLCENGINE_ARK_BASE_URL`, `ARK_BASE_URL`；默认 `https://ark.cn-beijing.volces.com/api/coding/v3` | `DeepSeek-V4-Pro`, `DeepSeek-V4-Flash` | 火山引擎/Volcengine Ark OpenAI 兼容编码端点。接受 `VOLCENGINE_MODEL` 和 `VOLCENGINE_ARK_MODEL`。 |
 | `openrouter` | `[providers.openrouter]` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL`；默认 `https://openrouter.ai/api/v1` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`；近期大模型 ID 包括 `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `google/gemma-4-31b-it`, `z-ai/glm-5.1`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6` | 附加的开放模型路由层。它不是 DeepSeek 的替代品；它让用户在选择 OpenRouter 时把受支持的模型 ID 路由过去。 |
 | `orcarouter` | `[providers.orcarouter]` | `ORCAROUTER_API_KEY` | `ORCAROUTER_BASE_URL`；默认 `https://api.orcarouter.ai/v1` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`；路由别名 `orcarouter/auto`；近期大模型 ID 镜像 OpenRouter 的命名空间目录 | [OrcaRouter](https://www.orcarouter.ai) OpenAI 兼容聚合网关。与 OpenRouter 共享命名空间的 `vendor/model` 线协议模型格式和 DeepSeek 模型集，因此 OpenRouter 的 base-URL 和模型规范化规则适用。接受 `ORCAROUTER_MODEL`。提供商别名：`orcarouter`, `orca_router`, `orca`。 |
-| `xiaomi-mimo` | `[providers.xiaomi_mimo]` | `XIAOMI_MIMO_TOKEN_PLAN_API_KEY`, `MIMO_TOKEN_PLAN_API_KEY`, `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` | `XIAOMI_MIMO_BASE_URL`, `MIMO_BASE_URL`, `XIAOMI_MIMO_MODE`, `MIMO_MODE`；默认 `https://token-plan-sgp.xiaomimimo.com/v1` | 聊天：`mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, `mimo-v2.5`；语音/TTS：`mimo-v2.5-tts`, `mimo-v2.5-tts-voicedesign`, `mimo-v2.5-tts-voiceclone`, `mimo-v2-tts` | 小米 MiMo OpenAI 兼容聊天补全路由。`mimo-v2.5-pro` 和 `mimo-v2.5` 可以使用文档中记载的提供商原生网页搜索插件；ultraspeed、语音/TTS 以及自定义兼容路由不会继承它。Token Plan 密钥（`tp-...`）默认使用 `api-key` 认证和 token-plan 端点；按量付费模式使用标准 API 密钥（`sk-...`）和 `https://api.xiaomimimo.com/v1`。它发送 `max_completion_tokens` 并用 MiMo 的 `thinking` 字段进行推理控制。Token Plan 成本/用量基于额度/配额；在小米暴露可靠的余额 API 之前，Codewhale 将其显示为未知。`codewhale speech` / `tts` 使用 TTS 模型。 |
+| `xiaomi-mimo` | `[providers.xiaomi_mimo]` | `XIAOMI_MIMO_TOKEN_PLAN_API_KEY`, `MIMO_TOKEN_PLAN_API_KEY`, `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` | `XIAOMI_MIMO_BASE_URL`, `MIMO_BASE_URL`, `XIAOMI_MIMO_MODE`, `MIMO_MODE`；默认 `https://token-plan-sgp.xiaomimimo.com/v1` | 聊天：`mimo-v2.6-pro`（默认）, `mimo-v2.6-flash`, `mimo-v2.5-pro-ultraspeed`；语音/TTS：`mimo-v2.5-tts`, `mimo-v2.5-tts-voicedesign`, `mimo-v2.5-tts-voiceclone`, `mimo-v2-tts` | 小米 MiMo OpenAI 兼容聊天补全路由。小米于 2026-10-21 10:00（UTC+8）[停用](https://mimo.mi.com/docs/updates/deprecate) `mimo-v2.5-pro` 和 `mimo-v2.5`；对这两个已配置的 ID，Codewhale 改为发送 `mimo-v2.6-pro` 和 `mimo-v2.6-flash`。`mimo-v2.6-pro` 和 `mimo-v2.6-flash` 可以使用文档中记载的提供商原生网页搜索插件；ultraspeed、语音/TTS 以及自定义兼容路由不会继承它。Token Plan 密钥（`tp-...`）默认使用 `api-key` 认证和 token-plan 端点；按量付费模式使用标准 API 密钥（`sk-...`）和 `https://api.xiaomimimo.com/v1`。它发送 `max_completion_tokens` 并用 MiMo 的 `thinking` 字段进行推理控制。Token Plan 成本/用量基于额度/配额；在小米暴露可靠的余额 API 之前，Codewhale 将其显示为未知。`codewhale speech` / `tts` 使用 TTS 模型。 |
 | `novita` | `[providers.novita]` | `NOVITA_API_KEY` | `NOVITA_BASE_URL`；默认 `https://api.novita.ai/openai/v1` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash` | 面向 DeepSeek 模型 ID 的 OpenAI 兼容托管路由。模型覆盖使用配置或 `CODEWHALE_MODEL` / `DEEPSEEK_MODEL`。 |
 | `fireworks` | `[providers.fireworks]` | `FIREWORKS_API_KEY` | `FIREWORKS_BASE_URL`；默认 `https://api.fireworks.ai/inference/v1` | `accounts/fireworks/models/deepseek-v4-pro` | OpenAI 兼容托管路由。模型覆盖使用配置或 `CODEWHALE_MODEL` / `DEEPSEEK_MODEL`。 |
 | `siliconflow` | `[providers.siliconflow]` | `SILICONFLOW_API_KEY` | `SILICONFLOW_BASE_URL`；默认 `https://api.siliconflow.com/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | OpenAI 兼容托管路由。官方文档使用 `.com` 端点。接受 `SILICONFLOW_MODEL`。推理别名 `deepseek-reasoner` 和 `deepseek-r1` 映射到 Pro；`deepseek-chat` 和 `deepseek-v3` 映射到 Flash。 |
 | `siliconflow-CN` | `[providers.siliconflow_cn]` | `SILICONFLOW_API_KEY` | `SILICONFLOW_BASE_URL`；默认 `https://api.siliconflow.cn/v1` | 使用 SiliconFlow 模型集 | 中国区 SiliconFlow 路由。未设置时回退到 `[providers.siliconflow]` 的 api_key / base_url / model。用 `provider = "siliconflow-CN"` 或 `CODEWHALE_PROVIDER=siliconflow-CN` 选择它。 |
 | `arcee` | `[providers.arcee]` | `ARCEE_API_KEY` | `ARCEE_BASE_URL`；默认 `https://api.arcee.ai/api/v1` | `trinity-large-thinking`, `trinity-large-preview` | Arcee AI 直连 OpenAI 兼容路由，按 256K 上下文 BF16 服务跟踪。接受 `ARCEE_MODEL`。OpenRouter 的 `arcee-ai/trinity-large-thinking` 仍是 OpenRouter 命名空间的模型 ID；直连 Arcee 使用裸 `trinity-large-thinking` ID。 |
 | `moonshot` | `[providers.moonshot]` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` | `MOONSHOT_BASE_URL`, `KIMI_BASE_URL`；默认 `https://api.moonshot.ai/v1` | 直连 Moonshot：`kimi-k3`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k2.6`；Kimi Code 会员：`k3`, `kimi-for-coding`, `kimi-for-coding-highspeed`（在 `https://api.kimi.com/coding/v1`） | Moonshot/Kimi 路由。精确的直连 `kimi-k3` 路由使用文档中记载的 Formula 网页搜索工具/fiber 循环；直连的 `kimi-k2.6` 保留内置的 `$web_search` 约定，精确的 Kimi Code 会员路由使用其结构化的 `/search` 服务。相邻路径、K2.7 直连模型以及跨产品的模型 ID 不会继承原生搜索。`kimi` 和 `kimi-k2` 别名选择 `kimi-k2.7-code`；接受 `MOONSHOT_MODEL`, `KIMI_MODEL_NAME` 和 `KIMI_MODEL`。Kimi 思考通过 `reasoning_content` 流式返回；Codewhale 把它保留在 Thinking 单元格中，并为思考/工具调用连续性重放它。直连 K3 请使用精确的 `base_url = "https://api.moonshot.ai/v1"` 和 `model = "kimi-k3"`；它始终思考，接收顶层 `reasoning_effort = "low" \| "high" \| "max"`（`off` 规范化为 `low`），只使用 `max_completion_tokens`，并按 [K3 快速入门](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart)省略 `temperature`/`top_p`。Kimi Code K3 请使用来自 [Kimi Code 控制台](https://www.kimi.com/code/console)的密钥、精确的 `base_url = "https://api.kimi.com/coding/v1"` 和裸 `model = "k3"`；`off` 变成启用的 `low`，而正常分派的 `auto` 选择并发送具体的 Codewhale 层级。只有省略推理设置时才由提供商默认值控制。该会员路由默认安全地使用 262,144 上下文 token；[Kimi Code 模型层级表](https://www.kimi.com/code/docs/en/kimi-code/models.html)授予 Allegretto 及以上套餐最高 1M，这些套餐可将其表示为 `context_window = 1048576`。`k3[1m]` 仅限 Claude Code，Codewhale 拒绝它。`kimi-for-coding` 仍是有效的 K2.7 会员路由，`kimi-for-coding-highspeed` 是它自己的高速名册条目（262,144 上下文）；会员 id 在直连平台端点上被拒绝，`kimi-k3` 在会员端点上仍被拒绝。计费由路由解析到的端点决定，对照两个精确的产品端点各判断一次：直连 Moonshot（`https://api.moonshot.ai/v1` 或默认值）按用量计费并显示美元估算，精确的 Kimi Code 会员端点按 Kimi Code 额度计费且从不显示美元估算，其他任何情况——网关主机、邻近的 Kimi 托管路径——报告 `cost: unknown` 而不是借用任一产品。导入的没有 `base_url` 的 Kimi Code token 仍解析到会员端点，因此按 Kimi Code 额度计费，绝不累积美元。完成的回合（父智能体或子智能体）从构建其客户端时不可变的端点回执计费，绝不从之后重新读取的配置计费：`MOONSHOT_BASE_URL`/`KIMI_BASE_URL` 只合并到*活动*提供商的表中，回合内的提供商切换可以把常驻配置移离实际运行的路由。遗留的 `auth_mode = "kimi_oauth"` 在不探测 Kimi CLI 文件的情况下失败于 API 密钥指引。Codewhale 不冒充 `kimi_cli` 或 `kimi_code_cli`。**中国区密钥：** 贡献者现场证据（@vFONGv，PR #5229，Windows 10 上验证）报告中国区 Moonshot 密钥必须搭配 `base_url = "https://api.moonshot.cn/v1"`；留在默认国际主机（`https://api.moonshot.ai/v1`）上会认证失败。我们自己没有中国区密钥来验证这一点，因此记录为用户报告而非测试过的路由。另请注意，仅编辑 `base_url` 不会生效，直到为该提供商重新运行 `codewhale auth set`。 |
-| `google` | `[providers.google]` | `GOOGLE_API_KEY`, `GEMINI_API_KEY` | `GOOGLE_BASE_URL`, `GEMINI_BASE_URL`；默认 `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-3.1-pro-preview`（默认）；`/model` 还列出 `gemini-3-pro-preview`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash` | Google Gemini 作为官方 OpenAI 兼容 Chat Completions 路由上的自有后端。思考模型在工具调用时捕获 `extra_content.google.thought_signature` 并在助手工具调用消息中重放它；重放一个未捕获签名的工具调用会失败关闭并给出可操作的错误，而不是让工具循环中断。`gemini-2.5-flash-lite` 默认关闭思考，并以警告降级。推理强度映射到文档化的 `google.thinking_config.thinking_level`（`low`/`high`）。该方言绑定精确的官方 base URL：指向其他网关的 `google` 行获得普通 OpenAI 语义且无签名要求。Codewhale 从不读取 Google OAuth 文件；只使用 AI Studio API 密钥。本环境未对真实端点做实时测试。 |
+| `google` | `[providers.google]` | `GOOGLE_API_KEY`, `GEMINI_API_KEY` | `GOOGLE_BASE_URL`, `GEMINI_BASE_URL`；默认 `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-3.1-pro-preview`（默认）；`/model` 还列出 `gemini-4-argon`, `gemini-3-pro-preview`, `gemini-3.8-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash` | Google Gemini 作为官方 OpenAI 兼容 Chat Completions 路由上的自有后端。思考模型在工具调用时捕获 `extra_content.google.thought_signature` 并在助手工具调用消息中重放它；重放一个未捕获签名的工具调用会失败关闭并给出可操作的错误，而不是让工具循环中断。`gemini-2.5-flash-lite` 默认关闭思考，并以警告降级。推理强度映射到文档化的 `google.thinking_config.thinking_level`（`low`/`high`）。该方言绑定精确的官方 base URL：指向其他网关的 `google` 行获得普通 OpenAI 语义且无签名要求。Codewhale 从不读取 Google OAuth 文件；只使用 AI Studio API 密钥。本环境未对真实端点做实时测试。 |
 | `zai` | `[providers.zai]` | `ZAI_API_KEY`, `Z_AI_API_KEY`, `ZHIPU_API_KEY`, `GLM_API_KEY` | `ZAI_BASE_URL`, `Z_AI_BASE_URL`；默认 `https://api.z.ai/api/coding/paas/v4`；通用 API `https://api.z.ai/api/paas/v4` 和 `https://open.bigmodel.cn/api/paas/v4` | `GLM-5.3` 默认；`/model` 还列出 `GLM-5.3-Flash`, `GLM-5.2`, `GLM-5.1` 和 `GLM-5-Turbo` | Z.AI GLM Coding Plan 路由。三条第一方 Chat 路由（api.z.ai 的两个产品与 BigModel 通用平台端点）共用同一种请求方言，因此推理控制——GLM-5.2 的思考开关、分档思考强度，以及把 `off` 改写为 `enabled` + `reasoning_effort: "low"` 的 GLM-5.3 强制思考改写——在 BigModel 上同样生效；`/preview` 等相邻路径仍保持失败关闭。两个通用 API 产品提供结构化的提供商原生网页搜索（全球为 `search-prime`，中国区为 `search_std`）；Coding Plan 和兼容的自定义端点不会继承它。`GLM-5.3` 是默认值，也是一等选择器行（`model = "GLM-5.3"` 或 `ZAI_MODEL=GLM-5.3`）；`GLM-5.3-Flash` 是 1M 多模态的快速同系模型（`model = "GLM-5.3-Flash"`）。显式选择 `GLM-5.2` 会保留它自己的 id。在 Z.ai 发布不同的 5.3 元数据之前，5.3 的限制和推理选项继承自 `GLM-5.2`；5.3 不带价格。Flash 采用已公布的 $0.15/$0.50 价目。在未开通 5.3 的账户上，真实调用仍可能以权限代码 1311 返回 429。 |
 | `stepfun` | `[providers.stepfun]` | `STEPFUN_API_KEY`, `STEP_API_KEY` | `STEPFUN_BASE_URL`, `STEP_BASE_URL`；默认 `https://api.stepfun.ai/v1`；Coding Plan 端点 `https://api.stepfun.ai/step_plan/v1` | `step-3.7-flash` | StepFun / StepFlash 直连 OpenAI 兼容路由。`/provider` 设置询问密钥属于哪种计费路由——按量付费还是 Step Plan——对照所选端点验证密钥，并把答案只写入 `[providers.stepfun].base_url`。既非两条已识别路由的 base URL 会被保留，问题被跳过。你也可以手动把 `[providers.stepfun].base_url` 或 `STEP_BASE_URL` 设为 Coding Plan URL。离线核算把已识别路由标记为 `stepfun-payg` 或 `stepfun-plan`，不持久化原始端点，只有标准 PAYG 路由接收 token 定价。接受 `STEPFUN_MODEL` 和 `STEP_MODEL`。 |
 | `minimax` | `[providers.minimax]` | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL`；默认 `https://api.minimax.io/v1`；中国 `https://api.minimaxi.com/v1` | `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.1`, `MiniMax-M2.1-highspeed`, `MiniMax-M2` | MiniMax 直连 OpenAI 兼容路由。Codewhale 发送 `reasoning_split = true`，这样 MiniMax 思考与答案文本分开到达。两种 MiniMax 方言都在相同端点和相同密钥上售卖按量付费和 Token Plan，因此计费从凭据*产品*分类，绝不由端点或默认值决定。`[providers.minimax]`/`[providers.minimax_anthropic]` 中的 `mode = "token-plan"`，或形如 `sk-cp…` 的 Token Plan 密钥，按 MiniMax Token Plan 额度计费且无美元估算；显式的按量付费模式（`pay-as-you-go`/`payg`/`metered`）胜过密钥形状。密钥的产品前缀只有在密钥位于配置中、由 `api_key_env` 绑定或作为 `MINIMAX_API_KEY` 导出到官方端点时才可见——通过 `codewhale auth set` 保存的密钥（secret store / OS keyring）刻意不被读取用于计费分类。没有显式模式且没有可见的产品标记时，路由报告 `cost: unknown` 而不是假定按量付费，因此 Token Plan 账户永远不会被收取虚构的美元。自定义/网关端点也以 `cost: unknown` 失败关闭。官方 M3 输入模态是文本、图像和视频；M2.7 仅文本。 |
@@ -522,17 +534,17 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `ollama-cloud` | `[providers.ollama_cloud]` | `OLLAMA_CLOUD_API_KEY`, 然后是 `OLLAMA_API_KEY` | `OLLAMA_CLOUD_BASE_URL`；默认 `https://ollama.com/v1` | `gpt-oss:120b`；任意的提供商自有 ID 直通 | 托管 OpenAI 兼容 `/v1/chat/completions` 路由。在 `ollama-cloud` 下保存凭据；精确的已发布 `ollama` + Cloud URL 元组与其遗留表和秘密槽位具有有界的只读内存兼容性。接受 `OLLAMA_CLOUD_MODEL`。 |
 | `huggingface` | `[providers.huggingface]` | `HUGGINGFACE_API_KEY`, `HF_TOKEN` | `HUGGINGFACE_BASE_URL`, `HF_BASE_URL`；默认 `https://router.huggingface.co/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | Hugging Face Inference Providers OpenAI 兼容路由器路由。接受的别名：`huggingface`, `hugging-face`, `hugging_face`, `hf`。Org 前缀的模型 ID 直通。接受 `HUGGINGFACE_MODEL` 和 `HF_MODEL`。Hub 浏览/导出是未来的独立功能。 |
 | `modelscope` | `[providers.modelscope]` | `MODELSCOPE_API_KEY` | `MODELSCOPE_BASE_URL`；默认 `https://api-inference.modelscope.cn/v1` | `Qwen/Qwen3.5-397B-A17B`（默认）, `Qwen/Qwen3.5-122B-A10B`, `Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-Flash-Next`, `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Pro-0813`, `deepseek-ai/DeepSeek-V4.1-Flash`, `ZhipuAI/GLM-4.7-Flash`, `ZhipuAI/GLM-5.2` | 阿里魔搭社区 OpenAI 兼容推理 API 路由。模型 ID 直通。接受 `MODELSCOPE_MODEL`。 |
-| `deepinfra` | `[providers.deepinfra]` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` | `DEEPINFRA_BASE_URL`；默认 `https://api.deepinfra.com/v1/openai` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | DeepInfra OpenAI 兼容路由。OpenAI SDK 的直接替代品。 |
+| `deepinfra` | `[providers.deepinfra]` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` | `DEEPINFRA_BASE_URL`；默认 `https://api.deepinfra.com/v1/openai` | `deepseek-ai/DeepSeek-V4-Pro`（默认）, `deepseek-ai/DeepSeek-V4-Flash`；也可选择 `deepseek-ai/DeepSeek-V4-Pro-0813`, `deepseek-ai/DeepSeek-V4.1-Flash-1017`, `deepseek-ai/DeepSeek-V4.1-Flash`, `deepseek-ai/DeepSeek-V4-Flash-0731` | DeepInfra OpenAI 兼容路由。OpenAI SDK 的直接替代品。`deepseek-v4-pro` 选择 V4-Pro，`deepseek-flash` / `deepseek-v4-flash` 选择 V4-Flash。DeepInfra 列出的 V4-Pro-0813、两个 V4.1 Flash ID 和 V4-Flash-0731 上下文均为 1,048,576，且未公布单独的输出上限，因此不做假设；V4.1 Flash 的两个 ID 支持图像输入。 |
 | `together` | `[providers.together]` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL`；默认 `https://api.together.xyz/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `thinkingmachines/inkling` | Together AI OpenAI 兼容路由。接受 `TOGETHER_MODEL`。模型别名 `deepseek-v4-pro` 和 `deepseek-v4-flash` 规范化为 Together 的 org 前缀 ID；`inkling` 和 `together-inkling` 规范化为 Together 发布的小写 Inkling 线协议 ID。Inkling 使用 Thinking Machines 的[官方模型仓库](https://huggingface.co/thinkingmachines/Inkling)中精确的 `none`/`minimal`/`low`/`medium`/`high`/`max` 推理词汇。Together 的[发布帖](https://www.together.ai/blog/together-ai-brings-thinking-machines-labs-new-model-inkling-on-day-0)目前称 Inkling 以 1M 上下文上线，而其[模型详情页](https://www.together.ai/models/inkling)称即将推出 256K 上下文且不公布价格。在 Together 活跃的 `/models` 端点和 Models.dev 目录解决该冲突之前，Inkling 不会种入 Codewhale 的离线选择器，也不会推断路由特定的上下文或成本。 |
 | `qianfan` | `[providers.qianfan]` | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` | `QIANFAN_BASE_URL`, `BAIDU_QIANFAN_BASE_URL`；默认 `https://api.baiduqianfan.ai/v1` | `ernie-4.0-turbo-8k`；提供商范围的定制 Qianfan 服务/模型 ID 直通 | 百度千帆 OpenAI 兼容路由。请求使用 Bearer 认证和 Chat Completions 负载。接受 `QIANFAN_MODEL` 和 `BAIDU_QIANFAN_MODEL`；别名 `baidu-qianfan`, `baidu_qianfan` 和 `baidu` 解析到该提供商。千帆文档中工具/函数调用按模型范围限定，因此 Codewhale 保留所选线协议模型，把实时能力证明留给后续的路由/能力工作。 |
 | `openai-codex` | `[providers.openai_codex]` | 官方“使用 ChatGPT 登录”（`codewhale auth chatgpt` / `/provider setup openai-codex`） | 官方端点 `https://api.openai.com/v1` | 当前账户目录；手动配置的模型 ID 仍属于显式选择 | **实验性。** 使用公共 Responses 端点（`/v1/responses`），要求已验证的 `chatgpt.tokens.use.direct` 授权。开源应用动态注册会为所选账户/工作区签发客户端 ID，Codewhale 保护并续期自己的令牌。可选模型由账户目录提供；公开模型表和旧版 Codex 令牌不能证明套餐使用权限。不会自动切换计费路径。设置、额度和预览限制见[使用 ChatGPT 登录](#使用-chatgpt-登录)。 |
-| `anthropic` | `[providers.anthropic]` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL`；默认 `https://api.anthropic.com` | `claude-opus-4-8`, `claude-sonnet-4-6`（默认）, `claude-haiku-4-5` | 原生 Anthropic Messages API 路由（`/v1/messages`、`x-api-key` + `anthropic-version: 2023-06-01`）——不是 OpenAI 兼容。通过 `cache_control` 断点提示缓存、自适应思考 + `output_config.effort`、按原样重放带签名的思考块、按 #2961 规范化的缓存遥测。接受 `ANTHROPIC_MODEL`。 |
+| `anthropic` | `[providers.anthropic]` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL`；默认 `https://api.anthropic.com` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1`, `claude-sonnet-4-6`（默认）, `claude-haiku-5-5` | 原生 Anthropic Messages API 路由（`/v1/messages`、`x-api-key` + `anthropic-version: 2023-06-01`）——不是 OpenAI 兼容。通过 `cache_control` 断点提示缓存、自适应思考 + `output_config.effort`、按原样重放带签名的思考块、按 #2961 规范化的缓存遥测。接受 `ANTHROPIC_MODEL`。 |
 | `openmodel` | `[providers.openmodel]` | `OPENMODEL_API_KEY` | `OPENMODEL_BASE_URL`；默认 `https://api.openmodel.ai` | `deepseek-v4-flash`；提供商范围的定制模型 ID 直通 | OpenModel Anthropic 兼容 Messages 路由。使用 `/v1/messages`、Bearer 认证和 `anthropic-version: 2023-06-01`；OpenModel 按模型 id 选择 DeepSeek、DashScope、Xiaomi、Claude 和其他路由。接受 `OPENMODEL_MODEL`。 |
 | `sakana` | `[providers.sakana]` | `FUGU_API_KEY`, `SAKANA_API_KEY` | `SAKANA_BASE_URL`；默认 `https://api.sakana.ai/v1` | `fugu`（默认）, `fugu-ultra-20260615` | Sakana AI Fugu OpenAI 兼容路由。标准 Chat Completions 线协议；支持流式。`fugu-ultra-20260615` 是重型/推理变体。环境变量别名：`FUGU_API_KEY`（主）, `SAKANA_API_KEY`；提供商别名：`sakana-ai`, `sakana_ai`, `fugu`。 |
 | `longcat` | `[providers.longcat]` | `LONGCAT_API_KEY` | `LONGCAT_BASE_URL`；默认 `https://api.longcat.chat/openai/v1` | `LongCat-2.0`（默认） | 美团 LongCat 精选模型网关。OpenAI 兼容 Chat Completions 线协议。在 https://longcat.chat/platform 注册获取 API 密钥。提供商别名：`long-cat`, `meituan-longcat`, `meituan`。 |
 | `opencode-go` | `[providers.opencode_go]` | `OPENCODE_GO_API_KEY` | `OPENCODE_GO_BASE_URL`；默认 `https://opencode.ai/zen/go/v1` | `deepseek-v4-pro`（默认）, `grok-4.5`, `glm-5.2`, `glm-5.1`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-flash`, `mimo-v2.5`, `mimo-v2.5-pro` | [OpenCode Go](https://opencode.ai/docs/go/) 订阅路由，使用 OpenAI 兼容 Chat Completions。接受 `OPENCODE_GO_MODEL`。Codewhale 使用裸线协议 ID；常见的 `opencode-go/<model-id>` 输入别名规范化为裸 ID。只在 Anthropic `/messages` 端点文档化的 Go 模型，在 Codewhale 支持按模型选择线协议之前被该路由刻意不公布。计费界面显示 Go 额度而不是 token 价格估算。 |
 | `opencode-zen` | `[providers.opencode_zen]` | `OPENCODE_ZEN_API_KEY`, 回退 `OPENCODE_API_KEY` | `OPENCODE_ZEN_BASE_URL`；默认 `https://opencode.ai/zen/v1` | `gpt-5.6`（默认）；当前的 GPT、Claude、Qwen、DeepSeek、MiniMax、GLM、Kimi、Grok、Muse Spark 和免费模型 ID | [OpenCode Zen](https://opencode.ai/docs/zen/) 模型感知网关。接受 `OPENCODE_ZEN_MODEL`，官方 `opencode/<model-id>` 选择器规范化为裸线协议 ID。每个模型的线协议先取自精选快照，再取自其 [Models.dev](https://models.dev) 行声明的 AI SDK 包：GPT、Grok 和 Muse Spark 行使用 `/responses`；Claude 和大多数 Qwen 行使用 `/messages`；DeepSeek、MiniMax、GLM、Kimi、`qwen3.8-max` 和免费行使用 `/chat/completions`。Responses 和 Chat Completions 用 Bearer `Authorization` 认证，而 Anthropic Messages 用 `x-api-key`；这些路由都不用 ChatGPT/Codex OAuth 指引或头。Gemini 失败关闭，因为其模型特定的 Google 线协议未实现；Models.dev 标记为 `deprecated` 的行以及任何已加载目录都未列出的模型也失败关闭。见 [OpenCode Zen 协议目录](#opencode-zen-协议目录)。 |
-| `meta` | `[providers.meta]` | `META_MODEL_API_KEY`, `MODEL_API_KEY` | `META_MODEL_API_BASE_URL`, `MODEL_API_BASE_URL`；默认 `https://api.meta.ai/v1` | `muse-spark-1.2`（默认） | [Meta Model API](https://developer.meta.com/ai/resources/blog/build-with-muse-spark/) 公开预览路由，使用 OpenAI 兼容 Chat Completions。Muse Spark 1.2 保留其线协议 ID、工具支持、1M 上下文、32K 输出元数据和 `none` 到 `xhigh` 的推理强度。接受 `META_MODEL_API_MODEL` 和 `MODEL_API_MODEL`。提供商别名：`meta-ai`, `meta_model_api`, `muse`, `muse-spark`。 |
+| `meta` | `[providers.meta]` | `META_MODEL_API_KEY`, `MODEL_API_KEY` | `META_MODEL_API_BASE_URL`, `MODEL_API_BASE_URL`；默认 `https://api.meta.ai/v1` | `muse-spark-1.2`（默认）, `muse-spark-1.3`, `muse-spark-1.3-contributor`, `muse-wonder-1.0`（预览）, `muse-spark-1.2-contributor`, `muse-spark-1.1` | [Meta Model API](https://developer.meta.com/ai/resources/blog/build-with-muse-spark/) 公开预览路由，使用 OpenAI 兼容 Chat Completions。默认仍为 `muse-spark-1.2`，保留其线协议 ID、工具支持、1M 上下文、32K 输出元数据和 `none` 到 `xhigh` 的推理强度；[Meta 推荐](https://dev.meta.ai/docs/models.md) 新工作使用 `muse-spark-1.3`（1,048,576 上下文），它仍可选择。接受 `META_MODEL_API_MODEL` 和 `MODEL_API_MODEL`。提供商别名：`meta-ai`, `meta_model_api`, `muse`, `muse-spark`。 |
 | `telecomjs` | `[providers.telecomjs]` | `TELECOMJS_API_KEY` | `TELECOMJS_BASE_URL`；默认 `https://aigw.telecomjs.com/v1` | 保守回退 `deepseek-v4-pro`；配置密钥后认证的 `/models` 行 | TelecomJS TokenHub OpenAI 兼容 Chat Completions 路由。实时目录按提供商和密钥指纹隔离，过期的行在瞬时刷新失败时存活，不支持的推理请求字段被省略。接受 `TELECOMJS_MODEL`。提供商别名：`telecom-js`, `telecom_js`, `telecomjs-cn`, `tokenhub`。 |
 | `mistral` | `[providers.mistral]` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL`；默认 `https://api.mistral.ai/v1` | `mistral-code-latest`（默认；`codestral-latest` 接受为别名）, `mistral-medium-latest`（别名：`mistral-medium-3-5`）, `mistral-small-latest`（别名：`mistral-small-2603`）, `mistral-large-latest` | Mistral AI（la Plateforme）OpenAI 兼容 Chat 路由。在文档化的第一方 HTTPS `/v1` 主机上，Medium 和 Small 发送可调的 `reasoning_effort`（仅 `none` 或 `high`），解析 Mistral 的多态 thinking/text 块，并以相同线协议形状重放存储的思考。已废弃的原生 Magistral ID 仍是显式配置兼容路由：它们始终思考，从不接收可调 effort 字段。Code 和 Large 不推理。除非是文档化的第一方主机之一，自定义 `MISTRAL_BASE_URL` 保持通用 Chat 语义。接受 `MISTRAL_MODEL`。提供商别名：`mistral-ai`, `mistralai`, `la-plateforme`。 |
 | `edenai` | `[providers.edenai]` | `EDENAI_API_KEY` | `EDENAI_BASE_URL`；默认 `https://api.edenai.run/v3`；欧盟 `https://api.eu.edenai.run/v3` | `deepseek/deepseek-v4-pro`（默认）；`provider/model` id 的实时 `/models` 目录 | Eden AI OpenAI 兼容聚合网关。目录行保持提供商范围；通用推理控制被省略，因为受支持的字段取决于所选上游家族。接受 `EDENAI_MODEL`。默认的 `deepseek/deepseek-v4-pro` 只列在全球目录上；在欧盟端点上把 `EDENAI_MODEL`（或 `model`）设为欧盟 `/models` 列表中的一行，例如 `qwen/deepseek-v4-pro`。提供商别名：`eden-ai`, `eden_ai`。 |
@@ -541,7 +553,7 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `concentrate` | `[providers.concentrate]` | `CONCENTRATE_API_KEY` | `CONCENTRATE_BASE_URL`；默认 `https://api.concentrate.ai/v1` | `deepseek-v4-pro`（默认；使用普通目录 ID 时由网关选择上游提供商）；形如 `openai/gpt-5.6-sol` 的 `provider/model` ID 会固定一个上游；`concentrate/auto` 是网关自己的路由器；无需认证即可读取的实时 `/v1/models` 目录 | Concentrate OpenAI Responses 兼容网关（`POST /v1/responses`，Bearer 认证，使用 Universal API 密钥）。需主动启用，且仅支持自带密钥（BYOK）：用你自己的密钥、走你自己的 Concentrate 账单，Codewhale 不收任何费用，也没有托管的默认路由。请求只携带文档中记载的字段（系统提示词作为 `system` 输入项传递）。约定见：[API 简介](https://concentrate.ai/docs/api-reference/introduction)、[请求参数](https://concentrate.ai/docs/api-reference/endpoint/request-parameters)、[流式传输](https://concentrate.ai/docs/api-reference/endpoint/streaming)、[错误](https://concentrate.ai/docs/api-reference/endpoint/errors)。参见 [Concentrate 说明](#concentrate-说明)。 |
 | `codewhale` | `[providers.codewhale]` | `CODEWHALE_API_KEY` | `CODEWHALE_API_BASE`；默认 `https://api.codewhale.net/v1` | `deepseek/deepseek-v4-pro`（默认）、`anthropic/claude-sonnet-5`、`openai/gpt-5.6` 仅是离线引导行；目录以已认证的 `GET /v1/models` 返回的、账户已连接的提供商列表为准 | Codewhale API：基于客户已连接到其 Codewhale 账户的提供商密钥，提供账户级的模型访问。一个带 `models:infer` 权限范围的 `cwc_key_…` 账户 API 密钥即可认证所有模型。模型 ID 就是账户目录返回的 `provider/model` 原样字符串，每一行都会声明自己的协议（`chat-completions` → `/v1/chat/completions`，`anthropic-messages` → `/v1/messages`，`responses` → `/v1/responses`）；所有协议都使用 `Authorization: Bearer`，绝不使用 `x-api-key`。`CODEWHALE_API_BASE` 必须是 HTTPS，回环地址除外。用 `codewhale account keys set <provider>` 连接提供商密钥。提供商别名：`codewhale-api`, `cw-api`, `codewhale-cloud`。 |
 | `xai` | `[providers.xai]` | `XAI_API_KEY`、Codewhale 自有的设备 OAuth，或显式的只读 Grok CLI 授权 | `XAI_BASE_URL`；默认 `https://api.x.ai/v1` | `grok-4.6`（默认）, `grok-4.7`, `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | xAI/Grok OpenAI 兼容 Chat Completions 路由。Grok 4.6 有 500K 上下文窗口、文本/图像输入、函数调用、结构化输出、服务端 web 搜索和 `low`/`medium`/`high`/`xhigh` 推理（默认 `high`）。[Grok 4.7](https://docs.x.ai/docs/models/grok-4.7) 有相同的 500K 窗口、文本/图像输入、函数调用、结构化输出、推理阶梯和 $2.00 / $0.50 缓存 / $6.00 费率；xAI 尚未记录其 web 搜索支持，因此 Codewhale 不声明。Grok 推理无法关闭（[推理指南](https://docs.x.ai/docs/guides/reasoning)）。提示达到 200K token 时其标准费率翻倍；同样的 2 倍长上下文规则适用于 `grok-4.5`（500K 上下文，$2.00 / $0.30 缓存 / $6.00）和 `grok-4.3`（1M 上下文，$1.25 / $0.20 缓存 / $2.50），按其[模型页](https://docs.x.ai/docs/models/grok-4.5)。没有文档化的 `latest`/`fast` 别名，也没有公布的数字输出上限。**API 密钥**（默认）：来自 console.x.ai 的 Bearer token，通过 `XAI_API_KEY` / keyring / `api_key`。**OAuth**：`codewhale auth xai-device` 使用 SSH 友好的设备登录和 Codewhale 自有的存储，它可能自行刷新。现有的 Grok CLI 凭据需要 `codewhale auth external-consent --provider xai --mode read-only`；被授予的外部文件从不刷新或重写。OAuth 在某些 SuperGrok 层级上可能返回 HTTP 403——把 API 密钥作为可靠回退。接受 `XAI_MODEL`。提供商别名：`x-ai`, `x_ai`, `grok`。 |
-| `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_TOKEN_PLAN_BASE_URL`；默认 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `qwen3.8-max`（默认）, `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | 阿里云 Model Studio Token Plan OpenAI 兼容 Chat Completions 路由。Token Plan 个人版和团队版共享该端点。`qwen3.8-max`、`qwen3.7-plus` 和 `qwen3.7-max` 可以通过 Token Plan Responses Harness 使用提供商原生网页搜索；预览版、Coding Plan 和 Anthropic 路由不会继承该能力。列出的所有模型都是可推理的文本/编码模型。DeepSeek 和 GLM 条目是提供商范围的，不与第一方路由冲突。接受 `MODELSTUDIO_TOKEN_PLAN_MODEL`。提供商别名：`modelstudio-token-plan`, `alibaba-token-plan`, `dashscope-token-plan`。 |
+| `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_TOKEN_PLAN_BASE_URL`；默认 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `qwen3.8-max`（默认）, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | 阿里云 Model Studio Token Plan OpenAI 兼容 Chat Completions 路由。Token Plan 个人版和团队版共享该端点。`qwen3.8-max`、`qwen3.7-plus` 和 `qwen3.7-max` 可以通过 Token Plan Responses Harness 使用提供商原生网页搜索；预览版、Coding Plan 和 Anthropic 路由不会继承该能力。列出的所有模型都是可推理的文本/编码模型。DeepSeek 和 GLM 条目是提供商范围的，不与第一方路由冲突。接受 `MODELSTUDIO_TOKEN_PLAN_MODEL`。提供商别名：`modelstudio-token-plan`, `alibaba-token-plan`, `dashscope-token-plan`。 |
 | `modelstudio-token-plan-anthropic` | `[providers.modelstudio_token_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | 默认 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` | 与 `modelstudio-token-plan` 相同的模型目录 | Token Plan Anthropic 兼容 Messages 路由（`/apps/anthropic`）。与 OpenAI 方言相同的 API 密钥。提供商别名：`modelstudio-token-plan-anthropic`, `alibaba-token-plan-anthropic`。 |
 | `modelstudio-coding-plan` | `[providers.modelstudio_coding_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_CODING_PLAN_BASE_URL`；默认 `https://coding-intl.dashscope.aliyuncs.com/v1` | `qwen3.8-max`（默认）；与 Token Plan 相同的目录 | 阿里云 Model Studio Coding Plan OpenAI 兼容 Chat Completions 路由。接受 `MODELSTUDIO_CODING_PLAN_MODEL`。提供商别名：`modelstudio-coding-plan`, `alibaba-coding-plan`, `dashscope-coding-plan`。 |
 | `modelstudio-coding-plan-anthropic` | `[providers.modelstudio_coding_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | 默认 `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` | 与 `modelstudio-coding-plan` 相同的模型目录 | Coding Plan Anthropic 兼容 Messages 路由（`/apps/anthropic`）。提供商别名：`modelstudio-coding-plan-anthropic`, `alibaba-coding-plan-anthropic`。 |
@@ -607,7 +619,7 @@ Hub 发布或仓库管理仍然是通过 Hub 原生工具（如 `huggingface_hub
 
 ### Xiaomi MiMo 说明
 
-`xiaomi-mimo` 默认为 `mimo-v2.5-pro`，用于长上下文推理和编码工作。聊天选择器还暴露 `mimo-v2.5-pro-ultraspeed` 和最新的 Omni 模型 `mimo-v2.5`。Xiaomi MiMo TTS 可通过 `codewhale --provider xiaomi-mimo speech "text" --model tts`（或 `tts` 别名）使用。在 Work 和 Operate 模式中，提供商特定的 `speech` / `tts` 工具在配置了 Xiaomi MiMo 路由时可通过延迟发现使用。
+`xiaomi-mimo` 默认为 `mimo-v2.6-pro`，用于长上下文推理和编码工作。聊天选择器还暴露 `mimo-v2.6-flash`（已停用的 Omni 模型 `mimo-v2.5` 的替代）和 `mimo-v2.5-pro-ultraspeed`。Xiaomi MiMo TTS 可通过 `codewhale --provider xiaomi-mimo speech "text" --model tts`（或 `tts` 别名）使用。在 Work 和 Operate 模式中，提供商特定的 `speech` / `tts` 工具在配置了 Xiaomi MiMo 路由时可通过延迟发现使用。
 
 `/provider xiaomi-mimo ultraspeed` 和 `/provider xiaomi-mimo pro-ultraspeed` 都选择 `mimo-v2.5-pro-ultraspeed`。`tts`、`voice-design` 和 `voice-clone` 等语音别名与正常的聊天默认值分开。
 
@@ -639,22 +651,31 @@ OrcaRouter（`https://api.orcarouter.ai/v1`）是专用的具名路由（[OrcaRo
 PKCE S256、回环回调与恒定时间 state 校验获得持久 `sk-orca-…` key；两条路径写入
 同一个 `orcarouter` 秘密槽位，`auth_mode = "api_key"`。
 
-浏览器授权为 `https://www.orcarouter.ai/auth`；交换为
-`POST https://www.orcarouter.ai/api/v1/auth/keys`，无需 client secret 或预注册
-回调 URI。推理和目录使用独立的 `https://api.orcarouter.ai/v1`，不能由另一个
-源站猜测路径。自托管可显式用 `ORCA_AUTH_BASE_URL` 与
-`ORCA_API_BASE_URL` / `ORCAROUTER_BASE_URL` 覆盖各自源站；远程必须 HTTPS，
-HTTP 只允许回环。
+浏览器授权为 `https://www.orcarouter.ai/auth`，参数含 `ref`（Codewhale 在
+OrcaRouter 的公开标识；OrcaRouter 签发 `app_id` 后一并携带）；交换为
+`POST https://www.orcarouter.ai/api/v1/auth/keys`，无需 client secret。推理和目录
+使用独立的 `https://api.orcarouter.ai/v1`，不能由另一个源站猜测路径。推理源站可用
+`ORCA_API_BASE_URL`、`ORCA_BASE_URL` 或 `ORCAROUTER_BASE_URL` 覆盖；远程必须
+HTTPS，HTTP 只允许回环。登录源站固定为 `https://www.orcarouter.ai`：
+`ORCA_AUTH_BASE_URL` 与 `ORCAROUTER_AUTH_BASE_URL` 只能将其改为回环 HTTP 地址以供
+本地测试夹具使用，其他值一律忽略，`ORCA_BASE_URL` 不再影响登录源站。
 
 所得 key 不是刷新令牌：重启后复用，不发送 refresh grant。请在 OrcaRouter
 控制台撤销；`/auth orcarouter-revoke` 只清除本地副本。Relay 401 将该凭据版本
 标为需重新认证，不静默重试。
 
-实时 `GET https://api.orcarouter.ai/v1/models` 用所配置 key 获取目录。
-聊天选择器仅保留 `supported_endpoint_types` 含 `openai`、`anthropic`、`gemini`
-或 `openai-response` 的行；图像生成、视频与 rerank 行被过滤，不按名称猜测。
+实时 `GET https://api.orcarouter.ai/v1/models` 用所配置 key 获取目录，其标价（含
+长提示词分档价）作为该路由的价格估计。该路由只使用 Chat Completions，因此聊天选择器
+仅保留 `supported_endpoint_types` 含 `openai` 的行；只在其他协议上提供的行（如仅限
+Gemini 的图像模型）不列出；图像生成、视频与 rerank 行被过滤，不按名称猜测。
 `architecture.input_modalities` 含 `image` 才确认图像输入；无 architecture 的行
 能力为未知。
+
+桌面应用通过 Runtime API 的 `POST /v1/providers/orcarouter/connect` 连接
+OrcaRouter，无需终端：本地 Engine 运行同一流程，应用在系统浏览器中打开返回的
+授权链接，Engine 在回环回调上等待、交换授权码，并以与
+`codewhale auth orcarouter` 完全相同的方式保存 key。详见
+[RUNTIME_API.md](RUNTIME_API.md)。
 
 ### 近期 OpenRouter 大模型
 
@@ -674,7 +695,7 @@ OpenRouter completions 和静态注册表行包括自 2026 年 4 月起通过 Op
 | `volcengine` | `DeepSeek-V4-Pro`, `DeepSeek-V4-Flash` | 是 | 是 |
 | `openrouter` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-m2.7`, `xiaomi/mimo-v2.5-pro`, `xiaomi/mimo-v2.5`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `z-ai/glm-5.1`, `z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`, `z-ai/glm-5-turbo`, `tencent/hy3-preview`, `google/gemma-4-31b-it`, `google/gemma-4-26b-a4b-it`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, `nvidia/nemotron-3-ultra-550b-a55b` | 是 | 是 |
 | `orcarouter` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `orcarouter/auto` | 是 | 是 |
-| `xiaomi-mimo` | `mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, `mimo-v2.5`；语音/TTS ID 通过 `codewhale speech` / `tts` 选择 | 是 | 聊天模型是；语音/TTS 模型否 |
+| `xiaomi-mimo` | `mimo-v2.6-pro`, `mimo-v2.6-flash`, `mimo-v2.5-pro-ultraspeed`；语音/TTS ID 通过 `codewhale speech` / `tts` 选择 | 是 | 聊天模型是；语音/TTS 模型否 |
 | `novita` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash` | 是 | 是 |
 | `fireworks` | `accounts/fireworks/models/deepseek-v4-pro` | 是 | 是 |
 | `siliconflow` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | 是 | 是 |
@@ -690,7 +711,7 @@ OpenRouter completions 和静态注册表行包括自 2026 年 4 月起通过 Op
 | `ollama-cloud` | `gpt-oss:120b`；任意的提供商自有模型 ID 原样通过 | 是 | 是 |
 | `huggingface` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | 是 | 否 |
 | `modelscope` | `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-122B-A10B`, `Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-Flash-Next`, `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Pro-0813`, `deepseek-ai/DeepSeek-V4.1-Flash`, `ZhipuAI/GLM-4.7-Flash`, `ZhipuAI/GLM-5.2` | 是 | 否 |
-| `deepinfra` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | 是 | 是 |
+| `deepinfra` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `deepseek-ai/DeepSeek-V4-Pro-0813`, `deepseek-ai/DeepSeek-V4.1-Flash-1017`, `deepseek-ai/DeepSeek-V4.1-Flash`, `deepseek-ai/DeepSeek-V4-Flash-0731` | 是 | 是 |
 | `together` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `thinkingmachines/inkling` | 是 | 是 |
 | `openai-codex` | `gpt-5.5` | 是 | 是 |
 | `anthropic` | `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-fable-5`, `claude-haiku-4-5` | 是 | 除 `claude-haiku-4-5` 外都是 |
@@ -698,11 +719,11 @@ OpenRouter completions 和静态注册表行包括自 2026 年 4 月起通过 Op
 | `sakana` | `fugu`, `fugu-ultra-20260615` | 是 | `fugu-ultra-20260615` 是 |
 | `longcat` | `LongCat-2.0` | 是 | 是 |
 | `opencode-go` | `deepseek-v4-pro`, `grok-4.5`, `glm-5.2`, `glm-5.1`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-flash`, `mimo-v2.5`, `mimo-v2.5-pro` | 是 | 是 |
-| `meta` | `muse-spark-1.2` | 是 | 是 |
+| `meta` | `muse-spark-1.3`, `muse-spark-1.3-contributor`, `muse-wonder-1.0`, `muse-spark-1.2`, `muse-spark-1.2-contributor` | 是 | 是 |
 | `xai` | `grok-4.6`, `grok-4.7`, `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | 是 | `grok-4.6`, `grok-4.7`, `grok-4.5`, `grok-4.3`, `grok-build` 和 `grok-4.20-0309-reasoning` 是 |
-| `google` | `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash` | 是 | 除 `gemini-3.5-flash-lite` 外都是 |
+| `google` | `gemini-4-argon`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-3.8-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash` | 是 | 除 `gemini-3.5-flash-lite` 外都是 |
 | `mistral` | `mistral-code-latest`, `mistral-medium-latest`, `mistral-small-latest`, `mistral-large-latest` | 是 | Medium 和 Small 是（在精确的第一方路由上 `reasoning_effort` 为 `none` 或 `high`）；已弃用的原生 Magistral 仍然是始终启用的显式兼容 ID；Code 和 Large 否 |
-| `modelstudio-token-plan`, `modelstudio-coding-plan` | `qwen3.8-max`, `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | 是 | 是 |
+| `modelstudio-token-plan`, `modelstudio-coding-plan` | `qwen3.8-max`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | 是 | 是 |
 | `csdn` | `glm_for_coding`；其他市场模型 ID 原样通过 | 是 | 是 |
 
 AtlasCloud 与配置层保持相同的默认模型，并为 Pro 和 Flash 行添加提供商范围的别名。其他 AtlasCloud 模型 ID 仍应通过 `ATLASCLOUD_MODEL`、配置或可用的实时模型列表来选择。
@@ -726,20 +747,23 @@ AtlasCloud 与配置层保持相同的默认模型，并为 Pro 和 Flash 行添
 
 | 提供商/模型类别 | 上下文窗口 | Max output 元数据 | 思考支持 | 缓存遥测 | FIM 端点 |
 | --- | --- | --- | --- | --- | --- |
-| DeepSeek V4（`deepseek-v4-pro`, `deepseek-v4-flash`） | 1,000,000 | 384,000 | 是 | 是 | 仅 DeepSeek beta |
+| DeepSeek V4（`deepseek-v4-pro`, `deepseek-v4-flash`） | 1,000,000 | 384,000 | 是 | 是 | 仅 DeepSeek beta，且仅限 Chat Completions 路由；默认的 Flash 路由使用 Responses，不提供 |
 | DeepSeek V4 Flash Vision 实验版（`deepseek-v4-flash-vision-exp`） | 继承自 Flash，1,000,000 | 继承自 Flash，384,000 | 是，继承 | 是，继承 | 未声明；仅限 Chat Completions 路由 |
 | DeepSeek 兼容别名（`deepseek-chat`, `deepseek-reasoner`） | 1,000,000 | 384,000 | 是 | 是 | 仅 DeepSeek beta |
 | NVIDIA NIM V4 注册表模型 | 1,000,000 | 384,000 | 是 | 是 | 代码中未记录 |
 | Volcengine Ark V4 模型 ID | 1,000,000 | 384,000 | 是 | 是 | 代码中未记录 |
 | OpenRouter、Novita、Fireworks、SiliconFlow、SGLang 和 vLLM V4 模型 ID | 1,000,000 | 384,000 | 是 | 否 | 代码中未记录 |
-| Xiaomi MiMo `mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, `mimo-v2.5` | 1,000,000 | 131,072 | 是 | 否 | 代码中未记录 |
+| Xiaomi MiMo `mimo-v2.6-pro`, `mimo-v2.6-flash` | 1,048,576 | 131,072 | 是 | 否 | 代码中未记录 |
+| Xiaomi MiMo `mimo-v2.5-pro-ultraspeed` | 1,000,000 | 131,072 | 是 | 否 | 代码中未记录 |
 | OpenRouter Qwen 3.6 Flash / Plus | 1,000,000 | 65,536 | 是 | 否 | 代码中未记录 |
 | OpenRouter Qwen 3.6 35B / 27B | 262,144 | 262,140 | 是 | 否 | 代码中未记录 |
 | OpenRouter Qwen 3.6 Max Preview | 262,144 | 65,536 | 是 | 否 | 代码中未记录 |
 | OpenAI API `gpt-5.5` | 1,050,000 | 128,000 | 是 | 否 | 代码中未记录 |
 | OpenAI API `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | 1,050,000 | 128,000 | 是 | 否 | 代码中未记录 |
 | Anthropic API `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-fable-5` | 1,000,000 | 128,000 | 是 | 是 | 代码中未记录 |
-| Google Gemini API `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1,048,576 | 65,536 | 取决于模型 | 否 | 代码中未记录 |
+| Google Gemini API `gemini-4-argon` | 1,048,576 | 未公布 | 取决于模型 | 否 | 代码中未记录 |
+| Google Gemini API `gemini-3.8-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1,048,576 | 65,536 | 取决于模型 | 否 | 代码中未记录 |
+| Meta Model API `muse-spark-1.3`, `muse-spark-1.3-contributor`, `muse-wonder-1.0` | 1,048,576 | 未公布 | 是 | 否 | 代码中未记录 |
 | Meta Model API `muse-spark-1.2` | 1,000,000 | 32,000 | 是 | 否 | 代码中未记录 |
 | ChatGPT 套餐路由（`openai-codex`） | 保守预算；账户列表不提供窗口大小 | 预览请求不发送输出上限 | 取决于模型 | 否 | 公共 `/v1/responses`；不从账户访问权限推断上下文上限 |
 | OpenModel 默认/自定义模型 ID | 回退 200,000，除非模型元数据或配置覆盖 | 回退 64,000 | 取决于模型 | 否 | 路由在 `/v1/messages` 使用 Messages 负载 |
@@ -798,7 +822,7 @@ MiniMax M3 使用输入长度和服务层级。Codewhale 省略 `service_tier`�
 
 更改 `provider`、`base_url` 或 `model` 可以选择支持 OpenAI 兼容负载形态的路由，但 Codewhale 无法在模型已将其作为散文发出之后，把任意的 JSON 文本转换成受信的工具调用。
 
-DeepSeek 将于 2026-07-24 15:59 UTC 退役 `deepseek-chat` 和 `deepseek-reasoner`。在请求到达 DeepSeek 第一方 OpenAI 或 Anthropic 端点之前，Codewhale 会把任一名称迁移到 `deepseek-v4-flash`。如果未配置推理层级，`deepseek-chat` 也会迁移到 `off`，`deepseek-reasoner` 迁移到 `high`，保留它们原先的非思考/思考意图；显式的 `reasoning_effort` 仍然权威。该映射刻意不是全局的：Wanjie Ark、聚合器、自托管运行时和自定义端点继续拥有它们自己的模型 id。
+DeepSeek 已于 2026-07-24 15:59 UTC 退役 `deepseek-chat` 和 `deepseek-reasoner`。在请求到达 DeepSeek 第一方 OpenAI 或 Anthropic 端点之前，Codewhale 会把任一名称迁移到 `deepseek-flash`。如果未配置推理层级，`deepseek-chat` 也会迁移到 `off`，`deepseek-reasoner` 迁移到 `high`，保留它们原先的非思考/思考意图；显式的 `reasoning_effort` 仍然权威。该映射刻意不是全局的：Wanjie Ark、聚合器、自托管运行时和自定义端点继续拥有它们自己的模型 id。
 
 ## 推理强度
 

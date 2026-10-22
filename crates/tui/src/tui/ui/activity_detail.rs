@@ -380,13 +380,7 @@ fn canonical_owned_file(
 }
 
 pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> bool {
-    if app.cell_at_virtual_index(cell_index).is_some_and(|cell| {
-        matches!(
-            cell,
-            HistoryCell::Tool(ToolCell::Exec(exec)) if exec.status == ToolStatus::Running
-        )
-    }) && let Some(detail) = crate::tui::shell_job_routing::shell_job_for_cell(app, cell_index)
-    {
+    if let Some(detail) = crate::tui::shell_job_routing::shell_job_for_cell(app, cell_index) {
         crate::tui::shell_job_routing::open_shell_job_pager(app, &detail);
         return true;
     }

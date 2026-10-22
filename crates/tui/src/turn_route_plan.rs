@@ -286,11 +286,13 @@ pub(crate) async fn plan_turn_route(
 
     let effective_reasoning_effort = selected_reasoning_effort
         .unwrap_or(request.reasoning_effort)
-        .api_value_for_route(
+        .normalize_for_route_identity(
             effective_provider,
+            turn_route.identity.key.as_str(),
             &turn_route.candidate.endpoint().base_url,
             &turn_route.model,
         )
+        .api_value_for_provider(effective_provider)
         .map(str::to_string);
 
     let routing_source = if !request.auto_model {

@@ -633,6 +633,7 @@
                 content: vec![ContentBlock::Thinking {
                     signature: None,
                     state: None,
+                    redacted_data: None,
                     thinking: "plan".to_string(),
                 }],
             };
@@ -781,6 +782,7 @@
                     ContentBlock::Thinking {
                         signature: None,
                         state: None,
+                        redacted_data: None,
                         thinking: "Need to inspect the directory".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -826,6 +828,7 @@
                     ContentBlock::Thinking {
                         signature: None,
                         state: None,
+                        redacted_data: None,
                         thinking: "Need to search".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -922,6 +925,7 @@
                     ContentBlock::Thinking {
                         signature: None,
                         state: None,
+                        redacted_data: None,
                         thinking: "Need to list files".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -1062,7 +1066,12 @@
                                    "protocol": "some-future-wire", "usable": true}},
                     {"id": "deepseek/deepseek-v4-pro", "object": "model"},
                     {"id": "   ", "object": "model"},
-                    {"id": "anthropic/claude-opus-4-8", "object": "model"}
+                    {"id": "anthropic/claude-opus-4-8", "object": "model"},
+                    {"id": "codewhale/Qwen3.8-27B", "object": "model", "owned_by": "codewhale",
+                     "codewhale": {"provider": "codewhale", "model": "Qwen3.8-27B",
+                                   "protocol": "chat-completions", "usable": true,
+                                   "limits": {"maxInputTokens": 7168, "maxOutputTokens": 1024,
+                                              "maxContextTokens": 16384}}}
                 ]
             }"#;
 
@@ -1072,7 +1081,7 @@
             .iter()
             .map(|row| (row.wire_model_id.as_str(), row))
             .collect();
-        assert_eq!(rows.len(), 5, "blank and duplicate ids are dropped");
+        assert_eq!(rows.len(), 6, "blank and duplicate ids are dropped");
         // The protocol comes from the response, not from a compiled roster.
         assert_eq!(by_id["deepseek/deepseek-v4-pro"].endpoint_key, "chat");
         assert!(by_id["deepseek/deepseek-v4-pro"].default_for_provider);
@@ -1086,10 +1095,25 @@
         // A row with no `codewhale` block still resolves through the namespace
         // rule rather than being dropped: the account listed it.
         assert_eq!(by_id["anthropic/claude-opus-4-8"].endpoint_key, "messages");
-        // Nothing is claimed that the account service did not state.
+        // Nothing is claimed that the account service did not state: only a
+        // row that advertises `codewhale.limits` carries limits, and they are
+        // the advertised numbers.
         assert!(
             rows.iter()
-                .all(|row| row.canonical_model.is_none() && row.limit.is_none() && row.cost.is_none())
+                .all(|row| row.canonical_model.is_none() && row.cost.is_none())
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.wire_model_id != "codewhale/Qwen3.8-27B")
+                .all(|row| row.limit.is_none())
+        );
+        let qwen = by_id["codewhale/Qwen3.8-27B"]
+            .limit
+            .as_ref()
+            .expect("advertised limits");
+        assert_eq!(
+            (qwen.context, qwen.input, qwen.output),
+            (Some(16384), Some(7168), Some(1024))
         );
 
         assert_eq!(

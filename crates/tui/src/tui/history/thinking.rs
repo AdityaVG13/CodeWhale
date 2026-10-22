@@ -146,7 +146,7 @@ pub(crate) fn render_thinking_with_preview_limit(
 
     let label = if streaming {
         format!("{}…", tr(locale, MessageId::WhaleStateThinking))
-    } else if let Some(duration) = duration_secs {
+    } else if let Some(duration) = duration_secs.filter(|duration| *duration >= 1.0) {
         tr(locale, MessageId::TranscriptThoughtFor).replace(
             "{duration}",
             &codewhale_command_contract::elapsed::format_elapsed_ms((duration * 1000.0) as u64),

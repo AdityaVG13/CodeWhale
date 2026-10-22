@@ -20,7 +20,7 @@ Workflow 通过同一个子智能体运行时执行命名步骤；Fleet 管理�
 按 `Tab` 补全输入框（composer）菜单，或在输入框为空时循环切换可见模式：**Plan → Work → Operate → Plan**。`Tab` 从不发送或排队输入框中的文本；用 `Enter` 发送或排队。按 `Shift+Tab` 循环切换权限姿态（Ask → Auto-Review → Full Access）。按 `Ctrl+T` 循环切换思考强度。运行 `/mode` 打开模式选择器，或直接用 `/mode work`、`/mode plan`、`/mode operate` 切换。
 
 - **Plan**：设计优先的提示方式。原语（primitive）名称保持不变，仍是大家熟悉的那些，但运行时会集中拒绝文件修改和 shell 执行。只读检查与策略允许的研究（包括延迟加载的 Web 搜索/抓取）仍然可用。当一个 Plan 回合成功结束并给出非空回复（包括纯文字计划）时，TUI 会询问如何继续：Work（Ask）、Work（Auto-Review），或继续规划。选择 Work 会把已批准的原文作为普通后续消息发送，并保留该回合已有的 To-dos，或追加一个待办的计划项而不替换无关的工作。
-- **Work**（内部为 `agent`）：普通的多步执行。第一回合的工具箱包含 `read`、`write`、`edit`、`bash`、`agent`、`workflow` 和 `todo_write`，以及无需先搜索即可使用的目标控制工具 `create_goal`、`get_goal` 和 `update_goal`。当请求属于一个持久的目标时，智能体会调用 `create_goal`；宿主从不根据措辞去推断目标，契约也不得告诉模型相反的内容。审批、沙箱、仓库规则（repository law）和托管策略决定什么可以执行。
+- **Work**（内部为 `agent`）：普通的多步执行。第一回合的工具箱包含 `read`、`write`、`edit`、`file_search`、`bash`、`todo_write`、`load_skill` 和 `task_shell_wait`，以及 `create_goal` 与合成工具 `tool_search`；`agent`、`workflow`、`get_goal` 和 `update_goal` 通过搜索发现加载（`get_goal`/`update_goal` 在目标激活时直接可用）。当请求属于一个持久的目标时，智能体会调用 `create_goal`；宿主从不根据措辞去推断目标，契约也不得告诉模型相反的内容。审批、沙箱、仓库规则（repository law）和托管策略决定什么可以执行。
 - **Operate**：以全力运行的 Work，即“ultra”模式。工具与权限和 Work 相同，区别在于如何使用它们。每个实质性请求都会成为一个目标（`create_goal`），计划保持可见（`todo_write`），多部分工作通过 `workflow` 和并行的 `agent` 工作者执行，非平凡的改动在宣布完成前先交给独立的审查者，长时间运行的命令继续在后台运行，循环或监视类工作则作为 `automation` 提出（获批后创建）。它会一直进行，直到目标被验证、被你阻塞或被暂停。
 
 `Act` 和 `/mode act` 仍然是 Work 的兼容别名。保存的设置仍然规范化为内部值 `agent`。
@@ -78,7 +78,7 @@ Operate 改变的是调度重点，而不是权限。它既不增加特定于模
 
 重新选择你当前所处的模式并不是空操作。恢复会话后，活动模式和 `default_mode` 经常不一致，所以再次选择活动模式就是让它持久化的方式；Codewhale 会给出"已保存为启动默认值"的回执，而不是报告"已经在该模式"。
 
-回合运行时，对当前路由的任何更改都会被拒绝——模式、模型、思考强度和提供商——无论你从哪个入口操作。这也包括斜杠命令入口（`/mode`、`/model`、`/config <key> <value>`、`/config preset`），它们在回合进行中同样可以触达。请先按 Esc 中断。仅重启的 `default_mode` 键豁免，因为它不触及正在运行的回合。
+回合运行时，对当前路由的任何更改都会被拒绝——模式、模型、思考强度和提供商——无论你从哪个入口操作。这也包括斜杠命令入口（`/mode`、`/model`、`/provider`、`/config <key> <value>`、`/config preset`），它们在回合进行中同样可以触达。请先按 Esc 中断。仅重启的 `default_mode` 键豁免，因为它不触及正在运行的回合。
 
 Codewhale 在跨进程的锁下写入 `settings.toml`，并以原子方式替换文件，所以同一主目录上的第二个 Codewhale 实例不会丢失你的选择，也不会读到写了一半的文件。退出时，排队写入在终端恢复前被刷新；任何失败的写入都会在退出时打印出来，而不是随备用屏幕一起消失。
 
@@ -108,9 +108,9 @@ Codewhale 在跨进程的锁下写入 `settings.toml`，并以原子方式替换
 遗留说明：`/set approval_mode ...` 已被 `/config` 取代。
 
 - `suggest`（**Ask**，默认）：工具审批可能打断你；当一个尚未解决的用户选择会实质性改变权限、成本、范围或结果时，Codewhale 会询问你。
-- `auto`（**Auto-Review**）：自动审查工具调用。在交互式会话中，模型仍可通过 `request_user_input` 有意向用户提问；问题会挂起回合，直到用户回答、取消，或配置的超时到期。无头 `exec` 没有应答方，因此不提供这个工具。工具安全拦截与向用户提问是分开的。审批由两层决定。**确定性底线**（配置的阻断规则加内置安全底线）放行已证明安全的调用，并对发布类操作和破坏性的后台/无头工作直接硬阻断；这一层从不由模型审查。回退拦截——确定性引擎无法证明安全的调用——会升级给一次性的**模型守护者**（v0.9.8），由它返回风险级别、允许/拒绝和理由。守护者在各自独立的 JSON 字段中看到被拦截的确切调用和确定性观察；对话历史、技能指令、附件和展开的模型上下文都被排除在外。它不推断用户意图，也不计算通用的用户意图分数。高风险或严重风险即使模型判定允许，也不能自动运行。它没有工具，不记规则，遇到过大的确切调用会拒绝而不是截断。恰好只发出一次审查请求；输出不完整或格式错误、超时、取消或提供商失败，都会失败关闭（fail closed）。无头适配器只使用确定性层。明确要求由人来决定的仓库规则拦截，在 Auto-Review 中直接阻断，而不是弹出一个隐藏的审批弹窗。
+- `auto`（**Auto-Review**）：自动审查工具调用。在交互式会话中，模型仍可通过 `request_user_input` 有意向用户提问；问题会挂起回合，直到用户回答、取消，或配置的超时到期。无头 `exec` 没有应答方，因此不提供这个工具。工具安全拦截与向用户提问是分开的。审批由两层决定。**确定性底线**（配置的阻断规则加内置安全底线）放行已证明安全的调用，并对发布类操作和破坏性的后台/无头工作直接硬阻断；这一层从不由模型审查。回退拦截——确定性引擎无法证明安全的调用——会升级给一次性的**模型守护者**（v0.9.8），由它返回风险级别、允许/拒绝和理由。守护者在各自独立的 JSON 字段中看到被拦截的确切调用和确定性观察；对话历史、技能指令、附件和展开的模型上下文都被排除在外。它不推断用户意图，也不计算通用的用户意图分数。高风险或严重风险即使模型判定允许，也不能自动运行。它没有工具，不记规则，遇到过大的确切调用会拒绝而不是截断。恰好只发出一次审查请求；输出不完整或格式错误、超时、取消或提供商失败，都会失败关闭（fail closed）。同一回合内，守护者连续拒绝三次，或在本回合最近五十次审查中拒绝达到十次，回合就会以“已中断”结束并显示一条状态行；同一批次中剩余的调用不再审查，直接拒绝。只有明确的拒绝才计数（超时或失败不算），一次放行会让连续拒绝重新计数，每个回合从零开始计数，子智能体按它自己的回合计数。无头适配器只使用确定性层。明确要求由人来决定的仓库规则拦截，在 Auto-Review 中直接阻断，而不是弹出一个隐藏的审批弹窗。
 
-LLM 审查器最接近 OpenAI Codex 的实验性 Auto-Review，对应提交 [`6fc6b9d6d2580d62622fc9884b5f5707f6505a5e`](https://github.com/openai/codex/tree/6fc6b9d6d2580d62622fc9884b5f5707f6505a5e)。Codex 的 [guardian 入口点](https://github.com/openai/codex/blob/6fc6b9d6d2580d62622fc9884b5f5707f6505a5e/codex-rs/core/src/guardian/mod.rs)重建对话上下文并运行专门的审查会话。Codewhale 有意只采用其中三点：针对确切动作的结构化决策、90 秒截止时间和失败关闭的结果。它不复制 Codex 的对话记录重建、用户授权分数、审查器工具、重试、持久审查会话或拒绝台账。
+LLM 审查器最接近 OpenAI Codex 的实验性 Auto-Review，对应提交 [`6fc6b9d6d2580d62622fc9884b5f5707f6505a5e`](https://github.com/openai/codex/tree/6fc6b9d6d2580d62622fc9884b5f5707f6505a5e)。Codex 的 [guardian 入口点](https://github.com/openai/codex/blob/6fc6b9d6d2580d62622fc9884b5f5707f6505a5e/codex-rs/core/src/guardian/mod.rs)重建对话上下文并运行专门的审查会话。Codewhale 有意只采用其中四点：针对确切动作的结构化决策、90 秒截止时间、失败关闭的结果，以及按回合计数的拒绝熔断。它不复制 Codex 的对话记录重建、用户授权分数、审查器工具、重试、持久审查会话或拒绝台账。
 
 Kimi Code 在提交 [`1414d4602898f406e540b23342cb18db23ff9efc`](https://github.com/MoonshotAI/kimi-code/tree/1414d4602898f406e540b23342cb18db23ff9efc) 也没有 LLM 审查器。它的有序[权限策略](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/permissionPolicyService.ts)先应用显式拒绝规则，然后它的 [Auto 策略](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/policies/auto-mode-approve.ts)直接返回 `approve`。Codewhale 使用上述确定性安全底线与模型守护者，同时保留模型有意向用户提问的能力。
 
@@ -163,7 +163,8 @@ MCP 工具以 `mcp_<server>_<tool>` 暴露，使用与内置工具相同的审�
 运行 `codewhale --help` 获取完整的规范列表。常见标志：
 
 - `-p, --prompt <TEXT>`：一次性提示模式（打印后退出）
-- `codewhale exec --auto --output-format stream-json <PROMPT>`：运行带工具的非交互式智能体，并为 harness 和后端封装层每行输出一个 JSON 对象。退出码：`0` 表示成功，`1` 表示真正的任务/智能体失败，`75`（`EX_TEMPFAIL`）表示回合因可重试的基础设施故障而结束（所有会话内重试都用尽之后，提供商/传输层出现 `network`/`timeout`），这样 harness 就能把可重试的基础设施类退出与任务失败区分开；流式输出末尾 `metadata` 事件中的 `error_category` 携带同样的分类
+- `codewhale exec --auto --output-format stream-json <PROMPT>`：运行带工具的非交互式智能体，并为 harness 和后端封装层每行输出一个 JSON 对象。`--auto` 默认启用 Full Access（完全访问；没有 Codewhale shell 沙箱，开启信任模式）；加上 `--sandbox workspace-write` 可保留 shell 沙箱和文件工具的工作区限制，并关闭信任模式。除 `danger-full-access` 外的任何 `--sandbox`（或配置中对应的 `sandbox_mode`）都会保持信任模式关闭；`external-sandbox` 依赖你自行提供的隔离。向模型提供工具的 exec 运行会在所有输出格式下保存。退出码：`0` 表示成功，`1` 表示真正的任务/智能体失败，`75`（`EX_TEMPFAIL`）表示回合因可重试的基础设施故障而结束（所有会话内重试都用尽之后，提供商/传输层出现 `network`/`timeout`），这样 harness 就能把可重试的基础设施类退出与任务失败区分开；流式输出末尾 `metadata` 事件中的 `error_category` 携带同样的分类
+- 请把 exec 标志放在提示词前。以 `-` 开头的提示词需要先加上 `--`，例如 `codewhale exec -- "- explain this option"`。单独的 `-` 是字面文本。提示词之后出现的已知 exec 长标志（包括 `--flag=value`）会被拒绝，除非它们位于显式的 `--` 之后，此时才按字面提示词文本处理。
 - `codewhale exec --prompt-file <PATH>` / `cat prompt.txt | codewhale exec --prompt-file -`：从文件或 stdin 读取提示词而不是命令行参数，用于超过操作系统单个参数长度上限（Linux 约 128 KiB）的提示词。不能与位置参数形式的提示词同时使用，位置参数 `-` 按字面文本处理；`--parent-death-watch` 占用 stdin，因此 `--prompt-file -` 与它一起使用会被拒绝
 - `codewhale exec --resume <ID|PREFIX> <PROMPT>` / `--session-id <ID|PREFIX>`：非交互式继续一个已保存的会话
 - `codewhale exec --continue <PROMPT>`：非交互式继续此工作区最近的已保存会话
@@ -183,7 +184,7 @@ MCP 工具以 `mcp_<server>_<tool>` 暴露，使用与内置工具相同的审�
 Codewhale 有三条相关、但有意彼此独立的恢复路径：
 
 - `codewhale fork <ID>` 从现有已保存对话创建新的已保存会话，并记录源会话 id。这是在不覆盖原始会话的前提下探索另一条回答路径的安全方式。
-- Esc-Esc 回溯会把实时对话记录倒回到之前的某条用户提示，并把该提示恢复到输入框中供编辑。它不会改动文件；之后运行 `/undo` 可以把该请求改过的文件改回去。
+- Esc-Esc 回溯会把实时对话记录倒回到之前的某条用户提示，并把该提示恢复到输入框中供编辑。它不会改动文件；`/restore` 可以把文件夹回滚到所选的恢复点，需要 `/trust on` 或 Full Access。
 - `/restore` 和 `revert_turn` 工具从 side-git 快照恢复工作区文件。`/restore list [N]` 在选择回滚点前列出更多快照选项。它们不会改写对话历史。
 
 Pi 风格的文件内树状浏览器是一个更大的 UI/数据模型项目。v0.8.40 交付的是范围有限的 fork/backtrack 原语和显式的谱系元数据。

@@ -258,6 +258,8 @@ fn contract_bash_nonzero_is_an_error_with_status_after_output() {
         None,
         &ToolContext::new("."),
         None,
+        false,
+        None,
     )
     .expect_err("nonzero must be a failed tool call");
     assert!(
@@ -571,7 +573,7 @@ async fn lowercase_bash_readonly_refusal_names_work_mode() {
         message.contains("The user can change modes with /mode."),
         "{message}"
     );
-    assert!(!message.contains("Act mode"));
+    assert!(!message.contains("Work mode"));
     assert!(!message.contains("switch to"), "{message}");
     assert!(!workspace.path().join("blocked-by-plan").exists());
 }
@@ -2144,8 +2146,8 @@ async fn background_shell_job_preserves_origin_identity() {
         result.content
     );
     assert!(
-        result.content.contains("`tool_search`") && result.content.contains("task_shell_wait"),
-        "owned background work must name a callable wait tool: {}",
+        result.content.contains("`task_shell_wait` directly"),
+        "owned background work must name the eager wait tool: {}",
         result.content
     );
     assert_eq!(
@@ -2724,8 +2726,8 @@ fn sandbox_denied_hint_names_the_effective_posture() {
     // DGF-02: an approved write blocked by a read-only sandbox must come
     // back naming the sandbox as the blocker, never as a bare failure.
     let tmp = tempdir().expect("tempdir");
-    let ctx =
-        ToolContext::new(tmp.path()).with_elevated_sandbox_policy(ExecutionSandboxPolicy::ReadOnly);
+    let ctx = ToolContext::new(tmp.path())
+        .with_elevated_sandbox_policy(ExecutionSandboxPolicy::read_only());
     let mut result =
         failed_network_shell_result("", "sh: cannot create out.txt: Operation not permitted");
     result.sandbox_denied = true;
@@ -2744,12 +2746,12 @@ fn sandbox_denied_hint_names_the_effective_posture() {
 #[test]
 fn contract_bash_denial_surfaces_the_escalation_shape() {
     let tmp = tempdir().expect("tempdir");
-    let ctx =
-        ToolContext::new(tmp.path()).with_elevated_sandbox_policy(ExecutionSandboxPolicy::ReadOnly);
+    let ctx = ToolContext::new(tmp.path())
+        .with_elevated_sandbox_policy(ExecutionSandboxPolicy::read_only());
     let mut result = failed_network_shell_result("", "Operation not permitted");
     result.sandbox_denied = true;
 
-    let error = finish_contract_bash_result(result, None, &ctx, None)
+    let error = finish_contract_bash_result(result, None, &ctx, None, false, None)
         .expect_err("sandbox denial is a failed call");
 
     assert!(
@@ -2763,8 +2765,8 @@ fn contract_bash_denial_surfaces_the_escalation_shape() {
 #[test]
 fn sandbox_denied_hint_absent_without_denial_or_policy() {
     let tmp = tempdir().expect("tempdir");
-    let ctx =
-        ToolContext::new(tmp.path()).with_elevated_sandbox_policy(ExecutionSandboxPolicy::ReadOnly);
+    let ctx = ToolContext::new(tmp.path())
+        .with_elevated_sandbox_policy(ExecutionSandboxPolicy::read_only());
     let undenied = failed_network_shell_result("", "No such file or directory");
     assert!(shell_sandbox_denied_hint(&ctx, &undenied).is_none());
 
@@ -2777,8 +2779,8 @@ fn sandbox_denied_hint_absent_without_denial_or_policy() {
 #[test]
 fn shell_delta_result_surfaces_sandbox_denied_hint() {
     let tmp = tempdir().expect("tempdir");
-    let ctx =
-        ToolContext::new(tmp.path()).with_elevated_sandbox_policy(ExecutionSandboxPolicy::ReadOnly);
+    let ctx = ToolContext::new(tmp.path())
+        .with_elevated_sandbox_policy(ExecutionSandboxPolicy::read_only());
     let mut result = failed_network_shell_result("", "Operation not permitted");
     result.sandbox_denied = true;
 
@@ -3277,9 +3279,9 @@ async fn test_exec_shell_foreground_can_move_to_background() {
     assert!(result.success);
     assert!(result.content.contains("moved to the background"));
     // The detach message points the model at a tool it can actually call.
-    // `Bash` is hidden; `task_shell_wait` is deferred behind `tool_search`.
+    // `Bash` is hidden; `task_shell_wait` is eager, so the message names it directly.
     assert!(
-        result.content.contains("`tool_search`") && result.content.contains("task_shell_wait"),
+        result.content.contains("`task_shell_wait` directly"),
         "{}",
         result.content
     );
@@ -3395,8 +3397,7 @@ async fn lowercase_bash_foreground_detach_is_a_successful_running_receipt() {
     assert!(
         result.content.contains("moved to the background")
             && result.content.contains("not killed")
-            && result.content.contains("`tool_search`")
-            && result.content.contains("task_shell_wait"),
+            && result.content.contains("`task_shell_wait` directly"),
         "{}",
         result.content
     );

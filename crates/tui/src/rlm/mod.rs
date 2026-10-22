@@ -11,6 +11,7 @@
 //! or caller. The persistent `rlm` action surface is caller-session scoped;
 //! `share_session=true` explicitly refuses. No HTTP sidecar is created.
 
+#[cfg(test)]
 use codewhale_models::Usage;
 
 pub mod bridge;
@@ -21,44 +22,6 @@ pub mod turn;
 pub(crate) use bridge::RlmBridge;
 pub use prompt::rlm_system_prompt;
 pub use turn::{RlmTermination, RlmTurnResult};
-
-fn add_usage_with_prompt_cache(total: &mut Usage, delta: &Usage) {
-    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
-    total.prompt_cache_hit_tokens =
-        add_optional_usage(total.prompt_cache_hit_tokens, delta.prompt_cache_hit_tokens);
-    total.prompt_cache_miss_tokens = add_optional_usage(
-        total.prompt_cache_miss_tokens,
-        delta.prompt_cache_miss_tokens,
-    );
-    total.prompt_cache_write_tokens = add_optional_usage(
-        total.prompt_cache_write_tokens,
-        delta.prompt_cache_write_tokens,
-    );
-    total.reasoning_tokens = add_optional_usage(total.reasoning_tokens, delta.reasoning_tokens);
-    total.reasoning_replay_tokens =
-        add_optional_usage(total.reasoning_replay_tokens, delta.reasoning_replay_tokens);
-    if let Some(delta_server) = delta.server_tool_use.as_ref() {
-        let total_server = total.server_tool_use.get_or_insert_default();
-        total_server.code_execution_requests = add_optional_usage(
-            total_server.code_execution_requests,
-            delta_server.code_execution_requests,
-        );
-        total_server.tool_search_requests = add_optional_usage(
-            total_server.tool_search_requests,
-            delta_server.tool_search_requests,
-        );
-    }
-}
-
-fn add_optional_usage(total: Option<u32>, delta: Option<u32>) -> Option<u32> {
-    match (total, delta) {
-        (Some(total), Some(delta)) => Some(total.saturating_add(delta)),
-        (None, Some(delta)) => Some(delta),
-        (Some(total), None) => Some(total),
-        (None, None) => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -87,7 +50,7 @@ mod tests {
             ..Usage::default()
         };
 
-        add_usage_with_prompt_cache(&mut total, &delta);
+        crate::core::turn::add_usage_to(&mut total, &delta);
 
         assert_eq!(total.input_tokens, 150);
         assert_eq!(total.output_tokens, 15);

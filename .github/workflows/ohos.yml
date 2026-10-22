@@ -1,36 +1,14 @@
 name: OpenHarmony
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - '.github/workflows/ohos.yml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'crates/**'
-      - 'scripts/ohos/**'
-      - 'scripts/ohos-env.sh'
-      - 'scripts/release/check-ohos-deps.sh'
-  pull_request:
-    branches: [main, master]
-    paths:
-      - '.github/workflows/ohos.yml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'crates/**'
-      - 'scripts/ohos/**'
-      - 'scripts/ohos-env.sh'
-      - 'scripts/release/check-ohos-deps.sh'
-  schedule:
-    - cron: '47 7 * * 1'
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
   group: ohos-${{ github.event.pull_request.number || github.ref }}
-  # Same as ci.yml: cancel superseded PR heads only; never cancel main pushes.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -66,7 +44,7 @@ jobs:
           # (checksum-verified from the GitHub mirror below).
           cache: ${{ github.ref == 'refs/heads/main' }}
           mirror: true
-      - name: Check Codewhale TUI with the real SDK/sysroot
+      - name: Check Codewhale TUI and CLI with the real SDK/sysroot
         shell: bash
         env:
           OHOS_NATIVE_SDK: ${{ steps.ohos-sdk.outputs.ohos_sdk_native }}
@@ -75,4 +53,4 @@ jobs:
           test -x "${OHOS_NATIVE_SDK}/llvm/bin/clang"
           test -d "${OHOS_NATIVE_SDK}/sysroot"
           . ./scripts/ohos-env.sh
-          cargo check --target aarch64-unknown-linux-ohos -p codewhale-tui --locked
+          cargo check --target aarch64-unknown-linux-ohos -p codewhale-tui -p codewhale-cli --locked

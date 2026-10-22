@@ -19,6 +19,7 @@ use codewhale_models::{
     OpaqueReasoningState, StreamEvent, Tool, Usage,
 };
 
+use super::chat::REASONING_REPLAY_PLACEHOLDER;
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
 use super::wire::{extract_sse_data_value, next_sse_line, push_sse_event_data};
@@ -113,7 +114,12 @@ pub(super) fn build_responses_body_for_provider(
             } else {
                 json!(responses_tools)
             };
-            body["tool_choice"] = json!("auto");
+            let tool_choice = request.tool_choice.as_ref().and_then(Value::as_str);
+            body["tool_choice"] = if tool_choice == Some("none") {
+                json!("none")
+            } else {
+                json!("auto")
+            };
             // The plan preview decoder tracks one active function-call block.
             body["parallel_tool_calls"] = json!(provider != ProviderKind::OpenaiCodex);
         }
@@ -701,7 +707,15 @@ impl CodewhaleClient {
                             thinking,
                             signature: None,
                             state: None,
+                            redacted_data: None,
                         },
+                        // Redacted thinking does not occur on Responses
+                        // routes (encrypted reasoning rides the reasoning
+                        // item's `encrypted_content` instead); keep the
+                        // match total without inventing a block shape.
+                        ContentBlockStart::RedactedThinking { .. } => {
+                            continue;
+                        }
                         ContentBlockStart::ToolUse {
                             id,
                             name,
@@ -869,6 +883,67 @@ pub(super) fn convert_messages_to_responses_input(
                 }
             }
             RolePlacement::Assistant | RolePlacement::InterruptedAssistant => {
+                let reasoning_item = |block: &ContentBlock| -> Option<Value> {
+                    let ContentBlock::Thinking {
+                        thinking, state, ..
+                    } = block
+                    else {
+                        return None;
+                    };
+                    if let Some(state) = state {
+                        let matches = state.provider == provider.as_str()
+                            && if provider == ProviderKind::OpenaiCodex {
+                                reasoning_api.is_some_and(|api| state.api == api)
+                            } else {
+                                state.api == "openai-responses"
+                            }
+                            && state.model == request.model;
+                        if !matches {
+                            return None;
+                        }
+                        let mut item = json!({
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": state.encrypted_content,
+                        });
+                        if let Some(id) = state.id.as_ref() {
+                            item["id"] = json!(id);
+                        }
+                        return Some(item);
+                    }
+                    is_deepseek.then(|| {
+                        let text = if thinking.trim().is_empty() {
+                            REASONING_REPLAY_PLACEHOLDER
+                        } else {
+                            thinking.as_str()
+                        };
+                        json!({
+                            "type": "reasoning",
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": text,
+                            }],
+                        })
+                    })
+                };
+                if is_deepseek {
+                    let before = items.len();
+                    items.extend(msg.content.iter().filter_map(&reasoning_item));
+                    if items.len() == before
+                        && msg
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+                    {
+                        items.push(json!({
+                            "type": "reasoning",
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": REASONING_REPLAY_PLACEHOLDER,
+                            }],
+                        }));
+                    }
+                }
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text, .. } => {
@@ -905,36 +980,9 @@ pub(super) fn convert_messages_to_responses_input(
                             }
                             items.push(item);
                         }
-                        ContentBlock::Thinking {
-                            thinking, state, ..
-                        } => {
-                            if let Some(state) = state {
-                                if state.provider == provider.as_str()
-                                    && if provider == ProviderKind::OpenaiCodex {
-                                        reasoning_api.is_some_and(|api| state.api == api)
-                                    } else {
-                                        state.api == "openai-responses"
-                                    }
-                                    && state.model == request.model
-                                {
-                                    let mut item = json!({
-                                        "type": "reasoning",
-                                        "summary": [],
-                                        "encrypted_content": state.encrypted_content,
-                                    });
-                                    if let Some(id) = state.id.as_ref() {
-                                        item["id"] = json!(id);
-                                    }
-                                    items.push(item);
-                                }
-                            } else if is_deepseek {
-                                items.push(json!({
-                                    "type": "reasoning",
-                                    "content": [{
-                                        "type": "reasoning_text",
-                                        "text": thinking,
-                                    }],
-                                }));
+                        ContentBlock::Thinking { .. } if !is_deepseek => {
+                            if let Some(item) = reasoning_item(block) {
+                                items.push(item);
                             }
                         }
                         _ => {}
@@ -1198,6 +1246,17 @@ fn parse_responses_usage(val: &Value) -> Usage {
         reasoning_tokens,
         reasoning_replay_tokens: None,
         server_tool_use: None,
+
+        input_audio_tokens: val
+            .pointer("/input_tokens_details/audio_tokens")
+            .and_then(Value::as_u64)
+            .map(super::saturating_u32),
+        output_audio_tokens: val
+            .pointer("/output_tokens_details/audio_tokens")
+            .and_then(Value::as_u64)
+            .map(super::saturating_u32),
+
+        request_usages: Vec::new(),
     }
 }
 

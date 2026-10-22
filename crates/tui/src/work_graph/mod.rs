@@ -45,7 +45,6 @@ pub use liveness::{
     task_owner_snapshot,
 };
 pub use migration::import_legacy;
-pub(crate) use model::constrained_effective_reasoning_for_route;
 pub use model::{
     ACTIVITY_CAP, AcceptanceRequirement, BoundedSet, BoundedVec, CompatPlanMetadata,
     CompatProjectionState, CompatTodoBinding, EdgeKind, EvidenceKind, EvidenceKindTag, EvidenceRef,
@@ -53,7 +52,9 @@ pub use model::{
     Provenance, ReasoningEffortTier, SCHEMA_VERSION, SEEN_KEYS_CAP, Ts, WorkActivityEvent,
     WorkEdge, WorkGraphSnapshot, WorkNode, external_identity_is_well_formed,
 };
+pub(crate) use model::{ENDED_OPERATION_CAP, constrained_effective_reasoning_for_route};
 pub use reducer::apply;
+pub(crate) use reducer::evictable_operations;
 pub(crate) use runtime::{ACTIVE_OPERATION_SUMMARY_END, ACTIVE_OPERATION_SUMMARY_START};
 pub use runtime::{SharedWorkRuntime, WorkRuntime, WorkRuntimeSnapshot, new_shared_work_runtime};
 pub use validate::{ValidationCode, ValidationReport, Violation, validate};

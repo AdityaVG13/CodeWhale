@@ -661,6 +661,11 @@ impl NetworkPolicyDecider {
         &self.policy
     }
 
+    #[must_use]
+    pub fn denies_by_default(&self) -> bool {
+        self.policy.default == DecisionToml::Deny
+    }
+
     /// Inspect the session cache.
     #[must_use]
     pub fn cache(&self) -> &NetworkSessionCache {

@@ -464,6 +464,7 @@ mod tests {
             true,
             super::super::RenderMode::Live,
             InlineDiffMode::Full,
+            codewhale_localization::Locale::En,
         ));
         assert!(text.contains("cancelled"), "{text}");
         assert!(!text.contains("FORGED-SUCCESS"), "{text}");

@@ -24,11 +24,11 @@ const SH_GUIDANCE: &str = "Use POSIX sh syntax: pipelines, redirections, $(comma
     process substitution, or here-strings. Use only installed programs and portable \
     utility options. Example: printf '%s\\n' 'sample'.";
 
-const ZSH_GUIDANCE: &str = "Use zsh syntax. Quote paths, literal wildcard patterns, \
-    and variable expansions; unmatched unquoted globs can fail before a command runs. \
-    A bare word starting with = undergoes =command PATH expansion (e.g. echo === fails); \
-    quote such arguments, e.g. echo '==='. Do not assume Bash array indexing or word \
-    splitting rules. Use only installed programs; do not assume GNU-specific flags on macOS/BSD.";
+const ZSH_GUIDANCE: &str = "Use zsh syntax. Commands run with zsh's NOMATCH and EQUALS \
+    options off, so an unmatched glob is passed through literally and a word starting \
+    with = is not expanded, as in Bash. Still quote paths, literal wildcard patterns \
+    and variable expansions. Do not assume Bash array indexing or word splitting rules. \
+    Use only installed programs; do not assume GNU-specific flags on macOS/BSD.";
 
 const CMD_GUIDANCE: &str = "Use cmd.exe syntax: %NAME% expands environment variables; use double quotes \
     around paths containing spaces (single quotes are not quoting delimiters). \
@@ -108,7 +108,7 @@ pub(super) fn description() -> &'static str {
 // Interpreter syntax lives on the command parameter. Repeating it in the
 // tool description adds the same bytes to every active request.
 pub(super) fn foreground_description() -> &'static str {
-    "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is the seconds to wait in the foreground (default 30 seconds); a command still running then is never killed for time: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id, so long builds and tests need no special timeout. Find task_shell_wait with tool_search to read more or wait for it. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user."
+    "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is the seconds to wait in the foreground (default 30 seconds); a command still running then is never killed for time: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id, so long builds and tests need no special timeout. Call task_shell_wait directly with that task_id to read more or wait for it; do not sleep-poll with bash. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user."
 }
 
 #[cfg(test)]
@@ -162,7 +162,7 @@ mod tests {
             assert!(text.contains(kind.binary()));
             assert_eq!(text.contains("Use PowerShell syntax"), kind.is_powershell());
             assert_eq!(
-                text.contains("=command PATH expansion"),
+                text.contains("NOMATCH and EQUALS options off"),
                 kind.binary() == "/bin/zsh"
             );
             assert!(!text.contains("user's login shell"));

@@ -31,14 +31,19 @@ function applySecurityHeaders(res: NextResponse): NextResponse {
  * keeps pulling subresources from `www` after the document moved.
  */
 const CANONICAL_HOST = "codewhale.net";
+const SITE_HOSTS = new Set([CANONICAL_HOST, `www.${CANONICAL_HOST}`]);
 
-function canonicalHostRedirect(req: NextRequest): NextResponse | null {
+function canonicalOriginRedirect(req: NextRequest): NextResponse | null {
   const host = req.headers.get("host");
   if (!host) return null;
   // Compare without the port so local and preview hosts are untouched.
   const bare = host.split(":")[0].toLowerCase();
-  if (bare !== `www.${CANONICAL_HOST}`) return null;
+  if (!SITE_HOSTS.has(bare)) return null;
+  const forwardedProto = req.headers.get("x-forwarded-proto")?.split(",")[0].trim().toLowerCase();
+  const insecure = req.nextUrl.protocol === "http:" || forwardedProto === "http";
+  if (bare === CANONICAL_HOST && !insecure) return null;
   const url = req.nextUrl.clone();
+  url.protocol = "https:";
   url.host = CANONICAL_HOST;
   url.port = "";
   // 308, not 301: clients may turn a 301'd POST (the admin login and post
@@ -75,7 +80,7 @@ function installAliasRedirect(req: NextRequest): NextResponse | null {
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  const canonical = canonicalHostRedirect(req);
+  const canonical = canonicalOriginRedirect(req);
   if (canonical) return applySecurityHeaders(canonical);
 
   // Skip API routes, static files, _next, and the dot-less metadata route
@@ -96,8 +101,8 @@ export function middleware(req: NextRequest) {
     return applySecurityHeaders(NextResponse.redirect(callback, 307));
   }
 
-  // `/login` and `/register` are aliases for the public sign-in / create-account
-  // pages. Fold them before locale detection so `/login` becomes `/en/signin`
+  // `/login` and `/register` are aliases for the public sign-in page.
+  // Fold them before locale detection so `/login` becomes `/en/signin`
   // instead of `/en/login` (which has no page).
   const canonicalAuth = canonicalPublicAuthPath(pathname);
   if (canonicalAuth && canonicalAuth !== pathname) {

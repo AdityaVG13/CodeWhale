@@ -1,7 +1,9 @@
 {
   "repository": "https://github.com/Hmbown/codewhale-ratatui",
   "commit": "2ad795b37782990844fd9cc2d78bac460929365a",
-  "version": "0.1.0",
+  "version": "0.1.2",
+  "upstream_version": "0.1.0",
+  "version_note": "version identifies the current vendored Cargo package; upstream_version and files retain the original snapshot provenance. Publish 0.1.2 only from the frozen Engine candidate directory, including its local patches.",
   "license": "MIT",
   "files": {
     "BENCHMARKS.md": "e9512637752467a627d1d15b3d3b6e23af72741ef713a243862ac600cbd6b9b7",

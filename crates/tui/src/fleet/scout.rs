@@ -166,11 +166,11 @@ mod tests {
 
     #[test]
     fn unpinned_scout_gets_verified_catalog_companion_or_inherits() {
-        // DeepSeek's documented cheap sibling is deepseek-v4-flash and it is
+        // DeepSeek's documented cheap sibling is deepseek-flash and it is
         // in the bundled catalog — a verified suggestion.
         let resolution = resolve_scout_route(None, "deepseek", "deepseek-v4-pro");
         assert_eq!(resolution.provider, "deepseek");
-        assert_eq!(resolution.model, "deepseek-v4-flash");
+        assert_eq!(resolution.model, "deepseek-flash");
         assert_eq!(resolution.source, ScoutSource::CatalogSuggestion);
 
         // Anthropic's Claude models have a documented cheap sibling
@@ -224,7 +224,7 @@ mod tests {
     fn receipt_line_names_the_source() {
         let resolution = resolve_scout_route(None, "deepseek", "deepseek-v4-pro");
         let line = resolution.receipt_line();
-        assert!(line.contains("deepseek-v4-flash"), "{line}");
+        assert!(line.contains("deepseek-flash"), "{line}");
         assert!(line.contains("catalog suggestion"), "{line}");
     }
 }

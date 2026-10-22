@@ -768,12 +768,12 @@ impl ProviderDashboardRow {
             runtime_status,
             is_active,
         );
-        let available_model_count = catalog_model_count_for_provider(provider);
-        let catalog_status = if available_model_count == 0 {
-            ProviderCatalogStatus::DefaultOnly
-        } else {
-            ProviderCatalogStatus::Bundled
-        };
+        // The provider-level snapshot (Models.dev plus bundled seeds) is one
+        // source; the exact route's own roster further down is another. Keep
+        // them separate so the status below can weigh both — a custom relay
+        // ships no bundled seeds, so this count alone says nothing about
+        // whether the route has a listing.
+        let bundled_model_count = catalog_model_count_for_provider(provider);
         let mut messages = Vec::new();
         // Use the same route-effective resolver as the active runtime. In
         // particular, Kimi Code's bare K3 model has a conservative 262K
@@ -797,8 +797,19 @@ impl ProviderDashboardRow {
                 )
                 .is_some()
             });
+        // The receipt's protocol label must match the wire a turn would
+        // mint: a custom table row passes its own `wire` dialect exactly as
+        // resolve_runtime_route does.
+        let wire_override = (provider == ProviderKind::Custom)
+            .then(|| {
+                codewhale_config::provider::wire_dialect_override(
+                    identity.key.as_str(),
+                    config.provider_wire_dialect(&identity),
+                )
+            })
+            .flatten();
         let route = if let Some(model) = declared_default {
-            crate::route_runtime::resolve_declared_model_candidate(
+            crate::route_runtime::resolve_declared_model_candidate_with_wire_override(
                 provider,
                 &provider_id,
                 model,
@@ -806,12 +817,13 @@ impl ProviderDashboardRow {
                 config.context_window_for_provider_config(&identity),
                 config.model_context_windows_for(&identity),
                 config.custom_models.as_deref().unwrap_or_default(),
+                wire_override,
             )
         } else {
             // Browsing a provider is a snapshot projection, not execution
             // admission. Actual local requests still require an explicit tag
             // or a fresh endpoint-owned roster in resolve_runtime_route.
-            crate::route_runtime::resolve_route_candidate_with_context_metadata(
+            crate::route_runtime::resolve_route_candidate_with_context_metadata_and_wire_override(
                 provider,
                 configured_model
                     .as_deref()
@@ -821,6 +833,7 @@ impl ProviderDashboardRow {
                 config.context_window_for_provider_config(&identity),
                 config.model_context_windows_for(&identity),
                 None,
+                wire_override,
             )
         };
         let (
@@ -890,9 +903,6 @@ impl ProviderDashboardRow {
                 &credential_resolution,
             ));
         }
-        if catalog_status == ProviderCatalogStatus::DefaultOnly {
-            messages.push("catalog snapshot missing; using provider default".to_string());
-        }
 
         let route_identity =
             route_identity_for_model(config, &identity, &default_route.logical_model);
@@ -938,6 +948,19 @@ impl ProviderDashboardRow {
             &base_url,
         )
         .len();
+        // "Snapshot missing" means the row has nothing but its default model.
+        // A provider-level snapshot OR this route's own roster is enough to
+        // show more, so judge the two sources together: reading only the
+        // provider-level count told every custom relay its catalog was missing
+        // while its live listing was already rendered underneath.
+        let catalog_status = if bundled_model_count == 0 && available_model_count == 0 {
+            ProviderCatalogStatus::DefaultOnly
+        } else {
+            ProviderCatalogStatus::Bundled
+        };
+        if catalog_status == ProviderCatalogStatus::DefaultOnly {
+            messages.push("catalog snapshot missing; using provider default".to_string());
+        }
         // #5772: the status projection needs an ambient candidate path to
         // report `ambient_path_changed`, so resolving it for a provider the
         // user never consented to would derive (and then render) another CLI's
@@ -1985,24 +2008,7 @@ impl ProviderPickerView {
     #[must_use]
     pub(crate) fn with_local_runtime_detected(mut self, detected: bool) -> Self {
         self.local_runtime_detected = detected;
-        if !self.rows.is_empty() && !self.row_visible(self.selected_idx) {
-            self.selected_idx = (0..self.rows.len())
-                .find(|idx| self.row_visible(*idx))
-                .unwrap_or(0);
-        }
         self
-    }
-
-    fn hides_undetected_local(&self, idx: usize) -> bool {
-        self.onboarding_mode
-            && !self.local_runtime_detected
-            && !self.rows[idx].is_configured
-            && self.rows[idx]
-                .provider
-                .provider()
-                .credential_help()
-                .acquisition
-                == CredentialAcquisition::LocalOptional
     }
 
     fn tr(&self, id: MessageId) -> Cow<'static, str> {
@@ -2165,9 +2171,6 @@ impl ProviderPickerView {
     }
 
     fn row_visible(&self, idx: usize) -> bool {
-        if self.hides_undetected_local(idx) {
-            return false;
-        }
         let query = self.query.trim();
         if !query.is_empty() {
             return self.rows[idx].matches_query(query);
@@ -3108,6 +3111,11 @@ impl ProviderPickerView {
         // every visible row is clickable, so record this frame's geometry for
         // hover + click handling (mirrors the model picker hitboxes).
         self.list_row_hitboxes.borrow_mut().clear();
+        let name_column = filtered
+            .iter()
+            .map(|(_, row)| crate::tui::ui_text::text_display_width(&row.display_name))
+            .max()
+            .unwrap_or(0);
         let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
         for (pos, (idx, row)) in filtered
             .iter()
@@ -3152,10 +3160,21 @@ impl ProviderPickerView {
             } else {
                 Style::default().fg(palette::STATUS_WARNING)
             };
-            let prefix = format!(" {arrow} {}{active_dot}  ", row.display_name);
+            let full_hint = row.list_row_hint(self.view);
+            let unpadded_prefix = format!(" {arrow} {}{active_dot}  ", row.display_name);
+            let spare = usize::from(layout.list.width).saturating_sub(
+                crate::tui::ui_text::text_display_width(&unpadded_prefix)
+                    + crate::tui::ui_text::text_display_width(&full_hint),
+            );
+            let name_pad = " ".repeat(
+                name_column
+                    .saturating_sub(crate::tui::ui_text::text_display_width(&row.display_name))
+                    .min(spare),
+            );
+            let prefix = format!(" {arrow} {}{active_dot}{name_pad}  ", row.display_name);
             let hint = crate::tui::ui_text::semantic_truncate_between_affixes(
                 &prefix,
-                &row.list_row_hint(self.view),
+                &full_hint,
                 "",
                 usize::from(layout.list.width),
             );
@@ -3165,6 +3184,7 @@ impl ProviderPickerView {
                 Span::styled(" ", spacer_style),
                 Span::styled(row.display_name.as_str(), label_style),
                 Span::styled(active_dot, label_style),
+                Span::styled(name_pad, spacer_style),
                 Span::styled("  ", spacer_style),
                 Span::styled(hint, hint_style),
             ]);
@@ -8394,6 +8414,10 @@ mod tests {
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "DEEPSEEK_BASE_URL",
+            "OLLAMA_API_KEY",
+            "OLLAMA_BASE_URL",
+            "VLLM_API_KEY",
+            "VLLM_BASE_URL",
         ]
         .into_iter()
         .map(EnvVarGuard::remove)
@@ -8463,10 +8487,39 @@ mod tests {
             assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
             assert!(!app.onboarding_recovers_configured_route());
             assert!(app.should_adopt_live_local_ollama());
-            let picker =
-                ProviderPickerView::new_for_onboarding(app.api_provider, None, &config, None);
+            assert!(!app.local_runtime_detected);
+            let mut picker =
+                ProviderPickerView::new_for_onboarding(app.api_provider, None, &config, None)
+                    .with_local_runtime_detected(app.local_runtime_detected);
             assert_eq!(picker.stage, Stage::List);
             assert_eq!(picker.selected_provider(), ProviderKind::Deepseek);
+            for (query, provider) in [
+                ("olla", ProviderKind::Ollama),
+                ("local", ProviderKind::Ollama),
+                ("vllm", ProviderKind::Vllm),
+            ] {
+                for ch in query.chars() {
+                    picker.handle_key(key(KeyCode::Char(ch)));
+                }
+                assert_eq!(picker.query, query);
+                assert!(
+                    picker
+                        .filtered_rows()
+                        .iter()
+                        .any(|(_, row)| row.provider == provider)
+                );
+                move_to_provider(&mut picker, provider);
+                assert_eq!(
+                    picker.rows[picker.selected_idx].readiness,
+                    ResolvedProviderReadiness::LocalUnchecked
+                );
+                assert!(matches!(
+                    picker.handle_key(key(KeyCode::Enter)),
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { identity })
+                        if identity.provider == provider
+                ));
+                picker.handle_key(key(KeyCode::Esc));
+            }
             let runtime = tokio::runtime::Runtime::new().unwrap();
             runtime
                 .block_on(crate::tui::setup::record_configured_route(&app))
@@ -8524,7 +8577,8 @@ mod tests {
         let _lock = crate::test_support::lock_test_env();
         let config = Config::default();
         let picker =
-            ProviderPickerView::new_for_onboarding(ProviderKind::Deepseek, None, &config, None);
+            ProviderPickerView::new_for_onboarding(ProviderKind::Deepseek, None, &config, None)
+                .with_local_runtime_detected(false);
 
         // First-run setup opens on the full catalog with the active provider
         // (DeepSeek) selected — hosted APIs are visible immediately, not

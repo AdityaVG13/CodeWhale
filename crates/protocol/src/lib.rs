@@ -17,6 +17,7 @@ pub mod fleet;
 pub mod ids;
 pub mod journal;
 pub mod op;
+pub mod placement;
 pub mod runtime;
 
 /// Common trait for lifecycle status enums across the protocol layer.
@@ -181,8 +182,9 @@ pub enum CanonicalHistorySource {
         runtime_thread_id: String,
         expected_document_digest: String,
     },
-    /// Local mounted handoff supplies the already protected complete document;
-    /// the actual owner reopens it and compares the same whole-document digest.
+    /// Local mounted handoff supplies the already protected document without
+    /// its journal-derived messages; the actual owner rebuilds them from the
+    /// journal, reopens the file and compares the same whole-document digest.
     SavedSession {
         session: Value,
         expected_document_digest: String,

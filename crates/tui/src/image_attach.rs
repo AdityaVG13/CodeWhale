@@ -1005,6 +1005,85 @@ pub fn strip_images_when_unsupported(
     stripped
 }
 
+pub(crate) const ELIDED_IMAGE_NOTE: &str = "[Image not attached to this request: this model accepts only a limited number of images per request, so the oldest are left out. It remains in the session; do not guess what it showed.]";
+
+pub(crate) const ELIDED_TOOL_IMAGE_NOTE: &str = "[Tool image not attached to this request: this model accepts only a limited number of images per request, so the oldest are left out; do not guess what it showed. Take a fresh observation (for example a new screenshot) if you need the current state; do not repeat an action to recover its image.]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ImageWindow {
+    pub total: usize,
+    pub elided: usize,
+    pub cap: usize,
+}
+
+fn block_carries_image(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::ImageUrl { .. } => true,
+        ContentBlock::ToolResult { content_blocks, .. } => {
+            content_blocks.as_ref().is_some_and(|blocks| {
+                blocks.iter().any(|value| {
+                    value.get("type").and_then(serde_json::Value::as_str) == Some("image")
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+#[must_use]
+pub(crate) fn count_request_images(messages: &[codewhale_models::Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| block_carries_image(block))
+        .count()
+}
+
+#[must_use]
+pub(crate) fn images_to_elide(total: usize, cap: usize) -> usize {
+    if total <= cap {
+        return 0;
+    }
+    let chunk = (cap / 4).max(1);
+    ((total - cap).div_ceil(chunk) * chunk).min(total)
+}
+
+pub(crate) fn cap_request_images(
+    messages: &mut [codewhale_models::Message],
+    cap: usize,
+) -> ImageWindow {
+    let total = count_request_images(messages);
+    let elided = images_to_elide(total, cap);
+    let mut remaining = elided;
+    for block in messages.iter_mut().flat_map(|message| &mut message.content) {
+        if remaining == 0 {
+            break;
+        }
+        if !block_carries_image(block) {
+            continue;
+        }
+        match block {
+            ContentBlock::ImageUrl { .. } => {
+                *block = ContentBlock::Text {
+                    text: ELIDED_IMAGE_NOTE.to_string(),
+                    cache_control: None,
+                };
+            }
+            ContentBlock::ToolResult {
+                content,
+                content_blocks,
+                ..
+            } => {
+                *content_blocks = None;
+                *content = format!("{content}\n{ELIDED_TOOL_IMAGE_NOTE}");
+            }
+            _ => continue,
+        }
+        remaining -= 1;
+    }
+    ImageWindow { total, elided, cap }
+}
+
 /// Total inline-image byte budget for one compaction retry that follows a
 /// provider body-size rejection.
 ///

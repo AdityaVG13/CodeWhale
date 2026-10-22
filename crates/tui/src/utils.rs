@@ -168,6 +168,12 @@ pub fn summarize_project(root: &Path) -> String {
         }
     }
 
+    summarize_key_files(key_files)
+}
+
+/// Classify admitted key files without another filesystem walk.
+#[must_use]
+pub(crate) fn summarize_key_files(mut key_files: Vec<String>) -> String {
     key_files.sort();
 
     if key_files.is_empty() {
@@ -379,9 +385,9 @@ fn hard_link_count(_path: &Path) -> Option<u64> {
 /// lock violation that clears on its own, while a real permission failure
 /// repeats until the attempts run out.
 ///
-/// The ordinary and confined Fleet writers share this classification
-/// and schedule, to tolerate brief sharing conflicts without letting
-/// either path invent a broader retry of its own. Only the rename is
+/// The Fleet writers, the plugin state writer and plugin snapshot publication
+/// share this classification and schedule, to tolerate brief sharing conflicts
+/// without letting any path invent a broader retry of its own. Only the rename is
 /// re-attempted: callers keep the temporary they already wrote and synced, so a
 /// retry never rewrites bytes or widens the window in which data can be lost.
 ///
@@ -393,7 +399,7 @@ pub(crate) fn windows_publish_retry_delay(
     error: &std::io::Error,
     attempt: usize,
 ) -> Option<std::time::Duration> {
-    const MAX_PERSIST_ATTEMPTS: usize = 6;
+    const MAX_PERSIST_ATTEMPTS: usize = 8;
     // 5 ERROR_ACCESS_DENIED, 32 ERROR_SHARING_VIOLATION, 33 ERROR_LOCK_VIOLATION.
     let transient = error.kind() == std::io::ErrorKind::PermissionDenied
         || matches!(error.raw_os_error(), Some(5 | 32 | 33));
@@ -1061,6 +1067,20 @@ pub fn url_encode(input: &str) -> String {
         }
     }
     encoded
+}
+
+/// Show `value` relative to `workspace` when it is an absolute path inside
+/// it, so a card never spends a row on the workspace prefix.
+pub fn workspace_relative(value: &str, workspace: &Path) -> String {
+    let path = Path::new(value);
+    if workspace.as_os_str().is_empty() || !path.is_absolute() {
+        return value.to_string();
+    }
+    match path.strip_prefix(workspace) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => value.to_string(),
+    }
 }
 
 /// Render a path for **user-facing display** with the home directory

@@ -154,19 +154,25 @@ pub(super) async fn list_sessions(
     State(state): State<RuntimeApiState>,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<SessionsResponse>, ApiError> {
-    let manager = SessionManager::new(state.sessions_dir.clone())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let all = manager
-        .list_sessions()
-        .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
-    // This route keeps returning full `SessionMetadata` for compatibility;
-    // `/v1/sessions/summary` is the projected shape. Membership *and* order
-    // come from the shared projection so the two routes never disagree.
-    let sessions: Vec<SessionMetadata> = project_sessions(&all, &projection_query(&query), None)
-        .into_iter()
-        .filter_map(|summary| all.iter().find(|m| m.id == summary.id).cloned())
-        .collect();
-    Ok(Json(SessionsResponse { sessions }))
+    let projection = projection_query(&query);
+    tokio::task::spawn_blocking(move || {
+        let manager = SessionManager::new(state.sessions_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+        let all = manager
+            .list_sessions()
+            .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
+        // This route keeps returning full `SessionMetadata` for compatibility;
+        // `/v1/sessions/summary` is the projected shape. Membership *and* order
+        // come from the shared projection so the two routes never disagree.
+        let sessions: Vec<SessionMetadata> = project_sessions(&all, &projection, None)
+            .into_iter()
+            .filter_map(|summary| all.iter().find(|m| m.id == summary.id).cloned())
+            .collect();
+        Ok::<_, ApiError>(SessionsResponse { sessions })
+    })
+    .await
+    .map_err(|_| ApiError::internal("session listing failed"))?
+    .map(Json)
 }
 
 /// `GET /v1/sessions/summary` — the projected row shape.
@@ -178,16 +184,18 @@ pub(super) async fn list_sessions_summary(
     State(state): State<RuntimeApiState>,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
-    let manager = SessionManager::new(state.sessions_dir.clone())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let all = manager
-        .list_sessions()
-        .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
-    Ok(Json(project_sessions(
-        &all,
-        &projection_query(&query),
-        None,
-    )))
+    let projection = projection_query(&query);
+    tokio::task::spawn_blocking(move || {
+        let manager = SessionManager::new(state.sessions_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+        let all = manager
+            .list_sessions()
+            .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
+        Ok::<_, ApiError>(project_sessions(&all, &projection, None))
+    })
+    .await
+    .map_err(|_| ApiError::internal("session summary listing failed"))?
+    .map(Json)
 }
 
 /// `PATCH /v1/sessions/{id}` — rename and/or archive a saved session.
@@ -435,6 +443,7 @@ pub(crate) async fn resume_session_in_runtime(
             .metadata
             .mode
             .clone()
+            .filter(|mode| crate::runtime_policy::parse_runtime_mode(mode).is_some())
             .unwrap_or_else(|| "agent".to_string())
     });
 
@@ -458,7 +467,7 @@ pub(crate) async fn resume_session_in_runtime(
             config_source.1,
         )
         .await
-        .map_err(map_resume_thread_create_err)?;
+        .map_err(|err| map_resume_thread_create_err(&session.metadata.id, err))?;
 
     let msg_count = session.messages.len();
     runtime
@@ -519,9 +528,10 @@ pub(super) async fn create_session_from_thread(
         });
     }
 
-    let messages = messages_from_thread_detail(&detail).map_err(|error| {
-        ApiError::internal(format!("Failed to reconstruct thread history: {error}"))
-    })?;
+    let messages =
+        messages_from_thread_detail(&state.runtime_threads, &detail).map_err(|error| {
+            ApiError::internal(format!("Failed to reconstruct thread history: {error}"))
+        })?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(format!(
             "Thread {thread_id} has no user or assistant messages to save"
@@ -677,7 +687,10 @@ pub(super) fn thread_detail_has_live_work(detail: &ThreadDetail) -> bool {
     })
 }
 
-pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> anyhow::Result<Vec<Message>> {
+pub(super) fn messages_from_thread_detail(
+    runtime: &RuntimeThreadManager,
+    detail: &ThreadDetail,
+) -> anyhow::Result<Vec<Message>> {
     let mut items_by_turn = HashMap::new();
     for item in &detail.items {
         items_by_turn
@@ -685,7 +698,7 @@ pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> anyhow::Resu
             .or_insert_with(Vec::new)
             .push(item.clone());
     }
-    RuntimeThreadManager::reconstruct_messages_from_turns_with(&detail.turns, &items_by_turn)
+    runtime.history_from_records(&detail.turns, &items_by_turn)
 }
 
 /// Merge the thread's authoritative cost into a session about to be saved.
@@ -796,6 +809,20 @@ pub(crate) async fn save_session_in_runtime(
                 .ok_or_else(|| ApiError::bad_request("No threads to save"))?
         }
     };
+
+    let detail = runtime
+        .get_thread_detail(&thread_id)
+        .await
+        .map_err(map_thread_err)?;
+    if thread_detail_has_live_work(&detail) {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "Thread {thread_id} has a queued or active turn; wait for completion before saving the session"
+            ),
+            code: None,
+        });
+    }
 
     // Get the engine handle (loads the thread into an engine if needed),
     // then request a session snapshot. This reuses the same code path as
@@ -1087,15 +1114,19 @@ fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
     }
 }
 
-fn map_resume_thread_create_err(err: anyhow::Error) -> ApiError {
+fn map_resume_thread_create_err(session_id: &str, err: anyhow::Error) -> ApiError {
     let reason = err.to_string();
     let message = format!("Failed to create thread: {reason}");
     if reason.starts_with("saved session has an empty provider identity")
         || reason.starts_with("saved session requires custom provider")
+        || reason.starts_with("persisted provider route requires exact custom provider")
         || reason.starts_with("legacy session records only the generic `custom` provider kind")
         || reason.starts_with("legacy `provider = \"custom\"`")
     {
-        ApiError::bad_request(message)
+        ApiError::bad_request(format!(
+            "{message}. {}",
+            crate::session_export::export_recovery_hint(session_id)
+        ))
     } else {
         // Thread-store writes, event persistence, and other runtime failures
         // are server-side faults; never disguise them as a client config error.
@@ -1194,14 +1225,18 @@ mod resume_thread_error_tests {
 
     #[test]
     fn provider_config_errors_are_client_errors_but_storage_errors_stay_internal() {
-        let provider = map_resume_thread_create_err(anyhow::anyhow!(
-            "saved session requires custom provider 'lm-studio', but `[providers.lm-studio]` is missing"
-        ));
+        let provider = map_resume_thread_create_err(
+            "session-1",
+            anyhow::anyhow!(
+                "saved session requires custom provider 'lm-studio', but `[providers.lm-studio]` is missing"
+            ),
+        );
         assert_eq!(provider.status, StatusCode::BAD_REQUEST);
 
-        let storage = map_resume_thread_create_err(anyhow::anyhow!(
-            "Failed to save runtime thread: permission denied"
-        ));
+        let storage = map_resume_thread_create_err(
+            "session-1",
+            anyhow::anyhow!("Failed to save runtime thread: permission denied"),
+        );
         assert_eq!(storage.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

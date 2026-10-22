@@ -283,7 +283,7 @@ Chat Completions 驱动回合。
 1. 发送用户输入之前，TUI 会把检查点（checkpoint）快照写入 `~/.codewhale/sessions/checkpoints/latest.json`
 2. 启动默认从新会话开始；此前的会话通过 `--resume`/`--continue`（或 TUI 里的 `Ctrl+R`）显式恢复
 3. 降级/离线期间，新的提示词在内存中排队，并镜像到 `~/.codewhale/sessions/checkpoints/offline_queue.json`
-4. 队列编辑（`/queue ...`）持续持久化，草稿和已排队的提示词可跨重启保留
+4. 队列编辑（`/queue ...`）持续持久化，草稿和已排队的提示词可跨重启保留。从之前的启动或其他会话恢复的消息会被保留：只有 `/queue send <n>` 才会发送，`/queue clear` 将其丢弃
 5. 回合成功完成后清除当前检查点，并写入一份持久会话快照
 6. 具备动作能力的回合还会在 `~/.codewhale/snapshots/<project_hash>/<worktree_hash>/.git` 下生成回合前/后的 side-git 工作区快照；`/restore N` 和 `revert_turn` 恢复文件状态，但不改动对话历史或用户的 `.git`
 

@@ -101,6 +101,7 @@ impl FleetWorkerCommand {
 #[derive(Debug, Clone)]
 pub struct FleetWorkerStartRequest {
     pub worker_id: String,
+    pub attempt: Option<super::executor::FleetExecutorAttempt>,
     pub command: FleetWorkerCommand,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
@@ -112,6 +113,7 @@ impl FleetWorkerStartRequest {
     pub fn new(worker_id: impl Into<String>, command: FleetWorkerCommand) -> Self {
         Self {
             worker_id: worker_id.into(),
+            attempt: None,
             command,
             cwd: None,
             env: BTreeMap::new(),
@@ -123,6 +125,7 @@ impl FleetWorkerStartRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetWorkerHandle {
+    pub transport_receipt: Option<codewhale_protocol::fleet::FleetArtifactRef>,
     pub worker_id: String,
     pub host_kind: FleetHostKind,
     pub pid: Option<u32>,
@@ -294,6 +297,7 @@ impl LocalProcessFleetHostAdapter {
         })?;
         let pid = child.id();
         let handle = FleetWorkerHandle {
+            transport_receipt: None,
             worker_id: request.worker_id.clone(),
             host_kind,
             pid: Some(pid),
@@ -499,6 +503,7 @@ impl FleetHostAdapter for LocalProcessFleetHostAdapter {
 
 #[derive(Debug, Clone)]
 pub struct SshFleetHostConfig {
+    pub tailscale_node_id: Option<String>,
     pub host: String,
     pub user: Option<String>,
     pub port: Option<u16>,
@@ -516,6 +521,7 @@ impl SshFleetHostConfig {
     pub fn new(host: impl Into<String>, working_directory: impl Into<PathBuf>) -> Self {
         Self {
             host: host.into(),
+            tailscale_node_id: None,
             user: None,
             port: None,
             identity: None,
@@ -530,6 +536,27 @@ impl SshFleetHostConfig {
     }
 
     pub fn from_host_spec(spec: &FleetHostSpec) -> FleetHostResult<Self> {
+        if let FleetHostSpec::Tailscale {
+            node_id,
+            user,
+            working_directory,
+            codewhale_binary,
+        } = spec
+        {
+            validate_ssh_destination_part("node id", node_id)?;
+            validate_ssh_destination_part("user", user)?;
+            if node_id.is_empty() || user.is_empty() {
+                return Err(FleetHostError::configuration(
+                    "Tailscale requires an explicit node id and OS user",
+                ));
+            }
+            let mut config = Self::new(node_id.clone(), working_directory.clone());
+            config.tailscale_node_id = Some(node_id.clone());
+            config.user = Some(user.clone());
+            config.codewhale_binary = codewhale_binary.clone();
+            config.validate()?;
+            return Ok(config);
+        }
         let FleetHostSpec::Ssh {
             host,
             port,
@@ -628,6 +655,8 @@ impl SshFleetHostConfig {
 pub struct SshFleetHostAdapter {
     config: SshFleetHostConfig,
     local: LocalProcessFleetHostAdapter,
+    tailnet_host_keys: Option<tempfile::NamedTempFile>,
+    tailnet_snapshot: Option<std::sync::Arc<super::tailnet::TailnetSnapshot>>,
 }
 
 impl SshFleetHostAdapter {
@@ -636,7 +665,16 @@ impl SshFleetHostAdapter {
         Ok(Self {
             config,
             local: LocalProcessFleetHostAdapter::new(workspace),
+            tailnet_host_keys: None,
+            tailnet_snapshot: None,
         })
+    }
+
+    pub(crate) fn set_tailnet_snapshot(
+        &mut self,
+        snapshot: Option<std::sync::Arc<super::tailnet::TailnetSnapshot>>,
+    ) {
+        self.tailnet_snapshot = snapshot;
     }
 
     pub fn build_ssh_command(
@@ -653,6 +691,23 @@ impl SshFleetHostAdapter {
             "-o".to_string(),
             format!("ConnectTimeout={}", self.config.connect_timeout_seconds),
         ];
+        if self.config.tailscale_node_id.is_some() {
+            if self.tailnet_host_keys.is_none() {
+                return Err(FleetHostError::configuration(
+                    "Tailscale node must be resolved before SSH launch",
+                ));
+            }
+            args.extend([
+                "-F".to_string(),
+                if cfg!(windows) { "NUL" } else { "/dev/null" }.to_string(),
+            ]);
+            args.extend([
+                "-o".to_string(),
+                "ProxyCommand=tailscale nc %h %p".to_string(),
+            ]);
+            args.extend(["-o".to_string(), "CanonicalizeHostname=no".to_string()]);
+            args.extend(["-o".to_string(), "UpdateHostKeys=no".to_string()]);
+        }
         if let Some(known_hosts) = &self.config.known_hosts {
             args.push("-o".to_string());
             args.push(format!("UserKnownHostsFile=\"{}\"", known_hosts.display()));
@@ -699,6 +754,7 @@ impl SshFleetHostAdapter {
         let env_allowlist = env.keys().cloned().collect();
         Ok(FleetWorkerStartRequest {
             worker_id: request.worker_id,
+            attempt: request.attempt,
             command,
             cwd: None,
             env,
@@ -725,8 +781,58 @@ impl FleetHostAdapter for SshFleetHostAdapter {
         &mut self,
         request: FleetWorkerStartRequest,
     ) -> FleetHostResult<FleetWorkerHandle> {
+        let mut transport_receipt = None;
+        if let Some(node_id) = self.config.tailscale_node_id.as_deref() {
+            let attempt = request.attempt.as_ref().ok_or_else(|| {
+                FleetHostError::configuration("Tailscale worker requires a Fleet attempt context")
+            })?;
+            let snapshot = self.tailnet_snapshot.as_ref().ok_or_else(|| {
+                FleetHostError::configuration(
+                    "Tailscale requires a fresh asynchronous inventory before launch",
+                )
+            })?;
+            let node = snapshot
+                .resolve(node_id)
+                .map_err(|error| FleetHostError::configuration(error.to_string()))?;
+            let (address, keys) = super::tailnet::ssh_destination(node)
+                .map_err(|error| FleetHostError::configuration(error.to_string()))?;
+            let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "tailnet_node_identity",
+                "phase": "checked_before_ssh_launch",
+                "run_id": attempt.run_id,
+                "task_id": attempt.task_id,
+                "attempt": attempt.attempt,
+                "node_id": node.id,
+                "address": address,
+                "user": self.config.user,
+                "checked_at": chrono::Utc::now().to_rfc3339(),
+                "inventory_observed_at": snapshot.observed_at,
+                "host_key_source": "local_tailscale_peer_map",
+                "authentication_confirmed": false,
+            }))
+            .map_err(|error| FleetHostError::configuration(error.to_string()))?;
+            let hash = crate::hashing::sha256_hex(&bytes);
+            transport_receipt = Some(
+                super::task_spec::write_fleet_artifact_ref(
+                    &self.local.workspace,
+                    &attempt.run_id,
+                    &attempt.task_id,
+                    &request.worker_id,
+                    codewhale_protocol::fleet::FleetArtifactKind::Receipt,
+                    &format!("{hash}.json"),
+                    &bytes,
+                    Some("application/json"),
+                )
+                .map_err(|error| FleetHostError::configuration(error.to_string()))?,
+            );
+            self.config.host = address;
+            self.config.known_hosts = Some(keys.path().to_path_buf());
+            self.tailnet_host_keys = Some(keys);
+        }
         let request = self.ssh_start_request(request)?;
-        self.local.start_with_kind(request, FleetHostKind::Ssh)
+        let mut handle = self.local.start_with_kind(request, FleetHostKind::Ssh)?;
+        handle.transport_receipt = transport_receipt;
+        Ok(handle)
     }
 
     fn read_status(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
@@ -742,6 +848,11 @@ impl FleetHostAdapter for SshFleetHostAdapter {
     }
 
     fn restart_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetWorkerHandle> {
+        if self.config.tailscale_node_id.is_some() {
+            return Err(FleetHostError::configuration(
+                "Tailscale workers require a fresh Fleet attempt and node identity check",
+            ));
+        }
         let request = self
             .local
             .processes
@@ -2148,6 +2259,7 @@ mod tests {
             self.spawned += 1;
             self.owned = true;
             Ok(FleetWorkerHandle {
+                transport_receipt: None,
                 worker_id: request.worker_id,
                 host_kind: FleetHostKind::LocalProcess,
                 pid: None,

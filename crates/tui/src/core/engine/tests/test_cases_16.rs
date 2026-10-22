@@ -897,11 +897,11 @@ async fn interpreter_execution_policy_preserves_readonly_and_exact_call_elevatio
         let workspace = tempdir().expect("workspace");
         let outside = tempdir().expect("outside workspace");
         let context = ToolContext::new(workspace.path())
-            .with_elevated_sandbox_policy(SandboxPolicy::ReadOnly);
+            .with_elevated_sandbox_policy(SandboxPolicy::read_only());
         for (name, policy, allowed) in [
-            ("ordinary.txt", SandboxPolicy::ReadOnly, false),
+            ("ordinary.txt", SandboxPolicy::read_only(), false),
             ("approved.txt", SandboxPolicy::DangerFullAccess, true),
-            ("ordinary-again.txt", SandboxPolicy::ReadOnly, false),
+            ("ordinary-again.txt", SandboxPolicy::read_only(), false),
         ] {
             let path = outside.path().join(name);
             let literal = json!(path.to_string_lossy()).to_string();

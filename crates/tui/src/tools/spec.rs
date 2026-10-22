@@ -116,6 +116,9 @@ pub struct RuntimeToolServices {
     /// Per-session backing store for `var_handle` payloads. Cloned tool
     /// contexts share this Arc so handles survive across turns.
     pub handle_store: SharedHandleStore,
+    /// Bounded host-computed source observations, isolated from writable
+    /// var_handles. Children clone the Arc, not delivery state or authority.
+    pub code_observations: SharedHandleStore,
     /// Per-session persistent RLM kernels, keyed by caller-chosen context name.
     pub rlm_sessions: SharedRlmSessionStore,
     /// Directory for `read_media`'s content-addressed store of
@@ -139,6 +142,7 @@ impl Default for RuntimeToolServices {
             work: None,
             hook_executor: None,
             handle_store: new_shared_handle_store(),
+            code_observations: new_shared_handle_store(),
             rlm_sessions: new_shared_rlm_session_store(),
             media_originals_dir: None,
         }
@@ -162,6 +166,7 @@ impl std::fmt::Debug for RuntimeToolServices {
             .field("work", &self.work.is_some())
             .field("hook_executor", &self.hook_executor.is_some())
             .field("handle_store", &true)
+            .field("code_observations", &true)
             .field("rlm_sessions", &true)
             .field("media_originals_dir", &self.media_originals_dir)
             .finish()
@@ -735,6 +740,7 @@ pub struct ToolExecutionState {
     /// Where the session's live permission posture lives. Set by the engine;
     /// every agent call re-reads it (`None` keeps the posture above as is).
     pub(crate) live_posture: Option<crate::core::engine::LivePosture>,
+    pub(crate) browser_tool: Option<String>,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -841,6 +847,7 @@ impl ToolContext {
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
                 nested_call_gate: None,
                 live_posture: None,
+                browser_tool: None,
             }),
         }
     }
@@ -1041,6 +1048,23 @@ impl ToolContext {
         tracker.reads.insert(path.to_path_buf(), snapshot);
     }
 
+    /// Distinct files read under `dir` so far this session. Echolocation's
+    /// hunt-phase sensor: 2+ tracked reads means the model is working this
+    /// pod and the next read there enters the terminal buzz. Lock
+    /// contention degrades to zero (sparse sounding), never an error.
+    pub(crate) fn pod_visit_count(&self, dir: &Path) -> usize {
+        self.file_read_tracker
+            .lock()
+            .map(|tracker| {
+                tracker
+                    .reads
+                    .keys()
+                    .filter(|path| path.parent() == Some(dir))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Require a successful, still-fresh `read_file` snapshot before a narrow
     /// in-place edit. This catches model edits made against guessed or stale
     /// content while leaving transactional patch preflight separate.
@@ -1048,6 +1072,31 @@ impl ToolContext {
         &self,
         path: &Path,
         requested_path: &str,
+    ) -> Result<(), ToolError> {
+        self.require_fresh_read_for(
+            path,
+            requested_path,
+            "File action=\"edit\"",
+            "File with action=\"read\"",
+            "File action=\"read\"",
+        )
+    }
+
+    pub fn require_fresh_read_before_write(
+        &self,
+        path: &Path,
+        requested_path: &str,
+    ) -> Result<(), ToolError> {
+        self.require_fresh_read_for(path, requested_path, "write", "read", "read")
+    }
+
+    fn require_fresh_read_for(
+        &self,
+        path: &Path,
+        requested_path: &str,
+        mutation: &str,
+        read_call: &str,
+        read: &str,
     ) -> Result<(), ToolError> {
         let prior = {
             let tracker = self.file_read_tracker.lock().map_err(|_| {
@@ -1060,25 +1109,25 @@ impl ToolContext {
 
         let Some(prior) = prior else {
             return Err(ToolError::execution_failed(format!(
-                "Refusing File action=\"edit\" for {} because it has not been read in this session. \
-                 Recovery: call File with action=\"read\" path=\"{requested_path}\" to inspect the current contents, \
-                 then retry File action=\"edit\" with a unique search string.",
+                "Refusing {mutation} for {} because it has not been read in this session. \
+                 Recovery: call {read_call} path=\"{requested_path}\" to inspect the current contents, \
+                 then retry {mutation}.",
                 path.display()
             )));
         };
 
         let current = file_read_snapshot(path).map_err(|e| {
             ToolError::execution_failed(format!(
-                "Refusing File action=\"edit\" for {} because the file could not be checked for staleness ({e}). \
-                 Recovery: call File with action=\"read\" path=\"{requested_path}\" again, then retry File action=\"edit\".",
+                "Refusing {mutation} for {} because the file could not be checked for staleness ({e}). \
+                 Recovery: call {read_call} path=\"{requested_path}\" again, then retry {mutation}.",
                 path.display()
             ))
         })?;
 
         if current != prior {
             return Err(ToolError::execution_failed(format!(
-                "Refusing File action=\"edit\" for {} because it changed since the last File action=\"read\" call. \
-                 Recovery: call File with action=\"read\" path=\"{requested_path}\" again and retry with the current contents.",
+                "Refusing {mutation} for {} because it changed since the last {read} call. \
+                 Recovery: call {read_call} path=\"{requested_path}\" again and retry with the current contents.",
                 path.display()
             )));
         }
@@ -1587,6 +1636,14 @@ pub trait ToolSpec: Send + Sync {
     /// turns they do not need to block neighboring read-only inspections.
     fn starts_detached_for(&self, _input: &Value) -> bool {
         false
+    }
+
+    fn refusal_before_approval(
+        &self,
+        _input: &Value,
+        _context: &ToolContext,
+    ) -> Option<ToolResult> {
+        None
     }
 
     /// Resolve input-specific policy without performing external side effects.

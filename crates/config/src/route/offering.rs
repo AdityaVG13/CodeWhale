@@ -33,6 +33,8 @@ pub struct RouteLimits {
     /// Output-token cap for the route/offering, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    #[serde(skip)]
+    pub output_declared: bool,
 }
 
 impl RouteLimits {

@@ -110,36 +110,47 @@ that had no equivalent, write-scope expansion.
 ## The workspace lock, and what losing it does and does not mean
 
 The ledger lives in one file, `.codewhale/state/subagents.v1.json`, written as a
-whole-document atomic replace. Two processes rewriting that file would be
-last-rename-wins, and the loser's `write_claims` would vanish — which silently
-re-opens concurrent overlapping mutation of the same paths after a restart. So
-one per-workspace advisory flock (`subagents.v1.lock`) decides who may *write*
-the file. That is the whole of its job.
+whole-document atomic replace. One per-workspace advisory flock
+(`subagents.v1.lock`) decides who may *write* the file, in one of two modes:
 
-Opening a second Codewhale session in the same workspace is ordinary usage, so
-losing that flock is an ordinary state, not a failure:
+- **Shared, warn on failure.** Interactive and `exec` sessions, `codewhale
+  fleet`, `codewhale resume`/`fork` mounts and the TUI's background task runtime
+  (`/task`, `task_create`, automations) take the flock shared, so several
+  sessions in one folder hold it at once. Failing to get it only logs a warning.
+- **Exclusive, fatal on failure.** `codewhale serve` and the other standalone
+  Runtime hosts take it exclusively and refuse to start without it. Beside such an
+  owner, shared holders cannot append.
+
+Every shared holder may append, and each append replaces the whole file, so the
+last rename wins. The ledger is loaded once at boot; agents another process
+started reload as non-live, so no other process's write claims are enforced
+here. A resume or fork mount only reads the ledger.
+
+A shared holder beside an exclusive owner, or one whose acquisition failed, does
+not get the flock. That is an ordinary state, not a failure:
 
 - **It does not affect liveness.** A session that cannot write the ledger runs
   its own agents normally. Whether an agent is alive is decided by heartbeat
   evidence, never by lock ownership. (Before v0.9.4 the cleanup pass
   terminalized every running agent with no live task handle purely because this
   process lacked the flock; that coupling is gone.)
-- **It does not affect reads.** The boot-time load is unconditional. A second
+- **It does not affect reads.** The boot-time load is unconditional. Such a
   session sees the workspace's decisions and write claims even though it cannot
-  append to them. Gating the load on the write flock previously left the second
-  session holding an empty default ledger, which it would write straight over
+  append to them. Gating the load on the write flock previously left a session
+  without the flock holding an empty default ledger, which it would write straight over
   the real one the moment the first session exited and the flock became
   acquirable.
 - **It does mean no durable ledger appends.** Decision, claim, contention, and
   reconciliation mutations still require the flock, and so does any
   shared-workspace write-capable launch, because such a launch must be durably
-  replayable before it executes. A second session can therefore delegate
-  read-only and isolated-worktree work, but not shared-workspace writers.
+  replayable before it executes. A session without the flock can therefore
+  delegate only read-only and isolated-worktree work. Two shared holders can
+  both launch shared-workspace writers, and neither enforces the other's claims
+  (see the known gap below).
 
-Known gap: a lock-less session holds the ledger as of its own boot. If the lock
-owner appends more records and then exits, the second session can acquire the
-flock and persist its boot-time snapshot, losing the records appended in
-between. Closing that — and letting a second session launch shared-workspace
-writers — needs per-session ledger segments unioned on read, so that no two
-processes ever write the same file and the claim-overlap check runs against the
-union. That work is not done.
+Known gap: every session holds the ledger as of its own boot, and shared holders
+rewrite the whole file. Records another session appended after this one booted
+can be lost when this one writes, and write claims are only enforced within one
+process. Closing that needs per-session ledger segments unioned on read, so that
+no two processes ever write the same file and the claim-overlap check runs
+against the union. That work is not done.

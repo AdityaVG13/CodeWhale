@@ -145,7 +145,7 @@ fn ref_id_for(namespace: &str, url: &str) -> String {
     format!("web_{}", &digest[..16])
 }
 
-fn normalize_http_url(url: &str) -> Option<String> {
+pub(crate) fn normalize_http_url(url: &str) -> Option<String> {
     let mut parsed = reqwest::Url::parse(url.trim()).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return None;

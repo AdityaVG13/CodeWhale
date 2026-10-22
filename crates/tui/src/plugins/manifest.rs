@@ -1177,19 +1177,15 @@ fn validate_text(field: &str, value: &str, max_chars: usize) -> Result<(), Strin
     if value.chars().any(char::is_control) {
         return Err(format!("{field} may not contain control characters"));
     }
-    if value.chars().any(is_bidi_control) {
+    if value
+        .chars()
+        .any(codewhale_sanitize::sanitize::is_bidi_control)
+    {
         return Err(format!(
             "{field} may not contain bidirectional formatting characters"
         ));
     }
     Ok(())
-}
-
-fn is_bidi_control(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
 }
 
 fn validate_unique_texts(field: &str, values: &[String], max_chars: usize) -> Result<(), String> {

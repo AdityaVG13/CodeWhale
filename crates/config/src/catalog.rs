@@ -816,6 +816,21 @@ pub enum CatalogRefreshError {
     Network,
 }
 
+impl CatalogRefreshError {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not found",
+            Self::RateLimited => "rate limited",
+            Self::InvalidResponse => "invalid response",
+            Self::EmptyList => "empty list",
+            Self::Network => "network error",
+        }
+    }
+}
+
 /// Freshness / health of a provider's cached live catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -1218,7 +1233,8 @@ impl CatalogCompiler {
             .chain(self.overrides)
         {
             if let Some(lower) = merged.get(&row.merge_key()) {
-                row.complete_from(lower, None);
+                let base_url = row.provider_api.clone();
+                row.complete_from(lower, base_url.as_deref());
             }
             merged.insert(row.merge_key(), row);
         }

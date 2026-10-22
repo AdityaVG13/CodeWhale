@@ -33,6 +33,7 @@ ALLOWED_WORKSPACE = {
     "codewhale-portable-config",
     "codewhale-command-contract",
     "codewhale-protocol",
+    "codewhale-sanitize",
 }
 FORBIDDEN_SERVICES = {
     "tokio", "reqwest", "hyper", "rusqlite", "sqlx", "keyring", "dbus", "zbus",

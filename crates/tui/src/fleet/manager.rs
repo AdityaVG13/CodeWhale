@@ -115,6 +115,22 @@ fn validate_run_document_with(
     doc: &mut FleetTaskSpecDocument,
 ) -> Result<Vec<String>> {
     validate_task_spec_document(doc)?;
+    let fallback = [default_local_worker("local")];
+    let candidates = if doc.workers.is_empty() {
+        &fallback[..]
+    } else {
+        &doc.workers
+    };
+    for task in &doc.tasks {
+        let decision = super::placement::decide(task, candidates, &BTreeSet::new());
+        if decision.worker_id.is_none() {
+            bail!(
+                "Fleet task {} has no eligible environment: {}",
+                task.id,
+                serde_json::to_string(&decision)?
+            );
+        }
+    }
     let roster = crate::fleet::identity::load_effective_roster(fleet_config, workspace, None);
     if let Some(error) = roster.load_error() {
         bail!("cannot create Fleet run: {error}");
@@ -609,7 +625,7 @@ impl FleetManager {
             .get(&run_id.0)
             .cloned()
             .ok_or_else(|| anyhow!("Fleet run {} does not exist", run_id.0))?;
-        let worker_ids = worker_ids_for_run(&run, max_workers);
+        let worker_ids = worker_ids_for_run(&run);
 
         // Heartbeats are durable ledger appends (a full-drive flush on
         // macOS). Timestamps have whole-second resolution and the stale window
@@ -632,22 +648,27 @@ impl FleetManager {
         loop {
             let state = self.ledger.rebuild_state()?;
             let active_workers = active_workers_for_run(&state, run_id);
-            if active_workers.len() >= max_workers {
+            let unavailable: BTreeSet<_> =
+                active_workers.union(unavailable_workers).cloned().collect();
+            if unavailable.len() >= max_workers {
                 break;
             }
-            let Some(worker_id) = worker_ids
-                .iter()
-                .find(|id| {
-                    !active_workers.contains(*id) && !unavailable_workers.contains(id.as_str())
-                })
-                .cloned()
+            let Some((entry, task_spec, decision)) =
+                next_enqueued_task_for_run(&state, run_id, &unavailable)
             else {
                 break;
             };
-            let Some((entry, task_spec)) = next_enqueued_task_for_run(&state, run_id) else {
-                break;
-            };
-            if !self.start_worker_task(&worker_id, &entry, &task_spec, Some(max_workers))? {
+            let worker_id = decision
+                .worker_id
+                .as_deref()
+                .expect("eligible placement has a worker");
+            if !self.start_worker_task(
+                worker_id,
+                &entry,
+                &task_spec,
+                Some(max_workers),
+                &decision,
+            )? {
                 // Busy coordination or a write-claim contention leaves the
                 // task durably queued. Returning to the driver tick avoids a
                 // tight loop over unchanged state and lets live workers make
@@ -864,6 +885,16 @@ impl FleetManager {
                 }
             }
         };
+        let tailnet_workers: BTreeSet<_> = self
+            .ledger
+            .rebuild_state()?
+            .runs
+            .get(&run_id.0)
+            .into_iter()
+            .flat_map(|run| &run.worker_specs)
+            .filter(|worker| matches!(worker.host, FleetHostSpec::Tailscale { .. }))
+            .map(|worker| worker.id.clone())
+            .collect();
         loop {
             // A terminal ledger update can race the foreground host process.
             // Do not lease new work onto a logical worker until its executor
@@ -872,6 +903,17 @@ impl FleetManager {
             let scheduling_error = self
                 .schedule_run_excluding(run_id, max_workers, &unavailable_workers)
                 .err();
+            if !tailnet_workers.is_empty() {
+                let state = self.ledger.rebuild_state()?;
+                let needs_inventory = active_tasks_for_run(&state, run_id).any(|task| {
+                    task.leased_to.as_deref().is_some_and(|worker| {
+                        tailnet_workers.contains(worker) && !executor.is_tracking(worker)
+                    })
+                });
+                if needs_inventory {
+                    executor.refresh_tailnet_inventory().await;
+                }
+            }
             self.drive_executor_tick(run_id, executor, codewhale_binary, model)?;
             self.refresh_run_status(run_id)?;
             if let Some(error) = scheduling_error {
@@ -1393,6 +1435,7 @@ impl FleetManager {
         entry: &FleetInboxEntry,
         task_spec: &FleetTaskSpec,
         max_active_for_run: Option<usize>,
+        decision: &codewhale_protocol::placement::PlacementDecision,
     ) -> Result<bool> {
         let run = self
             .ledger
@@ -1431,7 +1474,14 @@ impl FleetManager {
             entry.attempts.saturating_add(1),
         );
         authority_envelope_for_worker(&sub_agent_worker, task_spec)?;
+        super::placement::require_match(task_spec, &worker_spec)?;
         let log_artifact = self.write_log_artifact(&entry.run_id, worker_id, task_spec)?;
+        let placement_artifact = super::placement::write_receipt(
+            &self.workspace,
+            &entry.run_id,
+            entry.attempts.saturating_add(1),
+            decision,
+        )?;
         // Hold the coordination manager from pure preflight through the
         // ledger's pre-commit projection callback and any append compensation. This keeps a concurrent
         // agent/Fleet registration from invalidating the overlap decision in
@@ -1484,6 +1534,7 @@ impl FleetManager {
                 },
                 FleetWorkerEventPayload::Starting,
                 FleetWorkerEventPayload::Artifact(log_artifact),
+                FleetWorkerEventPayload::Artifact(placement_artifact),
                 FleetWorkerEventPayload::Running,
             ],
             || {
@@ -1654,24 +1705,31 @@ impl FleetManager {
                 attempt,
             ) {
                 Ok(handle) => {
-                    let artifact = self.host_log_artifact(&handle.log_path);
-                    if self
-                        .ledger
-                        .append_event_if_leased(
-                            run_id,
-                            worker_id,
-                            &task.entry.task_id,
-                            task.entry.attempts,
-                            &timestamp(),
-                            FleetWorkerEventPayload::Artifact(artifact),
-                        )?
-                        .is_none()
-                    {
-                        executor.stop_worker(worker_id)?;
-                        executor.forget_worker(worker_id);
-                        continue;
+                    let artifacts = std::iter::once(self.host_log_artifact(&handle.log_path))
+                        .chain(handle.transport_receipt);
+                    let mut still_leased = true;
+                    for artifact in artifacts {
+                        if self
+                            .ledger
+                            .append_event_if_leased(
+                                run_id,
+                                worker_id,
+                                &task.entry.task_id,
+                                task.entry.attempts,
+                                &timestamp(),
+                                FleetWorkerEventPayload::Artifact(artifact),
+                            )?
+                            .is_none()
+                        {
+                            executor.stop_worker(worker_id)?;
+                            executor.forget_worker(worker_id);
+                            still_leased = false;
+                            break;
+                        }
                     }
-                    started += 1;
+                    if still_leased {
+                        started += 1;
+                    }
                 }
                 Err(err) => {
                     let recoverable = matches!(err.kind, FleetHostErrorKind::Retryable);
@@ -2262,6 +2320,7 @@ fn default_local_workers(run_id: &FleetRunId, max_workers: usize) -> Vec<FleetWo
 
 fn default_local_worker_with_name(worker_id: &str, index: usize) -> FleetWorkerSpec {
     FleetWorkerSpec {
+        environment: None,
         id: worker_id.to_string(),
         name: format!("Local worker {index}"),
         host: FleetHostSpec::Local,
@@ -2276,6 +2335,7 @@ fn default_local_worker_with_name(worker_id: &str, index: usize) -> FleetWorkerS
 
 fn default_local_worker(worker_id: &str) -> FleetWorkerSpec {
     FleetWorkerSpec {
+        environment: None,
         id: worker_id.to_string(),
         name: worker_id.to_string(),
         host: FleetHostSpec::Local,
@@ -2286,10 +2346,9 @@ fn default_local_worker(worker_id: &str) -> FleetWorkerSpec {
     }
 }
 
-fn worker_ids_for_run(run: &FleetRun, max_workers: usize) -> Vec<String> {
+fn worker_ids_for_run(run: &FleetRun) -> Vec<String> {
     run.worker_specs
         .iter()
-        .take(max_workers)
         .map(|worker| worker.id.clone())
         .collect()
 }
@@ -2333,27 +2392,41 @@ fn latest_task_for_worker<'a>(
 fn next_enqueued_task_for_run(
     state: &FleetLedgerState,
     run_id: &FleetRunId,
-) -> Option<(FleetInboxEntry, FleetTaskSpec)> {
+    unavailable: &BTreeSet<String>,
+) -> Option<(
+    FleetInboxEntry,
+    FleetTaskSpec,
+    codewhale_protocol::placement::PlacementDecision,
+)> {
     let run = state.runs.get(&run_id.0)?;
-    let task = state
+    let mut queued: Vec<_> = state
         .tasks
         .values()
         .filter(|task| {
             task.entry.run_id == *run_id && matches!(task.status, FleetTaskLedgerStatus::Enqueued)
         })
-        .min_by_key(|task| {
-            (
-                task.entry.priority,
-                task.entry.enqueued_at.clone(),
-                task.entry.task_id.clone(),
-            )
-        })?;
-    let task_spec = run
-        .task_specs
-        .iter()
-        .find(|spec| spec.id == task.entry.task_id)
-        .cloned()?;
-    Some((task.entry.clone(), task_spec))
+        .collect();
+    queued.sort_by(|a, b| {
+        (a.entry.priority, &a.entry.enqueued_at, &a.entry.task_id).cmp(&(
+            b.entry.priority,
+            &b.entry.enqueued_at,
+            &b.entry.task_id,
+        ))
+    });
+    for task in queued {
+        let Some(spec) = run
+            .task_specs
+            .iter()
+            .find(|spec| spec.id == task.entry.task_id)
+        else {
+            continue;
+        };
+        let decision = super::placement::decide(spec, &run.worker_specs, unavailable);
+        if decision.worker_id.is_some() {
+            return Some((task.entry.clone(), spec.clone(), decision));
+        }
+    }
+    None
 }
 
 fn task_spec_for_state(state: &FleetLedgerState, task: &FleetTaskState) -> Option<FleetTaskSpec> {
@@ -2383,6 +2456,7 @@ fn host_label(host: &FleetHostSpec) -> String {
     match host {
         FleetHostSpec::Local => "local".to_string(),
         FleetHostSpec::Ssh { host, .. } => format!("ssh:{host}"),
+        FleetHostSpec::Tailscale { node_id, .. } => format!("tailscale:{node_id}"),
         FleetHostSpec::Docker { image, .. } => format!("docker:{image}"),
     }
 }
@@ -2609,7 +2683,10 @@ fn validate_task_cwd_for_host(
     host: &FleetHostSpec,
     task_cwd: &Path,
 ) -> Result<()> {
-    if !matches!(host, FleetHostSpec::Ssh { .. }) {
+    if !matches!(
+        host,
+        FleetHostSpec::Ssh { .. } | FleetHostSpec::Tailscale { .. }
+    ) {
         return Ok(());
     }
     let workspace_root = crate::tools::spec::resolve_strict_authority_path(
@@ -2820,6 +2897,7 @@ mod tests {
             .with_sub_agent_manager(coordination.clone());
         let mut nested = task("nested");
         nested.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             root: Some(PathBuf::from("nested")),
             ..FleetWorkspaceRequirements::default()
         });
@@ -2886,6 +2964,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("nested")).unwrap();
         let mut nested = task("nested");
         nested.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             root: Some(PathBuf::from("nested")),
             ..FleetWorkspaceRequirements::default()
         });
@@ -2932,10 +3011,12 @@ mod tests {
             capabilities: Vec::new(),
         });
         nested.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             root: Some(PathBuf::from("nested")),
             ..FleetWorkspaceRequirements::default()
         });
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "ssh-worker".to_string(),
             name: "SSH worker".to_string(),
             host: FleetHostSpec::Ssh {
@@ -3269,6 +3350,7 @@ mod tests {
                 capabilities: Vec::new(),
             });
             task.workspace = Some(FleetWorkspaceRequirements {
+                placement: None,
                 writable_paths: vec![PathBuf::from("src")],
                 ..FleetWorkspaceRequirements::default()
             });
@@ -3593,6 +3675,7 @@ mod tests {
 
     fn resume_worker_spec(id: &str) -> FleetWorkerSpec {
         FleetWorkerSpec {
+            environment: None,
             id: id.to_string(),
             name: id.to_string(),
             host: FleetHostSpec::Local,
@@ -4029,7 +4112,7 @@ mod tests {
         assert_eq!(inspection.status, FleetWorkerStatus::Busy);
         assert_eq!(inspection.current_task_id.as_deref(), Some("task-a"));
         assert!(inspection.latest_heartbeat_at.is_some());
-        assert_eq!(inspection.artifacts.len(), 1);
+        assert_eq!(inspection.artifacts.len(), 2);
         assert!(inspection.last_error.is_none());
 
         let inspection = manager.interrupt_worker(worker_id).unwrap();
@@ -5082,11 +5165,19 @@ esac
             workers: vec![
                 default_local_worker("local-task"),
                 FleetWorkerSpec {
+                    environment: None,
                     id: "docker-transport".to_string(),
                     name: "Docker transport".to_string(),
-                    host: FleetHostSpec::Docker {
-                        image: "fake".to_string(),
-                        args: Vec::new(),
+                    host: FleetHostSpec::Ssh {
+                        host: "example.invalid".to_string(),
+                        port: None,
+                        user: None,
+                        identity: None,
+                        known_hosts: None,
+                        host_key_fingerprint: None,
+                        working_directory: None,
+                        env_allowlist: Vec::new(),
+                        codewhale_binary: None,
                     },
                     trust_level: None,
                     labels: BTreeMap::new(),
@@ -5288,6 +5379,7 @@ esac
             });
             if role == "builder" {
                 task.workspace = Some(FleetWorkspaceRequirements {
+                    placement: None,
                     writable_paths: vec![PathBuf::from(".codewhale/fleet")],
                     ..FleetWorkspaceRequirements::default()
                 });
@@ -5680,6 +5772,7 @@ esac
                     capabilities: vec!["rust".to_string()],
                 }),
                 workspace: Some(FleetWorkspaceRequirements {
+                    placement: None,
                     root: None,
                     required_files: vec![PathBuf::from("Cargo.toml")],
                     writable_paths: vec![PathBuf::from(".codewhale/fleet")],
@@ -5719,6 +5812,7 @@ esac
                     capabilities: vec!["rust".to_string()],
                 }),
                 workspace: Some(FleetWorkspaceRequirements {
+                    placement: None,
                     root: None,
                     required_files: vec![],
                     writable_paths: vec![],

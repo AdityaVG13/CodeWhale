@@ -202,7 +202,7 @@ pub(crate) fn safety(app: &App) -> StatusSafety {
     );
     let enforced = app.sandbox_backend.is_some();
     match policy {
-        crate::sandbox::SandboxPolicy::ReadOnly => StatusSafety::ReadOnly { enforced },
+        crate::sandbox::SandboxPolicy::ReadOnly { .. } => StatusSafety::ReadOnly { enforced },
         crate::sandbox::SandboxPolicy::WorkspaceWrite { network_access, .. } => {
             StatusSafety::WorkspaceWrite {
                 enforced,

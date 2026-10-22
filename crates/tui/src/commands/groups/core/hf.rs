@@ -54,7 +54,7 @@ Codewhale has three distinct Hugging Face surfaces:
 2. Hugging Face MCP - Hub, docs, datasets, Spaces, and community tools
    Connect Codewhale to Hugging Face's MCP server through mcp.json.
    Use: /hf mcp status or /hf mcp setup
-   Then: /mcp validate or restart Codewhale so model-visible tools reload.
+   Then: /mcp reload or restart Codewhale so model-visible tools reload.
 
 3. Hugging Face Hub workflows - publish, upload, or manage repositories
    Use explicit Hub tooling such as huggingface_hub or git-based flows.

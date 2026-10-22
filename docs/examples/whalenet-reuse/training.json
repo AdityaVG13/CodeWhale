@@ -1,0 +1,10 @@
+[
+  {"job":"compile","seconds":58}, {"job":"compile","seconds":61},
+  {"job":"compile","seconds":59}, {"job":"compile","seconds":65},
+  {"job":"compile","seconds":60}, {"job":"compile","seconds":62},
+  {"job":"compile","seconds":63}, {"job":"compile","seconds":57},
+  {"job":"integration","seconds":118}, {"job":"integration","seconds":121},
+  {"job":"integration","seconds":125}, {"job":"integration","seconds":119},
+  {"job":"integration","seconds":123}, {"job":"integration","seconds":116},
+  {"job":"integration","seconds":124}, {"job":"integration","seconds":120}
+]

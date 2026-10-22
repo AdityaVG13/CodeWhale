@@ -27,13 +27,27 @@
           "id": "claude-fable-5"
         },
         {
-          "id": "claude-haiku-4-5"
+          "id": "claude-fable-5-1",
+          "canonical": "anthropic/claude-fable-5-1"
+        },
+        {
+          "id": "claude-haiku-4-5",
+          "canonical": "anthropic/claude-haiku-4-5"
+        },
+        {
+          "id": "claude-haiku-5-5",
+          "canonical": "anthropic/claude-haiku-5-5"
         },
         {
           "id": "claude-opus-4-8"
         },
         {
-          "id": "claude-opus-5"
+          "id": "claude-opus-5",
+          "canonical": "anthropic/claude-opus-5"
+        },
+        {
+          "id": "claude-opus-5-5",
+          "canonical": "anthropic/claude-opus-5-5"
         },
         {
           "id": "claude-sonnet-4-6",
@@ -41,6 +55,10 @@
         },
         {
           "id": "claude-sonnet-5"
+        },
+        {
+          "id": "claude-sonnet-5-5",
+          "canonical": "anthropic/claude-sonnet-5-5"
         }
       ],
       "transport": "anthropic-messages"
@@ -64,6 +82,7 @@
       "models": [
         {
           "id": "trinity-large-thinking",
+          "canonical": "arcee-ai/trinity-large-thinking",
           "default": true
         },
         {
@@ -198,20 +217,28 @@
       "models": [
         {
           "id": "deepseek-flash",
-          "canonical": "deepseek-flash",
+          "canonical": "deepseek/deepseek-v4.1-flash",
           "default": true
         },
         {
           "id": "deepseek-v4-flash",
-          "canonical": "deepseek-v4-flash"
+          "canonical": "deepseek/deepseek-v4.1-flash"
         },
         {
           "id": "deepseek-v4-flash-vision-exp",
-          "canonical": "deepseek-v4-flash"
+          "canonical": "deepseek/deepseek-v4.1-flash"
         },
         {
           "id": "deepseek-v4-pro",
-          "canonical": "deepseek-v4-pro"
+          "canonical": "deepseek/deepseek-v4-pro-0813"
+        },
+        {
+          "id": "deepseek-v4-pro-0813",
+          "canonical": "deepseek/deepseek-v4-pro-0813"
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "canonical": "deepseek/deepseek-v4.1-flash"
         }
       ],
       "transport": "model-aware"
@@ -219,7 +246,7 @@
     {
       "id": "deepseek-anthropic",
       "family": "deepseek",
-      "label": "DeepSeek",
+      "label": "DeepSeek (Anthropic API)",
       "endpoint": "https://api.deepseek.com/anthropic",
       "wire": "anthropic-messages",
       "defaultModel": "deepseek-flash",
@@ -352,14 +379,29 @@
       ],
       "models": [
         {
-          "id": "muse-spark-1.1"
+          "id": "muse-spark-1.1",
+          "canonical": "meta/muse-spark-1.1"
         },
         {
           "id": "muse-spark-1.2",
+          "canonical": "meta/muse-spark-1.2",
           "default": true
         },
         {
-          "id": "muse-spark-1.2-contributor"
+          "id": "muse-spark-1.2-contributor",
+          "canonical": "meta/muse-spark-1.2"
+        },
+        {
+          "id": "muse-spark-1.3",
+          "canonical": "meta/muse-spark-1.3"
+        },
+        {
+          "id": "muse-spark-1.3-contributor",
+          "canonical": "meta/muse-spark-1.3"
+        },
+        {
+          "id": "muse-wonder-1.0",
+          "canonical": "meta/muse-wonder-1.0"
         }
       ],
       "transport": "chat-completions"
@@ -397,7 +439,7 @@
     {
       "id": "minimax-anthropic",
       "family": "minimax",
-      "label": "MiniMax",
+      "label": "MiniMax (Anthropic API)",
       "endpoint": "https://api.minimax.io/anthropic",
       "wire": "anthropic-messages",
       "defaultModel": "MiniMax-M3",
@@ -463,7 +505,7 @@
     {
       "id": "modelstudio-coding-plan",
       "family": "alibaba-modelstudio",
-      "label": "Alibaba Cloud Model Studio",
+      "label": "Alibaba Cloud Model Studio (Coding Plan)",
       "endpoint": "https://coding-intl.dashscope.aliyuncs.com/v1",
       "wire": "chat-completions",
       "defaultModel": "qwen3.8-max",
@@ -479,29 +521,25 @@
       ],
       "models": [
         {
-          "id": "deepseek-v4-flash-0731"
+          "id": "deepseek-v4-flash-0731",
+          "canonical": "deepseek/deepseek-v4-flash-0731"
         },
         {
-          "id": "deepseek-v4-pro"
+          "id": "deepseek-v4-pro",
+          "canonical": "deepseek/deepseek-v4-pro"
         },
         {
-          "id": "glm-5.2"
+          "id": "glm-5.2",
+          "canonical": "zhipuai/glm-5.2"
         },
         {
-          "id": "qwen3.6-flash"
-        },
-        {
-          "id": "qwen3.7-max"
-        },
-        {
-          "id": "qwen3.7-plus"
+          "id": "qwen3.7-plus",
+          "canonical": "alibaba/qwen3.7-plus"
         },
         {
           "id": "qwen3.8-max",
+          "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview"
         }
       ],
       "transport": "chat-completions"
@@ -509,7 +547,7 @@
     {
       "id": "modelstudio-coding-plan-anthropic",
       "family": "alibaba-modelstudio",
-      "label": "Alibaba Cloud Model Studio",
+      "label": "Alibaba Cloud Model Studio (Coding Plan, Anthropic API)",
       "endpoint": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
       "wire": "anthropic-messages",
       "defaultModel": "qwen3.8-max",
@@ -525,29 +563,25 @@
       ],
       "models": [
         {
-          "id": "deepseek-v4-flash-0731"
+          "id": "deepseek-v4-flash-0731",
+          "canonical": "deepseek/deepseek-v4-flash-0731"
         },
         {
-          "id": "deepseek-v4-pro"
+          "id": "deepseek-v4-pro",
+          "canonical": "deepseek/deepseek-v4-pro"
         },
         {
-          "id": "glm-5.2"
+          "id": "glm-5.2",
+          "canonical": "zhipuai/glm-5.2"
         },
         {
-          "id": "qwen3.6-flash"
-        },
-        {
-          "id": "qwen3.7-max"
-        },
-        {
-          "id": "qwen3.7-plus"
+          "id": "qwen3.7-plus",
+          "canonical": "alibaba/qwen3.7-plus"
         },
         {
           "id": "qwen3.8-max",
+          "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview"
         }
       ],
       "transport": "anthropic-messages"
@@ -571,29 +605,33 @@
       ],
       "models": [
         {
-          "id": "deepseek-v4-flash-0731"
+          "id": "deepseek-v4-flash-0731",
+          "canonical": "deepseek/deepseek-v4-flash-0731"
         },
         {
-          "id": "deepseek-v4-pro"
+          "id": "deepseek-v4-pro",
+          "canonical": "deepseek/deepseek-v4-pro"
         },
         {
-          "id": "glm-5.2"
+          "id": "glm-5.2",
+          "canonical": "zhipuai/glm-5.2"
         },
         {
-          "id": "qwen3.6-flash"
+          "id": "qwen3.6-flash",
+          "canonical": "alibaba/qwen3.6-flash"
         },
         {
-          "id": "qwen3.7-max"
+          "id": "qwen3.7-max",
+          "canonical": "alibaba/qwen3.7-max"
         },
         {
-          "id": "qwen3.7-plus"
+          "id": "qwen3.7-plus",
+          "canonical": "alibaba/qwen3.7-plus"
         },
         {
           "id": "qwen3.8-max",
+          "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview"
         }
       ],
       "transport": "chat-completions"
@@ -601,7 +639,7 @@
     {
       "id": "modelstudio-token-plan-anthropic",
       "family": "alibaba-modelstudio",
-      "label": "Alibaba Cloud Model Studio",
+      "label": "Alibaba Cloud Model Studio (Token Plan, Anthropic API)",
       "endpoint": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
       "wire": "anthropic-messages",
       "defaultModel": "qwen3.8-max",
@@ -617,29 +655,33 @@
       ],
       "models": [
         {
-          "id": "deepseek-v4-flash-0731"
+          "id": "deepseek-v4-flash-0731",
+          "canonical": "deepseek/deepseek-v4-flash-0731"
         },
         {
-          "id": "deepseek-v4-pro"
+          "id": "deepseek-v4-pro",
+          "canonical": "deepseek/deepseek-v4-pro"
         },
         {
-          "id": "glm-5.2"
+          "id": "glm-5.2",
+          "canonical": "zhipuai/glm-5.2"
         },
         {
-          "id": "qwen3.6-flash"
+          "id": "qwen3.6-flash",
+          "canonical": "alibaba/qwen3.6-flash"
         },
         {
-          "id": "qwen3.7-max"
+          "id": "qwen3.7-max",
+          "canonical": "alibaba/qwen3.7-max"
         },
         {
-          "id": "qwen3.7-plus"
+          "id": "qwen3.7-plus",
+          "canonical": "alibaba/qwen3.7-plus"
         },
         {
           "id": "qwen3.8-max",
+          "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview"
         }
       ],
       "transport": "anthropic-messages"
@@ -667,13 +709,16 @@
         },
         {
           "id": "kimi-k2.7-code",
+          "canonical": "moonshotai/kimi-k2.7-code",
           "default": true
         },
         {
-          "id": "kimi-k2.7-code-highspeed"
+          "id": "kimi-k2.7-code-highspeed",
+          "canonical": "moonshotai/kimi-k2.7-code"
         },
         {
-          "id": "kimi-k3"
+          "id": "kimi-k3",
+          "canonical": "moonshotai/kimi-k3"
         }
       ],
       "transport": "chat-completions"
@@ -696,12 +741,8 @@
       ],
       "models": [
         {
-          "id": "deepseek/deepseek-v4-flash",
-          "canonical": "deepseek-v4-flash"
-        },
-        {
           "id": "deepseek/deepseek-v4-pro",
-          "canonical": "deepseek-v4-pro",
+          "canonical": "deepseek/deepseek-v4-pro",
           "default": true
         }
       ],
@@ -791,16 +832,20 @@
         },
         {
           "id": "gpt-5.6",
+          "canonical": "openai/gpt-5.6-sol",
           "default": true
         },
         {
-          "id": "gpt-5.6-luna"
+          "id": "gpt-5.6-luna",
+          "canonical": "openai/gpt-5.6-luna"
         },
         {
-          "id": "gpt-5.6-sol"
+          "id": "gpt-5.6-sol",
+          "canonical": "openai/gpt-5.6-sol"
         },
         {
-          "id": "gpt-5.6-terra"
+          "id": "gpt-5.6-terra",
+          "canonical": "openai/gpt-5.6-terra"
         }
       ],
       "transport": "chat-completions"
@@ -898,42 +943,51 @@
       "models": [
         {
           "id": "deepseek/deepseek-v4-flash",
-          "canonical": "deepseek-v4-flash"
+          "canonical": "deepseek/deepseek-v4-flash"
         },
         {
           "id": "deepseek/deepseek-v4-pro",
-          "canonical": "deepseek-v4-pro",
+          "canonical": "deepseek/deepseek-v4-pro",
           "default": true
         },
         {
           "id": "dots-studio/dots-3-note-preview:free"
         },
         {
-          "id": "minimax/minimax-m3"
+          "id": "minimax/minimax-m3",
+          "canonical": "minimax/MiniMax-M3"
         },
         {
-          "id": "qwen/qwen3.6-35b-a3b"
+          "id": "qwen/qwen3.6-35b-a3b",
+          "canonical": "alibaba/qwen3.6-35b-a3b"
         },
         {
-          "id": "qwen/qwen3.6-flash"
+          "id": "qwen/qwen3.6-flash",
+          "canonical": "alibaba/qwen3.6-flash"
         },
         {
-          "id": "qwen/qwen3.6-plus"
+          "id": "qwen/qwen3.6-plus",
+          "canonical": "alibaba/qwen3.6-plus"
         },
         {
-          "id": "qwen/qwen3.7-plus"
+          "id": "qwen/qwen3.7-plus",
+          "canonical": "alibaba/qwen3.7-plus"
         },
         {
-          "id": "qwen/qwen3.8-flash"
+          "id": "qwen/qwen3.8-flash",
+          "canonical": "alibaba/qwen3.8-flash"
         },
         {
-          "id": "z-ai/glm-5.2"
+          "id": "z-ai/glm-5.2",
+          "canonical": "zhipuai/glm-5.2"
         },
         {
-          "id": "z-ai/glm-5.3"
+          "id": "z-ai/glm-5.3",
+          "canonical": "zhipuai/glm-5.3"
         },
         {
-          "id": "z-ai/glm-5.3-flash"
+          "id": "z-ai/glm-5.3-flash",
+          "canonical": "zhipuai/glm-5.3-flash"
         }
       ],
       "transport": "chat-completions"
@@ -1035,11 +1089,11 @@
       "models": [
         {
           "id": "deepseek-ai/DeepSeek-V4-Flash",
-          "canonical": "deepseek-v4-flash"
+          "canonical": "deepseek/deepseek-v4-flash"
         },
         {
           "id": "deepseek-ai/DeepSeek-V4-Pro",
-          "canonical": "deepseek-v4-pro",
+          "canonical": "deepseek/deepseek-v4-pro",
           "default": true
         }
       ],
@@ -1089,10 +1143,12 @@
         },
         {
           "id": "step-3.7-flash",
+          "canonical": "stepfun/step-3.7-flash",
           "default": true
         },
         {
-          "id": "step-5-preview"
+          "id": "step-5-preview",
+          "canonical": "stepfun/step-5-preview"
         }
       ],
       "transport": "chat-completions"
@@ -1227,14 +1283,17 @@
           "id": "grok-4.3"
         },
         {
-          "id": "grok-4.5"
+          "id": "grok-4.5",
+          "canonical": "xai/grok-4.5"
         },
         {
           "id": "grok-4.6",
+          "canonical": "xai/grok-4.6",
           "default": true
         },
         {
-          "id": "grok-4.7"
+          "id": "grok-4.7",
+          "canonical": "xai/grok-4.7"
         }
       ],
       "transport": "chat-completions"
@@ -1245,7 +1304,7 @@
       "label": "Xiaomi MiMo",
       "endpoint": "https://token-plan-sgp.xiaomimimo.com/v1",
       "wire": "chat-completions",
-      "defaultModel": "mimo-v2.5-pro",
+      "defaultModel": "mimo-v2.6-pro",
       "envVars": [
         "XIAOMI_MIMO_TOKEN_PLAN_API_KEY",
         "MIMO_TOKEN_PLAN_API_KEY",
@@ -1261,17 +1320,11 @@
       ],
       "models": [
         {
-          "id": "mimo-v2.5"
-        },
-        {
-          "id": "mimo-v2.5-pro",
-          "default": true
-        },
-        {
           "id": "mimo-v2.6-flash"
         },
         {
-          "id": "mimo-v2.6-pro"
+          "id": "mimo-v2.6-pro",
+          "default": true
         }
       ],
       "transport": "chat-completions"
@@ -1300,17 +1353,21 @@
           "id": "GLM-5-Turbo"
         },
         {
-          "id": "GLM-5.2"
+          "id": "GLM-5.2",
+          "canonical": "zhipuai/glm-5.2"
         },
         {
           "id": "GLM-5.3",
+          "canonical": "zhipuai/glm-5.3",
           "default": true
         },
         {
-          "id": "GLM-5.3-Flash"
+          "id": "GLM-5.3-Flash",
+          "canonical": "zhipuai/glm-5.3-flash"
         },
         {
-          "id": "glm-5.1"
+          "id": "glm-5.1",
+          "canonical": "zhipuai/glm-5.1"
         }
       ],
       "transport": "chat-completions"

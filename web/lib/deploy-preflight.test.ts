@@ -134,10 +134,8 @@ describe("web workflow deploy trigger contract", () => {
   const deploy = jobBlock(workflow, "deploy");
   const deployReminder = jobBlock(workflow, "deploy-reminder");
 
-  it("still runs lint on pushes and pull requests", () => {
-    expect(workflow).toContain("  push:\n    branches: [master, main]");
-    expect(workflow).toContain("  pull_request:\n    branches: [master, main]");
-    expect(workflow).toContain("  workflow_dispatch:");
+  it("runs lint only for manually requested final validation", () => {
+    expect(workflow).toMatch(/^on:\n  workflow_dispatch:\n\npermissions:/m);
     expect(jobBlock(workflow, "lint")).not.toContain("if:");
   });
 

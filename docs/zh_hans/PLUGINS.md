@@ -35,8 +35,10 @@ Codewhale 在插件上只帮忙，不推销。规则如下：
 - **内置插件从不作为推荐出现。** Computer Use 这类内置插件，
   只会出现在 `/plugin list` 和 Extensions 里。
 - **只认具体词。** 泛化词（accessibility、browser、chrome、docs、screenshot、
-  web、wiki 等）永远不触发推荐。匹配器和市场的 `check-marketplace.mjs`
-  共用同一份停用词表。
+  web、wiki 等）和 Codewhale 自己的词汇（agent、code、data、MCP、model、
+  session、tool）永远不触发推荐，所以问 MCP 服务器为什么卡住，不会冒出某个
+  厂商的插件。有辨识度的名称、短语和域名照常匹配。匹配器和市场的
+  `check-marketplace.mjs` 共用同一份停用词表。
 - **只推荐本机跑得起来的。** 插件的 `when.os` 若排除了当前操作系统，就不会被推荐。
 - **给出真正的下一步。** 模型请求的那一行会按插件的实际需要写成 Install、
   Review trust 或 Enable。只有那个按钮可点，它打开的是 `/plugin show <name>`；

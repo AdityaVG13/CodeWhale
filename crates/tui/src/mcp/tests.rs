@@ -3633,8 +3633,8 @@ async fn reload_if_config_changed_skips_when_content_unchanged() {
 
 /// #1267 part 2: when the on-disk config changes content, the next
 /// `reload_if_config_changed` call must swap in the new config and
-/// (would) drop all live connections. We can't stand up a real
-/// `McpConnection` in a unit test, so we observe the swap via the
+/// (would) drop the live connections of changed servers. We can't stand up
+/// a real `McpConnection` in a unit test, so we observe the swap via the
 /// publicly-readable side: server names go from empty to non-empty.
 #[tokio::test]
 async fn reload_if_config_changed_swaps_config_on_content_change() {
@@ -6484,7 +6484,7 @@ async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without
     assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 1);
     assert!(!success_seen.load(AtomicOrdering::SeqCst));
 
-    // The dead connection was dropped, so the next call reconnects.
+    // The dead connection was kept as a dead entry, so the next call reconnects.
     let result = pool
         .call_tool("mcp_dephy_search", serde_json::json!({ "query": "dephy" }))
         .await
@@ -6988,10 +6988,10 @@ fn mcp_recovery_kind_routes_expired_aws_credentials_to_external_login() {
     // Unrelated text that merely shares substrings stays where it was.
     for (stderr, expected) in [
         ("processor token invalid", McpRecoveryKind::Diagnose),
-        ("401 Unauthorized", McpRecoveryKind::Reauth),
+        ("401 Unauthorized", McpRecoveryKind::Diagnose),
         (
             "oauth token expired; invalid_grant",
-            McpRecoveryKind::Reauth,
+            McpRecoveryKind::Diagnose,
         ),
         (
             "laws of token expiry were expired",
@@ -7863,7 +7863,7 @@ async fn needs_auth_server_advertises_synthetic_authenticate_tool() {
     assert!(wiki.auth_required, "{wiki:?}");
     assert!(!wiki.connected);
     let recovery = wiki
-        .recovery_kind(false)
+        .recovery_kind(true)
         .expect("a server needing auth has a recovery");
     assert_eq!(recovery, McpRecoveryKind::Reauth);
     assert_eq!(
@@ -8439,7 +8439,7 @@ async fn mid_session_revocation_for_backend(backend: McpBackend) {
         .expect("wikiserver in snapshot");
     assert!(wiki.auth_required, "{wiki:?}");
     assert!(!wiki.connected);
-    assert_eq!(wiki.recovery_kind(false), Some(McpRecoveryKind::Reauth));
+    assert_eq!(wiki.recovery_kind(true), Some(McpRecoveryKind::Reauth));
 
     assert_eq!(
         mock.frames

@@ -553,7 +553,7 @@ const SUBAGENT_CHECKPOINT_MESSAGE_BUDGET_BYTES: usize = 256 * 1024;
 /// keeps a bounded tail plus the true `message_count` so inspection stays
 /// useful without pinning a whole unbounded transcript in RAM.
 const SUBAGENT_TRANSCRIPT_MESSAGE_BUDGET_BYTES: usize = 1024 * 1024;
-const SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 const SUBAGENT_TRANSCRIPT_ARTIFACT_DIR: &str = "subagent-transcripts";
 const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
@@ -1029,6 +1029,8 @@ pub struct AgentWorkerRecord {
     /// session-addressable without being guessed into a later conversation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_origin_turn_id: Option<String>,
     #[serde(default = "default_subagent_actor_kind")]
     pub actor_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1152,6 +1154,7 @@ impl AgentWorkerRecord {
             parent_run_id: spec.parent_run_id.clone(),
             spec,
             owner_session_id,
+            runtime_origin_turn_id: None,
             actor_kind: default_subagent_actor_kind(),
             follow_up,
             takeover,
@@ -2407,6 +2410,55 @@ impl SubAgentCompletion {
         })
     }
 }
+#[derive(Default)]
+pub(crate) struct TerminalEventDelivery {
+    pending: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicBool,
+    settled: tokio::sync::Notify,
+}
+
+impl TerminalEventDelivery {
+    pub(crate) fn mark_failed(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn wait(&self) -> Result<()> {
+        loop {
+            let settled = self.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if self.pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                break;
+            }
+            settled.await;
+        }
+        anyhow::ensure!(
+            !self.failed.load(std::sync::atomic::Ordering::Acquire),
+            "a background worker lifecycle event could not reach its receiver or durable journal"
+        );
+        Ok(())
+    }
+}
+
+struct PendingTerminalEvent {
+    owner: Arc<TerminalEventDelivery>,
+    delivered: bool,
+}
+
+impl Drop for PendingTerminalEvent {
+    fn drop(&mut self) {
+        if !self.delivered {
+            self.owner
+                .failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.owner
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.owner.settled.notify_waiters();
+    }
+}
 
 /// Live-only sinks needed to publish one terminal child outcome.
 ///
@@ -2422,6 +2474,7 @@ struct SubAgentTerminalDeliveryContext {
     parent_completion_tx: Option<mpsc::Sender<SubAgentCompletion>>,
     mailbox: Option<Mailbox>,
     event_tx: Option<mpsc::Sender<Event>>,
+    event_delivery: Option<Arc<TerminalEventDelivery>>,
     /// Shared session namespace (root session id), cloned down the spawn
     /// tree; over-budget final reports are spilled under it so the truncation
     /// footer can name a retrievable artifact.
@@ -2435,6 +2488,10 @@ impl SubAgentTerminalDeliveryContext {
             parent_completion_tx: runtime.parent_completion_tx.clone(),
             mailbox: runtime.mailbox.clone(),
             event_tx: runtime.event_tx.clone(),
+            event_delivery: runtime
+                .execution_limits
+                .as_ref()
+                .map(|limits| limits.terminal_events.clone()),
             session_id: runtime.context.state_namespace.clone(),
         }
     }
@@ -2465,7 +2522,7 @@ impl SubAgentTerminalDeliveryContext {
         }
 
         if let Some(event_tx) = self.event_tx.as_ref() {
-            send_terminal_event(
+            send_terminal_event_with_delivery(
                 event_tx,
                 Event::AgentComplete {
                     owner_session_id: self.session_id.clone(),
@@ -2478,6 +2535,7 @@ impl SubAgentTerminalDeliveryContext {
                     usage: result.usage.clone(),
                     display_name: Some(subagent_result_display_name(result)),
                 },
+                self.event_delivery.as_ref(),
             );
         }
     }
@@ -2494,20 +2552,53 @@ impl SubAgentTerminalDeliveryContext {
 /// lossy: delivered late it could land after the completion and resurrect a
 /// Running row, while a lost one is recovered by the completion itself.
 pub(crate) fn send_terminal_event<T: Send + 'static>(event_tx: &mpsc::Sender<T>, event: T) {
+    send_terminal_event_with_delivery(event_tx, event, None);
+}
+
+fn send_terminal_event_with_delivery<T: Send + 'static>(
+    event_tx: &mpsc::Sender<T>,
+    event: T,
+    delivery: Option<&Arc<TerminalEventDelivery>>,
+) {
     let event = match event_tx.try_send(event) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+        Ok(()) => return,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            if let Some(delivery) = delivery {
+                delivery
+                    .failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            return;
+        }
         Err(mpsc::error::TrySendError::Full(event)) => event,
     };
+    let pending = delivery.map(|owner| {
+        owner
+            .pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        PendingTerminalEvent {
+            owner: owner.clone(),
+            delivered: false,
+        }
+    });
     let tx = event_tx.clone();
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(async move {
-                let _ = tx.send(event).await;
+                let mut pending = pending;
+                let delivered = tx.send(event).await.is_ok();
+                if let Some(pending) = pending.as_mut() {
+                    pending.delivered = delivered;
+                }
             });
         }
         Err(_) => {
             std::thread::spawn(move || {
-                let _ = tx.blocking_send(event);
+                let mut pending = pending;
+                let delivered = tx.blocking_send(event).is_ok();
+                if let Some(pending) = pending.as_mut() {
+                    pending.delivered = delivered;
+                }
             });
         }
     }
@@ -2545,13 +2636,15 @@ fn terminal_mailbox_message(result: &SubAgentResult, report_ref: Option<&str>) -
     }
 }
 
-/// Parent transcript snapshot available to sub-agents that opt into context
-/// forking. Leading messages may be inherited as context, but every child
-/// keeps its own resolved system prompt so parent-specific model identity or
-/// role text cannot override the worker's actual route and instructions.
+/// Parent transcript snapshot for opted-in context forks. Cold forks keep
+/// their resolved top-level prompt; guarded same-route inheritance may reuse
+/// the parent header. Resolved role, task and skill instructions remain in
+/// the later system-role fork context. Client routing and child authority are
+/// enforced independently of prompt text.
 #[derive(Clone, Debug)]
 pub struct SubAgentForkContext {
     pub messages: Vec<Message>,
+    pub live_header: crate::prompt_zones::SharedLiveHeader<crate::route_receipt::TurnRouteReceipt>,
     /// Stable, To-do-free parent state captured once at turn start. History
     /// semantics stay exactly as they were: this text is not re-derived per
     /// spawn.
@@ -2591,6 +2684,7 @@ impl SubAgentForkContext {
 
         Self {
             messages: self.messages.clone(),
+            live_header: Arc::clone(&self.live_header),
             structured_state_block,
             work_source: self.work_source.clone(),
         }
@@ -2800,6 +2894,63 @@ impl Drop for ForegroundChildRegistration {
 }
 
 #[derive(Clone)]
+pub(crate) struct SubAgentExecutionLimits {
+    pub max_admitted: usize,
+    pub heartbeat_timeout: Duration,
+    pub default_max_steps: Option<u32>,
+    pub default_wall_time: Option<Duration>,
+    pub launch_gate: Arc<governor::DynamicGate>,
+    pub terminal_events: Arc<TerminalEventDelivery>,
+    pub admission: CancellationToken,
+}
+
+impl SubAgentExecutionLimits {
+    pub(crate) fn new(
+        max_agents: usize,
+        max_admitted: usize,
+        heartbeat_timeout: Duration,
+        launch_concurrency: usize,
+        default_max_steps: Option<u32>,
+        default_wall_time: Option<Duration>,
+    ) -> Self {
+        let max_agents = max_agents.clamp(1, MAX_SUBAGENTS);
+        Self {
+            max_admitted: max_admitted.clamp(max_agents, crate::config::MAX_SUBAGENT_ADMISSION),
+            heartbeat_timeout: if heartbeat_timeout.is_zero() {
+                Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS)
+            } else {
+                heartbeat_timeout
+            },
+            default_max_steps,
+            default_wall_time,
+            launch_gate: Arc::new(governor::DynamicGate::new(
+                launch_concurrency.clamp(1, max_agents),
+            )),
+            terminal_events: Arc::new(TerminalEventDelivery::default()),
+            admission: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        max_agents: usize,
+        max_admitted: usize,
+        heartbeat_timeout: Duration,
+        launch_concurrency: usize,
+    ) {
+        let max_agents = max_agents.clamp(1, MAX_SUBAGENTS);
+        self.max_admitted = max_admitted.clamp(max_agents, crate::config::MAX_SUBAGENT_ADMISSION);
+        self.heartbeat_timeout = if heartbeat_timeout.is_zero() {
+            Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS)
+        } else {
+            heartbeat_timeout
+        };
+        self.launch_gate
+            .set_capacity(launch_concurrency.clamp(1, max_agents));
+    }
+}
+
+#[derive(Clone)]
 pub struct SubAgentRuntime {
     pub client: CodewhaleClient,
     /// Session `Config` snapshot, used for role-model defaults,
@@ -2853,6 +3004,7 @@ pub struct SubAgentRuntime {
     /// Manager handle so children can recurse via `agent`. All agents
     /// at every depth share the same manager.
     pub manager: SharedSubAgentManager,
+    pub(crate) execution_limits: Option<SubAgentExecutionLimits>,
     /// Depth in the spawn tree. 0 = top-level user turn; 1 = direct child;
     /// etc. Children clone the parent runtime and increment this on spawn.
     pub spawn_depth: u32,
@@ -2999,6 +3151,7 @@ impl SubAgentRuntime {
             worker_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
             event_tx,
             manager,
+            execution_limits: None,
             spawn_depth: 0,
             parent_agent_id: None,
             max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
@@ -3236,6 +3389,12 @@ impl SubAgentRuntime {
         self
     }
 
+    #[must_use]
+    pub(crate) fn with_execution_limits(mut self, limits: Option<SubAgentExecutionLimits>) -> Self {
+        self.execution_limits = limits;
+        self
+    }
+
     /// Preserve whether the parent session is using per-turn model routing.
     #[must_use]
     pub fn with_auto_model(mut self, auto_model: bool) -> Self {
@@ -3325,6 +3484,7 @@ impl SubAgentRuntime {
             worker_profile: self.worker_profile.clone(),
             event_tx: self.event_tx.clone(),
             manager: self.manager.clone(),
+            execution_limits: self.execution_limits.clone(),
             spawn_depth: self.spawn_depth.saturating_add(1),
             parent_agent_id: self.parent_agent_id.clone(),
             max_spawn_depth: self
@@ -3336,7 +3496,16 @@ impl SubAgentRuntime {
             runtime_usage_lease: self.runtime_usage_lease.clone(),
             accounting_origin: self.accounting_origin.clone(),
             parent_completion_tx: self.parent_completion_tx.clone(),
-            fork_context: self.fork_context.clone(),
+            fork_context: self.fork_context.as_ref().map(|context| {
+                let mut context = context.clone();
+                let snapshot = context
+                    .live_header
+                    .lock()
+                    .ok()
+                    .and_then(|cell| cell.clone());
+                context.live_header = Arc::new(std::sync::Mutex::new(snapshot));
+                context
+            }),
             mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
             api_timeout_retry_base_backoff: self.api_timeout_retry_base_backoff,
@@ -3514,6 +3683,7 @@ pub struct SubAgent {
     pub needs_input: Option<SubAgentNeedsInput>,
     pub started_at: Instant,
     pub last_activity_at: Instant,
+    heartbeat_timeout: Option<Duration>,
     /// `None` = full registry inheritance, with approval-gated tools still
     /// blocked unless the parent runtime is auto-approved.
     /// `Some(list)` = explicit narrow allowlist (Custom agents, legacy).
@@ -3544,7 +3714,7 @@ pub struct SubAgent {
     requested_stop: Option<(SubAgentStatus, Option<String>)>,
     // An unresolved forced-stop retains the exact existing capacity/barrier
     // guards until owner teardown; it cannot be replayed as completed work.
-    unsettled_launch: Option<governor::DynamicGatePermit>,
+    unsettled_launch: Option<Vec<governor::DynamicGatePermit>>,
     unsettled_foreground: Option<ForegroundChildRegistration>,
 }
 
@@ -3583,6 +3753,7 @@ impl SubAgent {
             needs_input: None,
             started_at,
             last_activity_at: started_at,
+            heartbeat_timeout: None,
             allowed_tools,
             session_boot_id,
             owner_session_id: String::new(),
@@ -3661,7 +3832,7 @@ pub const COORDINATION_LOCK_TIMEOUT_MARKER: &str =
     "timed out acquiring delegated coordination lock";
 
 impl CoordinationProcessLock {
-    fn acquire(state_root: &Path) -> Result<Self> {
+    fn acquire(state_root: &Path, exclusive: bool) -> Result<Self> {
         let requested_root = normalize_subagent_workspace(state_root);
         let lock_dir = requested_root.join(".codewhale").join("state");
         // Refuse a linked `.codewhale` or `state` before creating anything:
@@ -3701,22 +3872,22 @@ impl CoordinationProcessLock {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let thread = std::thread::spawn(move || {
-            let lock = fd_lock::RwLock::new(lock_file);
-            // Changed from try_write (exclusive) to try_read (shared) so two
-            // sessions in the same state root can coexist without a sticky
-            // error — job rows still settle via atomic rename + sequence guard.
-            // Matches user intent: "no reason to have a lock like that".
-            match lock.try_read() {
-                Ok(guard) => {
-                    // Shared lock: multiple sessions coexist, no pid stamping needed.
-                    // The exclusive pid dance was for telling same-process handover
-                    // from foreign owner — with shared locks every holder is equal
-                    // and job rows settle via atomic rename, so we just hold the
-                    // shared flock for the session lifetime.
-                    let _guard = guard;
+            let mut lock = fd_lock::RwLock::new(lock_file);
+            let acquired = if exclusive {
+                lock.try_write().map(|guard| {
                     let _ = ready_tx.send(Ok::<(), String>(()));
+                    let _guard = guard;
                     let _ = release_rx.recv();
-                }
+                })
+            } else {
+                lock.try_read().map(|guard| {
+                    let _ = ready_tx.send(Ok::<(), String>(()));
+                    let _guard = guard;
+                    let _ = release_rx.recv();
+                })
+            };
+            match acquired {
+                Ok(()) => {}
                 Err(error) => {
                     let _ = ready_tx.send(Err(error.to_string()));
                 }
@@ -3810,8 +3981,10 @@ pub struct SubAgentManager {
     /// isolate it without changing child execution cwd or file authority.
     state_root: PathBuf,
     state_path: Option<PathBuf>,
-    coordination_process_lock: std::sync::Mutex<Option<CoordinationProcessLock>>,
+    coordination_process_lock: std::sync::Mutex<Option<Arc<CoordinationProcessLock>>>,
     coordination_process_lock_required: bool,
+    coordination_exclusive: bool,
+    workspace_writer_locks: HashMap<PathBuf, Arc<CoordinationProcessLock>>,
     /// Configured default per-child model-turn budget (`[subagents]
     /// default_max_steps`, #5324). `None` keeps the unbounded Fleet default;
     /// an explicit spawn `max_steps` still wins. Zero means unbounded.
@@ -4323,6 +4496,8 @@ impl SubAgentManager {
             state_path: None,
             coordination_process_lock: std::sync::Mutex::new(None),
             coordination_process_lock_required: false,
+            coordination_exclusive: false,
+            workspace_writer_locks: HashMap::new(),
             max_steps: None,
             wall_time: None,
             max_agents,
@@ -4387,6 +4562,16 @@ impl SubAgentManager {
         return Err("coordination workspace identity is unsupported on this platform".into());
         #[cfg(any(unix, windows))]
         {
+            if self.coordination_exclusive
+                && normalize_subagent_workspace(&lexical)
+                    != normalize_subagent_workspace(&self.state_root)
+                && !self.workspace_writer_locks.contains_key(&canonical_root)
+            {
+                let lock = CoordinationProcessLock::acquire(&lexical, true)
+                    .map_err(|error| error.to_string())?;
+                self.workspace_writer_locks
+                    .insert(canonical_root.clone(), Arc::new(lock));
+            }
             let receipt = CoordinationClaimScope {
                 canonical_root,
                 platform: platform.into(),
@@ -5439,9 +5624,7 @@ impl SubAgentManager {
     ///
     /// The same single predicate as claim admission (#5562): an agent restored
     /// `Running` from a prior session (crash leftover) and an owner whose agent
-    /// record is not loaded are both non-live — the per-workspace coordination
-    /// process lock means no other process is writing concurrently, so there is
-    /// no live peer to fail closed against.
+    /// record is not loaded are both non-live.
     ///
     /// Worktree-isolated peers are excluded too: they write into their own
     /// checkout and can never contend for these paths.
@@ -5480,7 +5663,9 @@ impl SubAgentManager {
             .coordination_process_lock
             .get_mut()
             .expect("coordination lock slot poisoned") =
-            CoordinationProcessLock::acquire(&self.state_root).ok();
+            CoordinationProcessLock::acquire(&self.state_root, self.coordination_exclusive)
+                .ok()
+                .map(Arc::new);
         self
     }
 
@@ -5499,9 +5684,9 @@ impl SubAgentManager {
         if slot.is_some() {
             return Ok(());
         }
-        match CoordinationProcessLock::acquire(&self.state_root) {
+        match CoordinationProcessLock::acquire(&self.state_root, self.coordination_exclusive) {
             Ok(lock) => {
-                *slot = Some(lock);
+                *slot = Some(Arc::new(lock));
                 Ok(())
             }
             Err(error) => Err(error.to_string()),
@@ -5648,9 +5833,18 @@ impl SubAgentManager {
             return Ok(std::thread::spawn(|| {}));
         };
         let state_root = self.state_root.clone();
+        let writer_locks = self
+            .coordination_process_lock
+            .lock()
+            .expect("coordination lock slot poisoned")
+            .iter()
+            .cloned()
+            .chain(self.workspace_writer_locks.values().cloned())
+            .collect::<Vec<_>>();
         // Spawn disk I/O off the write-lock hot path.  `payload` is fully
         // owned (cloned from `self.agents`) so it is `Send` and safe to move.
         let handle = std::thread::spawn(move || {
+            let _writer_locks = writer_locks;
             if let Err(err) = write_json_atomic(&state_root, &path, &payload) {
                 tracing::warn!(target: "subagent", ?err, "failed to persist sub-agent state");
             }
@@ -5845,6 +6039,7 @@ impl SubAgentManager {
                 needs_input: persisted.needs_input,
                 started_at,
                 last_activity_at: started_at,
+                heartbeat_timeout: None,
                 allowed_tools,
                 // Empty string when loading pre-#405 records; the
                 // manager treats that the same as a non-matching id —
@@ -6065,6 +6260,21 @@ impl SubAgentManager {
         owner_session_id: &str,
         precomputed_evidence: Option<DeliveryEvidence>,
     ) {
+        self.register_worker_for_session_with_origin(
+            spec,
+            owner_session_id,
+            precomputed_evidence,
+            None,
+        );
+    }
+
+    pub(crate) fn register_worker_for_session_with_origin(
+        &mut self,
+        spec: AgentWorkerSpec,
+        owner_session_id: &str,
+        precomputed_evidence: Option<DeliveryEvidence>,
+        runtime_origin_turn_id: Option<String>,
+    ) {
         let worker_id = spec.worker_id.clone();
         let now_ms = epoch_millis_now();
         let mut record = AgentWorkerRecord::new_for_session(
@@ -6073,6 +6283,7 @@ impl SubAgentManager {
             owner_session_id.to_string(),
             precomputed_evidence,
         );
+        record.runtime_origin_turn_id = runtime_origin_turn_id;
         self.push_worker_event(
             &mut record,
             AgentWorkerStatus::Starting,
@@ -8393,7 +8604,10 @@ impl SubAgentManager {
         agent.status == SubAgentStatus::Running
             && agent.task_handle.is_some()
             && agent.requested_stop.is_none()
-            && agent.last_activity_at.elapsed() >= self.running_heartbeat_timeout
+            && agent.last_activity_at.elapsed()
+                >= agent
+                    .heartbeat_timeout
+                    .unwrap_or(self.running_heartbeat_timeout)
     }
 
     pub fn touch(&mut self, agent_id: &str) -> bool {
@@ -8428,6 +8642,13 @@ impl SubAgentManager {
         options: SubAgentSpawnOptions,
         precomputed_delivery_evidence: Option<DeliveryEvidence>,
     ) -> Result<SubAgentResult> {
+        if runtime
+            .execution_limits
+            .as_ref()
+            .is_some_and(|limits| limits.admission.is_cancelled())
+        {
+            return Err(anyhow!("Runtime worker admission is closed"));
+        }
         let mut origin = match options.origin.as_ref() {
             Some(origin) => origin.clone(),
             None => self
@@ -8469,6 +8690,16 @@ impl SubAgentManager {
         self.cleanup(COMPLETED_AGENT_RETENTION);
 
         self.check_admission_capacity()?;
+        if let Some(limits) = runtime.execution_limits.as_ref() {
+            let admitted = self.live_count_for_session(&runtime.context.state_namespace);
+            if admitted >= limits.max_admitted {
+                return Err(anyhow!(
+                    "Sub-agent route admission limit reached (max_admitted {}, admitted {}). Wait for queued/running agents to finish or cancel unneeded agents.",
+                    limits.max_admitted,
+                    admitted
+                ));
+            }
+        }
         runtime.max_spawn_depth = runtime
             .max_spawn_depth
             .min(runtime.worker_profile.max_spawn_depth);
@@ -8501,7 +8732,14 @@ impl SubAgentManager {
             narrow_optional_limit(runtime.max_output_tokens, options.max_output_tokens);
         let mut max_steps = narrow_model_steps(
             runtime.worker_profile.max_steps,
-            resolve_max_steps(agent_type.clone(), options.max_steps, self.max_steps),
+            resolve_max_steps(
+                agent_type.clone(),
+                options.max_steps,
+                runtime
+                    .execution_limits
+                    .as_ref()
+                    .map_or(self.max_steps, |limits| limits.default_max_steps),
+            ),
         );
         if let Some(source) = options
             .resume_from_agent_id
@@ -8537,10 +8775,14 @@ impl SubAgentManager {
         // `wall_time_secs` may raise it up to MAX_CHILD_WALL_TIME. An operator
         // `[subagents] default_wall_time_secs` stays a ceiling, and inherited
         // profiles and deadlines still only narrow.
+        let default_wall_time = runtime
+            .execution_limits
+            .as_ref()
+            .map_or(self.wall_time, |limits| limits.default_wall_time);
         let wall_time = options
             .wall_time
-            .unwrap_or_else(|| self.wall_time.unwrap_or(DEFAULT_CHILD_WALL_TIME))
-            .min(self.wall_time.unwrap_or(MAX_CHILD_WALL_TIME))
+            .unwrap_or_else(|| default_wall_time.unwrap_or(DEFAULT_CHILD_WALL_TIME))
+            .min(default_wall_time.unwrap_or(MAX_CHILD_WALL_TIME))
             .min(
                 runtime
                     .worker_profile
@@ -8639,6 +8881,7 @@ impl SubAgentManager {
             // live holder, so a reused name never resolves ambiguously.
             if let Some(existing) = self.agents.values().find(|existing| {
                 existing.session_name == name
+                    && self.agent_is_owned_by_session(existing, &runtime.context.state_namespace)
                     && !self.is_from_prior_session(existing)
                     && !subagent_status_is_settled(&existing.status)
             }) {
@@ -8733,7 +8976,18 @@ impl SubAgentManager {
                 ));
             }
         }
+        let runtime_origin_turn_id = if runtime.context.runtime.active_thread_id.as_deref()
+            == Some(runtime.context.state_namespace.as_str())
+        {
+            runtime
+                .runtime_usage_lease
+                .as_ref()
+                .map(|lease| lease.owner().to_string())
+        } else {
+            None
+        };
         let durable_registration = write_capable
+            || runtime_origin_turn_id.is_some()
             || continuation_from.is_some()
             || origin
                 .selected_workspace
@@ -8918,12 +9172,17 @@ impl SubAgentManager {
                 }
             };
         agent.owner_session_id = runtime.context.state_namespace.clone();
+        agent.heartbeat_timeout = runtime
+            .execution_limits
+            .as_ref()
+            .map(|limits| limits.heartbeat_timeout);
         agent.stop_token = Some(runtime.cancel_token.clone());
         agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
-        self.register_worker_for_session(
+        self.register_worker_for_session_with_origin(
             worker_spec,
             &runtime.context.state_namespace,
             precomputed_delivery_evidence,
+            runtime_origin_turn_id,
         );
         self.install_worker_origin(&agent_id, origin);
 
@@ -9315,7 +9574,11 @@ impl SubAgentManager {
             let millis =
                 |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
             snap.idle_ms = Some(millis(agent.last_activity_at.elapsed()));
-            snap.heartbeat_timeout_ms = Some(millis(self.running_heartbeat_timeout));
+            snap.heartbeat_timeout_ms = Some(millis(
+                agent
+                    .heartbeat_timeout
+                    .unwrap_or(self.running_heartbeat_timeout),
+            ));
         }
         if let Some(record) = self.worker_records.get(&agent.id) {
             snap.usage = Some(record.usage.clone());
@@ -9502,11 +9765,17 @@ impl SubAgentManager {
                 agent.status == SubAgentStatus::Running
                     && !agent.completion_claimed
                     && agent.requested_stop.is_none()
-                    && agent.last_activity_at.elapsed() >= timeout
+                    && agent.last_activity_at.elapsed()
+                        >= agent.heartbeat_timeout.unwrap_or(timeout)
             })
             .map(|agent| agent.id.clone())
             .collect::<Vec<_>>();
         for agent_id in stale_agent_ids {
+            let timeout = self
+                .agents
+                .get(&agent_id)
+                .and_then(|agent| agent.heartbeat_timeout)
+                .unwrap_or(timeout);
             let orphan = self
                 .agents
                 .get(&agent_id)
@@ -10247,6 +10516,7 @@ struct SubAgentTranscriptArtifactWriter {
     persisted_messages: usize,
     /// Prefix of the current live history already in the artifact.
     synced_live_messages: usize,
+    last_system_prompt: Option<SystemPrompt>,
 }
 
 impl SubAgentTranscriptArtifactWriter {
@@ -10271,6 +10541,7 @@ impl SubAgentTranscriptArtifactWriter {
             relative_path,
             persisted_messages: 0,
             synced_live_messages: 0,
+            last_system_prompt: None,
         })
     }
 
@@ -10381,8 +10652,10 @@ pub fn load_subagent_transcript_artifact(
         .ok_or_else(|| anyhow!("sub-agent transcript artifact is empty"))?;
     let header: Value = serde_json::from_str(header_line)?;
     if header.get("kind").and_then(Value::as_str) != Some("subagent_transcript_header")
-        || header.get("schema_version").and_then(Value::as_u64)
-            != Some(u64::from(SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION))
+        || !matches!(
+            header.get("schema_version").and_then(Value::as_u64),
+            Some(1 | 2)
+        )
         || header.get("agent_id").and_then(Value::as_str) != Some(agent_id)
     {
         return Err(anyhow!(
@@ -10393,6 +10666,24 @@ pub fn load_subagent_transcript_artifact(
     let mut messages = Vec::new();
     for line in lines.filter(|line| !line.trim().is_empty()) {
         let record: Value = serde_json::from_str(line)?;
+        if record.get("kind").and_then(Value::as_str) == Some("system_prompt") {
+            anyhow::ensure!(
+                header.get("schema_version").and_then(Value::as_u64) == Some(2),
+                "system prompt record requires transcript schema 2"
+            );
+            anyhow::ensure!(
+                record.get("at_message_index").and_then(Value::as_u64)
+                    == Some(messages.len() as u64),
+                "system prompt record has an invalid message boundary"
+            );
+            let _: SystemPrompt = serde_json::from_value(
+                record
+                    .get("system_prompt")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("system prompt record has no prompt"))?,
+            )?;
+            continue;
+        }
         if record.get("kind").and_then(Value::as_str) != Some("message") {
             return Err(anyhow!("unknown sub-agent transcript artifact record"));
         }
@@ -10949,6 +11240,17 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
     )
 }
 
+#[must_use]
+pub(crate) fn new_shared_worker_authority(workspace: PathBuf) -> SharedSubAgentManager {
+    new_shared_subagent_manager_with_timeout(
+        workspace,
+        MAX_SUBAGENTS,
+        MAX_SUBAGENTS,
+        Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
+        MAX_SUBAGENTS,
+    )
+}
+
 /// Create a shared sub-agent manager with configurable concurrency and stale
 /// running-agent heartbeat timeout.
 #[must_use]
@@ -10970,6 +11272,44 @@ pub fn new_shared_subagent_manager_with_timeout(
         None,
         None,
     )
+}
+
+pub(crate) fn new_shared_runtime_subagent_manager(
+    workspace: PathBuf,
+    workers: usize,
+) -> Result<SharedSubAgentManager> {
+    type RuntimeManagerRegistry =
+        parking_lot::Mutex<HashMap<PathBuf, (usize, std::sync::Weak<RwLock<SubAgentManager>>)>>;
+    static MANAGERS: std::sync::OnceLock<RuntimeManagerRegistry> = std::sync::OnceLock::new();
+    let workers = workers.clamp(1, MAX_SUBAGENTS);
+    let state_path = default_state_path(&workspace)?;
+    let key = checked_subagent_state_path(&workspace, &state_path)?;
+    let mut managers = MANAGERS
+        .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+        .lock();
+    managers.retain(|_, (_, manager)| manager.strong_count() > 0);
+    if let Some((capacity, manager)) = managers.get(&key)
+        && let Some(manager) = manager.upgrade()
+    {
+        anyhow::ensure!(
+            *capacity == workers,
+            "Runtime worker authority already has aggregate capacity {capacity}; requested {workers}. Attach to its owner or stop it before changing workers."
+        );
+        return Ok(manager);
+    }
+    let mut manager = SubAgentManager::new(workspace.clone(), workers)
+        .with_admission_limit(workers)
+        .with_launch_concurrency(workers)
+        .with_state_path(state_path);
+    manager.coordination_exclusive = true;
+    manager = manager.require_coordination_process_lock();
+    manager
+        .ensure_coordination_process_lock()
+        .map_err(anyhow::Error::msg)?;
+    manager.load_state()?;
+    let manager = Arc::new(RwLock::new(manager));
+    managers.insert(key, (workers, Arc::downgrade(&manager)));
+    Ok(manager)
 }
 
 /// Create a shared sub-agent manager with an explicit control-plane state root.
@@ -11023,8 +11363,8 @@ pub fn new_shared_subagent_manager_with_state_root_and_timeout(
     // empty ledger that would be written straight over the real one the
     // moment the first session exited and the flock became acquirable
     // (owner report, 2026-08-04). Read unconditionally; the write gate on
-    // `persist_state`/`persist_state_synchronously` is what keeps the file
-    // single-writer.
+    // `persist_state`/`persist_state_synchronously` still checks this
+    // manager's coordinator admission before publishing.
     if let Err(err) = manager.load_state() {
         // Routed through tracing instead of stderr — see comment in
         // `persist_state_best_effort` above.
@@ -12610,6 +12950,9 @@ async fn spawn_subagent_from_input(
         .unwrap_or(checkpoint_messages);
         let resume_ctx = SubAgentForkContext {
             messages,
+            // Resume forks a settled agent: nothing is live in the
+            // provider cache, so inheritance stays off by construction.
+            live_header: crate::prompt_zones::new_live_header_cell(),
             structured_state_block: None,
             work_source: None,
         };
@@ -13218,9 +13561,9 @@ fn subagent_skill_catalog(context: &ToolContext) -> String {
 }
 
 fn subagent_request_system_prompt(subagent_system_prompt: &str) -> SystemPrompt {
-    // Forking inherits conversation context, not the parent's identity. A
-    // child can have a different provider/model/profile, so its own resolved
-    // role prompt must stay at system precedence.
+    // Cold or different-route forks keep their own resolved role prompt.
+    // Exact-route cache inheritance is admitted later by the common Engine;
+    // the role/task framing remains recorded in the fork history.
     SystemPrompt::Text(subagent_system_prompt.to_string())
 }
 
@@ -13237,22 +13580,24 @@ fn build_initial_subagent_messages(
         assignment,
         agent_type,
         &system_prompt,
-        fork_context,
+        fork_context.cloned(),
     )
 }
+
+pub(crate) const SUBAGENT_CONTEXT_OPEN: &str = "<codewhale:subagent_context>";
 
 fn build_initial_subagent_messages_with_system(
     prompt: &str,
     assignment: &SubAgentAssignment,
     agent_type: &FleetRole,
     subagent_system_prompt: &str,
-    fork_context: Option<&SubAgentForkContext>,
+    fork_context: Option<SubAgentForkContext>,
 ) -> Vec<Message> {
-    let mut messages = fork_context
-        .map(|context| context.messages.clone())
-        .unwrap_or_default();
+    let mut messages = Vec::new();
 
     if let Some(context) = fork_context {
+        // Resolution already made this child's isolated copy of the parent.
+        messages = context.messages;
         if let Some(state) = context
             .structured_state_block
             .as_deref()
@@ -13265,7 +13610,7 @@ fn build_initial_subagent_messages_with_system(
         }
 
         messages.push(system_text_message(format!(
-            "<codewhale:subagent_context>\n{}\n</codewhale:subagent_context>",
+            "{SUBAGENT_CONTEXT_OPEN}\n{}\n</codewhale:subagent_context>",
             subagent_system_prompt
         )));
     }
@@ -13727,12 +14072,20 @@ async fn run_subagent_task_inner(mut task: SubAgentTask) {
     // slot after waiting starts its work clock then (#6015), still bounded by
     // any inherited deadline. Cancellation while queued is handled by
     // the admitted child actor before it emits Started/Starting.
-    let mut _launch_permit = None;
+    let mut _launch_permits = Vec::new();
     let mut launch_wait_timed_out = false;
     let mut launched_from_queue = false;
-    if let Some(gate) = task.launch_gate.as_ref() {
+    let owner_gate = (task.runtime.spawn_depth == 1)
+        .then(|| {
+            task.runtime
+                .execution_limits
+                .as_ref()
+                .map(|limits| &limits.launch_gate)
+        })
+        .flatten();
+    for gate in owner_gate.into_iter().chain(task.launch_gate.as_ref()) {
         match Arc::clone(gate).try_acquire() {
-            Some(permit) => _launch_permit = Some(permit),
+            Some(permit) => _launch_permits.push(permit),
             None => {
                 match tokio::time::timeout_at(
                     deadline.into(),
@@ -13741,10 +14094,17 @@ async fn run_subagent_task_inner(mut task: SubAgentTask) {
                 .await
                 {
                     Ok(permit) => {
-                        launched_from_queue = permit.is_some();
-                        _launch_permit = permit;
+                        if let Some(permit) = permit {
+                            launched_from_queue = true;
+                            _launch_permits.push(permit);
+                        } else {
+                            break;
+                        }
                     }
-                    Err(_) => launch_wait_timed_out = true,
+                    Err(_) => {
+                        launch_wait_timed_out = true;
+                        break;
+                    }
                 }
             }
         }
@@ -13883,7 +14243,7 @@ async fn run_subagent_task_inner(mut task: SubAgentTask) {
                     Some(note.clone()),
                 )
             });
-            agent.unsettled_launch = _launch_permit.take();
+            agent.unsettled_launch = Some(std::mem::take(&mut _launch_permits));
             agent.unsettled_foreground = task._foreground_child_registration.take();
         }
         if let Some(record) = manager.worker_records.get_mut(&agent_id) {
@@ -14825,6 +15185,10 @@ fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
     // quota error mentioning "429" is not a transient rate limit. Retain the
     // transport fallback for generic/parse errors and relay HTTP 400s, which
     // can carry an upstream timeout rather than an invalid request.
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if crate::llm_client::image_count_rejection(&message).is_some() {
+        return false;
+    }
     match error.downcast_ref::<LlmError>() {
         Some(
             LlmError::QuotaExhausted(_)
@@ -14838,7 +15202,6 @@ fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
         _ => {}
     }
 
-    let message = format!("{error:#}").to_ascii_lowercase();
     [
         "did not receive response headers",
         "response headers",
@@ -17691,8 +18054,9 @@ fn subagent_reasoning_effort_for_request(
     role_reasoning_default: Option<&str>,
 ) -> Option<String> {
     let normalize = |effort: ReasoningEffort| {
-        effort.normalize_for_route(
+        effort.normalize_for_route_identity(
             runtime.client.api_provider(),
+            runtime.client.admitted_provider_identity().key.as_str(),
             runtime.client.base_url(),
             model,
         )
@@ -17732,8 +18096,9 @@ fn subagent_reasoning_effort_for_request(
 
 fn fallback_subagent_reasoning_effort(runtime: &SubAgentRuntime, model: &str) -> Option<String> {
     let normalize = |effort: ReasoningEffort| {
-        effort.normalize_for_route(
+        effort.normalize_for_route_identity(
             runtime.client.api_provider(),
+            runtime.client.admitted_provider_identity().key.as_str(),
             runtime.client.base_url(),
             model,
         )
@@ -19421,9 +19786,14 @@ mod owner_scoped_coordination_tests {
         let selected = root.join("selected");
         fs::create_dir_all(original.join("src")).unwrap();
         fs::create_dir_all(selected.join("src")).unwrap();
-        let mut manager = SubAgentManager::new(original.clone(), 2);
+        let authority = new_shared_runtime_subagent_manager(original.clone(), 2).unwrap();
+        let mut manager = authority.try_write().unwrap();
         admit(&mut manager, &original);
         admit(&mut manager, &selected);
+        let independent =
+            SubAgentManager::new(selected.clone(), 2).require_coordination_process_lock();
+        assert!(independent.ensure_coordination_process_lock().is_err());
+        assert!(independent.persist_state_synchronously().is_err());
         manager
             .preflight_worker_coordination(&writer("original", &original, "src"))
             .unwrap();

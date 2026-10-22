@@ -18,4 +18,5 @@ tsconfig.tsbuildinfo
 # base merged to a stale file and reddened main (2026-09-26). `npm run
 # prebuild`, `npm run dev` and the vitest global setup write them.
 lib/changelog.generated.ts
+lib/release-notes.generated.ts
 lib/install-guide.generated.ts

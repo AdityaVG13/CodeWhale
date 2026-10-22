@@ -52,6 +52,14 @@ $env:CC_SHELL_ESCAPED_FLAGS = "1"
 Set-Item -Path "Env:CFLAGS_$target" -Value $commonFlags
 Set-Item -Path "Env:CXXFLAGS_$target" -Value $commonFlags
 Set-Item -Path "Env:CMAKE_TOOLCHAIN_FILE_$target" -Value $cmakeToolchain
+$env:CMAKE_GENERATOR = "Ninja"
+if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+    $sdkNinja = [System.IO.Path]::Combine($sdk, "build-tools", "cmake", "bin")
+    if (-not (Test-Path -LiteralPath ([System.IO.Path]::Combine($sdkNinja, "ninja.exe")) -PathType Leaf)) {
+        Stop-OhosEnv "ninja was not found on PATH and the OpenHarmony SDK does not bundle build-tools/cmake/bin/ninja.exe; install ninja so CMake-based crates such as aws-lc-sys can build for $target."
+    }
+    $env:PATH = "$sdkNinja;$env:PATH"
+}
 $env:LIBCLANG_PATH = [System.IO.Path]::GetDirectoryName($libclang)
 Set-Item -Path "Env:BINDGEN_EXTRA_CLANG_ARGS_$target" -Value $commonFlags
 

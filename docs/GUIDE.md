@@ -351,8 +351,8 @@ direct. Multi-step delegation uses a compact Workflow plan with dependencies,
 bounded scopes, and completion evidence passed between steps. Fleet configures
 and manages those same sub-agents and their roles. One bounded, independent
 task can use a direct agent; continued work reuses it through `followup`.
-Heavy work can also run on a cloud computer with `codewhale dispatch "<task>"`,
-which goes through the signed-in account with a quote and EU-compute consent.
+`codewhale dispatch "<task>"` (running work on a Codewhale cloud computer) is
+not available: cloud computers and accounts are paused for new users.
 
 For trusted workspaces where you intentionally want actions to proceed without
 approval prompts, select the Full Access permission posture with `Shift+Tab`.
@@ -388,6 +388,7 @@ Common commands for first-time users:
 | `/workflows` | Open the live Workflow run dashboard: every run this workspace's journal keeps, with phases, children, progress, and host-side cancel |
 | `/config` | Edit runtime and provider settings |
 | `/statusline` | Choose which footer status chips are visible |
+| `/color` | Give this chat's composer box its own color: bare `/color` cycles red, orange, amber, green, cyan, blue, purple and pink, `/color blue` picks one, `/color off` returns to the theme |
 | `/receipts` | List what this session did: files changed, commands run, web and MCP calls, agents, approvals and who gave them, failures |
 | `/compact` | Summarize long context to recover token budget |
 | `/copy` | Copy the last completed assistant response to the clipboard |
@@ -425,7 +426,7 @@ level per turn. When the DeepSeek routing model is available, Auto may select
 any runnable provider/model pair in the redacted inventory. That classification
 sends the latest request (capped at 4,000 characters) plus a bounded summary of
 up to six recent context rows (900 characters each) to
-`DeepSeek / deepseek-v4-flash`. Credentials, endpoints, and provider error text
+`DeepSeek / deepseek-flash`. Credentials, endpoints, and provider error text
 are not included in the inventory. Without that router, Auto uses a local,
 provider-aware heuristic and sends no routing request. If a classifier attempt
 fails validation or errors, Auto falls back to that heuristic while retaining
@@ -519,7 +520,7 @@ Codewhale keeps these records on your machine, under `~/.codewhale/`:
   including edits made to those files since it started. `/restore` rolls the
   whole folder back to a point you pick, overwriting later edits, so it
   needs `/trust on` or Full Access. Esc Esc rewinds the conversation only;
-  `/undo` afterwards puts the files back.
+  `/restore` afterwards rolls the files back.
 - **Security events.** `audit.log` records credential changes, hook
   environment key names, compaction passes, the terminal's approval
   routing, and Auto-Review verdicts. It is not a list of what a session did.
@@ -615,7 +616,8 @@ Use skills when a task has a repeatable process:
 - Using a project-specific memory or wiki workflow.
 
 Inside the TUI, `/skill <name>` activates a skill when one is available, and
-bare `/skills` opens the Skills Manager (owned-only inventory, no network). Use
+bare `/skills` opens Extensions → Skills (owned-only inventory, no network).
+Use `/skills manage` for the manager and
 `/skills <prefix>`, `/skills inspect`, `/skills --remote`, `/skills suggest <task>`,
 or `/skills sync` for the text/registry paths. Suggestions rank the remote
 catalog but never install or activate anything. The command palette can also

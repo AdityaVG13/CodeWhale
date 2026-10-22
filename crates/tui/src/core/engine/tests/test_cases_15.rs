@@ -596,6 +596,7 @@ fn turn_metadata_keeps_stable_fields_while_pressure_reports_live_estimates() {
             context_tokens: Some(10_000),
             input_tokens: None,
             output_tokens: Some(512),
+            output_declared: false,
         }),
         AppMode::Agent,
         None,

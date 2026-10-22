@@ -6,7 +6,7 @@ use super::*;
 
 pub(super) const MAX_HAND_BACK_TOKENS: u64 = 8_192;
 const MAX_HAND_BACK_OUTPUT: u32 = 1_024;
-const MIN_HAND_BACK_OUTPUT: u64 = 128;
+pub(crate) const MIN_HAND_BACK_OUTPUT: u64 = 128;
 const MAX_HAND_BACK_TIME: Duration = Duration::from_secs(10);
 
 pub(super) fn wall_deadlines(runtime: &SubAgentRuntime) -> (Option<Instant>, Option<Instant>) {

@@ -27,7 +27,7 @@
 | `Ctrl-L` | 压缩对话上下文（状态行显示进度；压缩已在运行时不执行任何操作） |
 | `Ctrl-O` | 打开所选或当前回合的思考详情，与输入框内容无关 |
 | `Ctrl-Alt-O` | 打开整个回合的 Turn Inspector，与输入框内容无关 |
-| `Alt-V` / `Option-V`（macOS） | 为所选的工具/智能体卡片打开详情分页器；未选择时，打开最新正在运行的 shell 的实时检查器，否则打开可见或最近的卡片；发出传统 Option-V 字符的终端也会被处理 |
+| `Alt-V` / `Option-V`（macOS） | 为所选的工具/智能体卡片打开详情分页器；未选择时，打开最新的可见错误，否则打开第一个有详情的可见卡片，再否则打开最近的一张。先点击某张卡片，新卡片出现时 Alt-V 仍会停留在它上面。发出传统 Option-V 字符的终端也会被处理 |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | 在任务面板（workbar）中切换文件树 |
 | `Ctrl-]` 或 `Ctrl-Tab` | Pet 主视图显示时循环切换 Pet 视图；其他时候循环切换 work dock：TODO → Agents → Jobs → Background。`Ctrl-]` 可移植；`Ctrl-Tab` 需要 kitty 键盘协议。Terminal.app 用它切换终端标签页 |
 | `Ctrl-Shift-Tab` | 终端能发送 kitty 键盘组合键时，反向循环切换 Pet 视图或 work dock。Terminal.app 用它切换终端标签页 |
@@ -142,7 +142,7 @@ Hotbar 的触发键刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 | `Alt-G` / `Alt-Shift-G` | 跳到顶部 / 底部 |
 | `Ctrl-Home` / `Ctrl-End` | 跳到顶部 / 底部（在输入框中也可用） |
 | `Alt-[` / `Alt-]` | 在工具输出块之间跳转 |
-| `Esc Esc` | 回溯到上一条用户消息（`←`/`→` 步进，`Enter` 回退）。只回退对话，不改动文件；用 `/undo` 把文件改回去 |
+| `Esc Esc` | 回溯到上一条用户消息（`←`/`→` 步进，`Enter` 回退）。只回退对话，不改动文件；`/restore` 可回滚文件夹（需要 `/trust on` 或 Full Access） |
 | `Esc` | 将焦点返回输入框 |
 | `Ctrl-Y` | 输入框为空时，复制获得焦点的对话记录单元 |
 | `Alt-V` | 为获得焦点的工具或消息打开原始详情 |

@@ -454,6 +454,7 @@ fn run(
     let mut events = Batch::default();
     let mut producer_seq = None;
     let mut sequence = 0u64;
+    let mut acknowledged = 0u64;
     let mut action: Option<Value> = None;
     let mut appearance_patch: Option<(Option<super::BodyStyle>, Option<super::TextLanguage>)> =
         None;
@@ -578,6 +579,10 @@ fn run(
                         changed = Instant::now();
                         producer_seq = None;
                         events.clear();
+                        acknowledged = 0;
+                    } else if next.cursor < acknowledged {
+                        fetched = Instant::now();
+                        continue;
                     } else if scene.as_ref().is_some_and(|s| s.tick != next.tick) {
                         previous = scene.clone();
                         changed = Instant::now();
@@ -633,9 +638,10 @@ fn run(
         {
             last_action = Instant::now();
             match client.post("/v1/action", pending) {
-                Ok(_) => {
+                Ok(reply) => {
                     let selected = pending["action"]["kind"] == "select";
                     sequence += 1;
+                    acknowledged = reply["cursor"].as_u64().unwrap_or(acknowledged);
                     action = None;
                     if selected {
                         fetched = Instant::now() - Duration::from_secs(1);

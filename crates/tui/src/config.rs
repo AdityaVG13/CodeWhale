@@ -1,5 +1,6 @@
 //! Configuration loading and defaults for codewhale.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use codewhale_execpolicy::ExecPolicyEngine;
+use codewhale_localization::{Locale, MessageId, tr};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 #[cfg(unix)]
@@ -366,10 +368,8 @@ pub fn provider_capability_with_wire(
     } else {
         None
     };
-    let exact_deepseek = canonical_official_deepseek_model_id(&model_lower);
-    let is_v4_pro = exact_deepseek == Some("deepseek-v4-pro");
-    let is_v4_flash =
-        exact_deepseek == Some(DEEPSEEK_ALIAS_REPLACEMENT) || alias_deprecation.is_some();
+    let official_deepseek =
+        canonical_official_deepseek_model_id(&model_lower).is_some() || alias_deprecation.is_some();
     let is_reasoner = matches!(provider, ProviderKind::WanjieArk)
         && (model_lower.contains("reasoner") || model_lower.contains("r1"));
 
@@ -377,7 +377,7 @@ pub fn provider_capability_with_wire(
     // model-only row. Reuse those facts before conservative fallback budgets.
     let offering =
         crate::provider_lake::bundled_catalog_offering_for_model(provider, resolved_model);
-    let context_window = if is_v4_pro || is_v4_flash {
+    let context_window = if official_deepseek {
         codewhale_models::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
     } else if let Some(window) = codewhale_models::context_window_for_model(resolved_model) {
         window
@@ -424,8 +424,7 @@ pub fn provider_capability_with_wire(
         });
 
     // Exact catalog reasoning facts and recognized compatibility aliases only.
-    let thinking_supported = is_v4_pro
-        || is_v4_flash
+    let thinking_supported = official_deepseek
         || is_reasoner
         || offering
             .as_ref()
@@ -467,7 +466,7 @@ fn deepseek_alias_deprecation(model_lower: &str) -> Option<ModelAliasDeprecation
             retirement_date: DEEPSEEK_ALIAS_RETIREMENT_DATE.to_string(),
             retirement_utc: DEEPSEEK_ALIAS_RETIREMENT_UTC.to_string(),
             notice: format!(
-                "{model_lower} is a compatibility alias for {DEEPSEEK_ALIAS_REPLACEMENT} and is scheduled to retire on {DEEPSEEK_ALIAS_RETIREMENT_DATE}."
+                "DeepSeek retired {model_lower} on {DEEPSEEK_ALIAS_RETIREMENT_DATE}; Codewhale sends {DEEPSEEK_ALIAS_REPLACEMENT} instead."
             ),
         }),
         _ => None,
@@ -476,9 +475,9 @@ fn deepseek_alias_deprecation(model_lower: &str) -> Option<ModelAliasDeprecation
 
 /// Canonicalize compact DeepSeek model aliases to stable IDs.
 ///
-/// Already-valid model IDs pass through unchanged. Only the compact
-/// `v4pro`/`v4flash` spellings and the experimental vision shorthand are
-/// rewritten to their hyphenated forms.
+/// Already-valid model IDs pass through unchanged. The compact `v4pro`
+/// spelling is rewritten to its hyphenated form, and the Flash and retired
+/// vision shorthands select `deepseek-flash`.
 #[must_use]
 pub fn canonical_model_name(model: &str) -> Option<&'static str> {
     codewhale_config::catalog::reviewed::compatibility_alias(
@@ -655,7 +654,7 @@ pub(crate) fn opencode_go_model_id(model: &str) -> Option<&'static str> {
     codewhale_config::opencode_go_model_id(model)
 }
 
-fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
+pub(crate) fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
     codewhale_config::catalog::reviewed::compatibility_alias(
         "canonical_xiaomi_mimo_model_id",
         &model.trim().to_ascii_lowercase().replace(['_', ' '], "-"),
@@ -1583,21 +1582,24 @@ impl StatusItem {
     /// One-line hint shown beside the label so the user knows what each item
     /// surfaces without having to toggle it on first.
     #[must_use]
-    pub fn hint(self) -> &'static str {
-        match self {
-            StatusItem::Mode => "plan · act · operate",
-            StatusItem::Model => "the model id you'll send to",
-            StatusItem::Cost => "running total for this session",
-            StatusItem::Cache => "% of prompt served from cache",
-            StatusItem::ContextPercent => "tokens used / model context window",
-            StatusItem::Tokens => "output tokens of the live or last turn",
-            StatusItem::Balance => "remaining prepaid credit from the active provider",
-            StatusItem::SessionMetrics => "time to first token and output rate",
-            StatusItem::Ttft => "average wait for the first token",
-            StatusItem::OutputRate => "average tok/s, including first-token wait",
-            StatusItem::Workspace => "directory this session writes to",
-            StatusItem::GitBranch => "branch the next commit lands on",
-        }
+    pub fn hint(self, locale: Locale) -> Cow<'static, str> {
+        tr(
+            locale,
+            match self {
+                StatusItem::Mode => MessageId::StatusPickerModeHint,
+                StatusItem::Model => MessageId::StatusPickerModelHint,
+                StatusItem::Cost => MessageId::StatusPickerCostHint,
+                StatusItem::Cache => MessageId::StatusPickerCacheHint,
+                StatusItem::ContextPercent => MessageId::StatusPickerContextPercentHint,
+                StatusItem::Tokens => MessageId::StatusPickerTokensHint,
+                StatusItem::Balance => MessageId::StatusPickerBalanceHint,
+                StatusItem::SessionMetrics => MessageId::StatusPickerSessionMetricsHint,
+                StatusItem::Ttft => MessageId::StatusPickerTtftHint,
+                StatusItem::OutputRate => MessageId::StatusPickerOutputRateHint,
+                StatusItem::Workspace => MessageId::StatusPickerWorkspaceHint,
+                StatusItem::GitBranch => MessageId::StatusPickerGitBranchHint,
+            },
+        )
     }
 
     /// Editable items in display order. Legacy combined metrics parse but
@@ -2005,6 +2007,12 @@ pub struct UpdateConfig {
     /// Optional GitHub-compatible latest-release JSON endpoint.
     #[serde(default)]
     pub update_uri: Option<String>,
+    #[serde(default = "default_update_show_whats_new")]
+    pub show_whats_new: bool,
+}
+
+fn default_update_show_whats_new() -> bool {
+    true
 }
 
 impl Default for UpdateConfig {
@@ -2013,6 +2021,7 @@ impl Default for UpdateConfig {
             check_for_updates: true,
             check_interval_hours: default_update_check_interval_hours(),
             update_uri: None,
+            show_whats_new: true,
         }
     }
 }
@@ -9560,37 +9569,11 @@ fn xiaomi_mimo_env_api_key_for_runtime(
 }
 
 fn wire_config_prefers_anthropic(wire: Option<&str>) -> bool {
-    let Some(raw) = wire.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    let normalized = raw.to_ascii_lowercase().replace(['_', ' '], "-");
-    matches!(
-        normalized.as_str(),
-        "anthropic"
-            | "anthropic-messages"
-            | "messages"
-            | "claude"
-            | "anthropic-compatible"
-            | "anthropic-compat"
-    )
+    codewhale_config::provider::wire_dialect_prefers_anthropic(wire)
 }
 
 fn wire_config_prefers_responses(wire: Option<&str>) -> bool {
-    let Some(raw) = wire.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    let normalized = raw.to_ascii_lowercase().replace(['_', ' '], "-");
-    matches!(
-        normalized.as_str(),
-        "responses"
-            | "responses-api"
-            | "openai-responses"
-            | "openai-responses-api"
-            | "response"
-            | "response-api"
-            | "openai-responses-compat"
-            | "responses-compat"
-    )
+    codewhale_config::provider::wire_dialect_prefers_responses(wire)
 }
 
 fn modelstudio_mode_is_coding_plan(provider: ProviderKind, mode: Option<&str>) -> bool {
@@ -10319,40 +10302,49 @@ fn model_for_provider(provider: ProviderKind, normalized: String) -> String {
     let lowered = normalized.to_ascii_lowercase();
     match (provider, lowered.as_str()) {
         (ProviderKind::NvidiaNim, "deepseek-v4-pro") => DEFAULT_NVIDIA_NIM_MODEL.to_string(),
-        (ProviderKind::NvidiaNim, "deepseek-v4-flash") => {
+        (ProviderKind::NvidiaNim, "deepseek-flash" | "deepseek-v4-flash") => {
             DEFAULT_NVIDIA_NIM_FLASH_MODEL.to_string()
         }
         (ProviderKind::Openrouter, "deepseek-v4-pro") => DEFAULT_OPENROUTER_MODEL.to_string(),
-        (ProviderKind::Openrouter, "deepseek-v4-flash") => {
+        (ProviderKind::Openrouter, "deepseek-flash" | "deepseek-v4-flash") => {
             DEFAULT_OPENROUTER_FLASH_MODEL.to_string()
         }
         (ProviderKind::Novita, "deepseek-v4-pro") => DEFAULT_NOVITA_MODEL.to_string(),
-        (ProviderKind::Novita, "deepseek-v4-flash") => DEFAULT_NOVITA_FLASH_MODEL.to_string(),
+        (ProviderKind::Novita, "deepseek-flash" | "deepseek-v4-flash") => {
+            DEFAULT_NOVITA_FLASH_MODEL.to_string()
+        }
         (ProviderKind::Fireworks, "deepseek-v4-pro") => DEFAULT_FIREWORKS_MODEL.to_string(),
+        (ProviderKind::Fireworks, "deepseek-flash") => "deepseek-v4-flash".to_string(),
         (
             ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
             "deepseek-v4-pro" | "deepseek-reasoner" | "deepseek-r1",
         ) => DEFAULT_SILICONFLOW_MODEL.to_string(),
         (
             ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
-            "deepseek-v4-flash" | "deepseek-chat" | "deepseek-v3",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-v3",
         ) => DEFAULT_SILICONFLOW_FLASH_MODEL.to_string(),
         (ProviderKind::Sglang, "deepseek-v4-pro") => DEFAULT_SGLANG_MODEL.to_string(),
-        (ProviderKind::Sglang, "deepseek-v4-flash") => DEFAULT_SGLANG_FLASH_MODEL.to_string(),
+        (ProviderKind::Sglang, "deepseek-flash" | "deepseek-v4-flash") => {
+            DEFAULT_SGLANG_FLASH_MODEL.to_string()
+        }
         (ProviderKind::Vllm, "deepseek-v4-pro") => DEFAULT_VLLM_MODEL.to_string(),
-        (ProviderKind::Vllm, "deepseek-v4-flash") => DEFAULT_VLLM_FLASH_MODEL.to_string(),
+        (ProviderKind::Vllm, "deepseek-flash" | "deepseek-v4-flash") => {
+            DEFAULT_VLLM_FLASH_MODEL.to_string()
+        }
         (ProviderKind::Deepinfra, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_DEEPINFRA_MODEL.to_string()
         }
-        (ProviderKind::Deepinfra, "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner") => {
-            DEFAULT_DEEPINFRA_FLASH_MODEL.to_string()
-        }
+        (
+            ProviderKind::Deepinfra,
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner",
+        ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         (ProviderKind::Together, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_TOGETHER_MODEL.to_string()
         }
         (
             ProviderKind::Together,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner",
         ) => DEFAULT_TOGETHER_FLASH_MODEL.to_string(),
         (ProviderKind::Together, "inkling" | "together-inkling" | "thinkingmachines/inkling") => {
             TOGETHER_INKLING_MODEL.to_string()
@@ -11279,7 +11271,7 @@ fn apply_requirements(config: &mut Config) -> Result<()> {
                     Path::new("."),
                     SandboxNetworkAccess::from_config(config.sandbox_network_access),
                 ) {
-                    SandboxPolicy::ReadOnly => "read-only",
+                    SandboxPolicy::ReadOnly { .. } => "read-only",
                     SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
                     SandboxPolicy::DangerFullAccess => "danger-full-access",
                     SandboxPolicy::ExternalSandbox { .. } => "external-sandbox",

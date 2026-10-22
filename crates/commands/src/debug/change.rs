@@ -277,6 +277,52 @@ pub fn extract_previous_version_number(content: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangelogEntryCounts {
+    pub features: usize,
+    pub fixes: usize,
+    pub other: usize,
+}
+
+pub fn count_changelog_entries(section: &str) -> ChangelogEntryCounts {
+    const UNCOUNTED: [&str; 5] = [
+        "contributors",
+        "thanks",
+        "community",
+        "known ",
+        "retroactive",
+    ];
+    let mut counts = ChangelogEntryCounts::default();
+    let mut slot: Option<usize> = None;
+    for line in section.lines() {
+        if let Some(heading) = line.strip_prefix("### ") {
+            let heading = heading.trim().to_ascii_lowercase();
+            slot = if heading.starts_with("added") || heading.starts_with("new") {
+                Some(0)
+            } else if heading.starts_with("fixed")
+                || heading.starts_with("security")
+                || heading.contains("fixes")
+            {
+                Some(1)
+            } else if UNCOUNTED.iter().any(|prefix| heading.starts_with(prefix)) {
+                None
+            } else {
+                Some(2)
+            };
+        } else if line.starts_with("## ") {
+            slot = None;
+        } else if line.starts_with("- ") {
+            match slot {
+                Some(0) => counts.features += 1,
+                Some(1) => counts.fixes += 1,
+                Some(_) => counts.other += 1,
+                None => {}
+            }
+        }
+    }
+    counts
+}
+
 pub fn section_has_body_content(lines: &[&str]) -> bool {
     lines.iter().any(|line| !line.trim().is_empty())
 }

@@ -32,12 +32,13 @@ export interface RepoFacts {
   defaultModel: string | null;
   nodeEngines: string | null;
   toolCount: number | null;
+  contributorCount: number;
   license: string | null;
   latestPublishedRelease: PublishedReleaseFact | null;
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-10-10T12:21:52.760Z",
+  "generatedAt": "2026-10-19T08:05:41.018Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
   "version": "0.10.2",
@@ -330,6 +331,118 @@ export const FACTS: RepoFacts = {
   ],
   "models": [
     {
+      "id": "claude-fable-5-1",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "claude-opus-5-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "provider": "Google",
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
+      "reasoning": false,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gemini-4-argon",
+      "provider": "Google",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gpt-6-luna",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gpt-6-sol",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "mimo-v2.6-flash",
+      "provider": "Xiaomi MiMo",
+      "contextWindow": 1048576,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "mimo-v2.6-pro",
+      "provider": "Xiaomi MiMo",
+      "contextWindow": 1048576,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "muse-spark-1.3",
+      "provider": "Meta",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "muse-spark-1.3-contributor",
+      "provider": "Meta",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "muse-wonder-1.0",
+      "provider": "Meta",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
       "id": "grok-4.7",
       "provider": "xAI",
       "contextWindow": 500000,
@@ -547,14 +660,6 @@ export const FACTS: RepoFacts = {
     },
     {
       "id": "qwen3.8-max",
-      "provider": "Qwen",
-      "contextWindow": 1000000,
-      "maxOutput": 131072,
-      "reasoning": true,
-      "addedAt": "2026-08-02"
-    },
-    {
-      "id": "qwen3.8-max-preview",
       "provider": "Qwen",
       "contextWindow": 1000000,
       "maxOutput": 131072,
@@ -957,6 +1062,7 @@ export const FACTS: RepoFacts = {
   "defaultModel": "deepseek-flash",
   "nodeEngines": ">=18",
   "toolCount": 79,
+  "contributorCount": 390,
   "license": "MIT",
   "latestPublishedRelease": {
     "tag": "v0.10.1",

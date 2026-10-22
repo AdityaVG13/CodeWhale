@@ -26,6 +26,8 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::hashing::sha256_hex;
+
 mod compiled_host;
 
 const GITHUB_LATEST_RELEASE_PAGE_URL: &str =
@@ -1841,23 +1843,6 @@ fn download_url_once_with(
     Ok((status, bytes))
 }
 
-/// Compute the SHA256 hex digest of data.
-pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(data);
-    hex_bytes(hash)
-}
-
-fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct GlibcVersion {
     major: u32,
@@ -2019,8 +2004,9 @@ Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this preflight at your own risk.",
 ///
 /// Writes the new binary to a secure temp file in the target directory, then
 /// installs it in place. Unix can atomically replace the executable path. On
-/// Windows, replacing a running executable can fail, so rename the current file
-/// out of the way before moving the new binary into the original path.
+/// Windows an atomic replace is tried first; when that fails, as it does for a
+/// running executable, the current file is renamed out of the way before the
+/// new binary moves into the original path.
 #[cfg(test)]
 fn replace_binary(target: &Path, new_bytes: &[u8]) -> Result<()> {
     replace_binary_with_validation(target, new_bytes, || Ok(()))
@@ -2127,24 +2113,42 @@ where
         }
     }
 
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync staged update at {}", tmp.path().display()))?;
+
     validate_before_replace()?;
 
     #[cfg(windows)]
     {
+        let tmp = match tmp.persist(target) {
+            Ok(_) => return Ok(()),
+            Err(error) if !target.exists() => bail!(
+                "failed to install new binary at {}: {}",
+                target.display(),
+                error.error
+            ),
+            Err(error) => error.file,
+        };
         let backup = backup_path_for(target);
-        if target.exists() {
-            std::fs::rename(target, &backup).with_context(|| {
-                format!(
-                    "failed to move current executable {} to {}",
-                    target.display(),
-                    backup.display()
-                )
-            })?;
-        }
-
+        std::fs::rename(target, &backup).with_context(|| {
+            format!(
+                "failed to move current executable {} to {}",
+                target.display(),
+                backup.display()
+            )
+        })?;
         if let Err(err) = tmp.persist(target) {
-            if backup.exists() {
-                let _ = std::fs::rename(&backup, target);
+            if backup.exists()
+                && let Err(restore_error) = std::fs::rename(&backup, target)
+            {
+                bail!(
+                    "failed to install new binary at {}: {}; restoring the previous binary also failed: {}. It is at {} — move it back by hand.",
+                    target.display(),
+                    err.error,
+                    restore_error,
+                    backup.display()
+                );
             }
             bail!(
                 "failed to install new binary at {}: {}",
@@ -2152,7 +2156,6 @@ where
                 err.error
             );
         }
-
         let _ = std::fs::remove_file(&backup);
     }
 

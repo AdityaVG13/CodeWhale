@@ -249,6 +249,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
         context_tokens: Some(4_096),
         input_tokens: None,
         output_tokens: Some(512),
+        output_declared: false,
     };
     engine.active_route_limits = Some(installed_limits);
     // Large enough to be critical for the installed 4K route, but safely
@@ -267,6 +268,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
             context_tokens: Some(123_456),
             input_tokens: None,
             output_tokens: Some(4_096),
+            output_declared: false,
         }),
         AppMode::Agent,
         None,
@@ -352,6 +354,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
         context_tokens: Some(64_000),
         input_tokens: None,
         output_tokens: Some(512),
+        output_declared: false,
     };
     engine.active_route_limits = Some(installed_limits);
     // Multi-byte content on purpose: chars().count() != len() here, so an
@@ -369,6 +372,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
             thinking: "step".repeat(100),
             signature: None,
             state: None,
+            redacted_data: None,
         }],
     });
     // Replayed-reasoning case (#perf-r5 fresh-eyes fix): an assistant message
@@ -383,6 +387,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
                 thinking: "replayed".repeat(300), // 8 bytes per unit -> even count
                 signature: None,
                 state: None,
+                redacted_data: None,
             },
             ContentBlock::ToolUse {
                 execution_id: None,
@@ -401,6 +406,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
                 thinking: "odd replay".to_string(), // 11 bytes / 4 = 2 (even)... use odd total
                 signature: None,
                 state: None,
+                redacted_data: None,
             },
             ContentBlock::ToolUse {
                 execution_id: None,
@@ -635,6 +641,7 @@ async fn planned_route_builds_subagent_catalog_without_installed_client() {
                 reasoning_effort_auto: planned.auto_controls_reasoning,
             },
             "",
+            None,
         )
         .await;
     assert!(
@@ -1996,6 +2003,7 @@ async fn fixed_route_with_a_prompt_describes_the_exact_next_turn() {
         context_tokens: Some(4_096),
         input_tokens: Some(3_000),
         output_tokens: Some(512),
+        output_declared: false,
     });
 
     let planned = plan(&config, &identity, false, "refactor the parser").await;
@@ -2188,6 +2196,7 @@ async fn preview_tool_snapshot_has_no_mcp_or_event_side_effects() {
                 reasoning_effort_auto: false,
             },
             "",
+            None,
         )
         .await;
 

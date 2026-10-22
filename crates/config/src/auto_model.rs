@@ -8,7 +8,7 @@
 //!
 //! - **`deepseek-v4-pro`** — complex tasks (debugging, refactoring, design,
 //!   security review, multi-file changes, code generation, …).
-//! - **`deepseek-v4-flash`** — simple tasks (lookups, formatting, small edits,
+//! - **`deepseek-flash`** — simple tasks (lookups, formatting, small edits,
 //!   translation, Q&A, …).
 //!
 //! This is a pure rule-based classifier. It lives in the config crate because
@@ -19,7 +19,7 @@
 pub const PRO_MODEL: &str = "deepseek-v4-pro";
 
 /// The resolved model name for the flash tier.
-pub const FLASH_MODEL: &str = "deepseek-v4-flash";
+pub const FLASH_MODEL: &str = "deepseek-flash";
 
 /// The threshold score above which a task is classified as complex (pro).
 /// Score ≥ 2 → pro, else → flash.

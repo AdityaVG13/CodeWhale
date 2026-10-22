@@ -3,22 +3,8 @@ name: Security audit
 permissions: {}
 
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/security-audit.yml'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '**/audit.toml'
-      - '**/package.json'
-      - '**/package-lock.json'
-      - 'web/scripts/patch-braces.mjs'
-      - 'web/scripts/audit-dependencies.mjs'
-      - 'web/scripts/dependency-security.test.mjs'
-  push:
-    branches: [main, master]
-  schedule:
-    # Run weekly on Monday at 06:31 UTC
-    - cron: '31 6 * * 1'
+  workflow_dispatch: {}
+  workflow_call: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,7 +50,7 @@ jobs:
         working-directory: ${{ matrix.directory }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
       # Audit the complete committed lock, including build dependencies, and

@@ -3,8 +3,10 @@
 # Format:
 #   alias = Display Name <id+login@users.noreply.github.com>
 #
-# The right-hand side must use GitHub's numeric noreply address so harvested
-# co-author credit lands in the contributor graph. The left-hand side may be a
+# The right-hand side must use GitHub's numeric noreply address so a harvested
+# commit authored with it links to the contributor's account. Only commit
+# authorship puts someone in the repository's contributor list; a co-author
+# trailer shows on their profile but not there. The left-hand side may be a
 # GitHub login, old-style noreply address, raw email from a contributor commit,
 # or local machine email seen in older harvested history.
 
@@ -263,3 +265,6 @@ Arlo = Arlo <253300483+xiaoray-blip@users.noreply.github.com>
 xyzs996 = Mark Yan <396284+xyzs996@users.noreply.github.com>
 xyzs996@gmail.com = Mark Yan <396284+xyzs996@users.noreply.github.com>
 Mark Yan = Mark Yan <396284+xyzs996@users.noreply.github.com>
+henrikdukefoss = Henrik Bakke Dukefoss <76407537+henrikdukefoss@users.noreply.github.com>
+Henrik Bakke Dukefoss = Henrik Bakke Dukefoss <76407537+henrikdukefoss@users.noreply.github.com>
+henrikdukef@gmail.com = Henrik Bakke Dukefoss <76407537+henrikdukefoss@users.noreply.github.com>

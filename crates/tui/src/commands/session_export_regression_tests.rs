@@ -42,6 +42,7 @@ struct ExportHarness {
     // temporary files are removed (matches ControlHarness).
     _home: EnvVarGuard,
     _codewhale_home: EnvVarGuard,
+    _ssh: [EnvVarGuard; 3],
     _env_lock: TestEnvLock,
     temp: TempDir,
 }
@@ -54,6 +55,7 @@ impl ExportHarness {
         std::fs::create_dir_all(&home).expect("home dir");
         let _home = EnvVarGuard::set("HOME", &home);
         let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+        let _ssh = ["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"].map(EnvVarGuard::remove);
         let options = TuiOptions {
             skills_dir: temp.path().join("skills"),
             memory_path: temp.path().join("memory.md"),
@@ -66,6 +68,7 @@ impl ExportHarness {
             app,
             _home,
             _codewhale_home,
+            _ssh,
             _env_lock: env_lock,
             temp,
         }
@@ -116,6 +119,7 @@ fn adapter_projects_authoritative_metadata_and_omits_hidden_payloads() {
                     thinking: "private chain of thought".to_string(),
                     signature: Some("signature-secret".to_string()),
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,
@@ -702,6 +706,7 @@ fn baseline_golden_messages() -> Vec<Message> {
                     thinking: "private chain of thought".to_string(),
                     signature: Some("signature-secret".to_string()),
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,
@@ -998,6 +1003,7 @@ fn command_clipboard_export_preserves_structure_and_redacts_secrets() {
                     thinking: "private chain of thought".to_string(),
                     signature: Some("signature-secret".to_string()),
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,

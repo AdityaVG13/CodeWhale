@@ -412,7 +412,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     worker_id: &str,
     run_id: &str,
     task_spec: &FleetTaskSpec,
-    _worker_spec: &FleetWorkerSpec,
+    worker_spec: &FleetWorkerSpec,
     model: &str,
     workspace: &std::path::Path,
     coordination_workspace: &std::path::Path,
@@ -425,7 +425,23 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let role = effective_fleet_role(worker_profile, agent_profile);
     let agent_type = runtime_role_for_member(role.as_deref().unwrap_or_default());
     let tool_profile = fleet_tool_profile(worker_profile);
-    let objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
+    super::placement::require_match(task_spec, worker_spec)?;
+    let mut objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
+    if worker_spec.environment.is_some()
+        || task_spec
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.placement.is_some())
+        || matches!(
+            worker_spec.host,
+            codewhale_protocol::fleet::FleetHostSpec::Tailscale { .. }
+        )
+    {
+        objective.push_str("\n\nExecution environment (operator-declared context; runtime permissions still apply):\n");
+        objective.push_str(&serde_json::to_string(&super::placement::environment(
+            worker_spec,
+        ))?);
+    }
     let max_spawn_depth = codewhale_config::FleetExecConfig::default().max_spawn_depth;
     let loadout = effective_fleet_loadout(worker_profile, agent_profile);
     let (effective_model, model_source) =
@@ -1701,6 +1717,7 @@ mod tests {
             instructions: format!("do {id}"),
             worker,
             workspace: Some(FleetWorkspaceRequirements {
+                placement: None,
                 root: Some(PathBuf::from(".")),
                 required_files: Vec::new(),
                 writable_paths: vec![PathBuf::from(".")],
@@ -1722,6 +1739,7 @@ mod tests {
     #[test]
     fn write_capable_fleet_worker_requires_and_persists_a_bounded_claim() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -1767,6 +1785,7 @@ mod tests {
     #[test]
     fn fleet_claim_roots_share_one_manager_workspace_namespace() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -1777,12 +1796,14 @@ mod tests {
         };
         let mut nested = fleet_task("nested", None);
         nested.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             root: Some(PathBuf::from("pkg-a")),
             writable_paths: vec![PathBuf::from("src")],
             ..FleetWorkspaceRequirements::default()
         });
         let mut root = fleet_task("root", None);
         root.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             root: Some(PathBuf::from(".")),
             writable_paths: vec![PathBuf::from("pkg-a/src")],
             ..FleetWorkspaceRequirements::default()
@@ -1826,6 +1847,7 @@ mod tests {
     #[test]
     fn fleet_manifest_rejects_control_characters_before_lease() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -1996,6 +2018,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -2592,6 +2615,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -2638,6 +2662,7 @@ mod tests {
     #[test]
     fn role_only_consultant_aliases_keep_high_reasoning_and_locked_posture() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -2715,6 +2740,7 @@ mod tests {
         // worker spec, so the model picked in /model is the model that runs.
         let task = fleet_task("build", None);
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -3631,6 +3657,7 @@ mod tests {
         profile.profile.provider = Some("deepseek".to_string());
         profile.profile.model = Some("deepseek-v4-flash".to_string());
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4114,6 +4141,7 @@ mod tests {
     #[test]
     fn fleet_task_max_steps_zero_or_omitted_is_unbounded_and_positive_is_enforced() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4156,6 +4184,7 @@ mod tests {
         );
         profile.profile.model = Some("glm-5.2".to_string());
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4273,6 +4302,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4316,6 +4346,7 @@ mod tests {
     #[test]
     fn fleet_worker_spec_model_route_precedence_is_profile_unpinned_task_then_session() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4443,6 +4474,7 @@ mod tests {
             )),
         );
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4536,6 +4568,7 @@ mod tests {
             metadata: Default::default(),
         };
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4586,6 +4619,7 @@ mod tests {
     #[test]
     fn fleet_fanout_role_loadouts_keep_distinct_child_models() {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "local-worker".to_string(),
             name: "Local worker".to_string(),
             host: FleetHostSpec::Local,
@@ -4649,6 +4683,7 @@ mod tests {
                 }),
                 workspace: matches!(&expected_type, FleetRole::Builder).then(|| {
                     FleetWorkspaceRequirements {
+                        placement: None,
                         root: Some(PathBuf::from(".")),
                         required_files: Vec::new(),
                         writable_paths: vec![PathBuf::from(".")],

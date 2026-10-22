@@ -2,7 +2,7 @@
   "format": "codewhale.features.v1",
   "source": {
     "path": "docs/features.toml",
-    "sha256": "2f91995d1103bbbade5761a51bc29fbcc3a0bc355d62fb1cf3ccafa3cb8d7a16"
+    "sha256": "fa0e52f5196f6caa02a7eb445ebd4c8e04989a9f46de4589833c69a5a00fe962"
   },
   "features": [
     {
@@ -48,7 +48,7 @@
     {
       "id": "web-search",
       "name": "Web search",
-      "summary": "Searches and fetches the web for the agent (web.run, with the web_search alias).",
+      "summary": "Searches and fetches the web for the agent, including DeepSeek Search (web.run, with the web_search alias).",
       "status": "stable",
       "surfaces": {
         "tui": "stable"
@@ -322,7 +322,7 @@
     {
       "id": "providers",
       "name": "Providers",
-      "summary": "First-class provider routes plus bundled OpenAI-compatible host descriptors.",
+      "summary": "Provider routes with endpoint-scoped model facts, explicit limits and sourced price estimates.",
       "status": "stable",
       "surfaces": {
         "tui": "stable",
@@ -361,6 +361,20 @@
       "registryLine": 305
     },
     {
+      "id": "environment-placement",
+      "name": "Environment-aware Fleet placement",
+      "summary": "Places Fleet tasks by environment requirements and connects explicitly configured workers through Tailscale.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/ENVIRONMENTS.md#environment-aware-fleet-placement-preview",
+      "registryLine": 314
+    },
+    {
       "id": "workflows",
       "name": "Workflows",
       "summary": "Checked-in .workflow.js scripts coordinate agents step by step.",
@@ -371,7 +385,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/WORKFLOW_AUTHORING.md",
-      "registryLine": 314
+      "registryLine": 323
     },
     {
       "id": "automatic-workflows",
@@ -384,7 +398,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/AUTOMATIC_WORKFLOWS.md",
-      "registryLine": 323
+      "registryLine": 332
     },
     {
       "id": "goals",
@@ -398,7 +412,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/CONFIGURATION.md#goal-loop-goal",
-      "registryLine": 332
+      "registryLine": 341
     },
     {
       "id": "todos",
@@ -412,7 +426,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/TOOL_SURFACE.md",
-      "registryLine": 341
+      "registryLine": 350
     },
     {
       "id": "composer-queue-steer",
@@ -426,7 +440,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/KEYBINDINGS.md",
-      "registryLine": 350
+      "registryLine": 359
     },
     {
       "id": "receipts",
@@ -440,7 +454,7 @@
       "since": "0.10.1",
       "flag": null,
       "docs": "docs/RECEIPTS.md",
-      "registryLine": 359
+      "registryLine": 368
     },
     {
       "id": "preview-request",
@@ -453,7 +467,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/PREVIEW_REQUEST.md",
-      "registryLine": 369
+      "registryLine": 378
     },
     {
       "id": "read-media",
@@ -466,7 +480,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/READ_MEDIA.md",
-      "registryLine": 378
+      "registryLine": 387
     },
     {
       "id": "memory",
@@ -480,7 +494,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/MEMORY.md",
-      "registryLine": 387
+      "registryLine": 396
     },
     {
       "id": "skills",
@@ -494,7 +508,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/SKILLS.md",
-      "registryLine": 398
+      "registryLine": 407
     },
     {
       "id": "plugins",
@@ -508,7 +522,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/PLUGINS.md",
-      "registryLine": 407
+      "registryLine": 416
     },
     {
       "id": "computer-use",
@@ -522,7 +536,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/PLUGIN_BUNDLES.md",
-      "registryLine": 416
+      "registryLine": 425
     },
     {
       "id": "script-tools",
@@ -535,7 +549,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/CONFIGURATION.md#script-tools-and-overrides",
-      "registryLine": 425
+      "registryLine": 434
     },
     {
       "id": "claude-plugin-compat",
@@ -548,7 +562,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/CLAUDE_PLUGIN_COMPAT.md",
-      "registryLine": 434
+      "registryLine": 443
     },
     {
       "id": "claude-settings-import",
@@ -561,7 +575,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 443
+      "registryLine": 452
     },
     {
       "id": "hooks",
@@ -575,7 +589,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/HOOKS.md",
-      "registryLine": 451
+      "registryLine": 460
     },
     {
       "id": "lsp",
@@ -589,7 +603,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/LSP_PHP_CUSTOM.md",
-      "registryLine": 460
+      "registryLine": 469
     },
     {
       "id": "runtime-api",
@@ -602,7 +616,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/RUNTIME_API.md",
-      "registryLine": 469
+      "registryLine": 478
     },
     {
       "id": "headless-exec",
@@ -615,7 +629,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/RUNTIME_API.md",
-      "registryLine": 478
+      "registryLine": 487
     },
     {
       "id": "github-review",
@@ -628,7 +642,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/GITHUB_APP.md",
-      "registryLine": 487
+      "registryLine": 496
     },
     {
       "id": "web-client",
@@ -641,7 +655,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/WEB.md",
-      "registryLine": 498
+      "registryLine": 507
     },
     {
       "id": "keybindings",
@@ -654,7 +668,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/KEYBINDINGS.md",
-      "registryLine": 507
+      "registryLine": 516
     },
     {
       "id": "settings",
@@ -668,7 +682,20 @@
       "since": null,
       "flag": null,
       "docs": "docs/CONFIGURATION.md",
-      "registryLine": 516
+      "registryLine": 525
+    },
+    {
+      "id": "whats-new-notice",
+      "name": "What's new after an update",
+      "summary": "Says once, on the first start after an update, what changed and links that version's release notes.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#whats-new-after-an-update",
+      "registryLine": 534
     },
     {
       "id": "themes",
@@ -681,7 +708,20 @@
       "since": null,
       "flag": null,
       "docs": "docs/schemas/user-theme.schema.json",
-      "registryLine": 525
+      "registryLine": 544
+    },
+    {
+      "id": "chat-color",
+      "name": "Chat color",
+      "summary": "/color gives one chat's composer box its own color, kept with that session.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/GUIDE.md",
+      "registryLine": 553
     },
     {
       "id": "localization",
@@ -694,7 +734,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/LOCALIZATION.md",
-      "registryLine": 534
+      "registryLine": 563
     },
     {
       "id": "voice",
@@ -708,7 +748,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 543
+      "registryLine": 572
     },
     {
       "id": "pet",
@@ -722,7 +762,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/PET_MODE.md",
-      "registryLine": 551
+      "registryLine": 580
     },
     {
       "id": "overview",
@@ -735,12 +775,12 @@
       "since": null,
       "flag": null,
       "docs": "docs/PROVIDERS.md",
-      "registryLine": 560
+      "registryLine": 589
     },
     {
       "id": "account-login",
       "name": "Account login",
-      "summary": "/login signs in to Codewhale or stores provider keys; plugin providers connect with /connect.",
+      "summary": "/login signs in to an optional Codewhale account; plugin providers connect with /connect.",
       "status": "stable",
       "surfaces": {
         "tui": "stable"
@@ -748,7 +788,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 569
+      "registryLine": 598
     },
     {
       "id": "account-computer-files",
@@ -758,10 +798,10 @@
       "surfaces": {
         "tui": "preview"
       },
-      "since": "unreleased",
+      "since": "0.10.2",
       "flag": null,
       "docs": null,
-      "registryLine": 577
+      "registryLine": 606
     },
     {
       "id": "context-anchors",
@@ -774,7 +814,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 586
+      "registryLine": 615
     },
     {
       "id": "window-pin",
@@ -787,7 +827,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 594
+      "registryLine": 623
     },
     {
       "id": "structured-copy",
@@ -800,7 +840,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 602
+      "registryLine": 631
     },
     {
       "id": "live-thinking",
@@ -813,7 +853,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 610
+      "registryLine": 639
     },
     {
       "id": "workbar",
@@ -826,7 +866,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 618
+      "registryLine": 647
     },
     {
       "id": "terminal-dock",
@@ -836,10 +876,10 @@
       "surfaces": {
         "tui": "stable"
       },
-      "since": null,
+      "since": "0.10.2",
       "flag": null,
       "docs": null,
-      "registryLine": 626
+      "registryLine": 655
     },
     {
       "id": "telemetry",
@@ -852,7 +892,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/TELEMETRY.md",
-      "registryLine": 636
+      "registryLine": 666
     },
     {
       "id": "docker",
@@ -865,7 +905,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/DOCKER.md",
-      "registryLine": 645
+      "registryLine": 675
     },
     {
       "id": "termux",
@@ -878,7 +918,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/TERMUX.md",
-      "registryLine": 654
+      "registryLine": 684
     },
     {
       "id": "chatgpt-plan-sign-in",
@@ -890,10 +930,10 @@
         "api": "partial",
         "web": "none"
       },
-      "since": "unreleased",
+      "since": "0.10.1",
       "flag": null,
       "docs": "docs/PROVIDERS.md#sign-in-with-chatgpt",
-      "registryLine": 663
+      "registryLine": 693
     },
     {
       "id": "claude-plan-sign-in",
@@ -905,10 +945,10 @@
         "api": "partial",
         "web": "none"
       },
-      "since": "unreleased",
+      "since": "0.10.2",
       "flag": null,
       "docs": "docs/PROVIDERS.md#sign-in-with-claude",
-      "registryLine": 673
+      "registryLine": 703
     },
     {
       "id": "plugin-oauth-providers",
@@ -920,10 +960,10 @@
         "api": "partial",
         "web": "none"
       },
-      "since": "unreleased",
+      "since": "0.10.1",
       "flag": null,
       "docs": "docs/PLUGIN_PROVIDERS.md",
-      "registryLine": 683
+      "registryLine": 713
     },
     {
       "id": "orcarouter-sign-in",
@@ -932,13 +972,13 @@
       "status": "experimental",
       "surfaces": {
         "tui": "preview",
-        "api": "none",
+        "api": "preview",
         "web": "none"
       },
-      "since": "unreleased",
+      "since": "0.10.1",
       "flag": null,
       "docs": "docs/PROVIDERS.md",
-      "registryLine": 693
+      "registryLine": 723
     },
     {
       "id": "merch-interest",
@@ -953,7 +993,7 @@
       "since": "unreleased",
       "flag": null,
       "docs": "web/lib/merch/README.md",
-      "registryLine": 704
+      "registryLine": 734
     },
     {
       "id": "profile-constitution",
@@ -964,10 +1004,10 @@
         "tui": "preview",
         "api": "preview"
       },
-      "since": "unreleased",
+      "since": "0.10.1",
       "flag": null,
       "docs": "docs/RUNTIME_API.md#profile-constitution",
-      "registryLine": 714
+      "registryLine": 744
     },
     {
       "id": "plugin-shell-install",
@@ -977,10 +1017,52 @@
       "surfaces": {
         "tui": "preview"
       },
-      "since": "unreleased",
+      "since": "0.10.2",
       "flag": null,
       "docs": "docs/PLUGINS.md",
-      "registryLine": 724
+      "registryLine": 754
+    },
+    {
+      "id": "fork-prefix-inheritance",
+      "name": "Fork prefix inheritance",
+      "summary": "Allows matching first-level Chat Completions forks to reuse a parent request header.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/CACHE.md#fork-prefix-inheritance",
+      "registryLine": 764
+    },
+    {
+      "id": "fork-trial-diagnostics",
+      "name": "Fork trial diagnostics",
+      "summary": "Opt-in JSON stderr observations of classified fork decisions and actual first-response cache usage.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/CACHE.md#fork-trial-diagnostics",
+      "registryLine": 774
+    },
+    {
+      "id": "source-navigation-echoes",
+      "name": "Source navigation echoes",
+      "summary": "File and search results include bounded source symbols, neighboring files and change attribution.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/ECHOLOCATION.md",
+      "registryLine": 784
     }
   ]
 }

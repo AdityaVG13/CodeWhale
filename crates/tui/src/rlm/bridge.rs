@@ -135,14 +135,14 @@ impl RlmUsageAccumulator {
         let completed = if let Some(Some(slot)) = state.records.get_mut(reservation.index)
             && !slot.completed
         {
-            super::add_usage_with_prompt_cache(&mut slot.record.usage.usage, usage);
+            crate::core::turn::add_usage_to(&mut slot.record.usage.usage, usage);
             slot.completed = true;
             true
         } else {
             false
         };
         if completed {
-            super::add_usage_with_prompt_cache(&mut state.usage, usage);
+            crate::core::turn::add_usage_to(&mut state.usage, usage);
         }
     }
 
@@ -797,7 +797,9 @@ mod tests {
         bridge.usage.cancel(missing_reservation, true).await;
 
         let snapshot = bridge.usage_snapshot().await;
-        assert_eq!(snapshot.usage, reported);
+        let mut expected_reported = reported.clone();
+        expected_reported.request_usages = vec![reported.clone()];
+        assert_eq!(snapshot.usage, expected_reported);
         assert_eq!(snapshot.records.len(), 1);
         assert_eq!(snapshot.drop_records.len(), 1);
         assert_eq!(snapshot.dropped_records, 1);
@@ -882,9 +884,11 @@ mod tests {
         }
 
         let snapshot = bridge.usage_snapshot().await;
-        assert_eq!(snapshot.usage, usage);
+        let mut expected_usage = usage.clone();
+        expected_usage.request_usages = vec![usage.clone()];
+        assert_eq!(snapshot.usage, expected_usage);
         assert_eq!(snapshot.records.len(), 1);
-        assert_eq!(snapshot.records[0].usage.usage, usage);
+        assert_eq!(snapshot.records[0].usage.usage, expected_usage);
         let rejected_fragments: Vec<_> = snapshot
             .nested_events
             .iter()

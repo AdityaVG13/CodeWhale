@@ -1,5 +1,5 @@
     fn parse_cli(args: &[&str]) -> Cli {
-        Cli::try_parse_from(args).expect("CLI args should parse")
+        parse_cli_args(args).expect("CLI args should parse")
     }
 
     #[test]
@@ -979,13 +979,54 @@
 
     #[test]
     fn exec_keeps_flags_before_split_prompt_words() {
-        let cli = parse_cli(&["codewhale", "exec", "--json", "hello", "world"]);
+        let cli = parse_cli(&["codewhale", "exec", "--json", "hello", "--world"]);
         let Some(Commands::Exec(args)) = cli.command else {
             panic!("expected exec command");
         };
 
         assert!(args.json);
-        assert_eq!(args.prompt, vec!["hello", "world"]);
+        assert_eq!(args.prompt, vec!["hello", "--world"]);
+        for flag in [
+            "--sandbox",
+            "--sandbox=workspace-write",
+            "--auto",
+            "--help",
+            "--enable=web_search",
+            "--operation-key=example",
+        ] {
+            let error = parse_cli_args(&["codewhale", "exec", "--auto", "fix tests", flag])
+                .expect_err("exec flags after the prompt must not silently become text");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            assert!(error.to_string().contains(flag.split('=').next().unwrap()));
+        }
+        for prompt in [
+            vec!["--", "--sandbox", "workspace-write"],
+            vec!["hello", "--", "--sandbox=workspace-write"],
+        ] {
+            let argv: Vec<&str> = ["codewhale", "exec", "--auto"]
+                .into_iter()
+                .chain(prompt)
+                .collect();
+            let cli = parse_cli(&argv);
+            let Some(Commands::Exec(args)) = cli.command else {
+                panic!("expected exec command");
+            };
+            assert!(args.sandbox.is_none());
+            assert!(args.prompt.iter().any(|word| word.starts_with("--sandbox")));
+        }
+        let error = Cli::try_parse_from([
+            "codewhale",
+            "exec",
+            "--auto",
+            "--sandox",
+            "workspace-write",
+            "--max-turns",
+            "1",
+            "--json",
+            "Reply with the single word OK and use no tools.",
+        ])
+        .expect_err("unknown flags before the prompt must fail parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

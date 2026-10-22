@@ -213,6 +213,7 @@ const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(600);
 // the per-tool spinner pulse — keep this fast enough that the whale-spout
 // braille pattern reads as continuous motion instead of teleport-frames.
 const UI_STATUS_ANIMATION_MS: u64 = crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
+const UI_QUIET_STATUS_ANIMATION_MS: u64 = 1_000;
 /// Ambient fish, the idle-mark caustic, and the completion wake use a modest
 /// ~12.5fps clock by default. On measured high-Hz displays the adaptive probe
 /// may raise this (still bounded); low_motion always freezes the cadence.
@@ -283,7 +284,7 @@ enum TranslationEvent {
     Thinking {
         origin_session_fingerprint: Option<String>,
         origin_turn_fingerprint: Option<String>,
-        placeholder: String,
+        translation_id: u64,
         translated: anyhow::Result<String>,
         usage: Option<codewhale_models::Usage>,
     },
@@ -489,8 +490,18 @@ mod memory_quick_add_tests {
     }
 }
 
-fn spawn_tui_engine(config: EngineConfig, api_config: &Config) -> EngineHandle {
-    let handle = spawn_engine(config, api_config);
+fn spawn_tui_engine(
+    app: &mut App,
+    api_config: &Config,
+    mcp_handoff: Option<crate::mcp::McpHandoff>,
+) -> EngineHandle {
+    let handle = spawn_engine(
+        build_engine_config(app, api_config),
+        api_config,
+        mcp_handoff,
+    );
+    app.mcp_snapshot_generation = 0;
+    app.mcp_snapshot_generation_invalidated = false;
     // Prime durable agent + coordination state through the same engine event
     // used by later refreshes. All TUI engine replacements use this wrapper,
     // so workspace switches and provider recovery cannot retain stale Work.
@@ -498,11 +509,54 @@ fn spawn_tui_engine(config: EngineConfig, api_config: &Config) -> EngineHandle {
     handle
 }
 
+async fn retire_tui_engine(
+    app: &mut App,
+    engine_handle: &EngineHandle,
+) -> Option<crate::mcp::McpHandoff> {
+    let mcp_handoff = engine_handle.retire_mcp_for_handoff();
+    let active = app
+        .active_compaction
+        .as_ref()
+        .map(|active| (active.id.clone(), active.auto));
+    let queued = (app.manual_compaction_queued && app.deferred_manual_compaction.is_none())
+        .then(|| app.manual_compaction_id.clone().unwrap_or_default());
+    for id in active.iter().map(|(id, _)| id).chain(queued.iter()) {
+        let _ = engine_handle.cancel_compaction(id.clone());
+    }
+    let _ = engine_handle.send(Op::Shutdown).await;
+    if active.is_some() || queued.is_some() {
+        let (id, auto) = active.unwrap_or_else(|| (queued.unwrap_or_default(), false));
+        app.manual_compaction_queued = false;
+        app.manual_compaction_id = None;
+        let text = app
+            .tr(MessageId::ContextCompactionStoppedOnEngineSwitch)
+            .into_owned();
+        apply_compaction_cancelled(app, &id, auto, text);
+    }
+    if std::mem::take(&mut app.is_purging) {
+        let text = app
+            .tr(MessageId::ContextPurgeAbandonedOnEngineSwitch)
+            .into_owned();
+        add_compaction_receipt(app, &text);
+        app.push_status_toast(text, StatusToastLevel::Warning, Some(5_000));
+    }
+    mcp_handoff
+}
+
+async fn replace_tui_engine(app: &mut App, api_config: &Config, engine_handle: &mut EngineHandle) {
+    let mcp_handoff = retire_tui_engine(app, engine_handle).await;
+    *engine_handle = spawn_tui_engine(app, api_config, mcp_handoff);
+}
+
 /// Startup and consent-triggered replacement restore the same conversation
 /// before admitting any pending input. The existing engine remains the sole
 /// owner of model-facing history and the frozen system prefix.
-async fn spawn_tui_engine_with_session(app: &mut App, config: &Config) -> Result<EngineHandle> {
-    let handle = spawn_tui_engine(build_engine_config(app, config), config);
+async fn spawn_tui_engine_with_session(
+    app: &mut App,
+    config: &Config,
+    mcp_handoff: Option<crate::mcp::McpHandoff>,
+) -> Result<EngineHandle> {
+    let handle = spawn_tui_engine(app, config, mcp_handoff);
     let restored = async {
         if !app.api_messages.is_empty() {
             handle

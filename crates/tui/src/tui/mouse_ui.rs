@@ -156,7 +156,9 @@ fn toggle_tool_run_expand(app: &mut App, mouse: MouseEvent) -> bool {
         return false;
     };
     let original_idx = app.original_cell_index_for_rendered(rendered_idx);
-    if app.tool_run_start_for_history_index(original_idx) != Some(original_idx) {
+    if app.tool_run_start_for_history_index(original_idx) != Some(original_idx)
+        || app.expanded_tool_runs.contains(&original_idx)
+    {
         return false;
     }
     app.toggle_tool_run_expansion_at(original_idx)

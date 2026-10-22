@@ -976,6 +976,7 @@ fn offline_resolver_keeps_images_for_a_text_only_seed_row() {
             saved_provider_model: None,
             base_url_override: None,
             limit_overrides: Vec::new(),
+            wire_override: None,
         })
         .expect("bundled Anthropic route resolves offline");
     assert_ne!(
@@ -1262,15 +1263,32 @@ fn bundled_asset_pricing_is_honest() {
         Some(131_072)
     );
 
-    // M3 has input-length and service tiers that the flat catalog cost shape
-    // cannot represent, so the bundled route row stays honestly unpriced.
+    // M3 publishes a context tier at 512K tokens. The row ships priced only
+    // because the tier travels with it; dropping the tier would underbill.
     let minimax_m3 = find(&rows, "minimax-anthropic", "MiniMax-M3");
-    assert!(minimax_m3.cost.is_none());
+    let cost = minimax_m3
+        .cost
+        .as_ref()
+        .expect("M3 is priced with its tier");
+    assert_eq!(cost.input, Some(0.30));
+    assert_eq!(cost.output, Some(1.20));
+    let tiers = cost.tiers.as_ref().expect("M3 keeps its context tier");
+    assert!(tiers.iter().any(|t| t.tier.size == 512_000));
 
     // Grok 4.6 also has a prompt-length tier, starting at 200K input tokens.
-    // The usage-aware TUI table prices it; a flat catalog row would underbill.
+    // It likewise ships priced with the tier preserved for usage-aware pricing.
     let grok_46 = find(&rows, "xai", "grok-4.6");
-    assert!(grok_46.cost.is_none());
+    let cost = grok_46
+        .cost
+        .as_ref()
+        .expect("Grok 4.6 is priced with its tier");
+    assert_eq!(cost.input, Some(2.0));
+    assert_eq!(cost.output, Some(6.0));
+    let tiers = cost
+        .tiers
+        .as_ref()
+        .expect("Grok 4.6 keeps its context tier");
+    assert!(tiers.iter().any(|t| t.tier.size == 200_000));
 
     let minimax_m2_7 = find(&rows, "minimax-anthropic", "MiniMax-M2.7");
     let cost = minimax_m2_7.cost.as_ref().expect("M2.7 is priced");

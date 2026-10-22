@@ -410,9 +410,21 @@ impl FleetScheduler {
                 return Ok(());
             }
             let counts = active_counts(&state, run);
-            let Some((worker_id, task)) = self.next_launch(run, &state, &counts) else {
+            let Some((worker_id, task, decision)) = self.next_launch(run, &state, &counts) else {
                 return Ok(());
             };
+            let workspace = self
+                .ledger
+                .path()
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| anyhow!("Fleet ledger has no workspace"))?;
+            let placement = super::placement::write_receipt(
+                workspace,
+                run_id,
+                task.entry.attempts.saturating_add(1),
+                &decision,
+            )?;
             let lease_expires_at = self.lease_expires_at();
             if !self.ledger.start_task_if_enqueued(
                 &task.entry.run_id,
@@ -426,6 +438,7 @@ impl FleetScheduler {
                         lease_expires_at: Some(lease_expires_at.clone()),
                     },
                     FleetWorkerEventPayload::Starting,
+                    FleetWorkerEventPayload::Artifact(placement),
                     FleetWorkerEventPayload::Running,
                 ],
                 || Ok(()),
@@ -442,7 +455,11 @@ impl FleetScheduler {
         run: &FleetRun,
         state: &FleetLedgerState,
         counts: &ActiveCounts,
-    ) -> Option<(String, FleetTaskState)> {
+    ) -> Option<(
+        String,
+        FleetTaskState,
+        codewhale_protocol::placement::PlacementDecision,
+    )> {
         let active_workers: BTreeSet<_> = active_tasks_for_run(state, &run.id)
             .into_iter()
             .filter_map(|task| task.leased_to)
@@ -474,17 +491,19 @@ impl FleetScheduler {
             {
                 continue;
             }
-            for worker in &run.worker_specs {
-                if active_workers.contains(&worker.id) {
-                    continue;
-                }
-                let host_key = host_key(worker);
-                if counts.by_host.get(&host_key).copied().unwrap_or(0)
-                    >= self.policy.max_workers_per_host
-                {
-                    continue;
-                }
-                return Some((worker.id.clone(), task));
+            let unavailable = run
+                .worker_specs
+                .iter()
+                .filter(|worker| {
+                    active_workers.contains(&worker.id)
+                        || counts.by_host.get(&host_key(worker)).copied().unwrap_or(0)
+                            >= self.policy.max_workers_per_host
+                })
+                .map(|worker| worker.id.clone())
+                .collect();
+            let decision = super::placement::decide(task_spec, &run.worker_specs, &unavailable);
+            if let Some(worker_id) = decision.worker_id.clone() {
+                return Some((worker_id, task, decision));
             }
         }
         None
@@ -652,6 +671,7 @@ fn host_key(worker: &FleetWorkerSpec) -> String {
     match &worker.host {
         FleetHostSpec::Local => "local".to_string(),
         FleetHostSpec::Ssh { host, .. } => format!("ssh:{host}"),
+        FleetHostSpec::Tailscale { node_id, .. } => format!("tailscale:{node_id}"),
         FleetHostSpec::Docker { image, .. } => format!("docker:{image}"),
     }
 }
@@ -708,6 +728,7 @@ mod tests {
 
     fn worker(id: &str) -> FleetWorkerSpec {
         FleetWorkerSpec {
+            environment: None,
             id: id.to_string(),
             name: id.to_string(),
             host: FleetHostSpec::Local,

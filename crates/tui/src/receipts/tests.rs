@@ -385,8 +385,18 @@ fn session_receipt_reads_transcript_and_approval_log_with_deciders() {
         ApprovalReceipt::asked("c5", "Web"),
         ApprovalReceipt::decided("c5", ApprovalOutcome::ApprovedOnce),
     ];
-    let receipt =
-        session_receipt(session_source_fixture(), &messages, &receipts, None).expect("receipt");
+    let outcomes = vec![
+        crate::session_manager::SavedTurnOutcome::failed("provider returned 500", 8),
+        crate::session_manager::SavedTurnOutcome::failed("turn budget exhausted", messages.len()),
+    ];
+    let receipt = session_receipt(
+        session_source_fixture(),
+        &messages,
+        &receipts,
+        &outcomes,
+        None,
+    )
+    .expect("receipt");
 
     let lines: Vec<String> = receipt.actions.iter().map(action_line).collect();
     assert_eq!(
@@ -398,6 +408,8 @@ fn session_receipt_reads_transcript_and_approval_log_with_deciders() {
             "did not run `rm -rf build` · denied by you",
             "fetched docs.rs · approved",
             "started agent reviewer — completed",
+            "turn failed — failed: provider returned 500",
+            "turn failed — failed: turn budget exhausted",
         ]
         .into_iter()
         .map(str::to_string)
@@ -411,6 +423,10 @@ fn session_receipt_reads_transcript_and_approval_log_with_deciders() {
         "a whole-file write has no counts"
     );
     assert_eq!((totals.commands, totals.commands_failed), (1, 1));
+    assert_eq!(totals.failures, 3);
+    assert_eq!(receipt.actions[6].turn.as_deref(), Some("1"));
+    assert_eq!(receipt.actions[6].at, Some(outcomes[0].ended_at));
+    assert_eq!(receipt.actions[7].turn.as_deref(), Some("2"));
     assert_eq!(totals.network, 1);
     assert_eq!(totals.subagents, 1);
     assert_eq!(totals.approvals.approved_by.posture, 1);
@@ -435,14 +451,27 @@ fn session_receipt_reads_transcript_and_approval_log_with_deciders() {
         receipt.not_recorded
     );
 
-    let turn_two =
-        session_receipt(session_source_fixture(), &messages, &receipts, Some("2")).expect("turn 2");
-    assert_eq!(turn_two.actions.len(), 3);
+    let turn_two = session_receipt(
+        session_source_fixture(),
+        &messages,
+        &receipts,
+        &outcomes,
+        Some("2"),
+    )
+    .expect("turn 2");
+    assert_eq!(turn_two.actions.len(), 4);
+    assert_eq!(turn_two.totals.failures, 1);
+    assert!(matches!(turn_two.actions[3].what, ActionKind::TurnFailed));
+    assert_eq!(
+        turn_two.actions[3].error.as_deref(),
+        Some("turn budget exhausted")
+    );
     for missing in ["x", "0", "3", "999"] {
         let error = session_receipt(
             session_source_fixture(),
             &messages,
             &receipts,
+            &outcomes,
             Some(missing),
         )
         .expect_err("a turn this session does not have");
@@ -485,7 +514,7 @@ fn markdown_and_json_share_one_record() {
 
 #[test]
 fn empty_session_says_nothing_happened() {
-    let receipt = session_receipt(session_source_fixture(), &[], &[], None).expect("receipt");
+    let receipt = session_receipt(session_source_fixture(), &[], &[], &[], None).expect("receipt");
     assert_eq!(totals_line(&receipt), "No actions recorded.");
     assert!(receipt.actions.is_empty());
 }
@@ -499,7 +528,7 @@ fn session_older_than_its_approval_log_does_not_claim_calls_ran_without_asking()
     ];
     let mut source = session_source_fixture();
     source.started_at = Some("2026-08-01T00:00:00Z".parse().expect("time"));
-    let receipt = session_receipt(source, &messages, &[], None).expect("receipt");
+    let receipt = session_receipt(source, &messages, &[], &[], None).expect("receipt");
     assert_eq!(receipt.totals.files_changed, 1);
     assert_eq!(receipt.totals.ran_without_asking, 0);
     assert!(
@@ -513,7 +542,7 @@ fn session_older_than_its_approval_log_does_not_claim_calls_ran_without_asking()
 
     let mut recent = session_source_fixture();
     recent.started_at = Some("2026-09-01T00:00:00Z".parse().expect("time"));
-    let receipt = session_receipt(recent, &messages, &[], None).expect("receipt");
+    let receipt = session_receipt(recent, &messages, &[], &[], None).expect("receipt");
     assert_eq!(receipt.totals.ran_without_asking, 1);
 }
 
@@ -584,7 +613,7 @@ fn calls_blocked_before_running_are_not_counted_as_run() {
     ];
     let mut source = session_source_fixture();
     source.started_at = Some("2026-09-24T00:00:00Z".parse().expect("time"));
-    let receipt = session_receipt(source, &messages, &[], None).expect("receipt");
+    let receipt = session_receipt(source, &messages, &[], &[], None).expect("receipt");
 
     let statuses: Vec<ActionStatus> = receipt.actions.iter().map(|action| action.status).collect();
     assert_eq!(
@@ -691,8 +720,8 @@ fn host_denial_reads_as_not_answered() {
         ApprovalReceipt::asked("h1", "bash"),
         ApprovalReceipt::decided_with("h1", ApprovalOutcome::Denied, Some(ApprovalDecider::Host)),
     ];
-    let receipt =
-        session_receipt(session_source_fixture(), &messages, &receipts, None).expect("receipt");
+    let receipt = session_receipt(session_source_fixture(), &messages, &receipts, &[], None)
+        .expect("receipt");
     let approvals = &receipt.totals.approvals;
     assert_eq!((approvals.denied, approvals.not_answered), (0, 1));
     assert_eq!(
@@ -801,7 +830,7 @@ fn shell_file_changes_come_from_the_turn_snapshots() {
     let mut source = session_source_fixture();
     source.id = session.to_string();
     source.workspace = Some(root.display().to_string());
-    let receipt = session_receipt(source, &messages, &[], None).expect("receipt");
+    let receipt = session_receipt(source, &messages, &[], &[], None).expect("receipt");
 
     let outside = receipt
         .actions
@@ -921,7 +950,7 @@ fn outside_text_cannot_mark_a_call_blocked() {
     ];
     let mut source = session_source_fixture();
     source.started_at = Some("2026-09-24T00:00:00Z".parse().expect("time"));
-    let receipt = session_receipt(source, &messages, &[], None).expect("receipt");
+    let receipt = session_receipt(source, &messages, &[], &[], None).expect("receipt");
 
     let statuses: Vec<(&str, ActionStatus)> = receipt
         .actions
@@ -977,7 +1006,7 @@ fn file_names_cannot_add_receipt_lines_or_escape_codes() {
     ];
     let mut source = session_source_fixture();
     source.title = Some("title\nwith a break\u{1b}[2J".into());
-    let receipt = session_receipt(source, &messages, &[], None).expect("receipt");
+    let receipt = session_receipt(source, &messages, &[], &[], None).expect("receipt");
     let line = action_line(&receipt.actions[0]);
     assert_eq!(
         line,
@@ -1043,7 +1072,7 @@ fn a_repeated_prompt_does_not_take_another_turns_snapshots() {
     let mut source = session_source_fixture();
     source.id = session.to_string();
     source.workspace = Some(root.display().to_string());
-    let receipt = session_receipt(source, &messages, &[], None).expect("receipt");
+    let receipt = session_receipt(source, &messages, &[], &[], None).expect("receipt");
 
     let turns: Vec<Option<&str>> = receipt
         .actions
@@ -1083,7 +1112,8 @@ fn session_receipts_join_only_unambiguous_execution_identities() {
         ApprovalReceipt::asked("first", "bash"),
         ApprovalReceipt::decided("first", ApprovalOutcome::ApprovedOnce),
     ];
-    let receipt = session_receipt(session_source_fixture(), &messages, &approvals, None).unwrap();
+    let receipt =
+        session_receipt(session_source_fixture(), &messages, &approvals, &[], None).unwrap();
     let commands = receipt
         .actions
         .iter()
@@ -1114,7 +1144,7 @@ fn session_receipts_join_only_unambiguous_execution_identities() {
             ApprovalReceipt::decided("wire", ApprovalOutcome::ApprovedOnce),
         ];
         let receipt =
-            session_receipt(session_source_fixture(), &ambiguous, &approvals, None).unwrap();
+            session_receipt(session_source_fixture(), &ambiguous, &approvals, &[], None).unwrap();
         assert!(
             receipt
                 .actions

@@ -173,9 +173,18 @@ impl ImageAnalyzeTool {
             || domain.to_ascii_lowercase().ends_with(".xiaomimimo.com")
     }
 
+    fn wire_model(&self) -> String {
+        let model = self.config.model.trim();
+        if !Self::is_xiaomi_mimo_model(model) || model.contains('/') {
+            return self.config.model.clone();
+        }
+        crate::config::canonical_xiaomi_mimo_model_id(model)
+            .map_or_else(|| self.config.model.clone(), str::to_string)
+    }
+
     fn request_payload(&self, prompt: &str, image_data: &str, mime_type: &str) -> Value {
         let mut payload = json!({
-            "model": self.config.model,
+            "model": self.wire_model(),
             "messages": [
                 {
                     "role": "user",

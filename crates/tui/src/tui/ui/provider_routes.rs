@@ -626,6 +626,9 @@ pub(crate) async fn switch_provider(
     identity: crate::config::ProviderIdentity,
     model_override: Option<String>,
 ) -> bool {
+    if app.reject_setting_change_while_busy(MessageId::SettingSubjectProvider) {
+        return false;
+    }
     if let Err(reason) = config.verify_provider_identity(&identity) {
         app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
         return false;
@@ -786,9 +789,7 @@ pub(crate) async fn switch_provider(
         app.session.last_completion_tokens = None;
     }
 
-    let _ = engine_handle.send(Op::Shutdown).await;
-    let engine_config = build_engine_config(app, config);
-    *engine_handle = spawn_tui_engine(engine_config, config);
+    replace_tui_engine(app, config, engine_handle).await;
     // A successful in-session switch must refresh the same key-scoped live
     // catalog as startup. TelecomJS is currently the only provider using this
     // seam; failures preserve the existing/static rows.
@@ -985,8 +986,7 @@ pub(crate) fn mcp_server_diagnosis(app: &App, name: &str) -> String {
 pub(crate) fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> bool {
     matches!(
         action,
-        crate::tui::app::McpUiAction::Validate
-            | crate::tui::app::McpUiAction::Logout { .. }
+        crate::tui::app::McpUiAction::Logout { .. }
             | crate::tui::app::McpUiAction::ImportList
             | crate::tui::app::McpUiAction::ImportApprove { .. }
     )

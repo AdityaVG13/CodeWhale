@@ -21,10 +21,11 @@ use crate::commands::CommandResult;
 /// delegating content generation to the LLM agent.
 ///
 /// FEAT-021 portable dispatch: consumes only the workspace path (supplied
-/// through the `WORKSPACE` facet); the workspace scan and prompt composition
-/// stay handler-owned (D2). `crate::utils`/`crate::project_context` are leaf,
+/// through the `WORKSPACE` facet) and the UI language name (through the
+/// `PRESENTATION` facet); the workspace scan and prompt composition stay
+/// handler-owned (D2). `crate::utils`/`crate::project_context` are leaf,
 /// path-parameterized helpers (no App/service state), consistent with D8.
-fn init(workspace: &Path) -> CommandResult {
+fn init(workspace: &Path, language: &str) -> CommandResult {
     // Ensure .deepseek/ is gitignored if we're inside a git repo.
     ensure_deepseek_gitignored(workspace);
 
@@ -43,7 +44,12 @@ fn init(workspace: &Path) -> CommandResult {
     };
 
     // Construct the prompt for the LLM agent.
-    let prompt = build_init_prompt(&context, existing_content.as_deref(), already_exists);
+    let prompt = build_init_prompt(
+        &context,
+        existing_content.as_deref(),
+        already_exists,
+        language,
+    );
 
     // Display message to user AND send the prompt to the agent.
     let verb = if already_exists {
@@ -717,6 +723,7 @@ fn build_init_prompt(
     context: &str,
     existing_content: Option<&str>,
     already_exists: bool,
+    language: &str,
 ) -> String {
     let mut prompt = String::new();
 
@@ -746,7 +753,7 @@ fn build_init_prompt(
 
     prompt.push_str("## Instructions\n\n");
 
-    prompt.push_str(
+    prompt.push_str(&format!(
         "1. **Read key source files** to understand the architecture:\n\
            - Start with the main entry point(s) (e.g., main.rs, index.ts, app.py)\n\
            - Read the top-level module structure to understand component boundaries\n\
@@ -781,12 +788,13 @@ fn build_init_prompt(
            - Be concise and actionable. This is a reference document, not a tutorial.\n\
            - Use markdown headings, code blocks, and bullet lists.\n\
            - Keep the total under ~150 lines unless the project genuinely needs more.\n\
-           - Write in English.\n\
+           - Write the whole file in {language}, headings included; keep commands, \
+             file paths and code identifiers as they are.\n\
            - Do NOT include placeholder HTML comments like \"<!-- add stuff here -->\".\n\
            - If you cannot determine something with confidence, omit that section rather than guessing.\n\n\
          4. **Write the file** using the file write tool. \
            The file should be named `AGENTS.md` at the workspace root.\n\n",
-    );
+    ));
 
     if already_exists {
         prompt.push_str(
@@ -822,7 +830,8 @@ impl codewhale_command_contract::metadata::RegisterCommand<crate::commands::Comm
     fn handler()
     -> codewhale_command_contract::handler::CommandHandler<crate::commands::CommandResult> {
         codewhale_command_contract::handler::CommandHandler::Contextual {
-            capabilities: codewhale_command_contract::handler::CommandCapabilities::WORKSPACE,
+            capabilities: codewhale_command_contract::handler::CommandCapabilities::WORKSPACE
+                .union(codewhale_command_contract::handler::CommandCapabilities::PRESENTATION),
             handler: init_contextual,
         }
     }
@@ -830,10 +839,11 @@ impl codewhale_command_contract::metadata::RegisterCommand<crate::commands::Comm
 
 /// Contextual `/init` dispatch (FEAT-021 Phase 4).
 ///
-/// Destructures the declared `WORKSPACE` facet with a safe missing-facet
-/// error. The workspace path is consumed via the `WORKSPACE` facet (D2);
+/// Destructures the declared `WORKSPACE` and `PRESENTATION` facets with safe
+/// missing-facet errors. The workspace path is consumed via the `WORKSPACE`
+/// facet (D2) and the language the file is written in via `PRESENTATION`;
 /// `/init` consumes no project-facet method, so it destructures exactly
-/// `WORKSPACE` (D4, least-capability — the initial PROJECT|WORKSPACE
+/// those two (D4, least-capability — the initial PROJECT|WORKSPACE
 /// declaration was amended after the critical audit; main's model expresses
 /// the declaration as exact facet destructuring rather than a bitmask).
 fn init_contextual(contexts: CommandContexts<'_>, _arg: Option<&str>) -> CommandResult {
@@ -841,7 +851,12 @@ fn init_contextual(contexts: CommandContexts<'_>, _arg: Option<&str>) -> Command
     let Some(workspace) = parts.workspace.as_deref() else {
         return crate::commands::CommandResult::error("Command capability unavailable: workspace");
     };
-    init(&workspace.workspace())
+    let Some(presentation) = parts.presentation.as_deref() else {
+        return crate::commands::CommandResult::error(
+            "Command capability unavailable: presentation",
+        );
+    };
+    init(&workspace.workspace(), presentation.language_name())
 }
 
 // ---------------------------------------------------------------------------
@@ -858,7 +873,7 @@ mod tests {
     #[test]
     fn init_returns_send_message_action() {
         let tmpdir = TempDir::new().unwrap();
-        let result = init(tmpdir.path());
+        let result = init(tmpdir.path(), "English");
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(msg.contains("Creating AGENTS.md"));
@@ -872,7 +887,7 @@ mod tests {
     fn init_says_updating_when_agents_md_exists() {
         let tmpdir = TempDir::new().unwrap();
         std::fs::write(tmpdir.path().join("AGENTS.md"), "existing content").unwrap();
-        let result = init(tmpdir.path());
+        let result = init(tmpdir.path(), "English");
         assert!(result.message.unwrap().contains("Updating AGENTS.md"));
         assert!(matches!(result.action, Some(AppAction::SendMessage(_))));
     }
@@ -881,7 +896,7 @@ mod tests {
     fn init_includes_gitignore_handling() {
         let tmpdir = TempDir::new().unwrap();
         std::fs::create_dir_all(tmpdir.path().join(".git")).unwrap();
-        let result = init(tmpdir.path());
+        let result = init(tmpdir.path(), "English");
         assert!(!result.is_error);
         // Should have added .deepseek/ to .gitignore.
         let gi = std::fs::read_to_string(tmpdir.path().join(".gitignore")).unwrap();
@@ -896,7 +911,7 @@ mod tests {
             "[package]\nname = \"test-crate\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        let result = init(tmpdir.path());
+        let result = init(tmpdir.path(), "English");
         let Some(AppAction::SendMessage(prompt)) = result.action else {
             panic!("expected SendMessage action");
         };
@@ -922,7 +937,7 @@ mod tests {
             "# My Project\n\nCustom instructions here.",
         )
         .unwrap();
-        let result = init(tmpdir.path());
+        let result = init(tmpdir.path(), "English");
         let Some(AppAction::SendMessage(prompt)) = result.action else {
             panic!("expected SendMessage action");
         };
@@ -1305,7 +1320,7 @@ mod tests {
     #[test]
     fn build_init_prompt_contains_all_sections() {
         let ctx = "## Project Summary\n\nA Rust project\n";
-        let prompt = build_init_prompt(ctx, None, false);
+        let prompt = build_init_prompt(ctx, None, false, "English");
         assert!(prompt.contains("Project Context"));
         assert!(prompt.contains("A Rust project"));
         assert!(prompt.contains("Read key source files"));
@@ -1318,7 +1333,7 @@ mod tests {
     fn build_init_prompt_with_existing_content() {
         let ctx = "## Project Summary\n\nA Rust project\n";
         let existing = "# Old AGENTS.md content";
-        let prompt = build_init_prompt(ctx, Some(existing), true);
+        let prompt = build_init_prompt(ctx, Some(existing), true, "English");
         assert!(prompt.contains("Old AGENTS.md content"));
         assert!(prompt.contains("Update it in place"));
     }
@@ -1326,7 +1341,7 @@ mod tests {
     #[test]
     fn build_init_prompt_new_file_no_update_instruction() {
         let ctx = "## Project Summary\n\nA Rust project\n";
-        let prompt = build_init_prompt(ctx, None, false);
+        let prompt = build_init_prompt(ctx, None, false, "English");
         assert!(!prompt.contains("The file already exists"));
     }
 

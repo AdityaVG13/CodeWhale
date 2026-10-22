@@ -4,13 +4,9 @@ name: Sync to CNB
 # so users behind GitHub-blocking networks can fetch the source and tagged
 # releases from the Tencent-hosted mirror.
 #
-# Triggers:
-#   * push to main              → mirrors that commit to CNB main
-#   * successful Release job   → mirrors the published tag to CNB
-#   * release work branches     → mirrors release-candidate refs for CNB preflight
-#   * fix/rebrand branches      → mirrors first-party heavy Linux CI refs
-#   * Tencent release branches  → mirrors Feishu/Lighthouse setup branches
-#   * workflow_dispatch         → manual fallback if any of the above fails
+# Main pushes mirror to CNB unless the repository variable CNB_MIRROR is
+# "disabled"; release tags arrive through release.yml; manual dispatch is the
+# fallback.
 #
 # Why the rewrite (v0.8.31):
 #   The previous implementation used the opaque tencentcom/git-sync Docker
@@ -25,13 +21,7 @@ name: Sync to CNB
 
 on:
   push:
-    branches:
-      - main
-      - 'work/v*'
-      - 'fix/*'
-      - 'rebrand/*'
-      - 'work/v*-feishu-*'
-      - 'work/v*-lighthouse*'
+    branches: [main]
   workflow_dispatch: {}
   workflow_call:
     inputs:
@@ -62,6 +52,7 @@ permissions:
 
 jobs:
   sync:
+    if: github.repository_owner == 'codewhale-hq' && (github.event_name != 'push' || vars.CNB_MIRROR != 'disabled')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -93,28 +84,6 @@ jobs:
           # Use a masked alias so the token never appears in log lines.
           git remote add cnb "${REMOTE_URL}"
 
-          # Push with retry on transient failures (CNB rate-limits, DNS
-          # blips, etc.). Args after `kind` are forwarded to `git push`
-          # so callers can pass `--force-with-lease`, multiple refspecs,
-          # etc. without quoting them into one string.
-          push_with_retry() {
-            local kind="$1"
-            shift
-            local attempt
-            for attempt in 1 2 3; do
-              echo "Attempt ${attempt}: pushing ${kind} to CNB"
-              if git push cnb "$@" 2>&1; then
-                echo "Successfully pushed ${kind} to CNB"
-                return 0
-              fi
-              if [ "${attempt}" -lt 3 ]; then
-                sleep $((attempt * 5))
-              fi
-            done
-            echo "::error::Failed to push ${kind} to CNB after 3 attempts" >&2
-            return 1
-          }
-
           if [[ -n "${RELEASE_TAG}" || "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="${RELEASE_TAG:-${GITHUB_REF#refs/tags/}}"
             # The tag starts CNB's public release pipeline. Require the
@@ -127,7 +96,7 @@ jobs:
             ./scripts/release/verify-remote-tag.sh \
               "https://github.com/${GITHUB_REPOSITORY}.git" "${TAG}" "${SOURCE_SHA}"
             node scripts/release/verify-release-inventory.js --manifest "${GITHUB_REPOSITORY}" "${TAG}"
-            push_with_retry "tag ${TAG}" "refs/tags/${TAG}:refs/tags/${TAG}"
+            scripts/release/mirror-push.sh cnb "tag ${TAG}" "refs/tags/${TAG}:refs/tags/${TAG}"
           elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
             # Plain --force. The CNB mirror is one-way by design —
             # nothing else pushes to it, so there's no contributor work
@@ -139,7 +108,7 @@ jobs:
             # That made the lease check spuriously fail with
             # `! [rejected] HEAD -> main (stale info)` even when CNB
             # was actually behind GitHub.
-            push_with_retry "main" HEAD:refs/heads/main --force
+            scripts/release/mirror-push.sh cnb "main" HEAD:refs/heads/main --force
           else
             # First-party fix/rebrand/release branches are first-class CNB
             # sources for heavy Linux CI, release preflight, and
@@ -148,5 +117,5 @@ jobs:
             # useful before the branch has merged to main or become a release
             # tag.
             BRANCH="${GITHUB_REF#refs/heads/}"
-            push_with_retry "branch ${BRANCH}" "HEAD:refs/heads/${BRANCH}" --force
+            scripts/release/mirror-push.sh cnb "branch ${BRANCH}" "HEAD:refs/heads/${BRANCH}" --force
           fi

@@ -467,9 +467,14 @@ mod tests {
         let error = result.error.expect("truncation must fail the RLM turn");
         assert!(error.contains("incomplete"), "{error}");
         assert!(error.contains("max_tokens"), "{error}");
-        assert_eq!(result.usage, usage, "billed usage must still be charged");
+        let mut expected_usage = usage.clone();
+        expected_usage.request_usages = vec![usage.clone()];
+        assert_eq!(
+            result.usage, expected_usage,
+            "billed usage must still be charged"
+        );
         assert_eq!(result.routed_usage.len(), 1);
-        assert_eq!(result.routed_usage[0].usage.usage, usage);
+        assert_eq!(result.routed_usage[0].usage.usage, expected_usage);
         assert_eq!(result.routed_usage_dropped_records, 0);
         assert_eq!(mock.call_count(), 1, "truncation must not retry");
         assert!(
@@ -714,7 +719,9 @@ mod tests {
                     .unwrap()
                     .contains("wall-clock deadline")
             );
-            assert_eq!(result.usage, text_response(partial).usage);
+            let mut expected_usage = text_response(partial).usage;
+            expected_usage.request_usages = vec![text_response(partial).usage];
+            assert_eq!(result.usage, expected_usage);
             assert_eq!(client.0.call_count(), 1);
             let snapshot = usage.snapshot().await;
             assert_eq!(snapshot.records.len(), 1, "keep completed usage");
@@ -1059,6 +1066,7 @@ mod tests {
             ContentBlock::Thinking {
                 signature: None,
                 state: None,
+                redacted_data: None,
                 thinking: "skip".to_string(),
             },
             ContentBlock::Text {

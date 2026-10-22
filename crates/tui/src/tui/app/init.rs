@@ -500,10 +500,14 @@ impl App {
             reasoning_effort =
                 reasoning_effort.normalize_for_route(provider, &active_route_base_url, &model);
         } else if !auto_model && !reasoning_effort_explicit {
-            if let Some(default) = ReasoningEffort::catalog_default(provider, &model) {
+            if let Some(default) =
+                ReasoningEffort::catalog_default(provider, &active_route_base_url, &model)
+            {
                 reasoning_effort = default;
             }
-        } else if !auto_model && ReasoningEffort::catalog_effort_values(provider, &model).is_some()
+        } else if !auto_model
+            && ReasoningEffort::catalog_effort_values(provider, &active_route_base_url, &model)
+                .is_some()
         {
             reasoning_effort =
                 reasoning_effort.normalize_for_route(provider, &active_route_base_url, &model);
@@ -691,11 +695,11 @@ impl App {
                 plugin_registry.as_ref(),
             )
             .map(|cfg| {
-                // Boot is lazy (#6033): the pre-event "connecting" prediction
-                // is the eager set — `required` servers plus ones the user's
-                // `tools.always_load` selection covers — not every enabled
-                // server. The engine's first boot event replaces this with
-                // the real in-flight set.
+                // The pre-event "connecting" prediction names only servers a
+                // session must start — `required` ones plus those the user's
+                // `tools.always_load` selection covers — not every server the
+                // boot pass starts. The engine's first boot event replaces
+                // this with the real in-flight set.
                 let requested = config
                     .tools
                     .as_ref()
@@ -798,6 +802,7 @@ impl App {
             paused_goal_objective: None,
             history: Vec::new(),
             history_version: 0,
+            details_epoch: 0,
             transcript_identity_epoch: 0,
             history_revisions: Vec::new(),
             tool_run_cache: ToolRunCache::default(),
@@ -921,6 +926,7 @@ impl App {
             focus_texture,
             launch,
             pending_launch_action: None,
+            pending_claude_login: None,
             pending_composer_submit: None,
             pending_hotbar_slot: None,
             synchronized_output_enabled,
@@ -1102,7 +1108,6 @@ impl App {
             agent_roster_session_id: None,
             agent_roster_print_requested: false,
             active_tool_entry_completed_at: HashMap::new(),
-            exploring_cell: None,
             exploring_entries: HashMap::new(),
             ignored_tool_calls: HashSet::new(),
             last_exec_wait_command: None,
@@ -1110,6 +1115,7 @@ impl App {
             streaming_source_receipt: None,
             suppress_stream_events_until_turn_complete: false,
             streaming_thinking_active_entry: None,
+            pending_thinking_translation_cells: HashMap::new(),
             thinking_revision_last_bump_at: None,
             streaming_state: StreamingState::new(),
             streaming_output_token_estimate: 0,
@@ -1120,6 +1126,7 @@ impl App {
             pending_gate_receipts: Vec::new(),
             child_gate_receipts: std::collections::HashMap::new(),
             queued_messages: VecDeque::new(),
+            held_restored_queue: 0,
             queued_draft: None,
             pending_steers: VecDeque::new(),
             inflight_steers: VecDeque::new(),
@@ -1203,6 +1210,7 @@ impl App {
             workspace_follow_symlinks: settings.workspace_follow_symlinks,
             session_title: None,
             window_title: None,
+            composer_color: None,
             title_default: config
                 .title
                 .as_deref()

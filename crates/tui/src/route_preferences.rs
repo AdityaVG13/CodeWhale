@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::config::{Config, ProviderIdentity, ProviderKind};
+use crate::config::{BaseUrlEnvReceipt, Config, ProviderIdentity, ProviderKind};
 use crate::config_persistence as persistence;
 
 /// Whether a config key names a provider or model selection.
@@ -319,6 +319,110 @@ pub fn selected_route(path: &Path) -> Result<(String, String, codewhale_config::
         codewhale_config::ModelSource::ProviderDefault
     };
     Ok((provider, config.default_model(), source))
+}
+
+pub fn list_models(
+    store: &codewhale_config::ConfigStore,
+    filter: Option<ProviderKind>,
+) -> Result<Vec<(ProviderKind, Vec<String>)>> {
+    crate::models_dev_live::maybe_load_persisted_cache();
+    let mut config = saved_config(store)?;
+    config.base_url_env_receipt = config
+        .active_provider_identity()
+        .map_or(BaseUrlEnvReceipt::NoOwner, |identity| {
+            BaseUrlEnvReceipt::Route(identity.provider, identity.key.to_string())
+        });
+    let providers = filter
+        .as_ref()
+        .map_or(ProviderKind::all(), std::slice::from_ref);
+    let mut catalogs = Vec::with_capacity(providers.len());
+    for provider in providers {
+        if *provider == ProviderKind::Custom
+            && config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider.as_str()))
+                .is_none()
+        {
+            continue;
+        }
+        let identity = config
+            .legacy_selection_identity(provider.as_str())
+            .map_err(anyhow::Error::msg)?;
+        let mut route_config = config.clone();
+        route_config
+            .scope_to_provider_identity(&identity)
+            .map_err(anyhow::Error::msg)?;
+        let mut models = crate::provider_lake::configured_catalog_models_for_route(
+            &route_config,
+            identity.provider,
+            identity.key.as_str(),
+            &route_config.active_route_base_url(),
+        );
+        if identity.provider != ProviderKind::OpenaiCodex {
+            let default_model = route_config.default_model();
+            if !default_model.is_empty() && !default_model.eq_ignore_ascii_case("auto") {
+                models.push(default_model);
+            }
+            models.sort();
+            models.dedup();
+        }
+        catalogs.push((*provider, models));
+    }
+    Ok(catalogs)
+}
+
+pub fn resolve_model(
+    path: &Path,
+    provider_identity: &str,
+    base_url: &str,
+    model: Option<&str>,
+) -> Result<codewhale_config::route::ReadyRouteCandidate> {
+    crate::models_dev_live::maybe_load_persisted_cache();
+    let store = codewhale_config::ConfigStore::load(Some(path.to_path_buf()))?;
+    let mut config = saved_config(&store)?;
+    let identity = config
+        .resolve_provider_selection_identity(provider_identity)
+        .map_err(anyhow::Error::msg)?;
+    config.set_provider_base_url_override(&identity, Some(base_url.into()))?;
+    crate::provider_catalog_live::maybe_load_persisted_cache_for_config(&config);
+    let route = crate::route_runtime::resolve_runtime_route_for_identity(&config, &identity, model)
+        .map_err(anyhow::Error::msg);
+    if !route.as_ref().is_ok_and(|route| {
+        (route.identity.provider == ProviderKind::OpenaiCodex
+            && crate::codex_model_cache::model_roster_for(&route.config)
+                .metadata_for(route.candidate.wire_model_id().as_str())
+                .is_some())
+            || crate::provider_lake::configured_catalog_offering_for_route(
+                &route.config,
+                route.identity.provider,
+                route.identity.key.as_str(),
+                &route.candidate.endpoint().base_url,
+                route.candidate.wire_model_id().as_str(),
+            )
+            .is_some()
+    }) {
+        if crate::provider_catalog_live::cached_entry_for_route(
+            identity.provider,
+            identity.key.as_str(),
+            base_url,
+        )?
+        .is_some_and(|entry| entry.fetched_at > 0)
+        {
+            return Err(
+                codewhale_agent::ModelResolutionError::ModelNotAvailableForProvider {
+                    provider: identity.provider,
+                    requested: model.unwrap_or("auto").to_string(),
+                }
+                .into(),
+            );
+        }
+        codewhale_agent::ModelRegistry::default().resolve(
+            model.filter(|model| *model != "auto"),
+            Some(identity.provider),
+        )?;
+    }
+    Ok(route?.candidate)
 }
 
 /// Save one explicit route preference after atomically adopting legacy choices.

@@ -5,7 +5,7 @@
 //!
 //! - a terminal session: the saved transcript (`sessions/<id>.json`, whose
 //!   `tool_use`/`tool_result` blocks are the calls) plus the session's
-//!   approval log (`sessions/<id>/approval_receipts.jsonl`);
+//!   approval log (`sessions/<id>/approval_receipts.jsonl`) and saved turn outcomes;
 //! - a Runtime thread (the app, `codewhale serve`): the thread's turn and item
 //!   records plus the `approval.*` events in its append-only event log.
 //!
@@ -15,8 +15,9 @@
 //! shell command changed, which no tool record names.
 //!
 //! Both are normalized into [`ToolStep`]s and [`ApprovalStep`]s and then
-//! classified by the same code, so `/receipts`, `codewhale receipts`, and
-//! `GET /v1/threads/{id}/receipt` cannot disagree about what happened.
+//! classified by the same code for `/receipts`, `codewhale receipts`, and
+//! `GET /v1/threads/{id}/receipt`. Live and saved terminal sessions supply
+//! their recorded turn outcomes so both surfaces report the same failures.
 //!
 //! The builder only reads. It never calls a provider, runs a tool, or writes
 //! a file (reading the snapshots runs `git diff` inside the side repo, which
@@ -102,6 +103,8 @@ type TurnPosture = (String, Option<&'static str>);
 /// A turn and the user's prompt text, if it had any.
 type TurnPrompt = (String, Option<String>);
 
+type TurnFailure = (Option<String>, Option<DateTime<Utc>>, Option<String>);
+
 /// Each matched turn's workspace change, and how many turns had no pair.
 type TurnChanges = (Vec<(String, TurnWorkspaceChange)>, usize);
 
@@ -131,10 +134,33 @@ pub(crate) fn session_receipt(
     source: ReceiptSource,
     messages: &[Message],
     approval_receipts: &[ApprovalReceipt],
+    turn_outcomes: &[crate::session_manager::SavedTurnOutcome],
     turn: Option<&str>,
 ) -> anyhow::Result<Receipt> {
     let mut notes = BTreeSet::new();
     let (steps, turn_postures, turn_prompts) = steps_from_messages(messages);
+    let failures = turn_outcomes
+        .iter()
+        .filter(|outcome| {
+            outcome.status == crate::core::events::TurnOutcomeStatus::Failed
+                && outcome.after_message_count <= messages.len()
+        })
+        .map(|outcome| {
+            let turn = messages
+                .iter()
+                .take(outcome.after_message_count)
+                .filter(|message| {
+                    crate::runtime_handoff::classify_user_turn_prompt(message)
+                        != crate::runtime_handoff::UserTurnPromptKind::NotPrompt
+                })
+                .count();
+            (
+                (turn > 0).then(|| turn.to_string()),
+                Some(outcome.ended_at),
+                Some(outcome.error.clone()),
+            )
+        })
+        .collect();
     let approvals = match ApprovalReplay::from_receipts(approval_receipts) {
         Ok(replay) => approvals_from_replay(&replay),
         Err(error) => {
@@ -212,7 +238,7 @@ pub(crate) fn session_receipt(
         source,
         steps,
         approvals,
-        Vec::new(),
+        failures,
         workspace_changes,
         Assembly {
             turn,
@@ -268,7 +294,11 @@ pub(crate) fn thread_receipt(
             }
         }
         if record.status == RuntimeTurnStatus::Failed {
-            failures.push((record.id.clone(), record.ended_at, record.error.clone()));
+            failures.push((
+                Some(record.id.clone()),
+                record.ended_at,
+                record.error.clone(),
+            ));
         }
     }
     let approvals = approvals_from_events(events);
@@ -380,6 +410,7 @@ pub(crate) fn run_receipts_command(
                 session_source(&session.metadata),
                 &session.messages,
                 &session.approval_receipts,
+                &session.turn_outcomes,
                 turn,
             )?
         }
@@ -405,6 +436,7 @@ pub(crate) fn run_receipts_command(
                         session_source(&session.metadata),
                         &session.messages,
                         &session.approval_receipts,
+                        &session.turn_outcomes,
                         turn,
                     )?
                 }
@@ -1678,7 +1710,7 @@ fn assemble(
     source: ReceiptSource,
     steps: Vec<ToolStep>,
     approvals: Vec<ApprovalStep>,
-    turn_failures: Vec<(String, Option<DateTime<Utc>>, Option<String>)>,
+    turn_failures: Vec<TurnFailure>,
     workspace_changes: Vec<(String, TurnWorkspaceChange)>,
     scope: Assembly<'_>,
     mut notes: BTreeSet<String>,
@@ -1841,12 +1873,12 @@ fn assemble(
     }
 
     for (turn_id, ended_at, error) in turn_failures {
-        if !in_scope(Some(&turn_id)) {
+        if !in_scope(turn_id.as_deref()) {
             continue;
         }
         actions.push(ReceiptAction {
             seq: 0,
-            turn: Some(turn_id),
+            turn: turn_id,
             at: ended_at,
             call_id: None,
             tool: "turn".to_string(),

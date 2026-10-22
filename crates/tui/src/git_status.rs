@@ -766,14 +766,13 @@ pub fn create_worktree(
     if new_branch {
         args.push("-b");
         args.push(branch);
-        args.push(path.to_str().ok_or("invalid path")?);
-    } else {
-        args.push(path.to_str().ok_or("invalid path")?);
+    }
+    args.push("--");
+    args.push(path.to_str().ok_or("invalid path")?);
+    if !new_branch {
         args.push(branch);
     }
-    git_write(repo, &args).map(|_| ())?;
-    force_refresh(repo);
-    Ok(())
+    git_write(repo, &args).map(|_| ())
 }
 
 /// Build the human-readable workspace context string ("branch | status")

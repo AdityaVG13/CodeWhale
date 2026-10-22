@@ -141,6 +141,7 @@ pub struct ApprovalRequest {
     /// This file write asks only because the folder has no git repository;
     /// in one it would run without a card. The card says so in one line.
     pub asks_without_git: bool,
+    stakes: ApprovalStakes,
 }
 
 /// Key approval details rendered prominently in the approval card.
@@ -166,7 +167,7 @@ impl ApprovalRequest {
     /// Presentation stakes for this request (see [`ApprovalStakes`]).
     #[must_use]
     pub fn stakes(&self) -> ApprovalStakes {
-        classify_stakes(&self.tool_name, self.category, self.risk, &self.params)
+        self.stakes
     }
 
     #[cfg(test)]
@@ -204,19 +205,18 @@ impl ApprovalRequest {
             crate::tools::approval_cache::build_approval_grouping_key(tool_name, params).0;
         let persistent_ask_rules =
             build_persistent_ask_rules(semantic_tool_name, params, workspace);
-        let persistent_allow_rules = if classify_stakes(tool_name, category, risk, params)
-            == ApprovalStakes::Critical
-            || description_is_repo_law_prompt(description)
-        {
-            Vec::new()
-        } else {
-            build_persistent_allow_rules(
-                semantic_tool_name,
-                params,
-                workspace,
-                &persistent_ask_rules,
-            )
-        };
+        let stakes = classify_stakes(tool_name, category, risk, params);
+        let persistent_allow_rules =
+            if stakes == ApprovalStakes::Critical || description_is_repo_law_prompt(description) {
+                Vec::new()
+            } else {
+                build_persistent_allow_rules(
+                    semantic_tool_name,
+                    params,
+                    workspace,
+                    &persistent_ask_rules,
+                )
+            };
 
         Self {
             id: id.to_string(),
@@ -246,6 +246,7 @@ impl ApprovalRequest {
             persistent_allow_rules,
             owner: None,
             asks_without_git: false,
+            stakes,
         }
     }
 
@@ -336,7 +337,7 @@ impl ApprovalRequest {
             .into_iter()
             .map(|mut detail| {
                 if matches!(detail.label.as_str(), "File" | "Path" | "Dir") {
-                    detail.value = workspace_relative(&detail.value, &self.workspace);
+                    detail.value = crate::utils::workspace_relative(&detail.value, &self.workspace);
                 }
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
                 if detail.is_preview
@@ -351,20 +352,6 @@ impl ApprovalRequest {
                 detail
             })
             .collect()
-    }
-}
-
-/// Show `value` relative to `workspace` when it is an absolute path inside
-/// it, so the card never spends a row on the workspace prefix.
-fn workspace_relative(value: &str, workspace: &Path) -> String {
-    let path = Path::new(value);
-    if workspace.as_os_str().is_empty() || !path.is_absolute() {
-        return value.to_string();
-    }
-    match path.strip_prefix(workspace) {
-        Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
-        Ok(relative) => relative.display().to_string(),
-        Err(_) => value.to_string(),
     }
 }
 

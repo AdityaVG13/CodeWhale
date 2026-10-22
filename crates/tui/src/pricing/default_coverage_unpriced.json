@@ -1,7 +1,7 @@
 [
   {
     "reason": "no_pricing_row",
-    "review": "Source reviewed at 36f11b82; fixture recorded time is 2026-09-08T12:00Z with 1000 input/100 output and no cache usage or live/signed/override price state. Exact default tuples below have no usable provider-owned bundled/hand row (pricing.rs:1639,1674,2282; provider_lake.rs:993). OpenRouter official identity with no frozen quote uses immutable bundled fallback (pricing.rs:2011,2089); its DeepSeek Pro row is costless. Zen resolves gpt-5.6 to wire gpt-5.6-sol (route/offering.rs:312), while its hand fallback prices only DeepSeek Flash (pricing.rs:2426). Wanjie is not the direct-DeepSeek retired-alias/hand-price owner. No numeric rates or model-owner rates are inferred. ZenMux review: metered OpenAI-compatible aggregator; its deepseek/deepseek-v4.1-flash default has no bundled/hand pricing row and resolves costless until the live catalog prices it. ModelScope review (ba62522a20 omitted this row): same shape — metered default with no bundled/hand row in pricing.rs.",
+    "review": "Source reviewed at 36f11b82; fixture recorded time is 2026-09-08T12:00Z with 1000 input/100 output and no cache usage or live/signed/override price state. Exact default tuples below have no usable provider-owned bundled/hand row (pricing.rs:1639,1674,2282; provider_lake.rs:993). OpenRouter and Together defaults retired from this group: the refreshed bundled seed now prices deepseek/deepseek-v4-pro and deepseek-ai/DeepSeek-V4-Pro. Zen resolves gpt-5.6 to wire gpt-5.6-sol (route/offering.rs:312), while its hand fallback prices only DeepSeek Flash (pricing.rs:2426). Wanjie is not the direct-DeepSeek retired-alias/hand-price owner. No numeric rates or model-owner rates are inferred. ZenMux review: metered OpenAI-compatible aggregator; its deepseek/deepseek-v4.1-flash default has no bundled/hand pricing row and resolves costless until the live catalog prices it. ModelScope review (ba62522a20 omitted this row): same shape — metered default with no bundled/hand row in pricing.rs.",
     "routes": [
       ["atlascloud", "deepseek-ai/deepseek-v4-flash", "https://api.atlascloud.ai/v1", "chat_completions", "metered"],
       ["codewhale", "deepseek/deepseek-v4-pro", "https://api.codewhale.net/v1", "chat_completions", "metered"],
@@ -15,14 +15,12 @@
       ["nvidia-nim", "deepseek-ai/deepseek-v4-pro", "https://integrate.api.nvidia.com/v1", "chat_completions", "metered"],
       ["opencode-zen", "gpt-5.6-sol", "https://opencode.ai/zen/v1", "responses", "metered"],
       ["openmodel", "deepseek-v4-flash", "https://api.openmodel.ai", "anthropic_messages", "metered"],
-      ["openrouter", "deepseek/deepseek-v4-pro", "https://openrouter.ai/api/v1", "chat_completions", "metered"],
       ["orcarouter", "deepseek/deepseek-v4-pro", "https://api.orcarouter.ai/v1", "chat_completions", "metered"],
       ["qianfan", "ernie-4.0-turbo-8k", "https://api.baiduqianfan.ai/v1", "chat_completions", "metered"],
       ["sakana", "fugu", "https://api.sakana.ai/v1", "chat_completions", "metered"],
       ["siliconflow", "deepseek-ai/DeepSeek-V4-Pro", "https://api.siliconflow.com/v1", "chat_completions", "metered"],
       ["siliconflow-CN", "deepseek-ai/DeepSeek-V4-Pro", "https://api.siliconflow.cn/v1", "chat_completions", "metered"],
       ["telecomjs", "deepseek-v4-pro", "https://aigw.telecomjs.com/v1", "chat_completions", "metered"],
-      ["together", "deepseek-ai/DeepSeek-V4-Pro", "https://api.together.xyz/v1", "chat_completions", "metered"],
       ["wanjie-ark", "deepseek-reasoner", "https://maas-openapi.wanjiedata.com/api/v1", "chat_completions", "metered"],
       ["zenmux", "deepseek/deepseek-v4.1-flash", "https://zenmux.ai/api/v1", "chat_completions", "metered"]
     ]
@@ -36,7 +34,7 @@
   },
   {
     "reason": "unknown_billing_basis",
-    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and nine non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239. AICraft is the sixth compatible default: dc170add3 restored its row from the closed PR #6171 with endpoint, credential env and bootstrap model only, and no billing product or pricing row was reviewed for it. Its default is claude-4.6-sonnet, which has no bundled/hand row either; that omission is recorded here on the shape of the descriptor, and a real source review of AICraft's billing basis is still owed. Tsubasa (#6695) is the seventh: endpoint, credential env and bootstrap model tsubasa-pro only; its public site lists prepaid-credit per-token rates, but no pricing row was reviewed or frozen for it, so it stays Unknown here too. Yolo-Auto is the eighth: its row carries endpoint, credential env and bootstrap model (qwen3.8-flash, the vendor's recommended start model on free and paid plans) only, the gateway sells flat-rate subscription tiers with no published per-token catalog to review, and the URL proves no plan product, so the route stays Unknown rather than being guessed into subscription or local-no-bill; a source review of Yolo-Auto's billing basis is owed. Cheaper Inference is the ninth non-Baseten compatible default: its gpt-5.4-mini bootstrap model and API endpoint do not establish a billing product or reviewed price, so it also remains Unknown. ChatGPT source review: the official API endpoint alone does not prove a ChatGPT plan product. route_billing.rs capture_product requires the Config's owned official registration for Subscription; the offline default inventory has none and remains Unknown. The retired backend endpoint supplies no transport or billing authority.",
+    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and ten non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239. AICraft is the sixth compatible default: dc170add3 restored its row from the closed PR #6171 with endpoint, credential env and bootstrap model only, and no billing product or pricing row was reviewed for it. Its default is claude-4.6-sonnet, which has no bundled/hand row either; that omission is recorded here on the shape of the descriptor, and a real source review of AICraft's billing basis is still owed. Tsubasa (#6695) is the seventh: endpoint, credential env and bootstrap model tsubasa-pro only; its public site lists prepaid-credit per-token rates, but no pricing row was reviewed or frozen for it, so it stays Unknown here too. Yolo-Auto is the eighth: its row carries endpoint, credential env and bootstrap model (qwen3.8-flash, the vendor's recommended start model on free and paid plans) only, the gateway sells flat-rate subscription tiers with no published per-token catalog to review, and the URL proves no plan product, so the route stays Unknown rather than being guessed into subscription or local-no-bill; a source review of Yolo-Auto's billing basis is owed. Cheaper Inference is the ninth non-Baseten compatible default: its gpt-5.4-mini bootstrap model and API endpoint do not establish a billing product or reviewed price, so it also remains Unknown. Standard Compute is the tenth: its row carries endpoint, credential env and the standardcompute router id only; the gateway sells flat monthly plans with a per-plan compute budget, and neither the URL nor the router id proves a plan product or per-request price, so the route stays Unknown. ChatGPT source review: the official API endpoint alone does not prove a ChatGPT plan product. route_billing.rs capture_product requires the Config's owned official registration for Subscription; the offline default inventory has none and remains Unknown. The retired backend endpoint supplies no transport or billing authority.",
     "routes": [
       ["aicraft", "claude-4.6-sonnet", "https://aicraftapi.com/v1", "chat_completions", "unknown"],
       ["cerebras", "llama-3.3-70b", "https://api.cerebras.ai/v1", "chat_completions", "unknown"],
@@ -50,6 +48,7 @@
       ["ollama-cloud", "gpt-oss:120b", "https://ollama.com/v1", "chat_completions", "unknown"],
       ["openai-codex", "gpt-5.6", "https://api.openai.com/v1", "responses", "unknown"],
       ["sensenova", "deepseek-v4-flash", "https://token.sensenova.cn/v1", "chat_completions", "unknown"],
+      ["standardcompute", "standardcompute", "https://api.stdcmpt.com/v1", "chat_completions", "unknown"],
       ["tsubasa", "tsubasa-pro", "https://api.tsubasa.sh/v1", "chat_completions", "unknown"],
       ["yolo-auto", "qwen3.8-flash", "https://yolo-auto.com/v1", "chat_completions", "unknown"]
     ]
@@ -75,7 +74,7 @@
       ["sglang", "deepseek-ai/DeepSeek-V4-Pro", "http://localhost:30000/v1", "chat_completions", "local"],
       ["vllm", "deepseek-ai/DeepSeek-V4-Pro", "http://localhost:8000/v1", "chat_completions", "local"],
       ["volcengine", "DeepSeek-V4-Pro", "https://ark.cn-beijing.volces.com/api/coding/v3", "chat_completions", "subscription"],
-      ["xiaomi-mimo", "mimo-v2.5-pro", "https://token-plan-sgp.xiaomimimo.com/v1", "chat_completions", "subscription"],
+      ["xiaomi-mimo", "mimo-v2.6-pro", "https://token-plan-sgp.xiaomimimo.com/v1", "chat_completions", "subscription"],
       ["zai", "GLM-5.3", "https://api.z.ai/api/coding/paas/v4", "chat_completions", "subscription"]
     ]
   }

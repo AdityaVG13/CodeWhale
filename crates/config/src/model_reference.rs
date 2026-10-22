@@ -178,7 +178,11 @@ impl ModelReferenceCard {
         let Some(pricing) = self.pricing.as_ref() else {
             return "unknown".to_string();
         };
-        if pricing.input_per_million.is_none() && pricing.output_per_million.is_none() {
+        if matches!(
+            pricing.status_label_at(crate::catalog::now_unix()),
+            "stale" | "unverified" | "unavailable"
+        ) || (pricing.input_per_million.is_none() && pricing.output_per_million.is_none())
+        {
             return "unknown".to_string();
         }
         let symbol = currency_symbol(&pricing.currency);
@@ -548,12 +552,12 @@ mod tests {
             .expect("bundled minimax row");
         assert_eq!(minimax.price_label(), "$0.30 / $1.20 per Mtok");
 
-        // MiniMax-M3 ships without verified per-token pricing, so its price
-        // stays honestly unknown rather than inheriting a sibling's rate.
+        // MiniMax-M3 carries its own base rate and a context tier.
         let minimax_m3 = db
             .find("minimax", "MiniMax-M3")
             .expect("bundled minimax m3 row");
-        assert_eq!(minimax_m3.price_label(), "unknown");
+        assert_eq!(minimax_m3.price_label(), "$0.30 / $1.20 per Mtok");
+        assert_eq!(minimax_m3.pricing.as_ref().unwrap().context_tiers.len(), 1);
     }
 
     #[test]

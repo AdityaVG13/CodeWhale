@@ -20,7 +20,7 @@
 //!   Checkpoints and clears are keyed by session id, so concurrent sessions
 //!   never coalesce into (or clear) each other's slot.
 //! - **Durability reporting**: `FlushAndReport` returns accumulated results;
-//!   cycles without a listener log failures instead of discarding them.
+//!   every failed write is also logged with its OS error when it happens.
 //! - **Bounded command channel with sender-side coalescing** (#6212):
 //!   `try_send` absorbs each request into a shared latest-wins state at send
 //!   time and wakes the actor through a small bounded channel, so a paused
@@ -412,7 +412,6 @@ pub fn spawn_persistence_actor(
                 health: &SessionSaveHealth,
             ) {
                 let cycle = flush_inner(manager, pending, health);
-                log_flush_failures(&cycle);
                 unreported.merge(cycle);
             }
 
@@ -589,7 +588,25 @@ fn flush_inner(
     let mut report = FlushReport::default();
     let mut record = |what: String, result: std::io::Result<()>| match result {
         Ok(()) => report.completed += 1,
-        Err(err) => report.failures.push((what, err.kind())),
+        Err(err) => {
+            let raw_os_error = err.raw_os_error().or_else(|| {
+                std::iter::successors(
+                    err.get_ref()
+                        .map(|inner| inner as &(dyn std::error::Error + 'static)),
+                    |error| error.source(),
+                )
+                .find_map(|error| error.downcast_ref::<std::io::Error>()?.raw_os_error())
+            });
+            tracing::warn!(
+                target: "persistence",
+                what = %what,
+                error_kind = ?err.kind(),
+                raw_os_error = ?raw_os_error,
+                error = %err,
+                "persistence write failed",
+            );
+            report.failures.push((what, err.kind()));
+        }
     };
 
     // Document saves are bounded (#6842): an oversized journal is archived
@@ -632,13 +649,13 @@ fn flush_inner(
     for (_, request) in std::mem::take(&mut pending.offline_queue) {
         match request {
             PendingOfflineQueue::Save { state, lease } => record(
-                "offline-queue".to_string(),
+                format!("offline-queue:{}", lease.session_id()),
                 manager
                     .save_offline_queue_state(&state, Some(lease.session_id()))
                     .map(|_| ()),
             ),
             PendingOfflineQueue::Clear { lease } => record(
-                "clear-offline-queue".to_string(),
+                format!("clear-offline-queue:{}", lease.session_id()),
                 manager.clear_offline_queue_state_for(lease.session_id()),
             ),
         }
@@ -698,19 +715,6 @@ impl SessionSaveHealth {
                 .next()
                 .map(|(id, kind)| (id.clone(), *kind)),
         }
-    }
-}
-
-/// Surface flush failures in the log for write cycles that have no caller
-/// waiting on a [`FlushReport`].
-fn log_flush_failures(report: &FlushReport) {
-    for (what, kind) in &report.failures {
-        tracing::warn!(
-            target: "persistence",
-            what = %what,
-            error_kind = ?kind,
-            "persistence write failed",
-        );
     }
 }
 

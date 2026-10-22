@@ -24,7 +24,7 @@ fn file_provider_extensions_intersect_each_workspace_root_and_exclusions() {
         exclude_slash_tmp: true,
     };
     let workspace_write = generate_policy(&policy, &workspace, &[]);
-    let read_only = generate_policy(&SandboxPolicy::ReadOnly, &workspace, &[]);
+    let read_only = generate_policy(&SandboxPolicy::read_only(), &workspace, &[]);
 
     for policy in [&workspace_write, &read_only] {
         assert!(policy.contains("(version 1)"));
@@ -203,7 +203,7 @@ fn denied_read_subpaths_block_reads_under_every_sandboxed_posture() {
         secret_file.to_string_lossy().into_owned(),
     ];
 
-    for policy in [SandboxPolicy::ReadOnly, SandboxPolicy::default()] {
+    for policy in [SandboxPolicy::read_only(), SandboxPolicy::default()] {
         // Without the deny-list the read succeeds (full-disk read posture).
         let open_args = create_seatbelt_args(read_cmd.clone(), &policy, workspace.path(), &[]);
         let open = Command::new(SANDBOX_EXEC_PATH)

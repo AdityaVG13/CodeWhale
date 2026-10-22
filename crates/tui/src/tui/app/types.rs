@@ -120,7 +120,6 @@ impl ComposerDensity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptSpacing {
     Compact,
-    Comfortable,
     Spacious,
 }
 
@@ -129,8 +128,7 @@ impl TranscriptSpacing {
     pub fn from_setting(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "compact" | "tight" => Self::Compact,
-            "spacious" | "loose" => Self::Spacious,
-            _ => Self::Comfortable,
+            _ => Self::Spacious,
         }
     }
 }

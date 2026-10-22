@@ -39,7 +39,7 @@ impl RouterCandidates {
     pub(crate) fn deepseek() -> Self {
         Self {
             big: "deepseek-v4-pro".to_string(),
-            cheap: Some("deepseek-v4-flash".to_string()),
+            cheap: Some("deepseek-flash".to_string()),
         }
     }
 }
@@ -65,12 +65,16 @@ fn catalog_family_candidates(
         ProviderKind::Anthropic
             if matches!(
                 lower.as_str(),
-                "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-sonnet-5"
+                "claude-opus-4-8"
+                    | "claude-sonnet-4-6"
+                    | "claude-sonnet-5"
+                    | "claude-opus-5-5"
+                    | "claude-sonnet-5-5"
             ) =>
         {
             Some("claude-haiku-4-5".to_string())
         }
-        ProviderKind::XiaomiMimo if lower == "mimo-v2.5-pro" => Some("mimo-v2.5".to_string()),
+        ProviderKind::XiaomiMimo if lower == "mimo-v2.6-pro" => Some("mimo-v2.6-flash".to_string()),
         ProviderKind::Arcee
             if matches!(
                 lower.as_str(),
@@ -676,8 +680,9 @@ pub(crate) fn normalize_auto_route_effort_for_configured_route(
 ) -> ReasoningEffort {
     crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
         .map(|route| {
-            effort.normalize_for_route(
+            effort.normalize_for_route_identity(
                 identity.provider,
+                identity.key.as_str(),
                 &route.candidate.endpoint().base_url,
                 &route.model,
             )
@@ -2798,7 +2803,7 @@ mod tests {
             AutoRouteDataPath::Classifier {
                 provider: "deepseek".into(),
                 provider_kind: ProviderKind::Deepseek,
-                model: "deepseek-v4-flash".to_string(),
+                model: "deepseek-flash".to_string(),
             }
         );
         assert_eq!(receipt.reason, AutoRouteReason::ClassifierRecommendation);
@@ -2973,7 +2978,7 @@ mod tests {
                 ref provider,
                 ref model,
                 ..
-            } if provider.as_str() == "deepseek" && model == "deepseek-v4-flash"
+            } if provider.as_str() == "deepseek" && model == "deepseek-flash"
         ));
         assert_eq!(
             receipt.reason,
@@ -3184,7 +3189,7 @@ mod tests {
 
         let deepseek = provider_router_candidates(ProviderKind::Deepseek, "deepseek-v4-pro");
         assert_eq!(deepseek.big, "deepseek-v4-pro");
-        assert_eq!(deepseek.cheap.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(deepseek.cheap.as_deref(), Some("deepseek-flash"));
 
         let openrouter =
             provider_router_candidates(ProviderKind::Openrouter, "deepseek/deepseek-v4-pro");
@@ -3260,7 +3265,7 @@ mod tests {
                 "claude-sonnet-4-6",
                 "claude-haiku-4-5",
             ),
-            (ProviderKind::XiaomiMimo, "mimo-v2.5-pro", "mimo-v2.5"),
+            (ProviderKind::XiaomiMimo, "mimo-v2.6-pro", "mimo-v2.6-flash"),
             (
                 ProviderKind::Arcee,
                 "trinity-large-thinking",
@@ -3763,7 +3768,7 @@ mod decision_router_tests {
         let raw = String::from_utf8(requests[0].body.clone()).expect("utf8 body");
         assert!(!raw.contains(TYPESAFE_TEST_KEY), "TypeSafe key leaked");
 
-        assert_eq!(selection.model, "deepseek-v4-flash");
+        assert_eq!(selection.model, "deepseek-flash");
         let receipt = receipt(&selection);
         assert_eq!(receipt.reason, AutoRouteReason::ClassifierRecommendation);
         assert_eq!(

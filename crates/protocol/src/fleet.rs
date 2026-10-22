@@ -263,6 +263,8 @@ pub struct FleetTaskWorkerProfile {
 /// Workspace and environment constraints needed before a task starts.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FleetWorkspaceRequirements {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::placement::PlacementRequirements>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<PathBuf>,
     #[serde(default)]
@@ -400,6 +402,8 @@ pub enum FleetScorerSpec {
 /// Worker specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetWorkerSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::placement::ExecutionEnvironment>,
     pub id: String,
     pub name: String,
     pub host: FleetHostSpec,
@@ -421,6 +425,12 @@ pub struct FleetWorkerSpec {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FleetHostSpec {
     Local,
+    Tailscale {
+        node_id: String,
+        user: String,
+        working_directory: PathBuf,
+        codewhale_binary: String,
+    },
     Ssh {
         host: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1201,6 +1211,7 @@ mod tests {
                     capabilities: vec!["rust".to_string()],
                 }),
                 workspace: Some(FleetWorkspaceRequirements {
+                    placement: None,
                     root: Some(PathBuf::from(".")),
                     required_files: vec![PathBuf::from("Cargo.toml")],
                     writable_paths: vec![],

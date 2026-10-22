@@ -316,8 +316,10 @@ async fn terminal_diagnostics_merge_cumulative_usage_within_one_request() {
     let (status, error) = engine.run_turn(&mut turn, surface, None, None).await;
     assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
     assert_eq!(mock.captured_requests().len(), 1);
+    let mut expected_usage = usage.clone();
+    expected_usage.request_usages = vec![usage.clone()];
     assert_eq!(
-        turn.usage, usage,
+        turn.usage, expected_usage,
         "repeated cumulative receipts are counted once"
     );
     let mut events = handle.rx_event.write().await;
@@ -1012,7 +1014,9 @@ async fn initial_routed_usage_is_total_only_emitted_once_and_keeps_parent_route_
     drop(rx);
 
     assert_eq!(routed_events, vec![classifier_usage.clone()]);
-    assert_eq!(terminal_parent_usage, parent_usage);
+    let mut expected_parent_usage = parent_usage.clone();
+    expected_parent_usage.request_usages = vec![parent_usage.clone()];
+    assert_eq!(terminal_parent_usage, expected_parent_usage);
     assert_eq!(total_usage.input_tokens, 18);
     assert_eq!(total_usage.output_tokens, 8);
     assert_eq!(dropped_records, 2);

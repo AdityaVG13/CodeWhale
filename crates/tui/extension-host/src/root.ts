@@ -65,6 +65,7 @@ export const REFUSED_SERVICES = new Set(['shellHooks',
   'loader', // one host-owned composition loader; plugins may not replace it
   'approval',
   'agents',
+  'subagents',
   'sessions',
   'llm',
   'sandboxPolicy',

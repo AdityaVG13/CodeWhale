@@ -8,14 +8,17 @@ use crate::working_set::WorkingSet;
 use codewhale_core::prefix_cache::PrefixStabilityManager;
 use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::{Message, SystemPrompt, Usage};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
-/// Maximum number of deferred schemas a conversation may keep in its active
-/// toolbox. The permanent `read`/`write`/`edit`/`bash`/`agent`/`tool_search`
-/// router surface is not counted here.
+/// Number of deferred schemas a conversation keeps in its active toolbox
+/// before another admission evicts one. Tools used in the current or previous
+/// turn are never evicted, so they can hold the toolbox above this bound. The
+/// permanent `read`/`write`/`edit`/`bash`/`agent`/`tool_search` router surface
+/// is not counted here.
 pub(crate) const TOOL_ACTIVATION_CACHE_MAX_NAMES: usize = 8;
-/// Maximum serialized bytes added to requests by cached deferred schemas.
+/// Serialized bytes cached deferred schemas may add to requests, under the
+/// same eviction rule as the name bound.
 pub(crate) const TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES: usize = 16 * 1024;
 
 /// Bounded, process-local conversation cache for tools activated by
@@ -28,6 +31,10 @@ pub(crate) const TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES: usize = 16 * 1024;
 pub(crate) struct ToolActivationCache {
     /// Least-recently used at the front, most-recently used at the back.
     names: VecDeque<String>,
+    last_use: HashMap<String, u64>,
+    uses: u64,
+    current_turn_floor: u64,
+    previous_turn_floor: u64,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -35,6 +42,7 @@ pub(crate) struct ToolActivationDelta {
     pub(crate) admitted: Vec<String>,
     pub(crate) evicted: Vec<String>,
     pub(crate) rejected: Vec<String>,
+    pub(crate) held: Vec<String>,
 }
 
 impl ToolActivationCache {
@@ -44,7 +52,30 @@ impl ToolActivationCache {
     /// identity, history, and workspace. The cache is intentionally
     /// process-local, but it must still be conversation-local.
     pub(crate) fn clear(&mut self) {
-        self.names.clear();
+        *self = Self::default();
+    }
+
+    pub(crate) fn begin_turn(&mut self) {
+        self.previous_turn_floor = self.current_turn_floor;
+        self.current_turn_floor = self.uses;
+    }
+
+    pub(crate) fn record_use(&mut self, name: &str) -> bool {
+        let Some(index) = self.names.iter().position(|cached| cached == name) else {
+            return false;
+        };
+        if let Some(name) = self.names.remove(index) {
+            self.uses += 1;
+            self.last_use.insert(name.clone(), self.uses);
+            self.names.push_back(name);
+        }
+        true
+    }
+
+    fn pinned(&self, name: &str) -> bool {
+        self.last_use
+            .get(name)
+            .is_some_and(|used| *used > self.previous_turn_floor)
     }
 
     fn catalog_tool<'a>(
@@ -60,6 +91,7 @@ impl ToolActivationCache {
         serde_json::to_vec(tool).map_or(usize::MAX, |bytes| bytes.len())
     }
 
+    #[cfg(test)]
     fn total_serialized_bytes(&self, catalog: &[codewhale_models::Tool]) -> usize {
         self.names
             .iter()
@@ -68,8 +100,30 @@ impl ToolActivationCache {
             .fold(0usize, usize::saturating_add)
     }
 
+    fn exceeds_budget<'a>(
+        catalog: &[codewhale_models::Tool],
+        names: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        let (count, bytes) = names
+            .into_iter()
+            .fold((0usize, 0usize), |(count, bytes), name| {
+                let size = Self::catalog_tool(catalog, name).map_or(0, Self::serialized_bytes);
+                (count + 1, bytes.saturating_add(size))
+            });
+        count > TOOL_ACTIVATION_CACHE_MAX_NAMES || bytes > TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES
+    }
+
+    fn eviction_candidate(&self, keep: &[String]) -> Option<usize> {
+        self.names
+            .iter()
+            .enumerate()
+            .filter(|&(_, name)| !keep.contains(name) && !self.pinned(name))
+            .min_by_key(|&(index, name)| (self.last_use.get(name).copied(), index))
+            .map(|(index, _)| index)
+    }
+
     /// Drop entries that are no longer deferred members of this turn's
-    /// filtered catalog and enforce both cache bounds.
+    /// filtered catalog. The size bounds are enforced only when admitting.
     pub(crate) fn revalidate(&mut self, catalog: &[codewhale_models::Tool]) -> Vec<String> {
         let mut evicted = Vec::new();
         self.names.retain(|name| {
@@ -81,23 +135,18 @@ impl ToolActivationCache {
             }
             keep
         });
-        while self.names.len() > TOOL_ACTIVATION_CACHE_MAX_NAMES
-            || self.total_serialized_bytes(catalog) > TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES
-        {
-            if let Some(name) = self.names.pop_front() {
-                evicted.push(name);
-            } else {
-                break;
-            }
+        for name in &evicted {
+            self.last_use.remove(name);
         }
         evicted
     }
 
-    /// Touch requested deferred tools in search-result priority order. An
-    /// oversized schema is rejected; otherwise least-recently-used entries
-    /// are evicted until both bounds hold. Insert each batch best-match-last
-    /// so overflow retains its highest-priority tools. Every batch entry is
-    /// still newer than entries from earlier batches.
+    /// Admit requested deferred tools in search-result priority order. An
+    /// oversized schema is rejected. Room comes from entries never used
+    /// (oldest admission first), then from the least recently used; tools
+    /// used in the current or previous turn are never evicted. When they
+    /// leave no room, the best match is admitted over the bounds and the rest
+    /// are held. The batch is stored best-match-last.
     pub(crate) fn activate(
         &mut self,
         catalog: &[codewhale_models::Tool],
@@ -108,29 +157,45 @@ impl ToolActivationCache {
             ..ToolActivationDelta::default()
         };
         let mut seen = HashSet::new();
-        let ordered = requested
-            .iter()
-            .filter(|name| seen.insert(name.as_str()))
-            .collect::<Vec<_>>();
-        for name in ordered.into_iter().rev() {
-            let Some(tool) = Self::catalog_tool(catalog, name) else {
-                delta.rejected.push(name.clone());
-                continue;
-            };
-            if Self::serialized_bytes(tool) > TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES {
+        let mut batch: Vec<String> = Vec::new();
+        for name in requested.iter().filter(|name| seen.insert(name.as_str())) {
+            let fits_alone = Self::catalog_tool(catalog, name).is_some_and(|tool| {
+                Self::serialized_bytes(tool) <= TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES
+            });
+            if !fits_alone {
                 delta.rejected.push(name.clone());
                 continue;
             }
-            if let Some(index) = self.names.iter().position(|cached| cached == name) {
-                self.names.remove(index);
+            if self.names.contains(name) {
+                batch.push(name.clone());
+                continue;
             }
+            let protected = self
+                .names
+                .iter()
+                .filter(|cached| batch.contains(*cached) || self.pinned(cached))
+                .chain(std::iter::once(name));
+            if !batch.is_empty() && Self::exceeds_budget(catalog, protected) {
+                delta.held.push(name.clone());
+                continue;
+            }
+            batch.push(name.clone());
             self.names.push_back(name.clone());
-            while self.names.len() > TOOL_ACTIVATION_CACHE_MAX_NAMES
-                || self.total_serialized_bytes(catalog) > TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES
-            {
-                if let Some(evicted) = self.names.pop_front() {
+            while Self::exceeds_budget(catalog, &self.names) {
+                let Some(index) = self.eviction_candidate(&batch) else {
+                    break;
+                };
+                if let Some(evicted) = self.names.remove(index) {
+                    self.last_use.remove(&evicted);
                     delta.evicted.push(evicted);
                 }
+            }
+        }
+        for name in batch.iter().rev() {
+            if let Some(index) = self.names.iter().position(|cached| cached == name)
+                && let Some(name) = self.names.remove(index)
+            {
+                self.names.push_back(name);
             }
         }
 
@@ -413,6 +478,11 @@ mod tests {
             reasoning_tokens: None,
             reasoning_replay_tokens: None,
             server_tool_use: None,
+
+            input_audio_tokens: None,
+            output_audio_tokens: None,
+
+            request_usages: Vec::new(),
         };
         usage.add(&api_usage);
         assert!(usage.cache_creation_input_tokens.is_none());
@@ -431,6 +501,11 @@ mod tests {
             reasoning_tokens: None,
             reasoning_replay_tokens: None,
             server_tool_use: None,
+
+            input_audio_tokens: None,
+            output_audio_tokens: None,
+
+            request_usages: Vec::new(),
         };
         usage.add(&api_usage);
         assert_eq!(usage.cache_read_input_tokens, Some(30));
@@ -452,6 +527,11 @@ mod tests {
             reasoning_tokens: None,
             reasoning_replay_tokens: None,
             server_tool_use: None,
+
+            input_audio_tokens: None,
+            output_audio_tokens: None,
+
+            request_usages: Vec::new(),
         };
         usage.add(&api_usage);
         // 0 is a valid observed value, must NOT be converted to None
@@ -479,7 +559,7 @@ mod tests {
             ]
         );
         assert_eq!(delta.admitted, requested[..TOOL_ACTIVATION_CACHE_MAX_NAMES]);
-        assert_eq!(delta.evicted, vec!["tool_8", "tool_9"]);
+        assert_eq!(delta.held, vec!["tool_8", "tool_9"]);
     }
 
     #[test]
@@ -512,7 +592,7 @@ mod tests {
         assert!(cache.names().any(|name| name == "big_best"));
         assert!(delta.admitted.len() < requested.len());
         assert_eq!(delta.admitted, requested[..delta.admitted.len()]);
-        assert!(!delta.evicted.is_empty());
+        assert!(!delta.held.is_empty());
         assert!(delta.rejected.is_empty());
         assert!(cache.total_serialized_bytes(&catalog) <= TOOL_ACTIVATION_CACHE_MAX_SCHEMA_BYTES);
     }

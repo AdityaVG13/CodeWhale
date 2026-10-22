@@ -563,6 +563,7 @@ pub fn classify_worker_exit(exit_code: Option<i32>, stopped: bool) -> FleetWorke
 pub struct FleetExecutor {
     workspace: std::path::PathBuf,
     sessions_dir: Option<std::path::PathBuf>,
+    tailnet_snapshot: Option<std::sync::Arc<super::tailnet::TailnetSnapshot>>,
     adapter: super::host::LocalProcessFleetHostAdapter,
     ssh_adapters: std::collections::BTreeMap<String, super::host::SshFleetHostAdapter>,
     streams: std::collections::BTreeMap<String, WorkerStream>,
@@ -711,12 +712,28 @@ pub struct FleetWorkerTerminalEvent {
 }
 
 impl FleetExecutor {
+    pub async fn refresh_tailnet_inventory(&mut self) {
+        let snapshot = tokio::task::spawn_blocking(|| {
+            super::tailnet::TailnetSnapshot::new(
+                super::tailnet::inventory().map_err(|error| error.to_string()),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            super::tailnet::TailnetSnapshot::new(Err(format!(
+                "Tailnet inventory task failed: {error}"
+            )))
+        });
+        self.tailnet_snapshot = Some(std::sync::Arc::new(snapshot));
+    }
+
     pub fn new(workspace: impl AsRef<std::path::Path>) -> Self {
         let workspace = workspace.as_ref().to_path_buf();
         Self {
             adapter: super::host::LocalProcessFleetHostAdapter::new(&workspace),
             workspace,
             sessions_dir: None,
+            tailnet_snapshot: None,
             ssh_adapters: std::collections::BTreeMap::new(),
             streams: std::collections::BTreeMap::new(),
         }
@@ -770,6 +787,7 @@ impl FleetExecutor {
         attempt: Option<FleetExecutorAttempt>,
     ) -> super::host::FleetHostResult<super::host::FleetWorkerHandle> {
         let mut request = super::host::FleetWorkerStartRequest::new(worker_id, command);
+        request.attempt = attempt.clone();
         request.cwd = cwd;
         let session_capture = if matches!(host, FleetHostSpec::Local) {
             self.sessions_dir.as_ref().map(|dir| {
@@ -802,12 +820,13 @@ impl FleetExecutor {
                 let handle = self.adapter.start_worker(request)?;
                 (handle, WorkerStreamHost::Local)
             }
-            FleetHostSpec::Ssh { .. } => {
+            FleetHostSpec::Ssh { .. } | FleetHostSpec::Tailscale { .. } => {
                 let config = super::host::SshFleetHostConfig::from_host_spec(host)?;
                 let key = worker_id.to_string();
                 let adapter = self.ssh_adapters.entry(key.clone()).or_insert(
                     super::host::SshFleetHostAdapter::new(&self.workspace, config)?,
                 );
+                adapter.set_tailnet_snapshot(self.tailnet_snapshot.clone());
                 let handle = adapter.start_worker(request)?;
                 (handle, WorkerStreamHost::Ssh(key))
             }
@@ -1133,6 +1152,7 @@ mod tests {
 
     fn launch_spec(task: &FleetTaskSpec, workspace: &std::path::Path) -> AgentWorkerSpec {
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker 1".to_string(),
             host: FleetHostSpec::Local,
@@ -1434,6 +1454,7 @@ mod tests {
         worker.role = Some("implementer".to_string());
         worker.tool_profile = None;
         task.workspace = Some(FleetWorkspaceRequirements {
+            placement: None,
             writable_paths: vec![std::path::PathBuf::from("src")],
             ..FleetWorkspaceRequirements::default()
         });

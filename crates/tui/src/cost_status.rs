@@ -588,6 +588,25 @@ pub fn child_usage_metadata_fields(
         "child_server_tool_use".into(),
         serde_json::json!(usage.server_tool_use),
     );
+    fields.insert(
+        "child_input_audio_tokens".into(),
+        serde_json::json!(usage.input_audio_tokens),
+    );
+    fields.insert(
+        "child_output_audio_tokens".into(),
+        serde_json::json!(usage.output_audio_tokens),
+    );
+    let requests = if usage.request_usages.len() > 1024
+        || usage
+            .request_usages
+            .iter()
+            .any(|request| !request.request_usages.is_empty())
+    {
+        vec![Usage::default(); 1025]
+    } else {
+        usage.request_usages.clone()
+    };
+    fields.insert("child_request_usages".into(), serde_json::json!(requests));
     fields
 }
 
@@ -885,6 +904,9 @@ pub fn child_usage_from_metadata(metadata: &serde_json::Value) -> Option<Usage> 
         "child_prompt_cache_write_tokens",
         "child_reasoning_tokens",
         "child_reasoning_replay_tokens",
+        "child_input_audio_tokens",
+        "child_output_audio_tokens",
+        "child_request_usages",
     ];
     if !TOKEN_FIELDS
         .iter()
@@ -900,6 +922,55 @@ pub fn child_usage_from_metadata(metadata: &serde_json::Value) -> Option<Usage> 
             .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
     }
 
+    let invalid_requests = || vec![Usage::default(); 1025];
+    let token_value = |value: &serde_json::Value| {
+        value.is_null()
+            || value
+                .as_u64()
+                .is_some_and(|value| u32::try_from(value).is_ok())
+    };
+    let flat_request = |request: &serde_json::Value| {
+        request.as_object().is_some_and(|fields| {
+            ["input_tokens", "output_tokens"].iter().all(|field| {
+                fields
+                    .get(*field)
+                    .is_some_and(|value| value.as_u64().is_some())
+            }) && fields.iter().all(|(key, value)| match key.as_str() {
+                "input_tokens"
+                | "output_tokens"
+                | "prompt_cache_hit_tokens"
+                | "prompt_cache_miss_tokens"
+                | "prompt_cache_write_tokens"
+                | "reasoning_tokens"
+                | "reasoning_replay_tokens"
+                | "input_audio_tokens"
+                | "output_audio_tokens" => token_value(value),
+                "request_usages" => value.as_array().is_some_and(|nested| nested.is_empty()),
+                "server_tool_use" => {
+                    value.is_null()
+                        || value.as_object().is_some_and(|tools| {
+                            tools.iter().all(|(key, value)| {
+                                matches!(
+                                    key.as_str(),
+                                    "code_execution_requests" | "tool_search_requests"
+                                ) && token_value(value)
+                            })
+                        })
+                }
+                _ => false,
+            })
+        })
+    };
+    let request_usages = match metadata.get("child_request_usages") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(requests))
+            if requests.len() <= 1024 && requests.iter().all(flat_request) =>
+        {
+            serde_json::from_value(serde_json::Value::Array(requests.clone()))
+                .unwrap_or_else(|_| invalid_requests())
+        }
+        Some(_) => invalid_requests(),
+    };
     Some(Usage {
         input_tokens: u32_field(metadata, "child_input_tokens").unwrap_or(0),
         output_tokens: u32_field(metadata, "child_output_tokens").unwrap_or(0),
@@ -912,6 +983,10 @@ pub fn child_usage_from_metadata(metadata: &serde_json::Value) -> Option<Usage> 
             .get("child_server_tool_use")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
+
+        input_audio_tokens: u32_field(metadata, "child_input_audio_tokens"),
+        output_audio_tokens: u32_field(metadata, "child_output_audio_tokens"),
+        request_usages,
     })
 }
 
@@ -4330,18 +4405,84 @@ mod tests {
     #[test]
     fn child_metadata_round_trip_preserves_zero_and_reasoning_usage() {
         let route = deepseek_envelope();
-        let usage = Usage {
+        let mut usage = Usage {
             input_tokens: 0,
             output_tokens: 9,
             reasoning_tokens: Some(7),
             reasoning_replay_tokens: Some(3),
+            input_audio_tokens: Some(0),
+            output_audio_tokens: Some(1),
             ..Usage::default()
         };
+        usage.request_usages.push(usage.clone());
         let mut metadata = serde_json::json!({"tool": "rlm_eval"});
         attach_child_usage_metadata(&mut metadata, &route, &usage);
 
         assert_eq!(child_route_envelope_from_metadata(&metadata), Some(route));
-        assert_eq!(child_usage_from_metadata(&metadata), Some(usage));
+        assert_eq!(child_usage_from_metadata(&metadata), Some(usage.clone()));
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("child_request_usages");
+        let mut legacy = usage.clone();
+        legacy.request_usages.clear();
+        assert_eq!(child_usage_from_metadata(&metadata), Some(legacy));
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([{}]),
+            serde_json::json!([{ "input_tokens": -1, "output_tokens": 9 }]),
+            serde_json::json!([{ "input_tokens": 0, "output_tokens": 9, "request_usages": [{}] }]),
+            serde_json::json!(vec![Usage::default(); 1025]),
+        ] {
+            metadata["child_request_usages"] = malformed;
+            let decoded = child_usage_from_metadata(&metadata).unwrap();
+            assert!(matches!(
+                codewhale_config::pricing::OfferingPricing::default()
+                    .quote_cost(&crate::pricing::token_usage_for_pricing(&decoded)),
+                Err(codewhale_config::pricing::PricingQuoteError::InvalidUsage)
+            ));
+        }
+        let pricing = codewhale_config::pricing::OfferingPricing {
+            input_per_million: Some(1.0),
+            output_per_million: Some(0.0),
+            context_tiers: vec![
+                serde_json::from_value(serde_json::json!({
+                    "tier": { "type": "context", "size": 200_000 },
+                    "input": 2.0,
+                    "output": 0.0,
+                }))
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let mut aggregate = Usage::default();
+        for _ in 0..3 {
+            crate::core::turn::add_usage_to(
+                &mut aggregate,
+                &Usage {
+                    input_tokens: 100_000,
+                    ..Default::default()
+                },
+            );
+        }
+        let fields = child_usage_metadata_fields(&deepseek_envelope(), &aggregate);
+        let mut decoded = child_usage_from_metadata(&serde_json::Value::Object(fields)).unwrap();
+        assert_eq!(
+            pricing
+                .quote_cost(&crate::pricing::token_usage_for_pricing(&decoded))
+                .unwrap()
+                .amount,
+            "0.3"
+        );
+        decoded.request_usages.clear();
+        assert_eq!(
+            pricing
+                .quote_cost(&crate::pricing::token_usage_for_pricing(&decoded))
+                .unwrap()
+                .amount,
+            "0.6"
+        );
 
         let mut zero_metadata = serde_json::json!({});
         let zero = Usage::default();

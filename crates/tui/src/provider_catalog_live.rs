@@ -90,6 +90,7 @@ pub struct ProviderLivePricingQuote {
     pub(crate) currency: Currency,
     pub(crate) provenance: PricingProvenance,
     pub(crate) cloud_facts: Option<CloudFactsPricingSource>,
+    pub(crate) pricing_schedule: Option<String>,
     pub(crate) input_per_million: Option<String>,
     pub(crate) output_per_million: Option<String>,
     pub(crate) cache_read_per_million: Option<String>,
@@ -120,6 +121,8 @@ struct ProviderLivePricingQuoteWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cloud_facts: Option<CloudFactsPricingSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pricing_schedule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     input_per_million: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_per_million: Option<String>,
@@ -147,6 +150,7 @@ impl TryFrom<&ProviderLivePricingQuote> for ProviderLivePricingQuoteWire {
             currency: quote.currency.clone(),
             provenance: quote.provenance.clone(),
             cloud_facts: quote.cloud_facts.clone(),
+            pricing_schedule: quote.pricing_schedule.clone(),
             input_per_million: quote.input_per_million.clone(),
             output_per_million: quote.output_per_million.clone(),
             cache_read_per_million: quote.cache_read_per_million.clone(),
@@ -190,6 +194,7 @@ impl<'de> Deserialize<'de> for ProviderLivePricingQuote {
             currency: wire.currency,
             provenance: wire.provenance,
             cloud_facts: wire.cloud_facts,
+            pricing_schedule: wire.pricing_schedule,
             input_per_million: wire.input_per_million,
             output_per_million: wire.output_per_million,
             cache_read_per_million: wire.cache_read_per_million,
@@ -227,6 +232,35 @@ impl ProviderLivePricingQuote {
         .any(Option::is_some)
     }
 
+    pub(crate) fn carries_pricing_decision(&self) -> bool {
+        self.carries_rates()
+            || self
+                .pricing_schedule
+                .as_deref()
+                .filter(|schedule| schedule.len() <= 32_768)
+                .and_then(|schedule| {
+                    serde_json::from_str::<(OfferingPricing, Option<OfferingPricing>)>(schedule)
+                        .ok()
+                })
+                .is_some_and(|(pricing, _)| pricing.has_any_price() || pricing.rate_withheld)
+    }
+
+    pub(crate) fn secondary_pricing_for_route(
+        &self,
+        provider: ProviderKind,
+        identity: &str,
+        model: &str,
+        fingerprint: &str,
+        at: u64,
+    ) -> Option<OfferingPricing> {
+        self.pricing_for_route(provider, identity, model, fingerprint, at)?;
+        serde_json::from_str::<(OfferingPricing, Option<OfferingPricing>)>(
+            self.pricing_schedule.as_deref()?,
+        )
+        .ok()?
+        .1
+    }
+
     fn is_structurally_valid(&self) -> bool {
         self.pricing_for_route(
             self.provider,
@@ -254,6 +288,7 @@ impl ProviderLivePricingQuote {
         cache_read_per_million: &Option<String>,
         cache_write_per_million: &Option<String>,
         cloud_facts: Option<&CloudFactsPricingSource>,
+        pricing_schedule: Option<&str>,
     ) -> Option<String> {
         let payload = serde_json::to_vec(&(
             "codewhale-provider-live-pricing-quote-v1",
@@ -280,6 +315,12 @@ impl ProviderLivePricingQuote {
             }
             None => payload,
         };
+        let payload = match pricing_schedule {
+            Some(schedule) => {
+                serde_json::to_vec(&("codewhale-pricing-schedule-v2", payload, schedule)).ok()?
+            }
+            None => payload,
+        };
         Some(format!("sha256:{}", crate::hashing::sha256_hex(payload)))
     }
 
@@ -303,6 +344,11 @@ impl ProviderLivePricingQuote {
         let output_per_million = Self::canonical_rate(pricing.output_per_million);
         let cache_read_per_million = Self::canonical_rate(pricing.cache_read_per_million);
         let cache_write_per_million = Self::canonical_rate(pricing.cache_write_per_million);
+        let mut owned = pricing.clone();
+        owned.provider = provider_identity.into();
+        owned.wire_model_id = wire_model.into();
+        let pricing_schedule =
+            Some(serde_json::to_string(&(owned, Option::<OfferingPricing>::None)).ok()?);
         let catalog_revision = Self::revision_for(
             provider,
             provider_identity,
@@ -316,6 +362,7 @@ impl ProviderLivePricingQuote {
             &cache_read_per_million,
             &cache_write_per_million,
             None,
+            pricing_schedule.as_deref(),
         )?;
         Some(Self {
             provider,
@@ -327,6 +374,7 @@ impl ProviderLivePricingQuote {
             currency: pricing.currency.clone(),
             provenance: pricing.provenance.clone(),
             cloud_facts: None,
+            pricing_schedule,
             input_per_million,
             output_per_million,
             cache_read_per_million,
@@ -375,14 +423,32 @@ impl ProviderLivePricingQuote {
         }
         match (&self.provenance, &self.cloud_facts) {
             (PricingProvenance::UserOverride, None) => {}
-            (PricingProvenance::ProviderLive, None)
+            (
+                PricingProvenance::ModelsDevBundled
+                | PricingProvenance::ProviderDocs
+                | PricingProvenance::CodewhaleCatalog,
+                None,
+            ) if published_pricing_scope(provider, provider_identity, endpoint_fingerprint) => {}
+            (PricingProvenance::ModelsDevLive, None)
                 if dispatched_at_unix.saturating_sub(self.catalog_fetched_at)
                     < DEFAULT_PROVIDER_CATALOG_TTL_SECS
-                    && reviewed_provider_live_scope(
+                    && published_pricing_scope(
                         provider,
                         provider_identity,
                         endpoint_fingerprint,
                     ) => {}
+            (PricingProvenance::ProviderLive, None)
+                if dispatched_at_unix.saturating_sub(self.catalog_fetched_at)
+                    < DEFAULT_PROVIDER_CATALOG_TTL_SECS
+                    && (reviewed_provider_live_scope(
+                        provider,
+                        provider_identity,
+                        endpoint_fingerprint,
+                    ) || published_pricing_scope(
+                        provider,
+                        provider_identity,
+                        endpoint_fingerprint,
+                    )) => {}
             (PricingProvenance::CloudFacts, Some(source))
                 if source.facts_version > 0
                     && !source.key_id.is_empty()
@@ -424,6 +490,7 @@ impl ProviderLivePricingQuote {
             && cost.cache_read.is_none()
             && cost.cache_write.is_none()
             && self.provenance != PricingProvenance::UserOverride
+            && self.pricing_schedule.is_none()
         {
             return None;
         }
@@ -440,9 +507,50 @@ impl ProviderLivePricingQuote {
             &self.cache_read_per_million,
             &self.cache_write_per_million,
             self.cloud_facts.as_ref(),
+            self.pricing_schedule.as_deref(),
         )?;
         if self.catalog_revision != expected_revision {
             return None;
+        }
+        if let Some(schedule) = self.pricing_schedule.as_deref() {
+            if schedule.len() > 32_768 {
+                return None;
+            }
+            let (pricing, secondary): (OfferingPricing, Option<OfferingPricing>) =
+                serde_json::from_str(schedule).ok()?;
+            if pricing.provider != self.provider_identity
+                || pricing.wire_model_id != self.wire_model
+                || pricing.provenance != self.provenance
+                || pricing.currency != self.currency
+                || pricing.input_per_million != cost.input
+                || pricing.output_per_million != cost.output
+                || pricing.cache_read_per_million != cost.cache_read
+                || pricing.cache_write_per_million != cost.cache_write
+                || !codewhale_config::pricing::catalog_cost_is_valid(&pricing.cost_structure())
+                || (matches!(
+                    self.provenance,
+                    PricingProvenance::ModelsDevLive | PricingProvenance::ProviderLive
+                ) && pricing.fetched_at.or(pricing.effective_at)
+                    != Some(self.catalog_fetched_at))
+                || (self.provenance == PricingProvenance::ProviderLive
+                    && pricing.endpoint_fingerprint.as_deref()
+                        != Some(self.endpoint_fingerprint.as_str()))
+                || (self.provenance != PricingProvenance::ModelsDevBundled
+                    && pricing
+                        .expires_at
+                        .is_some_and(|expires| dispatched_at_unix >= expires))
+                || secondary.as_ref().is_some_and(|row| {
+                    row.provider != self.provider_identity
+                        || row.wire_model_id != self.wire_model
+                        || row.currency != Currency::Cny
+                        || row.provenance != self.provenance
+                        || self.provenance != PricingProvenance::ProviderDocs
+                        || !codewhale_config::pricing::catalog_cost_is_valid(&row.cost_structure())
+                })
+            {
+                return None;
+            }
+            return Some(pricing);
         }
         Some(OfferingPricing {
             provider: self.provider_identity.clone(),
@@ -456,6 +564,8 @@ impl ProviderLivePricingQuote {
             provenance: self.provenance.clone(),
             effective_at: Some(self.catalog_fetched_at),
             endpoint_fingerprint: Some(self.endpoint_fingerprint.clone()),
+
+            ..Default::default()
         })
     }
 }
@@ -514,20 +624,37 @@ fn storage_provider(kind: ProviderKind, identity: &str) -> String {
 
 /// Providers whose model list is owned by their own `/v1/models` roster
 /// rather than the cross-provider Models.dev snapshot: the named live
-/// gateways, plus custom hosts whose private roster no snapshot can serve
-/// (#6289 widened). The active-provider refresh and the picker's freshness
-/// receipt both gate on this one predicate, so they cannot drift apart.
+/// gateways, custom hosts whose private roster no snapshot can serve, and any
+/// builtin name pointed at an endpoint outside its official family (#6289
+/// widened).
+///
+/// `base_url` is what separates the last two: `openai` against
+/// `api.openai.com` is the reviewed snapshot row, while `openai` against a
+/// relay is a private roster only its own listing can describe. A vendor-named
+/// table that actually relays a private host is as unserved by the snapshot as
+/// a `[providers.<name>]` table is. The active-provider refresh and the
+/// picker's freshness receipt both gate on this one predicate, so they cannot
+/// drift apart.
 #[cfg(test)]
 #[test]
 fn orcarouter_and_existing_custom_routes_own_live_catalogs() {
-    assert!(provider_owns_live_catalog(ProviderKind::Orcarouter));
-    assert!(provider_owns_live_catalog(ProviderKind::Custom));
-    assert!(provider_owns_live_catalog(ProviderKind::Openrouter));
-    assert!(provider_owns_live_catalog(ProviderKind::Ollama));
-    assert!(!provider_owns_live_catalog(ProviderKind::Openai));
+    assert!(provider_owns_live_catalog(ProviderKind::Orcarouter, ""));
+    assert!(provider_owns_live_catalog(ProviderKind::Custom, ""));
+    assert!(provider_owns_live_catalog(ProviderKind::Openrouter, ""));
+    assert!(provider_owns_live_catalog(ProviderKind::Ollama, ""));
+    // A builtin name on its own official endpoint keeps the snapshot row.
+    assert!(!provider_owns_live_catalog(
+        ProviderKind::Openai,
+        "https://api.openai.com/v1"
+    ));
+    // The same name on a private relay owns its roster.
+    assert!(provider_owns_live_catalog(
+        ProviderKind::Openai,
+        "https://relay.example.test/v1"
+    ));
 }
 
-pub(crate) fn provider_owns_live_catalog(provider: ProviderKind) -> bool {
+pub(crate) fn provider_owns_live_catalog(provider: ProviderKind, base_url: &str) -> bool {
     matches!(
         provider,
         ProviderKind::Openrouter
@@ -539,6 +666,7 @@ pub(crate) fn provider_owns_live_catalog(provider: ProviderKind) -> bool {
             | ProviderKind::Codewhale
             | ProviderKind::Ollama
     ) || provider == ProviderKind::Custom
+        || codewhale_config::provider_preserves_custom_base_url_model(provider, base_url)
 }
 
 /// Whether a catalog scope holds an account-scoped roster that must never be
@@ -553,6 +681,19 @@ fn is_account_scoped_scope(provider: &str, fingerprint: &str) -> bool {
         || fingerprint == base_url_fingerprint(codewhale_config::catalog::BASETEN_BASE_URL)
         || fingerprint
             == base_url_fingerprint(ProviderKind::Codewhale.provider().default_base_url())
+}
+
+pub(crate) fn route_is_account_scoped(
+    config: &Config,
+    identity: &crate::config::ProviderIdentity,
+) -> bool {
+    is_account_scoped_scope(
+        &storage_provider(
+            identity.provider,
+            &canonical_provider_scope(identity.key.as_str()),
+        ),
+        &base_url_fingerprint(&config.base_url_for_route(identity)),
+    )
 }
 
 fn cache_lock_path(path: &Path) -> PathBuf {
@@ -772,6 +913,30 @@ pub(crate) fn cached_entry_for_route(
             &base_url_fingerprint(base_url),
         )
         .cloned())
+}
+
+/// Borrow one exact cached route for the duration of `read`.
+///
+/// The picker asks about one route once per model row, and on a relay
+/// publishing a few hundred models that turned into one full deep clone of the
+/// whole catalog entry per row. Callers that only need to look something up
+/// (rather than keep the entry) use this instead.
+pub(crate) fn with_cached_entry_for_route<R>(
+    kind: ProviderKind,
+    identity: &str,
+    base_url: &str,
+    read: impl FnOnce(&codewhale_config::catalog::CachedProviderCatalog) -> R,
+) -> Result<Option<R>> {
+    ensure_cache_loaded()?;
+    let cache = CACHE
+        .read()
+        .map_err(|_| anyhow::anyhow!("catalog cache unavailable"))?;
+    Ok(cache
+        .get(
+            &storage_provider(kind, identity),
+            &base_url_fingerprint(base_url),
+        )
+        .map(read))
 }
 
 /// Whether a saved `(provider, model)` pin is absent from that exact route's
@@ -1096,10 +1261,7 @@ pub fn maybe_load_persisted_cache_for_config(config: &Config) -> usize {
     let provider = identity.provider;
     let provider_identity = canonical_provider_scope(identity.key.as_str());
     let fingerprint = base_url_fingerprint(&config.base_url_for_route(&identity));
-    if is_account_scoped_scope(
-        &storage_provider(provider, &provider_identity),
-        &fingerprint,
-    ) {
+    if route_is_account_scoped(config, &identity) {
         forget_account_scoped_provider(provider, &provider_identity);
         return 0;
     }
@@ -1321,6 +1483,14 @@ fn reviewed_provider_live_scope(
     }
 }
 
+fn published_pricing_scope(provider: ProviderKind, identity: &str, fingerprint: &str) -> bool {
+    !matches!(
+        provider,
+        ProviderKind::Custom | ProviderKind::OpenaiCodex | ProviderKind::OpencodeGo
+    ) && identity == provider.as_str()
+        && fingerprint == base_url_fingerprint(provider.provider().default_base_url())
+}
+
 #[must_use]
 pub(crate) fn fresh_provider_live_pricing_quote_at(
     provider: ProviderKind,
@@ -1361,7 +1531,7 @@ pub(crate) fn fresh_provider_live_pricing_quote_at(
         || pricing.wire_model_id.trim() != wire_model
         || pricing.currency != Currency::Usd
         || pricing.provenance != PricingProvenance::ProviderLive
-        || pricing.effective_at != Some(entry.fetched_at)
+        || pricing.fetched_at.or(pricing.effective_at) != Some(entry.fetched_at)
         || pricing.endpoint_fingerprint.as_deref() != Some(endpoint_fingerprint)
         || pricing.input_per_million.is_none()
         || pricing.output_per_million.is_none()
@@ -1425,9 +1595,28 @@ pub(crate) fn configured_dispatch_pricing_quote_at(
         output_per_million: cost.output,
         cache_read_per_million: cost.cache_read,
         cache_write_per_million: cost.cache_write,
+        reasoning_per_million: cost.reasoning,
+        input_audio_per_million: cost.input_audio,
+        output_audio_per_million: cost.output_audio,
+        context_tiers: cost.context_tiers(),
+        rate_withheld: declared.cost.is_some()
+            && !OfferingPricing {
+                input_per_million: cost.input,
+                output_per_million: cost.output,
+                cache_read_per_million: cost.cache_read,
+                cache_write_per_million: cost.cache_write,
+                reasoning_per_million: cost.reasoning,
+                input_audio_per_million: cost.input_audio,
+                output_audio_per_million: cost.output_audio,
+                context_tiers: cost.context_tiers(),
+                ..Default::default()
+            }
+            .has_any_price(),
         provenance: PricingProvenance::UserOverride,
         effective_at: None,
         endpoint_fingerprint: Some(base_url_fingerprint(base_url)),
+
+        ..Default::default()
     };
     // Freeze even an unpriced declaration: missing rates must not fall through
     // to a same-named bundled or subsequently refreshed price.
@@ -1451,8 +1640,17 @@ pub(crate) fn declared_or_catalog_quote(
     catalog: impl FnOnce() -> Option<ProviderLivePricingQuote>,
 ) -> Option<ProviderLivePricingQuote> {
     match declared {
-        Some(quote) if quote.carries_rates() => Some(quote),
-        declared => catalog().or(declared),
+        Some(quote) if quote.carries_pricing_decision() => Some(quote),
+        declared => catalog()
+            .filter(|quote| {
+                matches!(
+                    quote.provenance,
+                    PricingProvenance::ProviderLive
+                        | PricingProvenance::ModelsDevLive
+                        | PricingProvenance::CloudFacts
+                )
+            })
+            .or(declared),
     }
 }
 
@@ -1473,6 +1671,140 @@ pub(crate) fn fresh_dispatch_pricing_quote_at(
     ) {
         return Some(quote);
     }
+    if crate::provider_lake::live_catalog_origin(provider, wire_model)
+        == Some(crate::provider_lake::LiveSource::ModelsDev)
+        && crate::provider_lake::catalog_offering_for_model_identity(
+            provider,
+            Some(provider_identity),
+            wire_model,
+        )
+        .is_some_and(|row| {
+            matches!(
+                row.source,
+                codewhale_config::catalog::CatalogSource::Live { .. }
+            )
+        })
+    {
+        return None;
+    }
+    if !published_pricing_scope(provider, provider_identity, &endpoint_fingerprint) {
+        if let Some(quote) = fresh_cloud_dispatch_pricing_quote_at(
+            provider,
+            provider_identity,
+            wire_model,
+            base_url,
+            dispatched_at_unix,
+        ) {
+            return Some(quote);
+        }
+        return None;
+    }
+    let at = chrono::DateTime::from_timestamp(i64::try_from(dispatched_at_unix).ok()?, 0)?;
+    let hand = crate::pricing::provider_owned_hand_quote_rows(provider, wire_model, at);
+    let needs_schedule = matches!(
+        provider,
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+    );
+    let catalog = crate::provider_lake::catalog_offering_for_route(
+        provider,
+        provider_identity,
+        base_url,
+        wire_model,
+    )
+    .filter(|offering| offering.wire_model_id == wire_model)
+    .map(|mut offering| {
+        if crate::provider_lake::live_catalog_origin(provider, wire_model)
+            == Some(crate::provider_lake::LiveSource::ModelsDev)
+            && let codewhale_config::catalog::CatalogSource::Live { fetched_at, .. } =
+                offering.pricing_source()
+        {
+            offering.cost_source = Some(codewhale_config::catalog::CatalogSource::ModelsDevLive {
+                fetched_at: *fetched_at,
+            });
+        }
+        offering
+    })
+    .and_then(|offering| OfferingPricing::from_catalog_offering_at(&offering, dispatched_at_unix))
+    .filter(|pricing| {
+        pricing
+            .live_pricing_defect(
+                Some(&endpoint_fingerprint),
+                Some(dispatched_at_unix),
+                DEFAULT_PROVIDER_CATALOG_TTL_SECS,
+            )
+            .is_none()
+    });
+    let catalog_is_live = catalog.as_ref().is_some_and(|pricing| {
+        matches!(
+            pricing.provenance,
+            PricingProvenance::ModelsDevLive | PricingProvenance::ProviderLive
+        )
+    });
+    let (pricing, mut secondary) = if needs_schedule && hand.is_some() {
+        hand?
+    } else if catalog_is_live {
+        catalog.map(|pricing| (pricing, None)).or(hand)?
+    } else if hand.is_some() {
+        hand?
+    } else if let Some(quote) = fresh_cloud_dispatch_pricing_quote_at(
+        provider,
+        provider_identity,
+        wire_model,
+        base_url,
+        dispatched_at_unix,
+    ) {
+        return Some(quote);
+    } else {
+        catalog.map(|pricing| (pricing, None))?
+    };
+    let mut quote = ProviderLivePricingQuote::from_pricing(
+        provider,
+        provider_identity,
+        wire_model,
+        &endpoint_fingerprint,
+        pricing.fetched_at.unwrap_or(dispatched_at_unix),
+        &pricing,
+    )?;
+    if let Some(row) = secondary.as_mut() {
+        row.provider = provider_identity.into();
+        row.wire_model_id = wire_model.into();
+        let (primary, _): (OfferingPricing, Option<OfferingPricing>) =
+            serde_json::from_str(quote.pricing_schedule.as_deref()?).ok()?;
+        quote.pricing_schedule = Some(serde_json::to_string(&(primary, secondary)).ok()?);
+        quote.catalog_revision = ProviderLivePricingQuote::revision_for(
+            quote.provider,
+            &quote.provider_identity,
+            &quote.wire_model,
+            &quote.endpoint_fingerprint,
+            quote.catalog_fetched_at,
+            &quote.currency,
+            &quote.provenance,
+            &quote.input_per_million,
+            &quote.output_per_million,
+            &quote.cache_read_per_million,
+            &quote.cache_write_per_million,
+            None,
+            quote.pricing_schedule.as_deref(),
+        )?;
+    }
+    quote.pricing_for_route(
+        provider,
+        provider_identity,
+        wire_model,
+        &endpoint_fingerprint,
+        dispatched_at_unix,
+    )?;
+    Some(quote)
+}
+
+fn fresh_cloud_dispatch_pricing_quote_at(
+    provider: ProviderKind,
+    provider_identity: &str,
+    wire_model: &str,
+    base_url: &str,
+    dispatched_at_unix: u64,
+) -> Option<ProviderLivePricingQuote> {
+    let endpoint_fingerprint = base_url_fingerprint(base_url);
     if !cloud_pricing_scope(provider, provider_identity, base_url) {
         return None;
     }
@@ -1535,6 +1867,7 @@ pub(crate) fn fresh_dispatch_pricing_quote_at(
         &quote.cache_read_per_million,
         &quote.cache_write_per_million,
         quote.cloud_facts.as_ref(),
+        quote.pricing_schedule.as_deref(),
     )?;
     quote.pricing_for_route(
         provider,

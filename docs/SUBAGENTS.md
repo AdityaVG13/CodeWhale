@@ -324,13 +324,24 @@ a shared write claim. For arbitrary analysis code, call `bash` with explicit
 }
 ```
 
-This mode requires native filesystem read-only isolation and denies network
-access. It accepts only foreground `run` with `command`, optional `cwd`, and
-`timeout_ms`. Background or interactive modes, stdin, sandbox escalation, and
-external execution backends are incompatible. If native enforcement is absent
-or cannot be prepared, the call refuses before executing the command; the flag
-never falls back to trusting a promise that the code only reads. Existing role,
-tool, and ancestor policy restrictions still apply.
+This mode requires native filesystem read-only isolation. Outbound network
+follows the caller's own shell and is on only when the session runs in Full
+Access, its sandbox allows network, its `[network]` policy does not default to
+deny, and the agent keeps its network grant; in Ask or Auto-Review, where a
+networked command needs an approval this mode never asks for, it stays offline.
+With network on, `curl` and HTTPS clients work. `read_only` blocks local file
+writes, not requests that change remote services. On macOS the mode then reaches
+hosts over IPv4, the system DNS resolver, and a local proxy named in
+`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, but not IPv6, another port on this
+machine's own addresses, or a local socket. On Linux it shares the host network
+namespace, including loopback and abstract unix sockets, as a networked
+workspace-write shell does. A networked run records `sandbox_network: true` in
+its tool-result metadata. It accepts only foreground `run` with `command`,
+optional `cwd`, and `timeout_ms`. Background or interactive modes, stdin,
+sandbox escalation, and external execution backends are incompatible. If native
+enforcement is absent or cannot be prepared, the call refuses before executing
+the command; the flag never falls back to trusting a promise that the code only
+reads. Existing role, tool, and ancestor policy restrictions still apply.
 
 For a write refusal outside your own scope, `agent(action="claim", ...)` can
 add permitted paths to your claim. It cannot take a live peer's claim. Wait for

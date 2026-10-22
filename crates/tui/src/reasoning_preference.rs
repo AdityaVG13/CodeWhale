@@ -241,6 +241,17 @@ impl ReasoningEffort {
         base_url: &str,
         wire_model: &str,
     ) -> Self {
+        self.normalize_for_route_identity(provider, provider.as_str(), base_url, wire_model)
+    }
+
+    #[must_use]
+    pub fn normalize_for_route_identity(
+        self,
+        provider: ProviderKind,
+        identity: &str,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Self {
         let normalized = self.normalize_for_provider(provider);
         if crate::config::is_exact_kimi_code_k3_route(provider, base_url, wire_model) {
             return match normalized {
@@ -283,8 +294,29 @@ impl ReasoningEffort {
                 other => other,
             };
         }
-        if let Some(values) = Self::catalog_effort_values(provider, wire_model) {
-            return Self::clamp_to_catalog_efforts(normalized, provider, wire_model, &values);
+        let catalog_identity = if provider == ProviderKind::Custom {
+            identity
+        } else {
+            provider.as_str()
+        };
+        if let Some(offering) = crate::provider_lake::catalog_offering_for_route(
+            provider,
+            catalog_identity,
+            base_url,
+            wire_model,
+        ) && let Some(values) = Self::catalog_effort_values_for_offering(&offering)
+        {
+            if normalized == Self::Off
+                && provider != ProviderKind::Custom
+                && !codewhale_config::provider_base_url_is_official(provider, base_url)
+            {
+                return Self::Off;
+            }
+            return Self::clamp_to_catalog_efforts(
+                normalized,
+                Self::catalog_default_for_offering(&offering),
+                &values,
+            );
         }
         match normalized {
             Self::Low | Self::Medium => Self::High,
@@ -292,8 +324,31 @@ impl ReasoningEffort {
         }
     }
 
-    pub fn catalog_default(provider: ProviderKind, wire_model: &str) -> Option<Self> {
-        let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
+    pub(crate) fn offering_for_reasoning(
+        provider: ProviderKind,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<codewhale_config::catalog::CatalogOffering> {
+        crate::provider_lake::catalog_offering_for_route(
+            provider,
+            provider.as_str(),
+            base_url,
+            wire_model,
+        )
+    }
+
+    pub fn catalog_default(
+        provider: ProviderKind,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<Self> {
+        let offering = Self::offering_for_reasoning(provider, base_url, wire_model)?;
+        Self::catalog_default_for_offering(&offering)
+    }
+
+    fn catalog_default_for_offering(
+        offering: &codewhale_config::catalog::CatalogOffering,
+    ) -> Option<Self> {
         offering.reasoning_options.iter().find_map(|option| {
             option
                 .get("type")
@@ -306,8 +361,18 @@ impl ReasoningEffort {
         })
     }
 
-    pub fn catalog_effort_values(provider: ProviderKind, wire_model: &str) -> Option<Vec<Self>> {
-        let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
+    pub fn catalog_effort_values(
+        provider: ProviderKind,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<Vec<Self>> {
+        let offering = Self::offering_for_reasoning(provider, base_url, wire_model)?;
+        Self::catalog_effort_values_for_offering(&offering)
+    }
+
+    pub(crate) fn catalog_effort_values_for_offering(
+        offering: &codewhale_config::catalog::CatalogOffering,
+    ) -> Option<Vec<Self>> {
         let mut efforts = Vec::new();
         let mut has_toggle = false;
         for option in &offering.reasoning_options {
@@ -348,31 +413,31 @@ impl ReasoningEffort {
             "xhigh" => Some(Self::XHigh),
             "ultra" | "ultracode" => Some(Self::Ultra),
             "max" | "maximum" => Some(Self::Max),
-            "auto" | "automatic" | "adaptive" => Some(Self::Auto),
+            "auto" | "automatic" | "adaptive" | "default" => Some(Self::Auto),
             _ => None,
         }
     }
 
-    fn clamp_to_catalog_efforts(
-        normalized: Self,
-        provider: ProviderKind,
-        wire_model: &str,
-        values: &[Self],
-    ) -> Self {
+    fn clamp_to_catalog_efforts(normalized: Self, default: Option<Self>, values: &[Self]) -> Self {
         if matches!(normalized, Self::Auto) || values.contains(&normalized) {
             return normalized;
         }
         let aliased = match normalized {
             Self::Minimal if values.contains(&Self::Low) => Self::Low,
             Self::Max | Self::Ultra if values.contains(&Self::XHigh) => Self::XHigh,
-            Self::Off => Self::catalog_default(provider, wire_model).unwrap_or(Self::High),
+            Self::Off => default.unwrap_or(Self::High),
             other => other,
         };
         if values.contains(&aliased) {
-            aliased
-        } else {
-            Self::catalog_default(provider, wire_model).unwrap_or(Self::High)
+            return aliased;
         }
+        if let Some(default) = default {
+            return default;
+        }
+        if values.contains(&Self::High) {
+            return Self::High;
+        }
+        normalized.nearest_in(values).unwrap_or(Self::High)
     }
 
     #[must_use]

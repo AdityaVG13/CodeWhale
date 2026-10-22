@@ -1200,7 +1200,7 @@ fn mode_invariant_matrix_covers_context_catalog_subagents_and_prompt_metadata() 
             .as_ref()
             .expect("mode context should always carry an elevated sandbox policy");
         match (case.sandbox, sandbox) {
-            (ExpectedSandbox::ReadOnly, SandboxPolicy::ReadOnly) => {}
+            (ExpectedSandbox::ReadOnly, SandboxPolicy::ReadOnly { .. }) => {}
             (
                 ExpectedSandbox::WorkspaceWrite,
                 SandboxPolicy::WorkspaceWrite {
@@ -1537,6 +1537,7 @@ fn turn_tool_context_uses_planned_authority_and_route_not_installed_session() {
             context_tokens: Some(123_456),
             input_tokens: None,
             output_tokens: Some(4_096),
+            output_declared: false,
         }),
         client: None,
         api_config: Box::new(Config::default()),

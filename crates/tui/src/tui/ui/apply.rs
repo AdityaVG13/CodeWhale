@@ -1036,7 +1036,12 @@ pub(crate) async fn apply_model_picker_choice(
     let effective_effort = if model_is_auto {
         effort
     } else {
-        effort.normalize_for_route(app.api_provider, &route_base_url, &resolved_model)
+        effort.normalize_for_route_identity(
+            app.api_provider,
+            current_identity.key.as_str(),
+            &route_base_url,
+            &resolved_model,
+        )
     };
     let effort_changed = effort != previous_effort;
 
@@ -1282,9 +1287,7 @@ pub(crate) async fn apply_provider_fallback_switch(
         app.session.last_completion_tokens = None;
     }
 
-    let _ = engine_handle.send(Op::Shutdown).await;
-    let engine_config = build_engine_config(app, config);
-    *engine_handle = spawn_tui_engine(engine_config, config);
+    replace_tui_engine(app, config, engine_handle).await;
 
     if !app.api_messages.is_empty() {
         let _ = engine_handle
@@ -1439,6 +1442,7 @@ async fn apply_conversation_undo(
     app.tool_details_by_cell.clear();
     app.exploring_entries.clear();
     app.ignored_tool_calls.clear();
+    app.bump_details_epoch();
     app.mark_history_updated();
     let manager = tokio::task::spawn_blocking(SessionManager::default_location).await??;
     let session = build_session_snapshot(app, &manager).map_err(anyhow::Error::msg)?;
@@ -1592,8 +1596,7 @@ async fn apply_command_result_inner(
                 };
                 sync_runtime_workspace_state(task_manager, app.workspace.clone()).await;
                 if respawn {
-                    let _ = engine_handle.send(Op::Shutdown).await;
-                    *engine_handle = spawn_tui_engine(build_engine_config(app, config), config);
+                    replace_tui_engine(app, config, engine_handle).await;
                 } else {
                     let _ = engine_handle
                         .send(Op::SetModel {
@@ -1702,8 +1705,7 @@ async fn apply_command_result_inner(
                 resolve_loaded_session_route(app, config);
                 app.update_model_compaction_budget();
                 if provider_changed || workspace_changed {
-                    let _ = engine_handle.send(Op::Shutdown).await;
-                    *engine_handle = spawn_tui_engine(build_engine_config(app, config), config);
+                    replace_tui_engine(app, config, engine_handle).await;
                 }
                 // SyncSession carries the conversation but not resolved route
                 // limits. Refresh the engine's model first so a loaded,
@@ -1829,8 +1831,7 @@ async fn apply_command_result_inner(
                         None,
                     );
                 }
-                let _ = engine_handle.send(Op::Shutdown).await;
-                *engine_handle = spawn_tui_engine(build_engine_config(app, config), config);
+                replace_tui_engine(app, config, engine_handle).await;
                 if !app.api_messages.is_empty() {
                     let _ = engine_handle
                         .send(Op::SyncSession {
@@ -2477,7 +2478,7 @@ async fn apply_command_result_inner(
                     run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
             }
             AppAction::StartClaudeLogin => {
-                let _ = run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
+                app.pending_claude_login = Some(false);
             }
             AppAction::StartClaudeRevoke => {
                 let path = app.config_path.clone();
@@ -2928,9 +2929,7 @@ async fn apply_command_result_inner(
                         );
                         crate::config::initialize_cloud_facts(config);
                         // Rebuild the engine with the new config so API key/model/base URL take effect.
-                        let _ = engine_handle.send(Op::Shutdown).await;
-                        let engine_config = build_engine_config(app, config);
-                        *engine_handle = spawn_tui_engine(engine_config, config);
+                        replace_tui_engine(app, config, engine_handle).await;
                         if !app.api_messages.is_empty() {
                             let _ = engine_handle
                                 .send(Op::SyncSession {
@@ -3239,6 +3238,7 @@ pub(crate) fn observe_human_request_settlement(app: &mut App, event: &EngineEven
 }
 
 pub(crate) fn note_human_decision_delivered(app: &mut App, tool_id: &str) {
+    crate::tui::tool_routing::start_exec_card(app, tool_id);
     if (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
         && !app.suppress_stream_events_until_turn_complete
         && !crate::tui::pending_requests::is_foreign_child_request(app, tool_id)
@@ -3548,9 +3548,8 @@ pub(crate) fn apply_backtrack(app: &mut App, depth: usize) {
         app.view_stack.pop();
     }
     // Backtrack rewinds the conversation only. State the file fact first,
-    // and name the command that puts the files back.
-    app.status_message =
-        Some("Files not changed. /undo puts them back. Conversation rewound.".to_string());
+    // and name the command that rolls the files back.
+    app.status_message = Some("Files not changed. Use /restore. Conversation rewound.".to_string());
     app.scroll_to_bottom();
     app.mark_history_updated();
     app.needs_redraw = true;
@@ -4367,10 +4366,17 @@ pub(crate) fn apply_loaded_session_with_goal(
         goal.validate()
             .map_err(|error| format!("saved session goal is invalid: {error}"))?;
     }
-    let provider_identity = config.resolve_persisted_provider_identity(
-        Some(&session.metadata.model_provider),
-        session.metadata.model_provider_id.as_deref(),
-    )?;
+    let provider_identity = config
+        .resolve_persisted_provider_identity(
+            Some(&session.metadata.model_provider),
+            session.metadata.model_provider_id.as_deref(),
+        )
+        .map_err(|reason| {
+            format!(
+                "{reason}. {}",
+                crate::session_export::export_recovery_hint(&session.metadata.id)
+            )
+        })?;
     let restored_route = resolve_runtime_route_for_identity(
         config,
         &provider_identity,
@@ -4430,8 +4436,8 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.active_cell = None;
     app.active_tool_details.clear();
     app.active_tool_entry_completed_at.clear();
+    app.bump_details_epoch();
     app.active_cell_revision = app.active_cell_revision.wrapping_add(1);
-    app.exploring_cell = None;
     app.exploring_entries.clear();
     app.ignored_tool_calls.clear();
     app.pending_tool_uses.clear();
@@ -4512,8 +4518,12 @@ pub(crate) fn apply_loaded_session_with_goal(
         let requested = app
             .reasoning_effort_preference
             .unwrap_or(app.reasoning_effort);
-        app.reasoning_effort =
-            requested.normalize_for_route(app.api_provider, &app.active_route_base_url, &app.model);
+        app.reasoning_effort = requested.normalize_for_route_identity(
+            app.api_provider,
+            app.provider_identity_for_persistence(),
+            &app.active_route_base_url,
+            &app.model,
+        );
     }
     app.provider_models.insert(
         app.provider_identity_for_persistence().to_string(),
@@ -4630,6 +4640,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.session_artifacts = session.artifacts;
     app.session_turn_outcomes = session.turn_outcomes;
     app.window_title = session.window_title;
+    app.composer_color = session.composer_color;
     app.workspace_context = None;
     app.workspace_is_linked_worktree = false;
     app.workspace_context_refreshed_at = None;

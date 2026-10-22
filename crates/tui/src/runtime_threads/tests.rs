@@ -2449,6 +2449,7 @@ fn sample_thread(thread_id: &str) -> ThreadRecord {
         title: None,
         session_id: None,
         saved_session_checkpoint: None,
+        last_read: None,
     }
 }
 
@@ -2677,6 +2678,7 @@ fn runtime_compaction_uses_provider_route_context() {
         context_tokens: Some(272_000),
         input_tokens: None,
         output_tokens: None,
+        output_declared: false,
     };
     let config = runtime_compaction_config(
         &Config::default(),
@@ -3304,6 +3306,7 @@ async fn real_turn_client_preflight_failure_writes_no_in_progress_record() -> Re
             ..crate::config::ProviderConfig::default()
         },
     );
+    let workspace = tempfile::tempdir()?;
     let manager = RuntimeThreadManager::open(
         Config {
             provider: Some("preflight-failure".to_string()),
@@ -3313,7 +3316,7 @@ async fn real_turn_client_preflight_failure_writes_no_in_progress_record() -> Re
             }),
             ..Config::default()
         },
-        PathBuf::from("."),
+        workspace.path().to_path_buf(),
         test_manager_config(test_runtime_dir()),
     )?;
     let thread = manager
@@ -3541,6 +3544,9 @@ async fn caller_cancellation_after_engine_acceptance_keeps_owned_turn_lifecycle(
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -3655,6 +3661,9 @@ async fn operation_key_replays_torn_response_survives_restart_and_rejects_mismat
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -4173,6 +4182,9 @@ async fn thread_updates_while_start_waits_for_capacity_survive_latest_turn_write
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -4336,6 +4348,9 @@ async fn compact_lifecycle_outlives_caller_and_preserves_concurrent_thread_updat
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -4345,6 +4360,16 @@ async fn compact_lifecycle_outlives_caller_and_preserves_concurrent_thread_updat
             base_url: None,
         })
         .await?;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), harness.rx_op.recv()).await? {
+            Some(Op::GetSessionSnapshot { tx }) => {
+                answer_session_snapshot(&tx, "settled");
+                break;
+            }
+            Some(_) => {}
+            None => bail!("engine mailbox closed before the settled-history snapshot"),
+        }
+    }
     let terminal = wait_for_terminal_turn(&manager, &turn_id).await?;
     assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
     assert_eq!(manager.active_turn_flags(&thread.id, &turn_id).await, None);
@@ -6704,18 +6729,6 @@ fn sample_item(turn_id: &str, item_id: &str, status: TurnItemLifecycleStatus) ->
     }
 }
 
-async fn install_mock_engine(
-    manager: &RuntimeThreadManager,
-    thread_id: &str,
-) -> crate::core::engine::MockEngineHandle {
-    let harness = mock_engine_handle();
-    manager
-        .install_test_engine(thread_id, harness.handle.clone())
-        .await
-        .expect("install mock engine");
-    harness
-}
-
 async fn wait_for_sender_strong_count<T>(
     sender: &tokio::sync::mpsc::Sender<T>,
     minimum: usize,
@@ -7794,6 +7807,7 @@ async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
                     thinking: "need a tool".to_string(),
                     signature: Some("sig-1".to_string()),
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,
@@ -7927,6 +7941,7 @@ async fn seeded_session_records_carry_a_total_order() -> Result<()> {
                     thinking: "consider".to_string(),
                     signature: None,
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,
@@ -8104,6 +8119,23 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
     assert!(evicted.is_empty(), "no idle threads should be evicted");
     assert_eq!(active.engines.len(), 2);
     assert_eq!(active.lru.len(), 2);
+    active.engines.get_mut("thr_a").unwrap().active_turn = None;
+    let authority = active.engines["thr_a"].engine.subagent_manager();
+    let child = {
+        let mut workers = authority.try_write().unwrap();
+        let child = workers.insert_test_running_agent("lru_child", &PathBuf::from("."));
+        workers.assign_test_session_owner(&child, "thr_a");
+        child
+    };
+    assert!(enforce_lru_capacity(&mut active, 2).is_empty());
+    let _ = authority
+        .try_write()
+        .unwrap()
+        .cancel_agent_for_session("thr_a", &child);
+    let evicted = enforce_lru_capacity(&mut active, 2);
+    assert_eq!(evicted.len(), 1);
+    assert!(!active.engines.contains_key("thr_a"));
+    assert!(active.engines.contains_key("thr_b"));
 }
 
 #[test]
@@ -8388,6 +8420,9 @@ async fn thread_lifecycle_persists_across_restart() -> Result<()> {
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 10,
                         output_tokens: 12,
@@ -8545,6 +8580,9 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage {
                 input_tokens: 18,
                 output_tokens: 8,
@@ -8983,6 +9021,9 @@ async fn terminal_settlement_preserves_late_sink_receipts_during_pending_request
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage {
                 input_tokens: 8,
                 output_tokens: 5,
@@ -9139,6 +9180,9 @@ async fn monitor_deduplicates_sink_and_metadata_and_persists_metadata_only_missi
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: batch.records[0].usage.usage.clone(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -9294,6 +9338,9 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 4,
@@ -9415,6 +9462,9 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -9625,6 +9675,9 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -9807,6 +9860,9 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -9879,6 +9935,9 @@ async fn completed_turn_without_engine_output_fails() -> Result<()> {
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 10,
                         output_tokens: 0,
@@ -9944,7 +10003,10 @@ async fn completed_turn_without_engine_output_fails() -> Result<()> {
 #[tokio::test]
 async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -> Result<()> {
     use crate::core::events::AgentProgressEventMeta;
-    use crate::tools::subagent::AgentWorkerStatus;
+    use crate::tools::subagent::{
+        AgentWorkerSpec, AgentWorkerStatus, AgentWorkerToolProfile, FleetRole, SubAgentManager,
+    };
+    use crate::worker_profile::WorkerRuntimeProfile;
 
     let runtime_dir = test_runtime_dir();
     let manager = test_manager(runtime_dir.clone())?;
@@ -9954,89 +10016,165 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
     let foreign = manager
         .create_thread(CreateThreadRequest::default())
         .await?;
-    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut harness = mock_engine_handle();
+    harness
+        .handle
+        .set_subagent_manager(Arc::new(tokio::sync::RwLock::new(SubAgentManager::new(
+            thread.workspace.clone(),
+            1,
+        ))));
+    manager
+        .install_test_engine(&thread.id, harness.handle.clone())
+        .await?;
+    let worker_manager = harness.handle.subagent_manager();
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     let thread_id = thread.id.clone();
     let foreign_id = foreign.id.clone();
+    let (registered_tx, registered_rx) = oneshot::channel::<()>();
+    let (late_tx, late_rx) = oneshot::channel::<()>();
+    let mut events_rx = manager.subscribe_events();
+    let completed = EngineEvent::AgentComplete {
+        display_name: Some("audit docs".into()),
+        owner_session_id: thread.id.clone(),
+        id: "worker_completed".into(),
+        result: "Completed successfully".into(),
+        outcome: Some(SubAgentStatus::Completed),
+        parent_run_id: Some("parent".into()),
+        spawn_depth: Some(2),
+        continuable: Some(false),
+        usage: None,
+    };
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
+            return;
+        }
+        if registered_rx.await.is_err() {
+            return;
+        }
+        let _ = tx_event
+            .send(EngineEvent::TurnStarted {
+                turn_id: "engine_worker_lifecycle".into(),
+                created_at: Utc::now(),
+                route: None,
+                submission_id: None,
+            })
+            .await;
+        for owner in [&thread_id, &foreign_id] {
             let _ = tx_event
-                .send(EngineEvent::TurnStarted {
-                    turn_id: "engine_worker_lifecycle".into(),
-                    created_at: Utc::now(),
-                    route: None,
-                    submission_id: None,
+                .send(EngineEvent::AgentSpawned {
+                    display_name: None,
+                    owner_session_id: owner.to_string(),
+                    id: "worker_spawn".into(),
+                    prompt: "private prompt".into(),
+                    worker_status: Some(AgentWorkerStatus::Queued),
+                    parent_run_id: Some("parent".into()),
+                    spawn_depth: 2,
+                    model: "fixture".into(),
+                    route_source: None,
                 })
                 .await;
-            for owner in [thread_id.clone(), foreign_id] {
-                let _ = tx_event
-                    .send(EngineEvent::AgentSpawned {
-                        display_name: None,
-                        owner_session_id: owner.clone(),
-                        id: "worker_spawn".into(),
-                        prompt: "private prompt".into(),
-                        worker_status: Some(AgentWorkerStatus::Queued),
-                        parent_run_id: Some("parent".into()),
-                        spawn_depth: 2,
-                        model: "fixture".into(),
-                        route_source: None,
-                    })
-                    .await;
-                let _ = tx_event
-                    .send(EngineEvent::AgentProgress {
-                        owner_session_id: owner.clone(),
-                        id: "worker_spawn".into(),
-                        status: "private progress".into(),
-                        activity: AgentProgressEventMeta::new(AgentWorkerStatus::RunningTool)
-                            .with_step(3)
-                            .with_tool("private_tool"),
-                        parent_run_id: Some("parent".into()),
-                        spawn_depth: 2,
-                    })
-                    .await;
-                for (id, outcome) in [
-                    ("worker_completed", Some(SubAgentStatus::Completed)),
-                    (
-                        "worker_failed",
-                        Some(SubAgentStatus::Failed("private failure".into())),
-                    ),
-                    (
-                        "worker_interrupted",
-                        Some(SubAgentStatus::Interrupted("private reason".into())),
-                    ),
-                    ("worker_cancelled", Some(SubAgentStatus::Cancelled)),
-                    ("worker_budget", Some(SubAgentStatus::BudgetExhausted)),
-                    ("worker_legacy", None),
-                ] {
-                    let _ = tx_event
-                        .send(EngineEvent::AgentComplete {
-                            // #6565: hosts name the agent the way the TUI does.
-                            display_name: (id == "worker_completed").then(|| "audit docs".into()),
-                            owner_session_id: owner.clone(),
-                            id: id.into(),
-                            result: "Completed successfully".into(),
-                            outcome,
-                            parent_run_id: Some("parent".into()),
-                            spawn_depth: Some(2),
-                            continuable: Some(id == "worker_interrupted"),
-                            usage: None,
-                        })
-                        .await;
-                }
-            }
             let _ = tx_event
-                .send(EngineEvent::TurnComplete {
-                    usage: Usage::default(),
-                    parent_route_usage: Usage::default(),
-                    routed_usage_dropped_records: 0,
-                    status: TurnOutcomeStatus::Completed,
-                    error: None,
-                    tool_catalog: None,
-                    base_url: None,
+                .send(EngineEvent::AgentProgress {
+                    owner_session_id: owner.to_string(),
+                    id: "worker_spawn".into(),
+                    status: "private progress".into(),
+                    activity: AgentProgressEventMeta::new(AgentWorkerStatus::RunningTool)
+                        .with_step(3)
+                        .with_tool("private_tool"),
+                    parent_run_id: Some("parent".into()),
+                    spawn_depth: 2,
                 })
                 .await;
         }
+        let _ = tx_event
+            .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await;
+        if late_rx.await.is_err() {
+            return;
+        }
+        let _ = tx_event.send(completed.clone()).await;
+        let _ = tx_event.send(completed.clone()).await;
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
+            return;
+        }
+        let _ = tx_event
+            .send(EngineEvent::TurnStarted {
+                turn_id: "engine_next_parent".into(),
+                created_at: Utc::now(),
+                route: None,
+                submission_id: None,
+            })
+            .await;
+        let _ = tx_event
+            .send(EngineEvent::MessageStarted { index: 0 })
+            .await;
+        let _ = tx_event
+            .send(EngineEvent::MessageDelta {
+                index: 0,
+                content: "Second parent response".into(),
+            })
+            .await;
+        let _ = tx_event
+            .send(EngineEvent::MessageComplete { index: 0 })
+            .await;
+
+        for owner in [&thread_id, &foreign_id] {
+            for (id, outcome) in [
+                (
+                    "worker_failed",
+                    Some(SubAgentStatus::Failed("private failure".into())),
+                ),
+                (
+                    "worker_interrupted",
+                    Some(SubAgentStatus::Interrupted("private reason".into())),
+                ),
+                ("worker_cancelled", Some(SubAgentStatus::Cancelled)),
+                ("worker_budget", Some(SubAgentStatus::BudgetExhausted)),
+                ("worker_legacy", None),
+                ("worker_unknown_origin", Some(SubAgentStatus::Completed)),
+            ] {
+                let _ = tx_event
+                    .send(EngineEvent::AgentComplete {
+                        display_name: None,
+                        owner_session_id: owner.to_string(),
+                        id: id.into(),
+                        result: "Completed successfully".into(),
+                        continuable: Some(id == "worker_interrupted"),
+                        outcome,
+                        parent_run_id: Some("parent".into()),
+                        spawn_depth: Some(2),
+                        usage: None,
+                    })
+                    .await;
+            }
+        }
+        let _ = tx_event.send(completed).await;
+        let _ = tx_event
+            .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await;
     });
     let turn = manager
         .start_turn(
@@ -10047,7 +10185,87 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
             },
         )
         .await?;
-    let _ = wait_for_terminal_turn(&manager, &turn.id).await?;
+    {
+        let mut workers = worker_manager.write().await;
+        for id in [
+            "worker_spawn",
+            "worker_completed",
+            "worker_failed",
+            "worker_interrupted",
+            "worker_cancelled",
+            "worker_budget",
+            "worker_legacy",
+            "worker_unknown_origin",
+        ] {
+            workers.register_worker_for_session_with_origin(
+                AgentWorkerSpec {
+                    worker_id: id.into(),
+                    run_id: id.into(),
+                    parent_run_id: Some("parent".into()),
+                    workflow_run_id: None,
+                    session_name: None,
+                    objective: "fixture".into(),
+                    role: None,
+                    agent_type: FleetRole::Verifier,
+                    model: "fixture".into(),
+                    workspace: if id == "worker_completed" {
+                        thread.workspace.join("isolated-child")
+                    } else {
+                        thread.workspace.clone()
+                    },
+                    git_branch: None,
+                    context_mode: "fresh".into(),
+                    fork_context: false,
+                    tool_profile: AgentWorkerToolProfile::Inherited,
+                    runtime_profile: WorkerRuntimeProfile::default(),
+                    max_steps: 2,
+                    spawn_depth: 2,
+                    max_spawn_depth: 3,
+                    child_route: None,
+                    launch_manifest: None,
+                },
+                &thread.id,
+                None,
+                (id != "worker_unknown_origin").then(|| turn.id.clone()),
+            );
+        }
+    }
+    registered_tx
+        .send(())
+        .map_err(|_| anyhow!("fixture registration receiver closed"))?;
+    let original = wait_for_terminal_turn(&manager, &turn.id).await?;
+    assert_eq!(original.status, RuntimeTurnStatus::Completed);
+    assert!(
+        manager.active.lock().await.engines[&thread.id]
+            .active_turn
+            .is_none()
+    );
+    late_tx
+        .send(())
+        .map_err(|_| anyhow!("fixture completion receiver closed"))?;
+    tokio::time::timeout(TURN_SETTLEMENT_DEADLOCK_TIMEOUT, async {
+        loop {
+            let event = events_rx.recv().await?;
+            if event.event == "agent.completed" && event.payload["agent_id"] == "worker_completed" {
+                anyhow::ensure!(
+                    event.turn_id.as_deref() == Some(turn.id.as_str()),
+                    "idle completion changed parent"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    let next = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "another parent".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let _ = wait_for_terminal_turn(&manager, &next.id).await?;
     let events = manager.events_since(&thread.id, None)?;
     let workers: Vec<_> = events
         .iter()
@@ -10061,7 +10279,12 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
     assert_eq!(
         workers.len(),
         8,
-        "foreign-owner envelopes must never enter this journal"
+        "foreign, unknown-origin and duplicate envelopes must not enter this journal"
+    );
+    assert!(
+        workers
+            .iter()
+            .all(|event| event.turn_id.as_deref() == Some(turn.id.as_str()))
     );
     assert_eq!(workers[0].payload["worker_status"], "queued");
     assert_eq!(workers[1].payload["worker_status"], "running_tool");
@@ -10096,6 +10319,27 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
             .unwrap()
             .starts_with("Sub-agent audit docs completed")
     );
+    let original = manager.store.load_turn(&turn.id)?;
+    assert_eq!(original.status, RuntimeTurnStatus::Completed);
+    assert!(
+        workers
+            .iter()
+            .all(|event| original.item_ids.contains(event.item_id.as_ref().unwrap()))
+    );
+    let current = manager.store.load_turn(&next.id)?;
+    assert!(
+        workers
+            .iter()
+            .all(|event| !current.item_ids.contains(event.item_id.as_ref().unwrap()))
+    );
+    assert_eq!(
+        manager
+            .store
+            .load_thread(&thread.id)?
+            .latest_turn_id
+            .as_deref(),
+        Some(next.id.as_str())
+    );
     let notices = manager.list_notices(&thread.id);
     assert!(
         notices
@@ -10115,9 +10359,6 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
             .iter()
             .all(|event| !event.event.starts_with("agent."))
     );
-
-    // Reopen only the existing journal authority. This proves persisted event
-    // replay, not a fresh worker-state snapshot or process resurrection.
     let reopened = RuntimeThreadStore::open(runtime_dir)?;
     let replay = reopened.events_since(&thread.id, None)?;
     assert_eq!(
@@ -10131,7 +10372,6 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
     );
     Ok(())
 }
-
 #[tokio::test]
 async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
@@ -10170,6 +10410,9 @@ async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()>
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage::default(),
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -10233,6 +10476,9 @@ async fn engine_error_remains_failed_after_nominal_turn_complete() -> Result<()>
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage::default(),
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -10816,6 +11062,9 @@ async fn compact_interrupt_persists_canceled_item_for_the_exact_request() -> Res
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -10942,6 +11191,11 @@ async fn compact_thread_receipt_keeps_exact_named_custom_identity() -> Result<()
 
 #[tokio::test]
 async fn compact_thread_with_real_engine_reaches_terminal_status() -> Result<()> {
+    // A real engine takes the workspace coordination lock exclusively, and
+    // nextest runs tests in parallel processes with this crate as their working
+    // directory. A `"."` workspace would therefore be the crate directory
+    // itself, and two exclusive holders of it cannot both start.
+    let workspace = tempfile::tempdir()?;
     let manager = RuntimeThreadManager::open(
         Config {
             // This test intentionally crosses the real-engine boundary. Give
@@ -10953,7 +11207,7 @@ async fn compact_thread_with_real_engine_reaches_terminal_status() -> Result<()>
             Some("runtime-thread-test-key".to_string()),
             Some("http://127.0.0.1:1/v1".to_string()),
         ),
-        PathBuf::from("."),
+        workspace.path().to_path_buf(),
         test_manager_config(test_runtime_dir()),
     )?;
     let thread = manager
@@ -11054,6 +11308,9 @@ async fn multi_turn_continuity_same_thread() -> Result<()> {
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 5,
                         output_tokens: 5,
@@ -11296,6 +11553,9 @@ async fn host_goal_loop_kickoff_arms_one_continuation_and_parks_at_engine_cap() 
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 10,
                         output_tokens: 10,
@@ -11415,6 +11675,9 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 10,
                         output_tokens: 10,
@@ -11494,6 +11757,9 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
                 .await;
             let _ = failed_tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 5,
                         output_tokens: 5,
@@ -11592,6 +11858,9 @@ async fn host_goal_loop_mirrors_terminal_snapshot_and_does_not_rearm() -> Result
                     .await;
                 let _ = tx_event
                     .send(EngineEvent::TurnComplete {
+                        turn_id: None,
+                        submission_id: None,
+                        compaction_id: None,
                         usage: Usage {
                             input_tokens: 7,
                             output_tokens: 3,
@@ -11698,6 +11967,9 @@ async fn model_created_goal_persists_through_adopted_revision() -> Result<()> {
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 10,
                         output_tokens: 10,
@@ -11782,6 +12054,9 @@ async fn model_created_goal_never_overwrites_concurrent_explicit_goal() -> Resul
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 10,
                         output_tokens: 10,
@@ -11884,6 +12159,9 @@ async fn live_goal_progress_is_revision_fenced_and_settled_once() -> Result<()> 
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 10,
@@ -12573,14 +12851,14 @@ async fn approval_required_with_stale_active_turn_is_denied() -> Result<()> {
         harness.rx_op.recv().await,
         Some(Op::SendMessage(TurnSpec { .. }))
     ));
-    {
+    let active_turn = {
         let mut active = manager.active.lock().await;
         let state = active
             .engines
             .get_mut(&thread.id)
             .context("missing active thread state")?;
-        state.active_turn = None;
-    }
+        state.active_turn.take().context("missing active turn")?
+    };
 
     harness
         .tx_event
@@ -12603,9 +12881,21 @@ async fn approval_required_with_stale_active_turn_is_denied() -> Result<()> {
         })
     );
 
+    manager
+        .active
+        .lock()
+        .await
+        .engines
+        .get_mut(&thread.id)
+        .context("missing active thread state")?
+        .active_turn = Some(active_turn);
+
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -12621,7 +12911,8 @@ async fn approval_required_with_stale_active_turn_is_denied() -> Result<()> {
         .await?;
 
     let terminal = wait_for_terminal_turn(&manager, &turn.id).await?;
-    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+    assert_eq!(terminal.error.as_deref(), Some(EMPTY_TURN_REASON));
     Ok(())
 }
 
@@ -12683,144 +12974,172 @@ async fn await_approval_identity(
 
 #[tokio::test]
 async fn approval_required_awaits_external_decision_allow() -> Result<()> {
-    let manager = test_manager(test_runtime_dir())?;
-    let thread = manager
-        .create_thread(CreateThreadRequest {
-            model: None,
-            workspace: None,
-            mode: None,
-            allow_shell: None,
-            trust_mode: None,
-            auto_approve: None,
-            archived: false,
-            system_prompt: None,
-            task_id: None,
-            ..Default::default()
-        })
-        .await?;
-
-    let mut harness = install_mock_engine(&manager, &thread.id).await;
-    let _turn = manager
-        .start_turn(
-            &thread.id,
-            StartTurnRequest {
-                prompt: "needs approval".to_string(),
-                input_summary: None,
+    for (call_id, tool_name, input) in [
+        (
+            "tool_external_allow",
+            "exec_command",
+            json!({"command":"echo fixture","metadata":{"values":[1,true,null]}}),
+        ),
+        (
+            "agent:worker_fixture:approval:00000000-0000-4000-8000-000000000001",
+            "write",
+            json!({"path":"proof/shared.txt","content":"fixture\n"}),
+        ),
+        ("tool_external_null", "fixture_null", Value::Null),
+    ] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest {
                 model: None,
+                workspace: None,
                 mode: None,
                 allow_shell: None,
                 trust_mode: None,
                 auto_approve: None,
+                archived: false,
+                system_prompt: None,
+                task_id: None,
                 ..Default::default()
-            },
-        )
-        .await?;
-    assert!(matches!(
-        harness.rx_op.recv().await,
-        Some(Op::SendMessage(TurnSpec { .. }))
-    ));
+            })
+            .await?;
 
-    harness
-        .tx_event
-        .send(EngineEvent::ApprovalRequired {
-            approval_key: "key1".to_string(),
-            approval_grouping_key: "key1".to_string(),
-            id: "tool_external_allow".to_string(),
-            tool_name: "exec_command".to_string(),
-            description: "external allow".to_string(),
-            input: serde_json::json!({}),
-            intent_summary: Some("I will update the config file.".to_string()),
-            approval_force_prompt: false,
-        })
-        .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let _turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "needs approval".to_string(),
+                    input_summary: None,
+                    model: None,
+                    mode: None,
+                    allow_shell: None,
+                    trust_mode: None,
+                    auto_approve: None,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ));
 
-    let deadline = Instant::now() + APPROVAL_READINESS_TIMEOUT;
-    while Instant::now() < deadline && manager.pending_approvals_count() == 0 {
-        sleep(Duration::from_millis(20)).await;
+        harness
+            .tx_event
+            .send(EngineEvent::ApprovalRequired {
+                approval_key: "key1".to_string(),
+                approval_grouping_key: "key1".to_string(),
+                id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                description: "external allow".to_string(),
+                input: input.clone(),
+                intent_summary: Some("I will update the config file.".to_string()),
+                approval_force_prompt: false,
+            })
+            .await?;
+
+        let deadline = Instant::now() + APPROVAL_READINESS_TIMEOUT;
+        while Instant::now() < deadline && manager.pending_approvals_count() == 0 {
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(manager.pending_approvals_count(), 1);
+
+        let approval_id = await_approval_identity(&manager, &thread.id, call_id).await?;
+
+        // The snapshot a reconnecting client resumes from carries the same opaque
+        // capability as the event, so both routes to the ID agree.
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        assert_eq!(detail.pending_approvals.len(), 1);
+        assert_eq!(detail.pending_approvals[0].id, approval_id);
+        assert_eq!(detail.pending_approvals[0].turn_id, _turn.id);
+        assert_eq!(detail.pending_approvals[0].tool_name, tool_name);
+        // The snapshot keeps the raw correlator so a client that reloaded past the
+        // event can still attach this prompt to the tool row it gates.
+        assert_eq!(
+            detail.pending_approvals[0].tool_call_id.as_deref(),
+            Some(call_id)
+        );
+        assert_eq!(detail.pending_approvals[0].input.as_ref(), Some(&input));
+        let serialized = serde_json::to_value(&detail.pending_approvals[0])?;
+        assert_eq!(serialized.get("input"), Some(&input));
+        let reloaded: PendingApprovalRequest = serde_json::from_value(serialized.clone())?;
+        assert_eq!(reloaded.input, Some(input.clone()));
+        let mut legacy = serialized;
+        legacy
+            .as_object_mut()
+            .expect("approval object")
+            .remove("input");
+        let legacy: PendingApprovalRequest = serde_json::from_value(legacy)?;
+        assert_eq!(legacy.input, None);
+        assert!(serde_json::to_value(legacy)?.get("input").is_none());
+        assert_eq!(detail.pending_user_inputs.len(), 0);
+
+        let events = manager.events_since(&thread.id, None)?;
+        let approval_event = events
+            .iter()
+            .rev()
+            .find(|event| event.event == "approval.required")
+            .context("missing approval.required event")?;
+        assert_eq!(approval_event.payload.get("input"), Some(&input));
+        assert_eq!(
+            approval_event
+                .payload
+                .get("intent_summary")
+                .and_then(Value::as_str),
+            Some("I will update the config file.")
+        );
+
+        assert!(!manager.deliver_external_approval(
+            call_id,
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert_eq!(manager.pending_approvals_count(), 1);
+
+        assert!(manager.deliver_external_approval(
+            &approval_id,
+            ExternalApprovalDecision::Allow { remember: false },
+        ));
+        assert_eq!(
+            harness.recv_approval_event().await,
+            Some(MockApprovalEvent::Approved {
+                id: call_id.to_string(),
+            })
+        );
+        assert_eq!(manager.pending_approvals_count(), 0);
+        assert!(
+            manager
+                .get_thread_detail(&thread.id)
+                .await?
+                .pending_approvals
+                .is_empty()
+        );
+        assert!(
+            manager.events_since(&thread.id, None)?.iter().any(|event| {
+                event.event == "approval.decided"
+                    && event.payload.get("approval_id").and_then(Value::as_str)
+                        == Some(approval_id.as_str())
+                    && event.payload.get("tool_call_id").and_then(Value::as_str) == Some(call_id)
+                    && event.payload.get("decision").and_then(Value::as_str) == Some("allow")
+            }),
+            "approval.decided must correlate the opaque id with the tool call it settled"
+        );
+
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
     }
-    assert_eq!(manager.pending_approvals_count(), 1);
-
-    let approval_id = await_approval_identity(&manager, &thread.id, "tool_external_allow").await?;
-
-    // The snapshot a reconnecting client resumes from carries the same opaque
-    // capability as the event, so both routes to the ID agree.
-    let detail = manager.get_thread_detail(&thread.id).await?;
-    assert_eq!(detail.pending_approvals.len(), 1);
-    assert_eq!(detail.pending_approvals[0].id, approval_id);
-    assert_eq!(detail.pending_approvals[0].turn_id, _turn.id);
-    assert_eq!(detail.pending_approvals[0].tool_name, "exec_command");
-    // The snapshot keeps the raw correlator so a client that reloaded past the
-    // event can still attach this prompt to the tool row it gates.
-    assert_eq!(
-        detail.pending_approvals[0].tool_call_id.as_deref(),
-        Some("tool_external_allow")
-    );
-    assert_eq!(detail.pending_user_inputs.len(), 0);
-
-    let events = manager.events_since(&thread.id, None)?;
-    let approval_event = events
-        .iter()
-        .rev()
-        .find(|event| event.event == "approval.required")
-        .context("missing approval.required event")?;
-    assert_eq!(
-        approval_event
-            .payload
-            .get("intent_summary")
-            .and_then(Value::as_str),
-        Some("I will update the config file.")
-    );
-
-    // The raw provider ID is not a credential: only the minted one settles.
-    assert!(!manager.deliver_external_approval(
-        "tool_external_allow",
-        ExternalApprovalDecision::Allow { remember: false },
-    ));
-    assert_eq!(manager.pending_approvals_count(), 1);
-
-    assert!(manager.deliver_external_approval(
-        &approval_id,
-        ExternalApprovalDecision::Allow { remember: false },
-    ));
-    // The engine is still addressed by the provider's own call ID.
-    assert_eq!(
-        harness.recv_approval_event().await,
-        Some(MockApprovalEvent::Approved {
-            id: "tool_external_allow".to_string(),
-        })
-    );
-    assert_eq!(manager.pending_approvals_count(), 0);
-    assert!(
-        manager
-            .get_thread_detail(&thread.id)
-            .await?
-            .pending_approvals
-            .is_empty()
-    );
-    assert!(
-        manager.events_since(&thread.id, None)?.iter().any(|event| {
-            event.event == "approval.decided"
-                && event.payload.get("approval_id").and_then(Value::as_str)
-                    == Some(approval_id.as_str())
-                && event.payload.get("tool_call_id").and_then(Value::as_str)
-                    == Some("tool_external_allow")
-                && event.payload.get("decision").and_then(Value::as_str) == Some("allow")
-        }),
-        "approval.decided must correlate the opaque id with the tool call it settled"
-    );
-
-    harness
-        .tx_event
-        .send(EngineEvent::TurnComplete {
-            usage: Usage::default(),
-            parent_route_usage: Usage::default(),
-            routed_usage_dropped_records: 0,
-            status: TurnOutcomeStatus::Completed,
-            error: None,
-            tool_catalog: None,
-            base_url: None,
-        })
-        .await?;
     Ok(())
 }
 
@@ -12928,6 +13247,9 @@ async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Re
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -13047,7 +13369,7 @@ async fn user_input_tool_timeout_and_cancel_clear_snapshot_before_turn_end() -> 
                 result: Err(error),
             })
             .await?;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(TURN_SETTLEMENT_DEADLOCK_TIMEOUT, async {
             loop {
                 let detail = manager.get_thread_detail(&thread.id).await?;
                 let events = manager.events_since(&thread.id, None)?;
@@ -13096,6 +13418,9 @@ async fn user_input_tool_timeout_and_cancel_clear_snapshot_before_turn_end() -> 
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -13687,6 +14012,9 @@ async fn thread_detail_cursor_precedes_projection_reads_at_terminal_boundary() -
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -13940,6 +14268,9 @@ async fn thread_detail_materializes_stream_prefixes_before_their_delta_cursor() 
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -14081,6 +14412,9 @@ async fn thread_detail_delta_boundary_is_replay_idempotent() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -14152,6 +14486,9 @@ async fn terminal_turn_cancels_pending_user_input_and_clears_snapshot() -> Resul
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -14254,6 +14591,9 @@ async fn interrupted_turn_cancels_pending_user_input_and_clears_snapshot() -> Re
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -14445,6 +14785,9 @@ async fn dynamic_tool_result_settles_snapshot_and_emits_one_safe_resolution() ->
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -14632,6 +14975,9 @@ async fn dynamic_tool_result_receipt_outlives_canceled_delivery_future() -> Resu
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -15463,6 +15809,9 @@ async fn dynamic_tool_timeout_clears_snapshot_and_emits_once() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -15551,6 +15900,9 @@ async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()>
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -15688,6 +16040,9 @@ async fn engine_withdrawal_retires_approval_and_unblocks_queued_events() -> Resu
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -15782,6 +16137,9 @@ async fn approval_wait_heartbeat_is_never_sequenced_after_the_decision() -> Resu
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -15900,6 +16258,9 @@ async fn approval_required_external_deny_is_denied() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -15923,6 +16284,7 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
     let manager = test_manager(test_runtime_dir())?;
 
     let mut gated = Vec::new();
+    let mut inputs = std::collections::HashMap::new();
     for prompt in ["first gated turn", "second gated turn"] {
         let thread = manager
             .create_thread(CreateThreadRequest::default())
@@ -15941,6 +16303,8 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
             harness.rx_op.recv().await,
             Some(Op::SendMessage(TurnSpec { .. }))
         ));
+        let input =
+            json!({"command":"echo fixture","owner_prompt":prompt,"nested":{"values":[null,true]}});
         harness
             .tx_event
             .send(EngineEvent::ApprovalRequired {
@@ -15949,12 +16313,13 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
                 id: RAW_CALL_ID.to_string(),
                 tool_name: "exec_command".to_string(),
                 description: format!("gated {prompt}"),
-                input: serde_json::json!({}),
+                input: input.clone(),
                 intent_summary: None,
                 approval_force_prompt: false,
             })
             .await?;
         let approval_id = await_approval_identity(&manager, &thread.id, RAW_CALL_ID).await?;
+        inputs.insert(thread.id.clone(), input);
         gated.push((thread, harness, approval_id));
     }
 
@@ -15976,6 +16341,10 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
         // provider behavior this fix survives — while the capability that
         // settles each one is distinct.
         assert_eq!(pending[0].tool_call_id.as_deref(), Some(RAW_CALL_ID));
+        assert_eq!(pending[0].input.as_ref(), inputs.get(&thread.id));
+        let reloaded: PendingApprovalRequest =
+            serde_json::from_value(serde_json::to_value(&pending[0])?)?;
+        assert_eq!(reloaded.input.as_ref(), inputs.get(&thread.id));
     }
 
     // The shared correlator is visible to both clients and settles neither.
@@ -16016,6 +16385,7 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
         .pending_approvals;
     assert_eq!(still_pending.len(), 1);
     assert_eq!(still_pending[0].id, approval_b);
+    assert_eq!(still_pending[0].input.as_ref(), inputs.get(&thread_b.id));
     assert!(
         manager
             .get_thread_detail(&thread_a.id)
@@ -16040,6 +16410,9 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -16124,6 +16497,7 @@ async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Res
         } else {
             None
         };
+        let input = json!({"approval_key":"extcall:ext:claimed","command":"echo fixture","nested":{"values":[null,true,3]}});
         harness
             .tx_event
             .send(EngineEvent::ApprovalRequired {
@@ -16133,7 +16507,7 @@ async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Res
                 tool_name: "bash".to_string(),
                 // Text and input cannot impersonate a Rust-minted origin key.
                 description: "Requested by extension:claimed".to_string(),
-                input: json!({"approval_key": "extcall:ext:claimed", "command": "echo fixture"}),
+                input: input.clone(),
                 intent_summary: None,
                 approval_force_prompt: forced,
             })
@@ -16165,6 +16539,17 @@ async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Res
         let detail = manager.get_thread_detail(&thread.id).await?;
         assert!(detail.pending_approvals.is_empty());
         assert_eq!(detail.approval_grants.len(), usize::from(remembered));
+        let required = manager
+            .events_since(&thread.id, None)?
+            .into_iter()
+            .find(|event| event.event == "approval.required");
+        if approved {
+            let required = required.context("automatic approval request receipt")?;
+            assert_eq!(required.payload.get("input"), Some(&input));
+            assert_eq!(required.payload["tool_call_id"], "policy-call");
+        } else {
+            assert!(required.is_none());
+        }
         let decided = manager
             .events_since(&thread.id, None)?
             .into_iter()
@@ -16205,6 +16590,9 @@ async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Res
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -16337,6 +16725,9 @@ async fn runtime_approval_disposition_forced_requests_require_human() -> Result<
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -16434,6 +16825,9 @@ async fn auto_review_force_prompt_is_denied_without_opening_a_modal() -> Result<
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -16559,6 +16953,9 @@ async fn approval_interrupt_revokes_waiter_and_rejects_late_actions() -> Result<
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -16696,6 +17093,9 @@ async fn approval_timeout_denies_clears_ui_and_next_turn_can_start() -> Result<(
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -16791,6 +17191,9 @@ async fn thinking_delta_emits_agent_reasoning_item() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -17158,14 +17561,14 @@ async fn elevation_required_with_stale_active_turn_is_denied() -> Result<()> {
         harness.rx_op.recv().await,
         Some(Op::SendMessage(TurnSpec { .. }))
     ));
-    {
+    let active_turn = {
         let mut active = manager.active.lock().await;
         let state = active
             .engines
             .get_mut(&thread.id)
             .context("missing active thread state")?;
-        state.active_turn = None;
-    }
+        state.active_turn.take().context("missing active turn")?
+    };
 
     harness
         .tx_event
@@ -17186,9 +17589,21 @@ async fn elevation_required_with_stale_active_turn_is_denied() -> Result<()> {
         })
     );
 
+    manager
+        .active
+        .lock()
+        .await
+        .engines
+        .get_mut(&thread.id)
+        .context("missing active thread state")?
+        .active_turn = Some(active_turn);
+
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -17204,7 +17619,8 @@ async fn elevation_required_with_stale_active_turn_is_denied() -> Result<()> {
         .await?;
 
     let terminal = wait_for_terminal_turn(&manager, &turn.id).await?;
-    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+    assert_eq!(terminal.error.as_deref(), Some(EMPTY_TURN_REASON));
     Ok(())
 }
 
@@ -17260,6 +17676,9 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
                 .await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage {
                         input_tokens: 8,
                         output_tokens: 9,
@@ -17297,7 +17716,7 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
         .await?;
 
     let steer_text = "add bullet list".to_string();
-    manager
+    let steered_turn = manager
         .steer_turn(
             &thread.id,
             &turn.id,
@@ -17306,36 +17725,48 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
             },
         )
         .await?;
+    assert!(matches!(steered_turn.steer_count, 0 | 1));
     let observed_steer = steer_seen_rx
         .await
         .context("driver did not receive steer")?;
     assert_eq!(observed_steer, steer_text);
 
+    tokio::time::timeout(TURN_SETTLEMENT_DEADLOCK_TIMEOUT, async {
+        loop {
+            let events = manager.events_since(&thread.id, None)?;
+            let delivered = events.iter().any(|event| {
+                event.turn_id.as_deref() == Some(turn.id.as_str()) && event.event == "turn.steered"
+            });
+            let completed = events.iter().any(|event| {
+                event.turn_id.as_deref() == Some(turn.id.as_str())
+                    && event.event == "item.completed"
+                    && event.payload["item"]["detail"] == steer_text
+            });
+            if delivered && completed {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("steer delivery did not settle")??;
+    assert_eq!(manager.store.load_turn(&turn.id)?.steer_count, 1);
+
     let final_turn = wait_for_terminal_turn(&manager, &turn.id).await?;
     assert_eq!(final_turn.status, RuntimeTurnStatus::Completed);
+    assert_eq!(final_turn.steer_count, 1);
 
-    let deadline = Instant::now() + TURN_SETTLEMENT_DEADLOCK_TIMEOUT;
-    loop {
-        let events = manager.events_since(&thread.id, None)?;
-        let steered = events.iter().any(|ev| ev.event == "turn.steered");
-        let completed = events.iter().any(|ev| {
-            ev.event == "item.completed"
-                && ev
-                    .payload
-                    .get("item")
-                    .and_then(|item| item.get("detail"))
-                    .and_then(Value::as_str)
-                    == Some("add bullet list")
-        });
-        if steered && completed {
-            break;
-        }
-        if Instant::now() >= deadline {
-            bail!("steer receipts were not persisted: steered={steered}, completed={completed}");
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(manager.store.load_turn(&turn.id)?.steer_count, 1);
+    let events = manager.events_since(&thread.id, None)?;
+    assert!(events.iter().any(|ev| ev.event == "turn.steered"));
+    assert!(events.iter().any(|ev| {
+        ev.event == "item.completed"
+            && ev
+                .payload
+                .get("item")
+                .and_then(|item| item.get("detail"))
+                .and_then(Value::as_str)
+                == Some("add bullet list")
+    }));
     Ok(())
 }
 
@@ -17441,6 +17872,9 @@ async fn steer_receipts_outlive_caller_cancellation_after_engine_acceptance() ->
         .await?;
     tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -17556,6 +17990,9 @@ async fn steer_dropped_by_the_engine_is_reported_as_undelivered() -> Result<()> 
         .await?;
     tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -17647,6 +18084,9 @@ async fn steer_rejects_a_terminal_durable_turn_without_dispatch_or_item() -> Res
         .await?;
     tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -17865,6 +18305,31 @@ async fn failed_turn_cancels_pending_user_input_and_clears_snapshot() -> Result<
     Ok(())
 }
 
+fn answer_session_snapshot(
+    tx: &Arc<
+        std::sync::Mutex<Option<tokio::sync::oneshot::Sender<crate::core::ops::SessionSnapshot>>>,
+    >,
+    text: &str,
+) {
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role": "user", "content": [{"type": "text", "text": text}]}
+    ]))
+    .expect("snapshot message");
+    if let Some(tx) = tx.lock().expect("snapshot sender").take() {
+        let _ = tx.send(crate::core::ops::SessionSnapshot {
+            session_id: String::new(),
+            messages,
+            total_tokens: 0,
+            model: String::new(),
+            model_provider: String::new(),
+            model_provider_id: None,
+            workspace: PathBuf::new(),
+            system_prompt: None,
+            mode: String::new(),
+        });
+    }
+}
+
 #[tokio::test]
 async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
@@ -17888,8 +18353,20 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
         let mut op_count = 0usize;
+        let mut snapshots = 0usize;
         while let Some(op) = rx_op.recv().await {
             match op {
+                Op::GetSessionSnapshot { tx } => {
+                    snapshots = snapshots.saturating_add(1);
+                    answer_session_snapshot(
+                        &tx,
+                        if snapshots == 1 {
+                            "auto settled"
+                        } else {
+                            "manual settled"
+                        },
+                    );
+                }
                 Op::SendMessage(TurnSpec { .. }) => {
                     op_count = op_count.saturating_add(1);
                     let _ = tx_event
@@ -17920,6 +18397,9 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                         .await;
                     let _ = tx_event
                         .send(EngineEvent::TurnComplete {
+                            turn_id: None,
+                            submission_id: None,
+                            compaction_id: None,
                             usage: Usage {
                                 input_tokens: 3,
                                 output_tokens: 3,
@@ -17963,6 +18443,9 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                         .await;
                     let _ = tx_event
                         .send(EngineEvent::TurnComplete {
+                            turn_id: None,
+                            submission_id: None,
+                            compaction_id: None,
                             usage: Usage {
                                 input_tokens: 1,
                                 output_tokens: 1,
@@ -17983,7 +18466,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                 }
                 _ => {}
             }
-            if op_count >= 2 {
+            if op_count >= 2 && snapshots >= 2 {
                 break;
             }
         }
@@ -18054,15 +18537,16 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
             && ev.payload.get("messages_after").and_then(Value::as_u64) == Some(2)
     }));
 
-    // The manual compact carried a summary_prompt → it must be persisted into
-    // the thread record so engine reloads restore it. The auto compact carried
-    // None → exactly one summary section, from the manual pass.
+    // Each compacting turn stores the history the engine settled on; a
+    // reload restores the newest one instead of replaying the turns it
+    // replaced, and the thread record carries no summary of its own.
     let record = manager.get_thread(&thread.id).await?;
-    let record_prompt = record.system_prompt.expect("record keeps a system prompt");
-    assert!(record_prompt.contains(COMPACTION_SUMMARY_BEGIN));
-    assert!(record_prompt.contains("Conversation Summary (Auto-Generated)"));
-    assert!(record_prompt.contains("key facts."));
-    assert_eq!(record_prompt.matches(COMPACTION_SUMMARY_BEGIN).count(), 1);
+    assert_eq!(record.system_prompt, None);
+    let restored = manager.restore_thread_messages(&record)?;
+    let expected: Vec<Message> = serde_json::from_value(json!([
+        {"role": "user", "content": [{"type": "text", "text": "manual settled"}]}
+    ]))?;
+    assert_eq!(restored, expected);
     Ok(())
 }
 
@@ -18103,6 +18587,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         title: None,
         session_id: None,
         saved_session_checkpoint: None,
+        last_read: None,
     };
     manager.store.save_thread(&thread)?;
 
@@ -18741,73 +19226,6 @@ async fn fork_at_user_message_does_not_mutate_source() -> Result<()> {
     Ok(())
 }
 
-// ── compaction summary persistence (merge_summary_into_prompt) ──
-
-#[test]
-fn summary_merge_scenario() {
-    // Scenario consolidation of: summary_merge_appends_section_to_base_prompt, summary_merge_replaces_existing_section_idempotently, summary_merge_handles_missing_base
-    // from summary_merge_appends_section_to_base_prompt
-    {
-        let merged = merge_summary_into_prompt(
-            Some("You are a helpful agent."),
-            "## 📋 Conversation Summary (Auto-Generated)\n\nUser prefers lists.",
-        );
-        assert!(merged.starts_with("You are a helpful agent."));
-        assert!(merged.contains(COMPACTION_SUMMARY_BEGIN));
-        assert!(merged.contains("User prefers lists."));
-        assert!(merged.ends_with(COMPACTION_SUMMARY_END));
-        // Reload restore keys on the marker: SyncSession migrates this carrier
-        // into one ordinary history checkpoint before provider dispatch.
-        assert!(merged.contains("Conversation Summary (Auto-Generated)"));
-    }
-    // from summary_merge_replaces_existing_section_idempotently
-    {
-        let first = merge_summary_into_prompt(Some("Base prompt."), "summary v1");
-        let second = merge_summary_into_prompt(Some(&first), "summary v2");
-        assert!(second.contains("summary v2"));
-        assert!(!second.contains("summary v1"));
-        assert_eq!(
-            second.matches(COMPACTION_SUMMARY_BEGIN).count(),
-            1,
-            "repeated compactions must swap the section, not stack duplicates"
-        );
-        assert!(second.starts_with("Base prompt."));
-    }
-    // from summary_merge_handles_missing_base
-    {
-        let merged = merge_summary_into_prompt(None, "only summary");
-        assert!(merged.starts_with(COMPACTION_SUMMARY_BEGIN));
-        assert!(merged.contains("only summary"));
-        let empty_base = merge_summary_into_prompt(Some(""), "only summary");
-        assert!(empty_base.starts_with(COMPACTION_SUMMARY_BEGIN));
-    }
-}
-
-#[test]
-fn summary_strip_scenario() {
-    // Scenario consolidation of: summary_strip_preserves_text_after_section, summary_strip_handles_missing_end_sentinel
-    // from summary_strip_preserves_text_after_section
-    {
-        let with_tail = format!(
-            "Base.\n\n{COMPACTION_SUMMARY_BEGIN}\nold summary\n{COMPACTION_SUMMARY_END}\n\nTrailing rules."
-        );
-        let stripped = strip_summary_section(&with_tail);
-        assert!(stripped.contains("Base."));
-        assert!(stripped.contains("Trailing rules."));
-        assert!(!stripped.contains("old summary"));
-        // Re-merge keeps the tail intact.
-        let merged = merge_summary_into_prompt(Some(&with_tail), "new summary");
-        assert!(merged.contains("Trailing rules."));
-        assert!(merged.contains("new summary"));
-    }
-    // from summary_strip_handles_missing_end_sentinel
-    {
-        let broken = format!("Base.\n\n{COMPACTION_SUMMARY_BEGIN}\ntruncated…");
-        let stripped = strip_summary_section(&broken);
-        assert_eq!(stripped, "Base.");
-    }
-}
-
 /// Release acceptance: the full two-task Agent Mail matrix in one run, with
 /// evidence written to disk. Run explicitly:
 ///   CODEWHALE_MAIL_ACCEPTANCE_DIR=/Volumes/VIXinSSD/CW/artifacts/... \
@@ -18946,6 +19364,9 @@ async fn agent_mail_release_acceptance_two_task_matrix() -> Result<()> {
     harness_b
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -20240,10 +20661,7 @@ mod runtime_image_inputs {
                     .is_err()
             );
             assert!(!manager.active.lock().await.engines.contains_key(&fork.id));
-            let mut harness = crate::core::engine::mock_engine_handle();
-            manager
-                .install_test_engine(&fork.id, harness.handle.clone())
-                .await?;
+            let mut harness = install_mock_engine(&manager, &fork.id).await;
             let turn = manager
                 .start_turn_from_stored_images(&fork.id, request.clone())
                 .await?;
@@ -20268,6 +20686,9 @@ mod runtime_image_inputs {
                 },
                 EngineEvent::MessageComplete { index: 0 },
                 EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage::default(),
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -20364,6 +20785,11 @@ fn output_cap_wire_requires_positive_integer_and_preserves_legacy_absence() -> R
 /// the rest clear on ack.
 #[tokio::test]
 async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result<()> {
+    use crate::tools::subagent::{
+        AgentWorkerSpec, AgentWorkerToolProfile, FleetRole, SubAgentManager,
+    };
+    use crate::worker_profile::WorkerRuntimeProfile;
+
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
         .create_thread(CreateThreadRequest {
@@ -20379,7 +20805,16 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
             ..Default::default()
         })
         .await?;
-    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let mut harness = mock_engine_handle();
+    harness
+        .handle
+        .set_subagent_manager(Arc::new(tokio::sync::RwLock::new(SubAgentManager::new(
+            thread.workspace.clone(),
+            1,
+        ))));
+    manager
+        .install_test_engine(&thread.id, harness.handle.clone())
+        .await?;
     let turn = manager
         .start_turn(
             &thread.id,
@@ -20393,8 +20828,38 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
         harness.rx_op.recv().await,
         Some(Op::SendMessage(TurnSpec { .. }))
     ));
-    // Agent-scoped events before TurnStarted are control-plane receipts and
-    // are skipped; the turn must start before completions count.
+    harness
+        .handle
+        .subagent_manager()
+        .write()
+        .await
+        .register_worker_for_session_with_origin(
+            AgentWorkerSpec {
+                worker_id: "agent_done".into(),
+                run_id: "agent_done".into(),
+                parent_run_id: None,
+                workflow_run_id: None,
+                session_name: None,
+                objective: "fixture".into(),
+                role: None,
+                agent_type: FleetRole::Verifier,
+                model: "fixture".into(),
+                workspace: thread.workspace.clone(),
+                git_branch: None,
+                context_mode: "fresh".into(),
+                fork_context: false,
+                tool_profile: AgentWorkerToolProfile::Inherited,
+                runtime_profile: WorkerRuntimeProfile::default(),
+                max_steps: 2,
+                spawn_depth: 1,
+                max_spawn_depth: 3,
+                child_route: None,
+                launch_manifest: None,
+            },
+            &thread.id,
+            None,
+            Some(turn.id.clone()),
+        );
     harness
         .tx_event
         .send(EngineEvent::TurnStarted {
@@ -20525,6 +20990,9 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -21523,6 +21991,9 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -22195,6 +22666,9 @@ async fn runtime_receipts_mask_configured_secrets() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -22441,6 +22915,9 @@ async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -22702,6 +23179,9 @@ async fn run_workspace_turn(
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -23289,6 +23769,9 @@ mod execution_identity {
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -23495,6 +23978,9 @@ mod execution_identity {
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -23840,6 +24326,9 @@ async fn profile_constitution_runtime_admission_binds_the_complete_snapshot_to_r
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,

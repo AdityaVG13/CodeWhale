@@ -19,42 +19,46 @@ Implementation sources:
 
 ## Default-active contract
 
-New turns start with twelve eager native names plus synthetic `tool_search`:
+New turns start with nine eager native names plus synthetic `tool_search`:
 
 1. `read`
 2. `write`
 3. `edit`
 4. `file_search`
 5. `bash`
-6. `agent`
-7. `workflow`
-8. `todo_write`
+6. `todo_write`
+7. `task_shell_wait`
+8. `load_skill`
 9. `create_goal`
-10. `get_goal`
-11. `update_goal`
-12. `load_skill`
-13. `tool_search` (synthetic, always active)
+10. `tool_search` (synthetic, always active)
 
-The twelve native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
+The nine native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
 `crates/tui/src/core/engine/tool_catalog.rs`, pinned by
-`default_active_contract_keeps_discovery_and_core_tools_eager`. An authority
-boundary may remove `agent` at the maximum child depth, but route size alone
-must not change this core vocabulary.
+`default_active_contract_keeps_discovery_and_core_tools_eager`. `agent`,
+`workflow`, `get_goal`, and `update_goal` are deferred by default and load
+via `tool_search` (`get_goal`/`update_goal` ride eager only while a goal is
+active). An authority boundary may remove `agent` at the maximum child depth,
+and Plan registers only the foreground shell surface (so no `task_shell_wait`),
+but route size alone must not change this core vocabulary.
 
-The direct schemas deliberately stay small:
+The core schemas deliberately stay small (deferred rows load via
+`tool_search` rather than riding every turn):
 
 | Tool | Input | Purpose |
 |---|---|---|
 | `read` | `path`, optional `offset`, optional `limit` | Read a bounded file window with explicit continuation or truncation notices. |
 | `write` | `path`, `content` | Create or replace a file. |
 | `edit` | `path`, `edits` | Apply one or more unambiguous text replacements against one original snapshot. |
+| `file_search` | `query`, optional `path`, `limit`, `extensions`, `exclude` | Find files by name, path fragment or glob and return bounded, ranked matches. Respects ignore files; `exclude` replaces default exclusions. |
 | `bash` | `command`, optional `timeout`, optional `description` | Run one cancellable foreground shell command and return a bounded tail. The optional description is display-only. |
-| `agent` | delegated task and optional scope/context controls | Start or inspect focused child work. |
-| `workflow` | plan/script/source_path plus run controls | Coordinate multi-agent phases with dependencies and completion checks. |
+| `agent` (deferred) | delegated task and optional scope/context controls | Start or inspect focused child work. |
+| `workflow` (deferred) | plan/script/source_path plus run controls | Coordinate multi-agent phases with dependencies and completion checks. |
 | `todo_write` | complete replacement list of `{content, status}` items | Keep optional, agent-owned progress notes for genuinely multi-step work. |
 | `create_goal` | objective plus optional budget | Start the session goal the turn works toward. |
-| `get_goal` | none | Read the active goal and its progress. |
-| `update_goal` | terminal status | Mark the goal complete or blocked. |
+| `get_goal` (deferred unless a goal is active) | none | Read the active goal and its progress. |
+| `update_goal` (deferred unless a goal is active) | terminal status | Mark the goal complete or blocked. |
+| `task_shell_wait` | `task_id`, optional `wait`, `timeout_ms`, `cancel`, `gate` | Poll or stop a background shell task. Completion still arrives as a runtime event, so use it for early output, true barriers, or gate evidence. |
+| `load_skill` | optional `name`, `query` | Load a named skill's `SKILL.md` body and companion-file list; omit `name` or use `name="list"` to list eligible skills, or use `query` to search names and descriptions. |
 | `tool_search` | `query`, optional matching controls | Discover policy-allowed deferred tools and add selected schemas to this conversation's toolbox. |
 
 Mode is an authority decision, not a synonym system. Plan, Work, and Operate
@@ -67,12 +71,18 @@ ordinary approval behavior but does not bypass hard safety or repository law.
 not model-visible. `tasks`, `Git`, `Run`, `Web`, `remember`, and other
 specialized capabilities are searchable rather than first-turn ceremony.
 
-A Bash description appears as a muted, bounded note under the command on the
-TUI shell card, including on automatic runs. It never replaces the command and
-is excluded from execution, exact approval keys and Auto-Review input. The
-original description remains in the recorded tool input and exports. Approval
-prompts, `/jobs`, the activity inspector, ACP and other Runtime clients keep
-showing the command; this change adds no description row to those surfaces.
+On the TUI's default (calm) shell card the Bash description is the headline,
+shown as written apart from stripped terminal escapes, collapsed whitespace and
+a length bound, and the command sits on its own `$` row directly under it in
+every state and at every width, including automatic runs. A card without a
+description leads with the `$` command instead. The labeled card
+(`show_tool_details = true` with `calm_mode = false`) keeps the command in its
+header and the description as a muted `note:` row. The description never
+replaces the command and is excluded from execution, exact approval keys and
+Auto-Review input. The original description remains in the recorded tool input
+and exports. Approval prompts, `/jobs`, the activity inspector, ACP and other
+Runtime clients keep showing the command; this change adds no description row
+to those surfaces.
 
 ## Local code execution
 
@@ -167,17 +177,46 @@ Code mode is on by default (`[features] code_mode = true`), which makes
 stay available either way. Set `code_mode = false` (or run with
 `--disable code_mode`) to go back to deferring `execute_tools` behind
 `tool_search`. The flag is session configuration, so the prompt prefix stays
-stable within a session. Without an engine turn (sub-agents), a program keeps
-the conservative profile: read-only, auto-approved native calls only, no MCP.
+stable within a session.
+
+Sub-agents get `execute_tools` on the same terms, unless their role is limited
+to the read-only evidence tools or an explicit tool list leaves it out. A
+child's nested call is planned by the child's own gate, so its grant and its
+approval path apply as for its direct calls, and it is admitted at execution
+against the child's write-scope claim and live peers. A child's program also
+stops at the child's tool timeout (time waiting on approvals is not counted)
+or its work deadline, and still returns the receipt. A program in which no
+nested call ran does not count as progress for the child's permission-denial
+guard, but the guard does not yet count a refused nested call as a denial
+either; only the child's step and time budgets end a loop of denied calls
+retried inside programs. Without an engine turn
+(a direct unit call), a program keeps the conservative profile: read-only,
+auto-approved native calls only, no MCP.
 
 ### Conversation toolbox cache
 
 A successful search activation is remembered by name for the current
-conversation. The cache holds at most eight deferred names and 16 KiB of
-serialized schemas, evicts least-recently-used entries, and revalidates every
-entry against the current catalog and policy before advertising it again. A
-session sync clears it. The cache cannot resurrect a removed, denied, or
-newly-eager tool.
+conversation. The cache is bounded at eight deferred names and 16 KiB of
+serialized schemas. To make room it evicts tools that were never called first
+(oldest activation first), then the least recently called; a tool called in the
+current or previous turn is never evicted. When such tools already fill the
+cache, a search still activates its best match over the bound and holds the
+rest; a later activation restores the bound once those tools go unused. Every
+entry is revalidated against the current catalog and policy before it is
+advertised again. A session sync clears it. The cache cannot resurrect a
+removed, denied, or newly-eager tool.
+
+When a search's activation pushes a previously activated tool out of the
+cache, that search's result lists it under `evicted_tool_references`, so the
+model is told the tool is no longer callable rather than finding it missing
+from the next request. A held match is listed under
+`unavailable_tool_references`. Both carry `tool_search_input`, an exact regex
+query for that one name that loads it again. Only tools that actually left the
+active set are listed; a tool that became eager stays callable and is not
+reported. Known limit: a tool dropped by the per-turn revalidation (removed,
+denied, or no longer deferred), or evicted to make room for a direct first call
+to a deferred tool, is still dropped silently, because there is no search
+result to carry the notice.
 
 Each subagent gets its own policy-filtered deferred catalog, always-present
 `tool_search`, and bounded activation cache. Forked messages and instructions
@@ -246,8 +285,9 @@ loaded through `tool_search` when needed.
 
 `bash` runs one cancellable foreground command. It does not carry background,
 TTY, wait, interact, or cancel action fields. Stateful process and terminal
-control is specialized functionality that must be discovered explicitly; it
-does not enlarge the first-turn shell schema.
+control stays out of the shell schema: `task_shell_wait` is eager for the
+background jobs `bash` starts, while interactive terminal control remains
+deferred behind `tool_search`; neither enlarges the first-turn shell schema.
 
 Use `tasks` when the work itself needs a durable lifecycle, structured gates,
 artifacts, replayable timelines, or a stable task id. Large tool results should
@@ -358,7 +398,13 @@ above must report `1 passed` (the ignored metrics test reports `1 passed`
 only because `--ignored` selects it); `0 passed` means the filter matched
 nothing and the check did not run.
 
-The provider-free receipt must report the twelve default-active names listed
+The provider-free receipt must report the ten default-active names listed
+above.
 above. A separate repository-wide tool count may include deferred, dynamic,
 feature-gated, and compatibility-only registrations; it is not the number of
 tools placed in the first-turn model catalog.
+
+
+### Source navigation receipts
+
+Source reads may include a bounded pod/symbol/link footer. Edits retain their unified diff in metadata and can name affected declarations and confirmed same-directory callers. File-name search and grep report matched directory pods; project maps can report bounded key-file symbols. Sounding content uses the same denied-read and credential exclusions plus protected regular-file handles. Caller content scans at most32 deterministic candidates at256KiB each; candidates outside that budget are reported as unscanned, never as additional known callers. Key-file content is capped at8MiB. Enumeration itself and platform I/O latency are not wall-clock bounded.

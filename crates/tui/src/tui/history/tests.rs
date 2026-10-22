@@ -107,6 +107,7 @@ fn exec_tool(command: &str, status: ToolStatus) -> ExecCell {
         started_at: None,
         duration_ms: None,
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -447,7 +448,7 @@ fn calm1_failed_tool_keeps_context_and_result_under_every_density_setting() {
 
         let text = lines_text(&cell.lines_with_options(80, options));
         assert!(
-            text.contains("lines omitted"),
+            text.contains(" lines) · "),
             "[{label}] a bounded failure must advertise omitted output: {text}"
         );
         assert!(
@@ -492,11 +493,11 @@ fn whatever_live_truncates_the_transcript_still_holds() {
         transcript.len()
     );
     assert!(
-        live_text.contains("lines omitted"),
+        live_text.contains(" lines) · "),
         "a live view that drops rows must say so: {live_text}"
     );
     assert!(
-        !transcript_text.contains("lines omitted"),
+        !transcript_text.contains(" lines) · "),
         "the transcript drops nothing, so it claims nothing: {transcript_text}"
     );
     assert!(transcript_text.contains(first) && transcript_text.contains(&last));
@@ -551,7 +552,7 @@ fn whatever_live_truncates_the_transcript_still_holds() {
     let live_text = lines_text(&quiet.lines_with_options(80, TranscriptRenderOptions::default()));
     let transcript_text = lines_text(&quiet.transcript_lines(80));
     assert!(
-        !live_text.contains(first) && !live_text.contains("lines omitted"),
+        !live_text.contains(first) && !live_text.contains(" lines) · "),
         "a quiet success collapses silently: {live_text}"
     );
     assert!(transcript_text.contains(first));
@@ -581,7 +582,7 @@ fn a_successful_run_preview_shows_how_the_run_ended() {
             "totals followed by other lines",
             node_test,
             &["> trip-timer@1.0.0 test", "ℹ pass 2", "ℹ fail 0"],
-            &["5 lines omitted", "4 lines omitted"],
+            &["(+5 lines)", "(+4 lines)"],
         ),
         (
             "result followed by blank lines",
@@ -591,7 +592,7 @@ fn a_successful_run_preview_shows_how_the_run_ended() {
                 "test b ... ok",
                 "test result: ok. 2 passed; 0 failed",
             ],
-            &["3 lines omitted"],
+            &["(+3 lines)"],
         ),
         (
             "nothing states an outcome",
@@ -601,7 +602,7 @@ fn a_successful_run_preview_shows_how_the_run_ended() {
                 "row 28 plain content",
                 "row 29 plain content",
             ],
-            &["27 lines omitted"],
+            &["(+27 lines)"],
         ),
     ];
 
@@ -633,7 +634,7 @@ fn a_successful_run_preview_shows_how_the_run_ended() {
         let announced: Vec<String> = live
             .iter()
             .map(line_text)
-            .filter(|line| line.contains("lines omitted"))
+            .filter(|line| line.contains(" lines) · "))
             .collect();
         assert_eq!(
             announced.len(),
@@ -2248,11 +2249,13 @@ fn restored_history_drops_the_wire_reasoning_placeholder() {
                 thinking: "(reasoning omitted)".to_string(),
                 signature: None,
                 state: None,
+                redacted_data: None,
             },
             ContentBlock::Thinking {
                 thinking: "Actual model reasoning".to_string(),
                 signature: None,
                 state: None,
+                redacted_data: None,
             },
         ],
     };
@@ -3220,7 +3223,7 @@ fn calm1_failed_tool_preview_matrix_preserves_full_details_and_mcp_identity() {
                 if status == ToolStatus::Failed {
                     assert!(text.contains("row 00") && text.contains("row 29"), "{text}");
                     assert!(!text.contains("row 15"), "{text}");
-                    assert!(text.contains("lines omitted"), "{text}");
+                    assert!(text.contains(" lines) · "), "{text}");
                     assert_eq!(
                         (0..30)
                             .filter(|i| text.contains(&format!("row {i:02}")))

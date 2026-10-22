@@ -54,6 +54,10 @@ struct RecoveryRef<'a> {
     artifact_id: Option<&'a str>,
 }
 
+pub(super) fn offers_retrieval(metadata: Option<&Value>) -> bool {
+    recovery_ref(metadata).is_some_and(|recovery| recovery.artifact_id.is_some())
+}
+
 fn recovery_ref(metadata: Option<&Value>) -> Option<RecoveryRef<'_>> {
     let obj = metadata?.as_object()?;
     let text = |key: &str| {
@@ -744,9 +748,12 @@ pub(super) fn extract_compaction_summary_prompt(
 ///
 /// The reserved-output term is the route-effective request cap: exactly what
 /// the API can receive after explicit overrides, compatibility/route ceilings,
-/// and the route window are intersected. A second hidden reasoning reserve
-/// would make preflight disagree with the wire request and can cause premature
-/// compaction on otherwise valid large-window inputs.
+/// and the route window are intersected. On a route that shares one window
+/// between input and output it is a quarter of the window instead (at most
+/// 64K, never more than the request cap), and each request's wire cap is sized
+/// from what its input leaves. A second hidden
+/// reasoning reserve would make preflight disagree with the wire request and
+/// can cause premature compaction on otherwise valid large-window inputs.
 #[cfg(test)]
 pub(super) fn context_input_budget_for_provider(
     provider: ProviderKind,
@@ -872,6 +879,11 @@ pub(super) fn context_does_not_fit_message(
 
 pub(super) fn is_image_input_rejection_message(message: &str) -> bool {
     let lower = message.to_lowercase();
+    if crate::llm_client::image_count_rejection(&lower)
+        .is_some_and(|rejection| rejection.limit != Some(0))
+    {
+        return false;
+    }
     let image_signal = lower.contains("image_url")
         || lower.contains("content.type")
         || lower.contains("content type")

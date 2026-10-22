@@ -57,6 +57,7 @@ pub(super) const TOOL_TEXT_LIMIT: usize = 300;
 /// downstream regardless. 72 keeps the header inside an 80-column terminal
 /// while showing meaningfully more of the command on a wide one.
 pub(super) const TOOL_HEADER_SUMMARY_LIMIT: usize = 72;
+pub(super) const CALM_HEADLINE_MIN_WIDTH: usize = 12;
 
 /// Contiguous rows taken from the start of a truncated output.
 ///

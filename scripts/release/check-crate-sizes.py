@@ -6,9 +6,9 @@ happens, which can strand a release half-published: v0.10.1 uploaded 26
 crates, then codewhale-tui was refused at 11.93 MiB compressed before its
 dependent codewhale-cli could follow. The packaging step already builds
 every tarball (`cargo publish --dry-run` stages them under
-`target/package/tmp-registry/`, `cargo package` writes `target/package/`);
-this checks those files so the refusal happens before the first real upload,
-at dry-run time as well as publish time.
+Cargo's build-directory `package/tmp-registry/`, `cargo package` writes
+`package/` there); this checks those files so the refusal happens before the
+first real upload, at dry-run time as well as publish time.
 
 Usage: check-crate-sizes.py <crate> [<crate> ...]
 """
@@ -45,7 +45,7 @@ def main() -> int:
         print(metadata.stderr, file=sys.stderr)
         return 1
     parsed = json.loads(metadata.stdout)
-    target_directory = Path(parsed["target_directory"])
+    target_directory = Path(parsed.get("build_directory") or parsed["target_directory"])
     versions = {package["name"]: package["version"] for package in parsed["packages"]}
 
     failures: list[str] = []

@@ -247,7 +247,7 @@ pub struct AppState {
     owner_frontend: Option<Arc<dyn RuntimeOwnerFrontend>>,
     config_path: Option<PathBuf>,
     config: Arc<RwLock<codewhale_config::ConfigToml>>,
-    /// Bookkeeping config/jobs and read-only historical archive access.
+    /// Bookkeeping config and read-only historical archive access.
     /// Actual turns and transcript writes belong to the captured owner.
     runtime: Arc<RwLock<Runtime>>,
     registry: ModelRegistry,
@@ -256,6 +256,7 @@ pub struct AppState {
     /// executes a turn — stdio `thread/message`, HTTP `/thread` messages, and
     /// both `/prompt` transports — because there is exactly one turn engine.
     runtime_bridge: Arc<Mutex<Option<SharedRuntimeBridge>>>,
+    runtime_catalog_transport: Option<RuntimeCatalogTransport>,
     /// Client-facing thread key → durable runtime thread id.
     ///
     /// Runtime threads are persisted by the captured owner's store. Durable
@@ -330,6 +331,14 @@ struct JsonRpcError {
 struct StdioDispatchResult {
     result: Value,
     should_exit: bool,
+}
+
+#[derive(Clone)]
+struct RuntimeCatalogTransport {
+    bridge: std::sync::Weak<Mutex<RuntimeBridge>>,
+    base_url: String,
+    client: reqwest::Client,
+    auth_token: Option<String>,
 }
 
 struct RuntimeBridge {
@@ -652,7 +661,19 @@ pub async fn bind_runtime_frontends(
     state.frontend_workspace = routing.workspace.clone();
     state.captured_routing = Some(routing);
     state.owner_frontend = owner_frontend;
-    *state.runtime_bridge.lock().await = Some(Arc::new(Mutex::new(bridge)));
+    let (base_url, client, auth_token) = (
+        bridge.base_url.clone(),
+        bridge.client.clone(),
+        bridge.auth_token.clone(),
+    );
+    let bridge = Arc::new(Mutex::new(bridge));
+    state.runtime_catalog_transport = Some(RuntimeCatalogTransport {
+        bridge: Arc::downgrade(&bridge),
+        base_url,
+        client,
+        auth_token,
+    });
+    *state.runtime_bridge.lock().await = Some(bridge);
     let daemon = daemon_socket::bind_captured_owner(state.clone(), owner, recovery).await?;
     Ok((daemon, state))
 }
@@ -1279,6 +1300,7 @@ fn build_state_with_transport(
         registry,
         auth_token,
         runtime_bridge: Arc::new(Mutex::new(None)),
+        runtime_catalog_transport: None,
         runtime_thread_map: Arc::new(Mutex::new(HashMap::new())),
         stdio_thread_hints: Arc::new(Mutex::new(HashMap::new())),
         in_flight_turns: Arc::new(Mutex::new(HashMap::new())),
@@ -1911,6 +1933,216 @@ async fn acquire_runtime_bridge(
         })
 }
 
+async fn runtime_catalog_models(
+    request: reqwest::RequestBuilder,
+    provider: &str,
+    provider_id: Option<&str>,
+) -> Result<Vec<Value>> {
+    let (client, request) = request.build_split();
+    let request = request?;
+    let mut models = Vec::new();
+    let mut cursor = None;
+    let mut cursors = std::collections::HashSet::new();
+    let mut ids = std::collections::HashSet::new();
+    let mut total = None;
+    for _ in 0..40 {
+        let mut page = request
+            .try_clone()
+            .context("Runtime catalog request cannot be replayed")?;
+        if let Some(cursor) = cursor.as_deref() {
+            page.url_mut()
+                .query_pairs_mut()
+                .append_pair("cursor", cursor);
+        }
+        let catalog = thread_control::read_json_response(client.execute(page).await?).await?;
+        anyhow::ensure!(
+            catalog.get("provider").and_then(Value::as_str) == Some(provider)
+                && catalog.get("model_provider_id").unwrap_or(&Value::Null) == &json!(provider_id),
+            "Runtime model catalog changed provider identity"
+        );
+        let count = catalog
+            .get("total")
+            .and_then(Value::as_u64)
+            .context("Runtime model catalog omitted its total")?;
+        anyhow::ensure!(
+            count <= 10_000 && total.is_none_or(|total| total == count),
+            "Runtime model catalog size changed or exceeds its limit"
+        );
+        total = Some(count);
+        let entries = catalog
+            .get("models")
+            .and_then(Value::as_array)
+            .context("Runtime model catalog omitted its models")?;
+        anyhow::ensure!(
+            entries.len() <= 250,
+            "Runtime model catalog page exceeds its limit"
+        );
+        for entry in entries {
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .context("Runtime model catalog contains an invalid model")?;
+            anyhow::ensure!(
+                ids.insert(id.to_string()),
+                "Runtime model catalog repeated a model"
+            );
+            models.push(entry.clone());
+        }
+        anyhow::ensure!(
+            models.len() as u64 <= count,
+            "Runtime model catalog exceeds its total"
+        );
+        match catalog.get("nextCursor") {
+            None | Some(Value::Null) => {
+                anyhow::ensure!(
+                    models.len() as u64 == count,
+                    "Runtime model catalog is incomplete"
+                );
+                return Ok(models);
+            }
+            Some(Value::String(next)) if !next.is_empty() && next.len() <= 1_368 => {
+                anyhow::ensure!(
+                    !entries.is_empty() && models.len() < count as usize,
+                    "Runtime model catalog continuation is invalid"
+                );
+                anyhow::ensure!(
+                    cursors.insert(next.clone()),
+                    "Runtime model catalog cursor repeated"
+                );
+                cursor = Some(next.clone());
+            }
+            _ => bail!("Runtime model catalog cursor is invalid"),
+        }
+    }
+    bail!("Runtime model catalog exceeded its page limit")
+}
+
+async fn runtime_app_models(state: &AppState) -> Result<Vec<Value>> {
+    let shared = acquire_runtime_bridge(state)
+        .await
+        .map_err(|error| anyhow!(error.message))?;
+    let transport = state
+        .runtime_catalog_transport
+        .as_ref()
+        .context("the captured Runtime catalog transport is unavailable")?;
+    let captured = transport
+        .bridge
+        .upgrade()
+        .context("the captured Runtime catalog owner is unavailable")?;
+    anyhow::ensure!(
+        Arc::ptr_eq(&shared, &captured),
+        "the captured Runtime catalog owner changed; refusing another owner"
+    );
+    let base_url = &transport.base_url;
+    let client = &transport.client;
+    let authed = |request: reqwest::RequestBuilder| match transport.auth_token.as_deref() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    let providers = thread_control::read_json_response(
+        authed(client.get(format!("{base_url}/v1/providers")))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?,
+    )
+    .await?;
+    let providers = providers
+        .get("providers")
+        .and_then(Value::as_array)
+        .context("Runtime provider catalog is invalid")?;
+    anyhow::ensure!(
+        providers.len() <= 256,
+        "Runtime provider catalog exceeds its limit"
+    );
+    let aliases = state.registry.list();
+    let mut models = Vec::new();
+    let mut routes = std::collections::HashSet::new();
+    for provider in providers {
+        if !provider
+            .get("has_model_catalog")
+            .and_then(Value::as_bool)
+            .context("Runtime provider omitted its catalog availability")?
+        {
+            continue;
+        }
+        let kind = provider
+            .get("id")
+            .and_then(Value::as_str)
+            .context("Runtime provider omitted its identity")?;
+        let parsed: codewhale_config::ProviderKind =
+            serde_json::from_value(json!(kind)).context("Runtime provider kind is unsupported")?;
+        anyhow::ensure!(
+            kind == parsed.as_str()
+                || codewhale_config::descriptors::compatibility_for_id(kind)
+                    .is_some_and(|compatibility| compatibility.kind == parsed),
+            "Runtime provider kind is not a recognized wire identity"
+        );
+        let provider_id = match provider.get("model_provider_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+            _ => bail!("Runtime configured provider identity is invalid"),
+        };
+        if !routes.insert((kind.to_string(), provider_id.map(str::to_string))) {
+            continue;
+        }
+        let mut url = reqwest::Url::parse(&format!("{base_url}/v1/providers/{kind}/models"))?;
+        url.query_pairs_mut().append_pair("limit", "250");
+        if let Some(id) = provider_id {
+            url.query_pairs_mut().append_pair("model_provider_id", id);
+        }
+        let request = authed(client.get(url)).timeout(Duration::from_secs(10));
+        for mut model in runtime_catalog_models(request, kind, provider_id).await? {
+            let id = model
+                .get("id")
+                .and_then(Value::as_str)
+                .context("Runtime model identity is invalid")?;
+            let compatibility_aliases = aliases
+                .iter()
+                .find(|entry| {
+                    parsed != codewhale_config::ProviderKind::Custom
+                        && provider_id.is_none_or(|identity| identity == kind)
+                        && entry.provider == parsed
+                        && entry.id == id
+                })
+                .map(|entry| entry.aliases.clone())
+                .unwrap_or_default();
+            let capabilities: codewhale_config::route::RouteCapabilities =
+                match model.pointer("/facts/capabilities") {
+                    None | Some(Value::Null) => Default::default(),
+                    Some(value) => serde_json::from_value(value.clone())
+                        .context("Runtime model capabilities are invalid")?,
+                };
+            let row = model
+                .as_object_mut()
+                .context("Runtime model entry is invalid")?;
+            row.insert("provider".into(), serde_json::to_value(parsed)?);
+            row.insert("model_provider_id".into(), json!(provider_id));
+            row.insert("aliases".into(), json!(compatibility_aliases));
+            row.insert(
+                "supports_tools".into(),
+                json!(
+                    capabilities.native_tool_calls
+                        == codewhale_config::route::CapabilityState::Supported
+                ),
+            );
+            row.insert(
+                "supports_reasoning".into(),
+                json!(
+                    capabilities.reasoning == codewhale_config::route::CapabilityState::Supported
+                ),
+            );
+            row.insert("capabilities".into(), serde_json::to_value(capabilities)?);
+            models.push(model);
+            anyhow::ensure!(
+                models.len() <= 100_000,
+                "Runtime model catalog exceeds the response limit"
+            );
+        }
+    }
+    Ok(models)
+}
+
 async fn acquire_live_runtime_bridge(
     state: &AppState,
 ) -> std::result::Result<tokio::sync::OwnedMutexGuard<RuntimeBridge>, JsonRpcError> {
@@ -2081,13 +2313,19 @@ impl RuntimeBridge {
             .get("current")
             .and_then(Value::as_str)
             .context("Runtime provider is unavailable")?;
+        let current_id = match providers.get("current_provider_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+            _ => bail!("Runtime configured provider identity is invalid"),
+        };
         let provider = providers
             .get("providers")
             .and_then(Value::as_array)
             .and_then(|providers| {
-                providers
-                    .iter()
-                    .find(|provider| provider.get("id").and_then(Value::as_str) == Some(current))
+                providers.iter().find(|provider| {
+                    provider.get("id").and_then(Value::as_str) == Some(current)
+                        && provider.get("model_provider_id").and_then(Value::as_str) == current_id
+                })
             })
             .context("Runtime provider is unavailable")?;
         let model = requested_model
@@ -2102,40 +2340,25 @@ impl RuntimeBridge {
         {
             bail!("Runtime provider identity is invalid");
         }
-        let mut cursor = None;
-        let mut seen = std::collections::HashSet::new();
-        loop {
-            let mut url =
-                reqwest::Url::parse(&format!("{}/v1/providers/{current}/models", self.base_url))?;
-            url.query_pairs_mut().append_pair("limit", "250");
-            if let Some(cursor) = cursor.as_deref() {
-                url.query_pairs_mut().append_pair("cursor", cursor);
-            }
-            let catalog = self.request_json(self.authed(self.client.get(url))).await?;
-            if let Some(entry) =
-                catalog
-                    .get("models")
-                    .and_then(Value::as_array)
-                    .and_then(|models| {
-                        models
-                            .iter()
-                            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
-                    })
-            {
-                if entry.get("output_token_limit").and_then(Value::as_str) == Some("supported") {
-                    return Ok(());
-                }
-                bail!("The selected Runtime model does not support maxOutputTokens");
-            }
-            let next = catalog
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .context("Output-limit support is unknown for the selected Runtime model")?;
-            if !seen.insert(next.to_string()) {
-                bail!("Runtime model catalog cursor repeated");
-            }
-            cursor = Some(next.to_string());
+        let mut url =
+            reqwest::Url::parse(&format!("{}/v1/providers/{current}/models", self.base_url))?;
+        url.query_pairs_mut().append_pair("limit", "250");
+        if let Some(id) = current_id {
+            url.query_pairs_mut().append_pair("model_provider_id", id);
         }
+        let request = self
+            .authed(self.client.get(url))
+            .timeout(Duration::from_secs(10));
+        let catalog = runtime_catalog_models(request, current, current_id).await?;
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
+            .context("Output-limit support is unknown for the selected Runtime model")?;
+        anyhow::ensure!(
+            entry.get("output_token_limit").and_then(Value::as_str) == Some("supported"),
+            "The selected Runtime model does not support maxOutputTokens"
+        );
+        Ok(())
     }
 
     /// Resolve `stdio_thread_id` to a runtime thread, minting one only when
@@ -3110,11 +3333,24 @@ async fn process_app_request(
                 events: Vec::new(),
             }
         }
-        AppRequest::Models => AppResponse {
-            ok: true,
-            data: json!({ "models": state.registry.list() }),
-            events: Vec::new(),
-        },
+        AppRequest::Models => {
+            let result = tokio::time::timeout(Duration::from_secs(30), runtime_app_models(state))
+                .await
+                .context("Runtime model catalog request timed out")
+                .and_then(|result| result);
+            match result {
+                Ok(models) => AppResponse {
+                    ok: true,
+                    data: json!({ "models": models }),
+                    events: Vec::new(),
+                },
+                Err(error) => AppResponse {
+                    ok: false,
+                    data: json!({ "error": error.to_string() }),
+                    events: Vec::new(),
+                },
+            }
+        }
         AppRequest::ThreadLoadedList => {
             let response = handle_thread_request(
                 state,
@@ -4983,8 +5219,7 @@ mod tests {
         let (state, _tmp) = capability_test_state();
         let first = state.runtime.read().await;
         let second = state.runtime.read().await;
-        assert!(first.app_status().ok);
-        assert!(second.app_status().ok);
+        assert_eq!(first.config.provider, second.config.provider);
     }
 
     #[tokio::test]
@@ -5355,12 +5590,18 @@ mod tests {
         }
         async fn providers() -> Json<Value> {
             Json(
-                json!({"current":"custom","providers":[{"id":"custom","default_model":"fixture-model"}]}),
+                json!({"current":"custom","current_provider_id":"fixture-route","providers":[{"id":"custom","model_provider_id":"fixture-route","default_model":"fixture-model"}]}),
             )
         }
-        async fn models() -> Json<Value> {
+        async fn models(
+            axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            assert_eq!(
+                query.get("model_provider_id").map(String::as_str),
+                Some("fixture-route")
+            );
             Json(
-                json!({"models":[{"id":"fixture-model","output_token_limit":"supported"},{"id":"uncapped-transport","output_token_limit":"unsupported"}]}),
+                json!({"provider":"custom","model_provider_id":"fixture-route","total":2,"models":[{"id":"fixture-model","output_token_limit":"supported"},{"id":"uncapped-transport","output_token_limit":"unsupported"}]}),
             )
         }
         async fn create_thread(State(f): State<Fixture>) -> Json<Value> {

@@ -1,7 +1,7 @@
 # 安装 Codewhale
 
 > 英文原文：[INSTALL.md](../INSTALL.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-10-06。按当前英文源码复核；下文 v0.10.0 安装记录与附录的原始测试范围保留，不能当作 v0.10.1 发布安装回执。
+> 最后与英文同步日期（last synced with English revision）：2026-10-19。按当前英文源码复核；下文 v0.10.0 安装记录与附录的原始测试范围保留，不能当作 v0.10.1 发布安装回执。
 
 Codewhale 是一个在终端里运行的开源编码智能体（coding agent）。你交给它一个任务（"修复失败的测试"、"加一个 CLI 参数"），它会读取你的仓库、编辑文件并运行命令。在默认的 **Ask**（询问）权限级别下，它会立即应用工作区内的文件编辑（并给你看 diff），但运行 shell 命令之前会先询问，所以请先提交或暂存你在意的改动。它支持多家模型提供商，默认是 **DeepSeek**。
 
@@ -9,27 +9,12 @@ Codewhale 是一个在终端里运行的开源编码智能体（coding agent）�
 
 安装路径最初是在一台全新的 **Ubuntu 24.04 x86_64** 机器上使用 **v0.10.0**（2026-09-22 发布）验证的。带日期的[安装回执](https://github.com/codewhale-hq/Codewhale/blob/37ecdfcc49bc68a9b0d058b97c3946e62c34bd31/docs/install-report/v0.10.0-2026-09-23/RECEIPTS.md)记录了当时实际运行的命令和核对的输出。在那台机器上无法运行的步骤标注为 **（该虚拟机上未测试：原因）**。macOS、Windows 和 Android 不在测试范围内，只有少量说明。第二轮在 **macOS 26.1（Apple silicon）** 上重新运行了安装器、手动下载、压缩包和 npm 路径、无密钥检查以及 zsh 补全，见 [macOS 说明](#macos-说明)。需要调用模型的步骤没有在 macOS 上重跑。
 
-使用 `latest` 的安装命令会解析到最新**已发布**的 GitHub Release 或包。两次发布之间，`main` 可能已经在描述下一个版本（例如尚未打标签的 v0.10.1 源码候选版）。预编译候选版只有在标签、校验和与发布资源齐备后，才可通过官方安装器获取；贡献者可以先从 `main` 构建源码。
+使用 `latest` 的安装命令会解析到最新**已发布**的 GitHub Release 或包。两次发布之间，`main` 可能已经在描述下一个版本（例如尚未打标签的 v0.10.2 源码候选版）。预编译候选版只有在标签、校验和与发布资源齐备后，才可通过官方安装器获取；贡献者可以先从 `main` 构建源码。
 
-## 用一个账号管理提供商密钥
+## 无需账号
 
-[注册](https://app.codewhale.net/register)或[登录](https://app.codewhale.net/login)
-后，就能集中管理模型提供商的 API 密钥。在账号的[提供商设置](https://app.codewhale.net/providers)
-中添加、更换或移除密钥，也可以使用下面的终端命令。换一台设备时，登录并选择
-Codewhale 模型通道，就能使用同一组账号密钥，无需再次粘贴。
-
-```bash
-codewhale login
-codewhale account keys set deepseek  # 隐藏输入，不回显密钥
-codewhale account keys list         # 只显示状态，不显示密钥
-codewhale --provider codewhale      # 使用账号的模型通道
-```
-
-这里的账号设置说明针对 0.10.1 源码候选版。登录不会自动上传已有的本地密钥。
-如果明确希望复制本地密钥，请使用 `codewhale account keys set deepseek --from-local`。
-账号密钥保存在服务端，用于经过账号通道的请求，不会下载到每台设备的本地密钥存储。
-不注册账号也可以使用本地密钥或本地模型。更换密钥、选择账号或本地通道的说明见
-[账号密钥设置](CONFIGURATION.md#账号提供商密钥)。
+Codewhale 不需要账号。你通过 `/provider` 或 `codewhale auth set` 保存的密钥只留在你的机器上，见
+[API 密钥与提供商](#8-api-密钥与提供商)。新的 Codewhale 账号暂未开放，因此本指南不再介绍账号密钥存储。
 
 ## 使用当前源码参与测试与贡献
 
@@ -621,7 +606,7 @@ codewhale exec --auto --output-format stream-json "…"   # one JSON event per l
 
 （注释含义：单次回答，无工具；启用工具并自动批准；汇总 JSON（提供商、模型、用量、输出）；每行一个 JSON 事件。）
 
-`--auto` 会自动批准 shell 命令，所以只在你信任的仓库或沙箱里使用。
+`--auto` 默认启用 Full Access（完全访问）：工具无需批准即可运行，shell 命令没有 Codewhale 沙箱，信任模式允许文件工具写入工作区以外的路径。加上 `--sandbox workspace-write` 可保留 shell 沙箱和文件工具的工作区限制，并关闭信任模式。
 
 普通的 `exec` 不给模型提供任何工具。只有 `--auto`、`--yolo`、`--allowed-tools` 或恢复某个会话才会打开工具面；`--max-turns`、`--disallowed-tools`、`--sandbox` 和输出格式这类限制项从不会增加工具（仅对工具有效的参数会打印警告）。如果提供商在输出上限处截断了回复，会要求模型继续，最终打印出的答案是完整的回复。普通运行最多进行 8 个模型步骤，除非用 `--max-turns` 另设上限；在该上限处仍被截断的回复会使这次运行失败。
 
@@ -637,7 +622,7 @@ codewhale exec --resume <id> "…"
 
 （注释含义：会话 ID 或其唯一前缀；继续此目录中最近的会话；列出已保存的会话；对最近会话进行无头跟进。）
 
-在 v0.10.0 中，只有 **TUI 会话**和 **`--output-format stream-json`** 的 exec 运行会被保存。普通的 `codewhale exec`/`exec --auto` 运行*不会*被保存，所以紧接着的 `exec --continue` 会失败，报 `No saved sessions found for workspace`。
+TUI 会话、恢复的 exec 会话，以及向模型提供工具的 exec 运行（包括 `exec --auto`）都会保存，无论使用哪种输出格式。`--output-format stream-json` 还会保存仅作答的运行。使用 `codewhale receipts --last` 可查看已保存运行的回执。其他仅作答的纯文本和 `--json` 运行只有在开始压缩对话时才会保存；否则不会为 `exec --continue` 或回执创建会话。
 
 ---
 
@@ -742,7 +727,7 @@ Codewhale 没有在 `$HOME` 和它被使用过的仓库之外写入任何东西�
 运行 `sudo apt-get install -y libdbus-1-dev pkg-config`。
 
 **`error: No saved sessions found for workspace …`（来自 `exec --continue`）。**
-上一次运行是纯文本的 `exec`，它不会被保存。请使用 TUI，或者 `--output-format stream-json`。
+此工作区尚无已保存的会话。新建的仅作答纯文本和 `--json` exec 运行只有在开始压缩对话时才会保存；使用 `--output-format stream-json` 可确保保存。TUI 会话和向模型提供工具的 exec 运行会在所有输出格式下保存。
 
 **zsh 补全在第一个词之后给出错误的建议。**
 v0.10.0 的已知 bug。bash 和 fish 没问题。
@@ -991,6 +976,9 @@ winget 方式的已知限制：
 
 #### Windows NSIS 安装器
 
+OS、终端兼容性目标与当前验收记录见
+[Windows 支持与发布验收](ENVIRONMENTS.md#windows-支持与发布验收)。
+
 从 v0.8.50 起，为喜欢传统双击安装的 Windows 用户提供了独立的、基于 NSIS 的安装器（无需 npm、Scoop 或 Cargo）。
 
 NSIS 安装器目前包含 Windows x64 二进制。Windows ARM64 用户应通过在原生 ARM64 Node.js 下运行的 npm 安装，或从同一个发布下载 `codewhale-windows-arm64.zip`；这两条路径使用的都是原生 ARM64 二进制。
@@ -1050,7 +1038,7 @@ codewhale doctor
 
 #### 从 x64 交叉编译到 ARM64 Linux
 
-发布资源使用 `aarch64-unknown-linux-musl`，并在原生 ARM runner 上构建。如果你想在 x64 Linux 主机上构建一个 GNU 链接的 ARM64 Linux 二进制（例如给 HarmonyOS / openEuler ARM64 轻薄本用），请使用 [`cross`](https://github.com/cross-rs/cross)，它把官方的 Rust 交叉目标封装在 Docker 容器里：
+发布资源使用 `aarch64-unknown-linux-musl`，并在原生 ARM runner 上构建。如果你想在 x64 Linux 主机上构建一个 GNU 链接的 ARM64 Linux 二进制（例如给 HarmonyOS PC 上的 openEuler Linux 子系统用），请使用 [`cross`](https://github.com/cross-rs/cross)，它把官方的 Rust 交叉目标封装在 Docker 容器里：
 
 ```bash
 # Once

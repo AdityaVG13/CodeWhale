@@ -6,6 +6,7 @@ use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
 use super::constants::{
@@ -27,8 +28,9 @@ pub(super) fn render_tool_output_mode(
     width: u16,
     line_limit: usize,
     mode: RenderMode,
+    locale: Locale,
 ) -> Vec<Line<'static>> {
-    render_preserved_output_mode(output, width, line_limit, mode, "result")
+    render_preserved_output_mode(output, width, line_limit, mode, Some("result"), locale)
 }
 
 pub(super) fn render_exec_output_mode(
@@ -36,8 +38,17 @@ pub(super) fn render_exec_output_mode(
     width: u16,
     line_limit: usize,
     mode: RenderMode,
+    locale: Locale,
+    labeled: bool,
 ) -> Vec<Line<'static>> {
-    render_preserved_output_mode(output, width, line_limit, mode, "output")
+    render_preserved_output_mode(
+        output,
+        width,
+        line_limit,
+        mode,
+        labeled.then_some("output"),
+        locale,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,9 +379,12 @@ fn render_preserved_output_mode(
     width: u16,
     line_limit: usize,
     mode: RenderMode,
-    first_label: &str,
+    first_label: Option<&str>,
+    locale: Locale,
 ) -> Vec<Line<'static>> {
-    debug_assert_eq!(first_label.len() + 2, FIRST_ROW_LABEL_COLUMNS);
+    if let Some(label) = first_label {
+        debug_assert_eq!(label.len() + 2, FIRST_ROW_LABEL_COLUMNS);
+    }
     let mut lines = Vec::new();
     if output.trim().is_empty() {
         // #3031: In compact/Live mode, suppress "(no output)" — the tool
@@ -398,7 +412,7 @@ fn render_preserved_output_mode(
         for (idx, row) in all_lines.iter().enumerate() {
             render_output_row(
                 &mut lines,
-                if idx == 0 { Some(first_label) } else { None },
+                if idx == 0 { first_label } else { None },
                 row,
                 width,
             );
@@ -423,7 +437,10 @@ fn render_preserved_output_mode(
             if omitted > 0 {
                 lines.push(details_affordance_line(
                     &format!(
-                        "{omitted} lines omitted \u{00B7} {}",
+                        "{} \u{00B7} {}",
+                        tr(locale, MessageId::ApprovalMoreLines)
+                            .replace("{count}", &omitted.to_string())
+                            .trim_start(),
                         crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output")
                     ),
                     Style::default().fg(palette::TEXT_MUTED),
@@ -440,11 +457,7 @@ fn render_preserved_output_mode(
         let row = &all_lines[idx];
         render_output_row(
             &mut lines,
-            if rendered_idx == 0 {
-                Some(first_label)
-            } else {
-                None
-            },
+            if rendered_idx == 0 { first_label } else { None },
             row,
             width,
         );
@@ -1136,7 +1149,7 @@ mod ansi_colour_tests {
         let output = "- text: Next shoreline cleanup: Saturday at 09:00, North Pier. \
                       Bring gloves and a refillable water bottle. (Demo data.)";
         for width in [60, 100, 110] {
-            let lines = render_tool_output_mode(output, width, 20, RenderMode::Live);
+            let lines = render_tool_output_mode(output, width, 20, RenderMode::Live, Locale::En);
             let rows: Vec<String> = lines
                 .iter()
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())

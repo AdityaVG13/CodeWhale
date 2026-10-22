@@ -199,7 +199,6 @@ pub(crate) fn show_single_setting(app: &App, key: &str) -> ConfigReply {
     fn spacing_display(s: crate::tui::app::TranscriptSpacing) -> &'static str {
         match s {
             crate::tui::app::TranscriptSpacing::Compact => "compact",
-            crate::tui::app::TranscriptSpacing::Comfortable => "comfortable",
             crate::tui::app::TranscriptSpacing::Spacious => "spacious",
         }
     }
@@ -612,7 +611,7 @@ pub(crate) fn config_editability_audit(
             "runtime",
             "Shift+Tab",
             codewhale_command_contract::config::ConfigMessage::literal(
-                "Shows the effective Act permission posture; Plan remains Read Only.",
+                "Shows the effective Work permission posture; Plan remains Read Only.",
             ),
         ),
         (
@@ -4122,6 +4121,10 @@ mod tests {
         ));
         fs::create_dir_all(&temp_root).unwrap();
         let _guard = EnvGuard::new(&temp_root);
+        let _tmux = EnvVarGuard::remove("TMUX");
+        let _sty = EnvVarGuard::remove("STY");
+        let _tilix_id = EnvVarGuard::remove("TILIX_ID");
+        let _terminator_uuid = EnvVarGuard::remove("TERMINATOR_UUID");
         // Neutralize the SSH markers: production intentionally caps motion
         // over SSH, and the suite routinely runs inside one.
         let _ssh_client = EnvVarGuard::remove("SSH_CLIENT");

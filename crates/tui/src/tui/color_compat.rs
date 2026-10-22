@@ -67,8 +67,9 @@ pub(crate) struct ColorCompatBackend<W: Write> {
     /// The terminal's own background, when detection measured one
     /// (`BackgroundSource::Osc11` or a resolvable `COLORFGBG` index). This is
     /// the surface a `Color::Reset` cell is really drawn on, so it is what the
-    /// contrast floor reasons against. `None` means "no evidence" and disables
-    /// the floor for unpainted cells rather than guessing.
+    /// contrast floor reasons against. `None` means "no evidence": an
+    /// unpainted cell then keeps the terminal's own ink, and a painted cell is
+    /// left alone rather than guessed at.
     detected_background: Option<ratatui::style::Color>,
 }
 
@@ -437,6 +438,10 @@ fn render_debug_line(
 ///   that. The floor guards the auto-detected default path.
 /// - Only text cells are clamped; frame chrome keeps its intended weight.
 ///   See [`palette::symbol_needs_text_contrast`].
+///
+/// A third case has no surface to measure against: an unpainted cell on a
+/// terminal that reported no background keeps the terminal's own ink, because
+/// that is the one colour guaranteed to read on the ground the terminal drew.
 fn enforce_cell_contrast(
     cell: &mut Cell,
     theme_id: ThemeId,
@@ -447,6 +452,9 @@ fn enforce_cell_contrast(
         return;
     }
     let Some(surface) = palette::effective_surface(cell.bg, detected_background) else {
+        if cell.bg == ratatui::style::Color::Reset && cell.fg == palette::TEXT_BODY {
+            cell.fg = ratatui::style::Color::Reset;
+        }
         return;
     };
     cell.fg = palette::enforce_contrast(cell.fg, surface, palette::AA_BODY_CONTRAST);
@@ -1342,10 +1350,10 @@ mod tests {
         }
     }
 
-    /// No measurement means no intervention: an unpainted cell on a terminal
-    /// we could not query renders exactly as before.
+    /// No measurement and no painted ground means the terminal's own ink is
+    /// the only colour guaranteed to read on the ground it actually drew.
     #[test]
-    fn unknown_background_leaves_unpainted_cells_alone() {
+    fn unknown_background_gives_unpainted_body_text_the_terminal_ink() {
         assert_eq!(
             cell_fg_after_adaptation(
                 "x",
@@ -1355,7 +1363,7 @@ mod tests {
                 ThemeId::System,
                 None,
             ),
-            palette::TEXT_BODY
+            Color::Reset
         );
     }
 

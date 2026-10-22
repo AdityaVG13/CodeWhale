@@ -8,9 +8,10 @@
 //! `codewhale doctor` reports them and `codewhale sessions scrub-secrets`
 //! rewrites them on request.
 //!
-//! Only transcript tool results and Runtime tool receipts (including event
-//! copies) are touched. Cleanup masks credential shapes and currently configured
-//! secret values; bare secrets absent from current configuration cannot be recovered.
+//! Only transcript tool results, transcript tool-call arguments and Runtime
+//! tool receipts (including event copies) are touched. Cleanup masks credential
+//! shapes and currently configured secret values; bare secrets absent from
+//! current configuration cannot be recovered.
 //! Runtime rewrites require the exclusive process lease, and session rewrites
 //! the session's live lease; busy stores and sessions open in an interactive
 //! surface are reported and left untouched while the remaining files are
@@ -186,11 +187,7 @@ pub(crate) fn configured_secrets(
     profile: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
     let config = crate::config::Config::load(config_path, profile)?;
-    let active_key = config.active_route_api_key_read_only().unwrap_or_default();
-    Ok(crate::client::configured_model_bound_secret_values(
-        &config,
-        &active_key,
-    ))
+    Ok(crate::client::active_model_bound_secret_values(&config))
 }
 
 /// Whether `path` sits directly in `manager`'s pre-import archive directory
@@ -338,13 +335,15 @@ fn scrub_file(path: &Path, apply: bool, secrets: &[String]) -> io::Result<FileSc
     Ok(FileScan::Dirty(redacted))
 }
 
-/// Mask credentials in every `tool_result` text field below `value`.
-/// Returns how many fields changed.
+/// Mask credentials in every `tool_result` and `tool_call` argument below
+/// `value`. Returns how many fields changed.
 fn scrub_value(value: &mut Value, secrets: &[String]) -> usize {
     match value {
         Value::Object(map) => {
             let mut changed = 0;
-            if map.get("type").and_then(Value::as_str) == Some("tool_result") {
+            // Owned, so the two `get_mut` calls below can borrow the map.
+            let block_type = map.get("type").and_then(Value::as_str).map(str::to_string);
+            if block_type.as_deref() == Some("tool_result") {
                 if let Some(Value::String(content)) = map.get_mut("content") {
                     changed += usize::from(scrub_text(content, secrets));
                 }
@@ -356,6 +355,15 @@ fn scrub_value(value: &mut Value, secrets: &[String]) -> usize {
                             changed += usize::from(scrub_text(text, secrets));
                         }
                     }
+                }
+            }
+            if matches!(block_type.as_deref(), Some("tool_use" | "server_tool_use"))
+                && let Some(input) = map.get_mut("input")
+            {
+                let redacted = crate::client::redact_json_model_bound_text(input, secrets);
+                if *input != redacted {
+                    *input = redacted;
+                    changed += 1;
                 }
             }
             if map.get("kind").and_then(Value::as_str) == Some("tool_call") {

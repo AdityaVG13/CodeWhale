@@ -23,7 +23,7 @@ jobs:
     name: Workspace parity
     # Cold check, Clippy, executable and test builds exceeded the old 45m
     # limit before the suite started. Retain the full CI test-job budget.
-    timeout-minutes: 165
+    timeout-minutes: 210
     runs-on: ubuntu-latest
     steps:
       # Every caller's resolve job already proved GITHUB_SHA equals the
@@ -32,7 +32,7 @@ jobs:
       # CodeQL treats a *sha* ref as an untrusted checkout on workflow_dispatch
       # (default-branch cache write).
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master 2026-07-18
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-07-18
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -115,6 +115,7 @@ jobs:
           kill "$monitor" 2>/dev/null || true
           exit "$status"
         env:
+          CARGO_BUILD_JOBS: '1'
           # Match the CI test lane: test threads get the same stack the product
           # gives itself (main.rs CODEWHALE_MAIN_STACK_BYTES). See the note in
           # ci.yml's "Run tests" step. Without it this gate runs the deep

@@ -1,5 +1,3 @@
-
-
 #[test]
 fn agent_mode_elevates_writes_without_granting_network() {
     // #273 elevated Agent mode's sandbox so `curl`, package managers, and
@@ -63,7 +61,7 @@ fn agent_mode_elevates_writes_without_granting_network() {
         .as_ref()
         .expect("Plan mode should make the shell sandbox policy explicit");
     assert!(
-        matches!(plan_policy, crate::sandbox::SandboxPolicy::ReadOnly),
+        matches!(plan_policy, crate::sandbox::SandboxPolicy::ReadOnly { .. }),
         "Plan mode must use ReadOnly sandbox to deny workspace writes (#1077); got {plan_policy:?}",
     );
     assert!(!plan_policy.has_network_access());
@@ -99,7 +97,7 @@ fn sandbox_policy_for_turn_returns_correct_default_policy_per_mode() {
             &workspace,
             SandboxNetworkAccess::Restricted,
         ),
-        SandboxPolicy::ReadOnly
+        SandboxPolicy::ReadOnly { .. }
     ));
 
     // Agent: WorkspaceWrite with workspace as writable root, network OFF.
@@ -163,6 +161,7 @@ async fn session_update_preserves_reasoning_tool_only_turn() {
             ContentBlock::Thinking {
                 signature: None,
                 state: None,
+                redacted_data: None,
                 thinking: "Need a tool before answering.".to_string(),
             },
             ContentBlock::ToolUse {
@@ -361,7 +360,7 @@ async fn live_runtime_authority_applies_latest_posture_and_sandbox_before_tools(
             ApprovalMode::Auto,
             false,
             Some("read-only".to_string()),
-            SandboxPolicy::ReadOnly,
+            SandboxPolicy::read_only(),
         ),
         (
             AppMode::Agent,
@@ -720,6 +719,7 @@ async fn fork_state_block_reuses_the_snapshot_body() {
     };
     let fork_context = crate::tools::subagent::SubAgentForkContext {
         messages: engine.messages_with_turn_metadata(),
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: state.to_system_block(),
         work_source: Some(engine.todo_source()),
     };
@@ -936,6 +936,7 @@ async fn same_turn_fork_carries_the_updated_todo() {
     .to_system_block();
     let fork_context = crate::tools::subagent::SubAgentForkContext {
         messages: engine.messages_with_turn_metadata(),
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: stable_block.clone(),
         work_source: Some(engine.todo_source()),
     };
@@ -1086,11 +1087,12 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
 #[tokio::test]
 async fn change_mode_op_updates_current_mode_and_emits_status() {
     let tmp = tempdir().expect("tempdir");
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "deepseek-v4-pro".to_string(),
         ..Default::default()
     };
+    config.features.disable(Feature::Mcp);
     let (engine, handle) = Engine::new(config, &Config::default());
 
     let run = tokio::spawn(engine.run());

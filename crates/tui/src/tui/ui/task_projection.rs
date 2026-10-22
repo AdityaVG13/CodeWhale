@@ -665,7 +665,8 @@ pub(super) fn shell_job_tool_status(status: &ShellStatus) -> ToolStatus {
     match status {
         ShellStatus::Running => ToolStatus::Running,
         ShellStatus::Completed => ToolStatus::Success,
-        ShellStatus::Failed | ShellStatus::Killed | ShellStatus::TimedOut => ToolStatus::Failed,
+        ShellStatus::Killed => ToolStatus::Stopped,
+        ShellStatus::Failed | ShellStatus::TimedOut => ToolStatus::Failed,
     }
 }
 

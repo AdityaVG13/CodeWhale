@@ -10,9 +10,9 @@ use super::{ApiError, RuntimeApiState, map_thread_err};
 /// is the last provider-counted prompt size when one exists.
 ///
 /// All numeric fields are nullable: a route that cannot express a bounded
-/// window (unknown model, no catalog or configured limits) reports `null`
-/// rather than an invented number, and `live: false` marks responses where
-/// the engine could not be loaded and only the static route window resolved.
+/// window reports `null`. Static windows retain their resolution source,
+/// including a named unverified fallback. `live: false` marks responses where
+/// the engine could not be loaded and only the stored route resolved.
 #[derive(Debug, Serialize)]
 pub(super) struct ThreadContextResponse {
     thread_id: String,
@@ -23,6 +23,7 @@ pub(super) struct ThreadContextResponse {
     /// route limits); `false` when only the store-recorded route resolved.
     live: bool,
     window_tokens: Option<u64>,
+    window_source: Option<&'static str>,
     input_tokens: Option<u64>,
     billed_input_tokens: Option<u64>,
     output_cap_tokens: Option<u64>,
@@ -53,6 +54,7 @@ pub(super) async fn get_thread_context(
             model_provider_id: snapshot.model_provider_id,
             live: true,
             window_tokens: Some(snapshot.window_tokens),
+            window_source: Some("engine_active_route"),
             input_tokens: Some(snapshot.input_tokens),
             billed_input_tokens: snapshot.billed_input_tokens,
             output_cap_tokens: Some(snapshot.output_cap_tokens),
@@ -66,17 +68,29 @@ pub(super) async fn get_thread_context(
 
     // Engine unavailable or the route cannot bound a window: still answer
     // with whatever the thread record and the static route catalog can prove.
-    let provider = thread
+    let config = state.config.read().clone();
+    let route = thread
         .model_provider
         .as_deref()
-        .and_then(crate::config::ProviderKind::parse);
-    let window_tokens = provider.map(|provider| {
-        u64::from(crate::route_budget::route_context_window_tokens(
-            provider,
-            &thread.model,
-            None,
-        ))
-    });
+        .and_then(|provider| {
+            config
+                .resolve_persisted_provider_identity(
+                    Some(provider),
+                    thread.model_provider_id.as_deref(),
+                )
+                .ok()
+        })
+        .and_then(|identity| {
+            crate::route_runtime::resolve_runtime_route_for_identity(
+                &config,
+                &identity,
+                Some(&thread.model),
+            )
+            .ok()
+        });
+    let window_tokens = route
+        .as_ref()
+        .map(|route| u64::from(route.context_window.tokens));
     Ok(Json(ThreadContextResponse {
         thread_id,
         model: thread.model,
@@ -84,6 +98,9 @@ pub(super) async fn get_thread_context(
         model_provider_id: thread.model_provider_id,
         live: false,
         window_tokens,
+        window_source: route
+            .as_ref()
+            .map(|route| route.context_window.source.label()),
         input_tokens: None,
         billed_input_tokens: None,
         output_cap_tokens: None,

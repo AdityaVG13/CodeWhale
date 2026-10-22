@@ -572,6 +572,20 @@
       return { id: approvalId };
     }
 
+    function retireApproval(name, data) {
+      if (name !== "approval.decided" && name !== "approval.timeout") return;
+      const payload = eventPayload(data) || {};
+      const approvalId = payload.approval_id || payload.id;
+      if (!approvalId) return;
+      const label = name === "approval.timeout"
+        ? "Timed out"
+        : payload.cancelled ? "Cancelled" : "Decided: " + (payload.decision || "decided");
+      for (const actions of document.querySelectorAll(".approval-actions")) {
+        if (actions.dataset.approvalId !== String(approvalId)) continue;
+        actions.innerHTML = "<span class='meta'>" + escapeHtml(label) + "</span>";
+      }
+    }
+
     function pruneVisibleEvents() {
       const events = $("events");
       while (events.childElementCount > MAX_VISIBLE_EVENTS) {
@@ -597,6 +611,7 @@
 
     function appendEvent(name, data) {
       noteAgentEvent(name, data);
+      retireApproval(name, data);
       const text = eventText(name, data);
       if (!text) return;
       const item = document.createElement("div");
@@ -612,6 +627,7 @@
       if (approval) {
         const actions = document.createElement("div");
         actions.className = "approval-actions";
+        actions.dataset.approvalId = String(approval.id);
         const allow = document.createElement("button");
         allow.className = "primary";
         allow.textContent = "Allow";

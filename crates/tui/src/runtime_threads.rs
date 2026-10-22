@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock as AsyncRwLock, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Notify, RwLock as AsyncRwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -50,7 +50,9 @@ use crate::route_runtime::{ResolvedRuntimeRoute, resolve_runtime_route_for_ident
 use crate::runtime_policy::RuntimePolicyProjection;
 use crate::tools::plan::new_shared_plan_state;
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
-use crate::tools::subagent::SubAgentStatus;
+use crate::tools::subagent::{
+    SharedSubAgentManager, SubAgentStatus, new_shared_runtime_subagent_manager,
+};
 use crate::tools::todo::new_shared_todo_list;
 #[cfg(test)]
 use codewhale_config::AppMode;
@@ -240,53 +242,16 @@ async fn coalesce_stream_delta(
     }
 }
 
-/// Sentinel delimiters wrapping the compaction summary section persisted in a
-/// thread record's `system_prompt`. The section carries the engine-rendered
-/// summary (which contains the compaction summary marker). On reload,
-/// `SyncSession` migrates that carrier into one ordinary history checkpoint
-/// and strips it from the model's standing system prompt. Delimiters make
-/// replacement idempotent: each completed
-/// compaction swaps the section in place instead of stacking duplicates.
-/// External `PATCH /v1/threads/{id}` callers that rewrite `system_prompt`
-/// should preserve this section verbatim or the summary is lost on reload.
-const COMPACTION_SUMMARY_BEGIN: &str = "<!-- compaction-summary:begin -->";
-const COMPACTION_SUMMARY_END: &str = "<!-- compaction-summary:end -->";
-
-/// Merge a rendered compaction summary into a thread record's system prompt,
-/// replacing any previously persisted summary section.
-fn merge_summary_into_prompt(base: Option<&str>, summary_text: &str) -> String {
-    let stripped = base.map(strip_summary_section).unwrap_or_default();
-    let mut out = stripped.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
+/// The system prompt a sync installs. A history that already carries its
+/// compaction checkpoint outranks a legacy summary section persisted in the
+/// thread record's prompt, which would otherwise replace that checkpoint.
+fn synced_system_prompt(prompt: Option<&str>, messages: &[Message]) -> Option<SystemPrompt> {
+    let prompt = prompt.map(|text| SystemPrompt::Text(text.to_string()));
+    if crate::compaction::history_is_post_provenance(messages) {
+        crate::compaction::strip_compaction_summaries(prompt.as_ref())
+    } else {
+        prompt
     }
-    out.push_str(COMPACTION_SUMMARY_BEGIN);
-    out.push('\n');
-    out.push_str(summary_text.trim());
-    out.push('\n');
-    out.push_str(COMPACTION_SUMMARY_END);
-    out
-}
-
-/// Remove a previously persisted compaction summary section, if present.
-fn strip_summary_section(base: &str) -> String {
-    let Some(start) = base.find(COMPACTION_SUMMARY_BEGIN) else {
-        return base.to_string();
-    };
-    let end = base[start..]
-        .find(COMPACTION_SUMMARY_END)
-        .map(|rel| start + rel + COMPACTION_SUMMARY_END.len());
-    let mut out = base[..start].trim_end().to_string();
-    if let Some(end) = end {
-        let tail = base[end..].trim_start();
-        if !tail.is_empty() {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(tail);
-        }
-    }
-    out
 }
 
 /// A fresh durable record id: `<prefix>_<32 hex>`. Records live in flat
@@ -535,6 +500,13 @@ fn sort_turn_items_by_start(items: &mut [TurnItemRecord]) {
         let right = b.started_at.unwrap_or(fallback);
         left.cmp(&right)
     });
+}
+
+fn newest_recorded_item_id(turns: &[TurnRecord]) -> Option<String> {
+    turns
+        .iter()
+        .rev()
+        .find_map(|turn| turn.item_ids.last().cloned())
 }
 
 /// Bumped to 2 for v0.6.6 after live engine semantics changed. The persisted
@@ -854,6 +826,16 @@ pub struct ThreadRecord {
     /// Exact saved transcript and the last Runtime turn it already contains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_session_checkpoint: Option<SavedSessionCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_read: Option<ThreadReadMarker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadReadMarker {
+    pub item_id: String,
+    pub last_in_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -929,6 +911,16 @@ pub(crate) fn checkpoint_prefix_len(
     Ok(None)
 }
 
+pub(crate) fn checkpoint_covers_every_turn(
+    checkpoint: &SavedSessionCheckpoint,
+    turns: &[TurnRecord],
+) -> bool {
+    match checkpoint.covered_turn_id.as_deref() {
+        Some(id) => turns.last().is_some_and(|turn| turn.id == id),
+        None => turns.is_empty(),
+    }
+}
+
 /// A thread's saved-session binding no longer describes any readable
 /// document: the document is gone, or its prefix is not the one the thread
 /// was bound to. The thread still owns its turns, so the binding is dropped
@@ -982,9 +974,8 @@ fn projected_user_text(message: &Message) -> Option<String> {
     // An engine-owned compaction checkpoint is not a turn's prompt. No turn
     // record can reproduce one — the compaction ran in the engine, between
     // records — so a document that carries it would read as drifted from the
-    // records it was rebuilt from. Every fork of a compacted source inherits
-    // the summary in its system prompt, and the engine installs the checkpoint
-    // into the synced history on the fork's first load, so leaving it in took
+    // records it was rebuilt from. A fork of a compacted source starts from
+    // the settled history that carries the checkpoint, so leaving it in took
     // the cut away from the fork itself: `/undo`, retry and fork-again each
     // refused with "cannot identify an exact saved-history boundary".
     if crate::compaction::is_wire_compaction_checkpoint_message(message) {
@@ -1162,9 +1153,9 @@ fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
 /// the kept turns hands every reader of that document — the session view,
 /// `restore_thread_messages` — a run of prompts with the agent's
 /// output missing, because nothing is left for it to rebuild the turns from.
-/// The turn store is not rewritten by compaction, so the records can: they are
-/// what the fork rebuilds the kept exchanges from
-/// (`reconstruct_messages_from_turns_with`).
+/// The records can: a compacting turn stores the history its engine settled
+/// on, and the fork rebuilds the kept exchanges from the newest one it keeps
+/// plus the raw turns after it (`RuntimeThreadStore::history_from_records`).
 ///
 /// The compaction names the turn it ran for, so the records answer the
 /// question directly. Any compaction in the thread is enough: the turns before
@@ -2370,6 +2361,11 @@ enum RuntimeEventMatch {
         message_id: String,
         attempt_count: u8,
     },
+    WorkerLifecycle {
+        turn_id: String,
+        agent_id: String,
+        event_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2949,6 +2945,7 @@ impl RuntimeThreadStore {
     /// Persist a goal record for a thread. The goal is stored as a JSON file
     /// in the `goals/` subdirectory; it is independent of the TUI state store
     /// and requires only that the runtime thread exists.
+    #[cfg(test)]
     pub fn save_goal(&self, goal: &codewhale_protocol::ThreadGoal) -> Result<()> {
         let _guard = self.goal_mutation.lock();
         self.save_goal_under_lock(goal)
@@ -3015,6 +3012,16 @@ impl RuntimeThreadStore {
         update: impl FnOnce(&mut codewhale_protocol::ThreadGoal),
     ) -> Result<Option<codewhale_protocol::ThreadGoal>> {
         let _guard = self.goal_mutation.lock();
+        self.update_goal_if_revision_under_lock(thread_id, goal_id, expected_status, update)
+    }
+
+    fn update_goal_if_revision_under_lock(
+        &self,
+        thread_id: &str,
+        goal_id: &str,
+        expected_status: Option<codewhale_protocol::ThreadGoalStatus>,
+        update: impl FnOnce(&mut codewhale_protocol::ThreadGoal),
+    ) -> Result<Option<codewhale_protocol::ThreadGoal>> {
         let Some(mut goal) = self.load_goal(thread_id)? else {
             return Ok(None);
         };
@@ -3077,8 +3084,7 @@ impl RuntimeThreadStore {
     }
 
     /// Remove the goal for a thread, returning `true` if one existed.
-    pub fn delete_goal(&self, thread_id: &str) -> Result<bool> {
-        let _guard = self.goal_mutation.lock();
+    fn delete_goal_under_lock(&self, thread_id: &str) -> Result<bool> {
         let path = self.goal_path(thread_id)?;
         if !path.exists() {
             return Ok(false);
@@ -3159,6 +3165,116 @@ impl RuntimeThreadStore {
             self.note_item_in_index(&item.turn_id, &item.id);
         }
         Ok(())
+    }
+
+    /// The engine history a compacting turn settled on, stored once under
+    /// its digest beside the items (listings read only `.json`). Forks share
+    /// it by reference, so it is never removed.
+    fn settled_history_path(&self, digest: &str) -> Result<PathBuf> {
+        Self::record_path(&self.items_dir, digest, "history", "settled history digest")
+    }
+
+    pub(crate) fn save_settled_history(&self, messages: &[Message]) -> Result<Value> {
+        let bytes = serde_json::to_vec(messages)?;
+        let digest = hex_digest(Sha256::digest(&bytes));
+        let path = self.settled_history_path(&digest)?;
+        reject_symlinked_store_file(&path)?;
+        crate::utils::write_atomic(&path, &bytes)
+            .with_context(|| format!("Failed to write settled history {}", path.display()))?;
+        Ok(json!({ "sha256": digest, "messages": messages.len() }))
+    }
+
+    /// The newest settled history among `turns`, and how many of them it
+    /// covers. A reference whose file is missing, altered or unreadable is an
+    /// error: replaying the raw turns instead would silently undo compaction.
+    fn settled_history(
+        &self,
+        turns: &[TurnRecord],
+        items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
+    ) -> Result<Option<(usize, Vec<Message>)>> {
+        for (index, turn) in turns.iter().enumerate().rev() {
+            let Some((item, reference)) = items_by_turn
+                .get(&turn.id)
+                .into_iter()
+                .flatten()
+                .rev()
+                .filter(|item| item.kind == TurnItemKind::ContextCompaction)
+                .find_map(|item| {
+                    let reference = item.metadata.as_ref()?.get("settled_history")?;
+                    Some((item, reference))
+                })
+            else {
+                continue;
+            };
+            let digest = reference
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .with_context(|| {
+                    format!(
+                        "Compaction item {} on turn {} names an invalid settled history",
+                        item.id, turn.id
+                    )
+                })?;
+            let expected = reference
+                .get("messages")
+                .and_then(Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .with_context(|| {
+                    format!(
+                        "Compaction item {} on turn {} names no settled history length",
+                        item.id, turn.id
+                    )
+                })?;
+            let path = self.settled_history_path(digest)?;
+            reject_symlinked_store_file(&path)?;
+            let bytes = fs::read(&path).with_context(|| {
+                format!(
+                    "Settled history for turn {} is unreadable: {}",
+                    turn.id,
+                    path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                hex_digest(Sha256::digest(&bytes)) == digest,
+                "Settled history {} for turn {} does not match its digest",
+                path.display(),
+                turn.id
+            );
+            let messages: Vec<Message> = serde_json::from_slice(&bytes)
+                .with_context(|| format!("Failed to parse settled history {}", path.display()))?;
+            anyhow::ensure!(
+                messages.len() == expected,
+                "Settled history {} for turn {} holds {} messages, not {expected}",
+                path.display(),
+                turn.id,
+                messages.len()
+            );
+            return Ok(Some((index + 1, messages)));
+        }
+        Ok(None)
+    }
+
+    /// The model-visible history the records hold: the newest settled
+    /// history, then every later turn rebuilt from its items.
+    pub(crate) fn history_from_records(
+        &self,
+        turns: &[TurnRecord],
+        items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
+    ) -> Result<Vec<Message>> {
+        let (covered, mut messages) = self
+            .settled_history(turns, items_by_turn)?
+            .unwrap_or_default();
+        messages.extend(RuntimeThreadManager::reconstruct_messages_from_turns_with(
+            &turns[covered..],
+            items_by_turn,
+        )?);
+        Ok(messages)
     }
 
     /// Journal for one history seed into an existing thread (#6555), kept
@@ -3652,6 +3768,24 @@ impl RuntimeThreadStore {
         }
         sort_turn_items_by_start(&mut out);
         Ok(out)
+    }
+
+    fn thread_item(
+        &self,
+        thread_id: &str,
+        item_id: &str,
+    ) -> Result<Option<(TurnItemRecord, TurnRecord)>> {
+        let item = match self.load_item(item_id) {
+            Ok(item) => item,
+            Err(error) if store_record_missing(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match self.load_turn(&item.turn_id) {
+            Ok(turn) if turn.thread_id == thread_id => Ok(Some((item, turn))),
+            Ok(_) => Ok(None),
+            Err(error) if store_record_missing(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn list_items_for_turns_map(
@@ -4371,6 +4505,16 @@ impl RuntimeThreadStore {
                 RuntimeEventMatch::TurnCompleted { turn_id } => {
                     event.event == "turn.completed"
                         && event.turn_id.as_deref() == Some(turn_id.as_str())
+                }
+                RuntimeEventMatch::WorkerLifecycle {
+                    turn_id,
+                    agent_id,
+                    event_name,
+                } => {
+                    event.event == *event_name
+                        && event.turn_id.as_deref() == Some(turn_id.as_str())
+                        && event.payload.get("agent_id").and_then(Value::as_str)
+                            == Some(agent_id.as_str())
                 }
                 RuntimeEventMatch::DynamicTerminal { turn_id, call_id } => {
                     matches!(
@@ -5229,6 +5373,7 @@ enum RuntimeTurnInputSource {
     /// durable-turn machinery as any other input.
     GoalContinuation {
         continuation_index: u32,
+        expected_goal: Box<codewhale_protocol::ThreadGoal>,
     },
 }
 
@@ -5264,8 +5409,11 @@ impl RuntimeTurnInputSource {
             // must not call it one.
             Self::GoalContinuation {
                 continuation_index: 0,
+                ..
             } => Some("Goal kickoff (host-driven)".to_string()),
-            Self::GoalContinuation { continuation_index } => Some(format!(
+            Self::GoalContinuation {
+                continuation_index, ..
+            } => Some(format!(
                 "Goal continuation pass #{continuation_index} (host-driven)"
             )),
         }
@@ -5278,7 +5426,9 @@ impl RuntimeTurnInputSource {
                 "input_provenance": "agent_mail",
                 "agent_mail_message_id": message_id,
             })),
-            Self::GoalContinuation { continuation_index } => Some(json!({
+            Self::GoalContinuation {
+                continuation_index, ..
+            } => Some(json!({
                 "input_provenance": "goal_continuation",
                 "goal_continuation_index": continuation_index,
             })),
@@ -5324,6 +5474,12 @@ pub struct ThreadDetail {
     pub approval_grants: Vec<RuntimeApprovalGrant>,
 }
 
+fn deserialize_present_approval_input<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApprovalRequest {
     /// Runtime-owned, single-use approval ID. Clients echo this value; it is
@@ -5331,12 +5487,18 @@ pub struct PendingApprovalRequest {
     pub id: String,
     pub turn_id: String,
     pub tool_name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_approval_input"
+    )]
+    pub input: Option<Value>,
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_summary: Option<String>,
-    /// The provider tool-call ID this approval gates, mirroring the
+    /// The Engine tool-execution ID this approval gates, mirroring the
     /// `tool_call_id` on `approval.required`. A client resuming from a
-    /// snapshot needs it to attach the prompt to the tool row it belongs to.
+    /// snapshot needs it to attach the prompt to the execution it belongs to.
     /// It is a correlator, never a capability: `deliver_external_approval`
     /// matches `id` only, so this value settles nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5482,6 +5644,7 @@ pub struct ThreadListFacts {
     /// Pending approvals plus pending user-input requests, from live request
     /// state rather than the store.
     pub pending_attention_count: usize,
+    pub newest_item_id: Option<String>,
 }
 
 /// One watchable notice on a thread, projected from engine events so
@@ -6168,6 +6331,10 @@ impl PreparedThreadFork {
     pub(crate) fn dropped_turns(&self) -> &[DroppedTurnSnapshots] {
         &self.dropped_turns
     }
+
+    pub(crate) fn original_user_text(&self) -> Option<&str> {
+        self.original_user_text.as_deref()
+    }
 }
 
 /// One turn a fork drops, as a turn-scoped file undo sees it.
@@ -6222,6 +6389,323 @@ async fn await_retained_completion(completion: &RuntimeCompletion) -> Result<()>
 
 pub type SharedRuntimeThreadManager = Arc<RuntimeThreadManager>;
 
+fn push_runtime_notice(
+    notices: &parking_lot::Mutex<HashMap<String, Vec<ActiveNotice>>>,
+    thread_id: &str,
+    kind: &str,
+    turn_id: &str,
+    subject: &str,
+    detail: String,
+) -> String {
+    debug_assert!(
+        codewhale_config::notifications::NotificationEvent::parse(kind).is_some(),
+        "notice kind must be a NotificationEvent name: {kind}"
+    );
+    let id = runtime_record_id("notice");
+    let mut notices = notices.lock();
+    let list = notices.entry(thread_id.to_string()).or_default();
+    list.push(ActiveNotice {
+        id: id.clone(),
+        kind: kind.to_string(),
+        turn_id: turn_id.to_string(),
+        subject: subject.to_string(),
+        detail,
+        raised_at: Utc::now(),
+    });
+    if list.len() > MAX_NOTICES_PER_THREAD {
+        list.drain(..list.len() - MAX_NOTICES_PER_THREAD);
+    }
+    id
+}
+
+struct RuntimeWorkerEventSink {
+    thread_id: String,
+    workspace: PathBuf,
+    manager: SharedSubAgentManager,
+    store: RuntimeThreadStore,
+    projection: Arc<Mutex<()>>,
+    event_emit: Arc<Mutex<()>>,
+    event_tx: broadcast::Sender<RuntimeEventRecord>,
+    notices: Arc<parking_lot::Mutex<HashMap<String, Vec<ActiveNotice>>>>,
+    owner: std::sync::Weak<RuntimeProcessOwnerLock>,
+}
+
+impl RuntimeWorkerEventSink {
+    async fn publish(&self, event: EngineEvent) -> Result<Option<String>> {
+        let (owner, agent_id, event_name) = match &event {
+            EngineEvent::AgentSpawned {
+                owner_session_id,
+                id,
+                ..
+            } => (owner_session_id, id.clone(), "agent.spawned"),
+            EngineEvent::AgentProgress {
+                owner_session_id,
+                id,
+                ..
+            } => (owner_session_id, id.clone(), "agent.progress"),
+            EngineEvent::AgentComplete {
+                owner_session_id,
+                id,
+                ..
+            } => (owner_session_id, id.clone(), "agent.completed"),
+            _ => return Ok(None),
+        };
+        if owner != &self.thread_id {
+            return Ok(None);
+        }
+        let _owner = self
+            .owner
+            .upgrade()
+            .context("Runtime event owner has closed")?;
+        let record = self
+            .manager
+            .read()
+            .await
+            .worker_records_for_workspace(&self.workspace)
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .map(|(record, _)| record)
+            .find(|record| {
+                record.owner_session_id == self.thread_id && record.spec.worker_id == agent_id
+            });
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let Some(turn_id) = record.runtime_origin_turn_id else {
+            return Ok(None);
+        };
+        let thread_id = self.thread_id.clone();
+        let _projection = self.projection.lock().await;
+        let store = self.store.clone();
+        let origin = turn_id.clone();
+        let selected_thread = thread_id.clone();
+        let selected_workspace = self.workspace.clone();
+        let selected_agent = agent_id.clone();
+        let duplicate = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let thread = store.load_thread(&selected_thread)?;
+            let turn = store.load_turn(&origin)?;
+            anyhow::ensure!(
+                turn.thread_id == selected_thread && thread.workspace == selected_workspace,
+                "child Runtime turn owner has changed"
+            );
+            if event_name == "agent.progress" {
+                return Ok(false);
+            }
+            store.contains_event(
+                &selected_thread,
+                &RuntimeEventMatch::WorkerLifecycle {
+                    turn_id: origin,
+                    agent_id: selected_agent,
+                    event_name: event_name.to_string(),
+                },
+            )
+        })
+        .await
+        .context("child receipt origin check failed")??;
+        if duplicate {
+            return Ok(Some(turn_id));
+        }
+        let item_id = if event_name == "agent.progress" {
+            runtime_record_id("item")
+        } else {
+            format!(
+                "item_{}",
+                crate::hashing::sha256_hex(format!("{turn_id}\0{agent_id}\0{event_name}"))
+            )
+        };
+        match event {
+            EngineEvent::AgentSpawned {
+                owner_session_id,
+                id,
+                prompt,
+                worker_status,
+                parent_run_id,
+                spawn_depth,
+                display_name,
+                ..
+            } if owner_session_id == thread_id => {
+                // Hosts name the agent the way the TUI does (#6565).
+                let name = display_name.as_deref().unwrap_or(&id);
+                let message = format!(
+                    "Sub-agent {name} spawned: {}",
+                    summarize_text(&prompt, SUMMARY_LIMIT)
+                );
+                let item = TurnItemRecord {
+                    schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                    id: item_id,
+                    turn_id: turn_id.clone(),
+                    kind: TurnItemKind::Status,
+                    status: TurnItemLifecycleStatus::Completed,
+                    summary: summarize_text(&message, SUMMARY_LIMIT),
+                    detail: Some(message),
+                    metadata: None,
+                    artifact_refs: Vec::new(),
+                    artifacts: Vec::new(),
+                    started_at: Some(Utc::now()),
+                    ended_at: Some(Utc::now()),
+                };
+                self.save_item(&item).await?;
+                self.emit_event(
+                    &thread_id,
+                    Some(&turn_id),
+                    Some(&item.id),
+                    "agent.spawned",
+                    json!({ "item": item, "agent_id": id, "agent_name": display_name,
+                            "worker_status": worker_status, "parent_run_id": parent_run_id,
+                            "spawn_depth": spawn_depth }),
+                )
+                .await?;
+            }
+            EngineEvent::AgentProgress {
+                owner_session_id,
+                id,
+                status,
+                activity,
+                parent_run_id,
+                spawn_depth,
+            } if owner_session_id == thread_id => {
+                let message = format!("Sub-agent {id}: {status}");
+                let item = TurnItemRecord {
+                    schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                    id: item_id,
+                    turn_id: turn_id.clone(),
+                    kind: TurnItemKind::Status,
+                    status: TurnItemLifecycleStatus::Completed,
+                    summary: summarize_text(&message, SUMMARY_LIMIT),
+                    detail: Some(message),
+                    metadata: None,
+                    artifact_refs: Vec::new(),
+                    artifacts: Vec::new(),
+                    started_at: Some(Utc::now()),
+                    ended_at: Some(Utc::now()),
+                };
+                self.save_item(&item).await?;
+                self.emit_event(
+                    &thread_id,
+                    Some(&turn_id),
+                    Some(&item.id),
+                    "agent.progress",
+                    json!({ "item": item, "agent_id": id,
+                            "worker_status": activity.worker_status, "step": activity.step,
+                            "parent_run_id": parent_run_id, "spawn_depth": spawn_depth }),
+                )
+                .await?;
+            }
+            EngineEvent::AgentComplete {
+                owner_session_id,
+                id,
+                result,
+                outcome,
+                parent_run_id,
+                spawn_depth,
+                continuable,
+                usage,
+                display_name,
+            } if owner_session_id == thread_id => {
+                let worker_status = outcome
+                    .as_ref()
+                    .map(crate::tools::subagent::subagent_status_name);
+                let name = display_name.as_deref().unwrap_or(&id);
+                let message = format!(
+                    "Sub-agent {name} {}: {}",
+                    worker_status.unwrap_or("settled (outcome unconfirmed)"),
+                    summarize_text(&result, SUMMARY_LIMIT)
+                );
+                let item = TurnItemRecord {
+                    schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                    id: item_id,
+                    turn_id: turn_id.clone(),
+                    kind: TurnItemKind::Status,
+                    status: TurnItemLifecycleStatus::Completed,
+                    summary: summarize_text(&message, SUMMARY_LIMIT),
+                    detail: Some(message),
+                    metadata: None,
+                    artifact_refs: Vec::new(),
+                    artifacts: Vec::new(),
+                    started_at: Some(Utc::now()),
+                    ended_at: Some(Utc::now()),
+                };
+                self.save_item(&item).await?;
+                self.emit_event(
+                    &thread_id,
+                    Some(&turn_id),
+                    Some(&item.id),
+                    "agent.completed",
+                    json!({ "item": item, "agent_id": id, "agent_name": display_name,
+                            "worker_status": worker_status, "parent_run_id": parent_run_id,
+                            "spawn_depth": spawn_depth, "continuable": continuable,
+                            "usage": usage }),
+                )
+                .await?;
+                self.raise_notice(
+                    &thread_id,
+                    codewhale_config::notifications::NotificationEvent::SubagentTerminal.as_str(),
+                    &turn_id,
+                    &id,
+                    format!(
+                        "{name} {}",
+                        match outcome.as_ref() {
+                            Some(SubAgentStatus::Completed) => "finished",
+                            Some(SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted) =>
+                                "failed",
+                            Some(SubAgentStatus::Cancelled | SubAgentStatus::Interrupted(_)) =>
+                                "stopped",
+                            Some(SubAgentStatus::Running) | None => "settled (outcome unconfirmed)",
+                        }
+                    ),
+                );
+            }
+            _ => {}
+        }
+        Ok(Some(turn_id))
+    }
+
+    async fn save_item(&self, item: &TurnItemRecord) -> Result<()> {
+        let store = self.store.clone();
+        let item = item.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            store.save_item(&item)?;
+            let _turn_mutation = store.turn_mutation.lock();
+            let mut turn = store.load_turn(&item.turn_id)?;
+            if !turn.item_ids.contains(&item.id) {
+                turn.item_ids.push(item.id);
+                store.save_turn(&turn)?;
+            }
+            Ok(())
+        })
+        .await
+        .context("child receipt persistence failed")?
+    }
+
+    async fn emit_event(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        event: impl Into<String>,
+        payload: Value,
+    ) -> Result<RuntimeEventRecord> {
+        let _emit = self.event_emit.lock().await;
+        let record = self
+            .store
+            .append_event(thread_id, turn_id, item_id, event, payload)
+            .await?;
+        let _ = self.event_tx.send(record.clone());
+        Ok(record)
+    }
+
+    fn raise_notice(
+        &self,
+        thread_id: &str,
+        kind: &str,
+        turn_id: &str,
+        subject: &str,
+        detail: String,
+    ) -> String {
+        push_runtime_notice(&self.notices, thread_id, kind, turn_id, subject, detail)
+    }
+}
+
 #[derive(Clone)]
 struct RecoveredTurnReceipt {
     turn: TurnRecord,
@@ -6275,8 +6759,13 @@ pub struct RuntimeThreadManager {
     config_admission: Arc<AsyncRwLock<()>>,
     engine_load: Arc<Mutex<()>>,
     shutdown_drain: Arc<Mutex<()>>,
-    engine_workers: Arc<parking_lot::Mutex<Vec<(EngineHandle, RuntimeCompletion)>>>,
+    engine_workers: Arc<parking_lot::Mutex<Vec<(String, EngineHandle, RuntimeCompletion)>>>,
+    subagent_manager: Arc<Mutex<Option<SharedSubAgentManager>>>,
     turn_monitors: Arc<parking_lot::Mutex<Vec<RuntimeCompletion>>>,
+    event_monitors: Arc<parking_lot::Mutex<Vec<RuntimeCompletion>>>,
+    event_reader_wake: Arc<Notify>,
+    event_pump_stop: CancellationToken,
+    _event_pump_owner: Arc<tokio_util::sync::DropGuard>,
     active: Arc<Mutex<ActiveThreads>>,
     event_emit: Arc<Mutex<()>>,
     projection_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -6517,8 +7006,7 @@ impl HeldRuntimeStore {
             }
             let turn_ids: Vec<String> = turns.iter().map(|turn| turn.id.clone()).collect();
             let items = store.list_items_for_turns_map(&turn_ids)?;
-            let messages =
-                RuntimeThreadManager::reconstruct_messages_from_turns_with(&turns, &items)?;
+            let messages = store.history_from_records(&turns, &items)?;
             if messages.is_empty() {
                 continue;
             }
@@ -7718,6 +8206,7 @@ impl RuntimeThreadManager {
         if let Some(reason) = grants.degraded_reason() {
             tracing::warn!(%reason, "approval grants are unavailable; remembered approvals will not apply");
         }
+        let event_pump_stop = CancellationToken::new();
         let manager = Self {
             host_profile,
             config: Arc::new(parking_lot::RwLock::new(config)),
@@ -7729,7 +8218,12 @@ impl RuntimeThreadManager {
             engine_load: Arc::new(Mutex::new(())),
             shutdown_drain: Arc::new(Mutex::new(())),
             engine_workers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            subagent_manager: Arc::new(Mutex::new(None)),
             turn_monitors: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            event_monitors: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            event_reader_wake: Arc::new(Notify::new()),
+            event_pump_stop: event_pump_stop.clone(),
+            _event_pump_owner: Arc::new(event_pump_stop.drop_guard()),
             active: Arc::new(Mutex::new(ActiveThreads::default())),
             event_emit: Arc::new(Mutex::new(())),
             projection_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -7856,18 +8350,18 @@ impl RuntimeThreadManager {
         let workers = self.engine_workers.lock().clone();
         for engine in engines
             .iter()
-            .chain(workers.iter().map(|(engine, _)| engine))
+            .chain(workers.iter().map(|(_, engine, _)| engine))
         {
             engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
         }
         for engine in engines
             .iter()
-            .chain(workers.iter().map(|(engine, _)| engine))
+            .chain(workers.iter().map(|(_, engine, _)| engine))
         {
             let _ = engine.send(Op::Shutdown).await;
         }
-        for (_, worker) in workers {
-            if let Err(error) = await_retained_completion(&worker).await {
+        for (_, _, worker) in &workers {
+            if let Err(error) = await_retained_completion(worker).await {
                 failure = Some(anyhow!("Runtime engine shutdown failed: {error}"));
             }
         }
@@ -7890,9 +8384,35 @@ impl RuntimeThreadManager {
                 break;
             }
         }
+        for (owner, engine, _) in &workers {
+            let authority = engine.subagent_manager();
+            let live = authority.read().await.live_count_for_session(owner);
+            if live > 0 {
+                failure = Some(anyhow!(
+                    "Runtime shutdown left {live} unsettled workers for {owner}"
+                ));
+            }
+        }
+        for engine in engines
+            .iter()
+            .chain(workers.iter().map(|(_, engine, _)| engine))
+        {
+            if let Err(error) = engine.wait_terminal_worker_events().await {
+                failure = Some(anyhow!("Runtime terminal worker delivery failed: {error}"));
+            }
+        }
+        self.event_pump_stop.cancel();
+        self.event_reader_wake.notify_waiters();
+        let pumps = self.event_monitors.lock().clone();
+        for pump in pumps {
+            if let Err(error) = await_retained_completion(&pump).await {
+                failure = Some(anyhow!("Runtime Engine event receiver failed: {error}"));
+            }
+        }
+        self.event_monitors.lock().clear();
         self.engine_workers
             .lock()
-            .retain(|(_, worker)| !completion_finished(worker));
+            .retain(|(_, _, worker)| !completion_finished(worker));
         let mut active = self.active.lock().await;
         active.engines.clear();
         active.lru.clear();
@@ -8628,6 +9148,7 @@ impl RuntimeThreadManager {
                 id: String::new(),
                 turn_id: "test-turn".to_string(),
                 tool_name: "test-tool".to_string(),
+                input: None,
                 description: format!("test approval {label}"),
                 intent_summary: None,
                 // Stands in for the provider's raw call ID so tests can prove
@@ -8803,32 +9324,70 @@ impl RuntimeThreadManager {
         self.event_tx.subscribe()
     }
 
-    /// Emit a durable `thread_goal_updated` event for the given thread.
-    ///
-    /// Called by the Runtime API goal handlers so SSE subscribers receive
-    /// goal lifecycle changes just like engine-driven updates.
+    /// Emit a durable `thread_goal_updated` event while its revision is current.
     pub async fn emit_goal_updated_event(
         &self,
         thread_id: &str,
         goal: codewhale_protocol::ThreadGoal,
-    ) -> Result<RuntimeEventRecord> {
-        let payload = serde_json::json!({
-            "kind": "thread_goal_updated",
-            "goal": serde_json::to_value(&goal)
-                .unwrap_or(serde_json::Value::Null),
-        });
-        self.emit_event(thread_id, None, None, "thread_goal_updated", payload)
-            .await
+    ) -> Result<Option<RuntimeEventRecord>> {
+        let thread_id = thread_id.to_string();
+        self.with_goal_publication(move |manager| {
+            let Some(mut current) = manager.store.load_goal(&thread_id)? else {
+                return Ok(None);
+            };
+            current.tokens_used = current.tokens_used.max(goal.tokens_used);
+            current.time_used_seconds = current.time_used_seconds.max(goal.time_used_seconds);
+            current.continuation_count = current.continuation_count.max(goal.continuation_count);
+            if current != goal {
+                return Ok(None);
+            }
+            manager
+                .emit_goal_event_under_lock(&thread_id, Some(&goal))
+                .map(Some)
+        })
+        .await
     }
 
-    /// Emit a durable `thread_goal_cleared` event for the given thread.
-    pub async fn emit_goal_cleared_event(&self, thread_id: &str) -> Result<RuntimeEventRecord> {
-        let payload = serde_json::json!({
-            "kind": "thread_goal_cleared",
-            "thread_id": thread_id,
-        });
-        self.emit_event(thread_id, None, None, "thread_goal_cleared", payload)
-            .await
+    async fn with_goal_publication<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let emit_order = self.event_emit.clone().lock_owned().await;
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _emit_order = emit_order;
+            let _goal_mutation = manager.store.goal_mutation.lock();
+            operation(&manager)
+        })
+        .await
+        .context("goal publication task panicked")?
+    }
+
+    fn emit_goal_event_under_lock(
+        &self,
+        thread_id: &str,
+        goal: Option<&codewhale_protocol::ThreadGoal>,
+    ) -> Result<RuntimeEventRecord> {
+        let (event, payload) = match goal {
+            Some(goal) => (
+                "thread_goal_updated",
+                json!({ "kind": "thread_goal_updated", "goal": goal }),
+            ),
+            None => (
+                "thread_goal_cleared",
+                json!({ "kind": "thread_goal_cleared", "thread_id": thread_id }),
+            ),
+        };
+        let record = self.store.append_event_transaction(
+            thread_id.to_string(),
+            None,
+            None,
+            event.to_string(),
+            payload,
+            EVENT_TRANSACTION_LOCK_TIMEOUT,
+        )?;
+        let _ = self.event_tx.send(record.clone());
+        Ok(record)
     }
 
     /// Return the persistent goal for a thread, or `Ok(None)` if none exists.
@@ -8894,21 +9453,27 @@ impl RuntimeThreadManager {
             .unwrap_or(false)
     }
 
-    /// Persist (create or replace) the goal for a thread.
+    /// Persist (create or replace) and publish the goal for a thread.
     pub async fn save_goal(&self, goal: codewhale_protocol::ThreadGoal) -> Result<()> {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.save_goal(&goal))
-            .await
-            .context("goal save task panicked")?
+        self.with_goal_publication(move |manager| {
+            manager.store.save_goal_under_lock(&goal)?;
+            manager.emit_goal_event_under_lock(&goal.thread_id, Some(&goal))?;
+            Ok(())
+        })
+        .await
     }
 
-    /// Remove the goal for a thread. Returns `true` if a goal existed.
+    /// Remove and publish the goal for a thread. Returns `true` if a goal existed.
     pub async fn remove_goal(&self, thread_id: &str) -> Result<bool> {
         let thread_id = thread_id.to_string();
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.delete_goal(&thread_id))
-            .await
-            .context("goal delete task panicked")?
+        self.with_goal_publication(move |manager| {
+            let deleted = manager.store.delete_goal_under_lock(&thread_id)?;
+            if deleted {
+                manager.emit_goal_event_under_lock(&thread_id, None)?;
+            }
+            Ok(deleted)
+        })
+        .await
     }
 
     /// Transition the goal status through a revision-checked mutation. A
@@ -8926,9 +9491,8 @@ impl RuntimeThreadManager {
     ) -> Result<Option<codewhale_protocol::ThreadGoal>> {
         let thread_id = thread_id.to_string();
         let expected_goal_id = expected_goal_id.to_string();
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            store.update_goal_if_revision(
+        self.with_goal_publication(move |manager| {
+            let updated = manager.store.update_goal_if_revision_under_lock(
                 &thread_id,
                 &expected_goal_id,
                 Some(expected_status),
@@ -8936,10 +9500,13 @@ impl RuntimeThreadManager {
                     goal.status = status;
                     goal.updated_at = chrono::Utc::now().timestamp();
                 },
-            )
+            )?;
+            if let Some(goal) = updated.as_ref() {
+                manager.emit_goal_event_under_lock(&thread_id, Some(goal))?;
+            }
+            Ok(updated)
         })
         .await
-        .context("goal status transition task panicked")?
     }
 
     /// Activate a persisted `Active` goal: make sure the engine carries the
@@ -8969,7 +9536,7 @@ impl RuntimeThreadManager {
         if objective.is_empty() {
             return Ok(());
         }
-        self.start_goal_turn(thread_id, objective, 0).await?;
+        self.start_goal_turn(thread_id, objective, 0, goal).await?;
         Ok(())
     }
 
@@ -8995,6 +9562,7 @@ impl RuntimeThreadManager {
         thread_id: &str,
         prompt: String,
         continuation_index: u32,
+        expected_goal: codewhale_protocol::ThreadGoal,
     ) -> Result<TurnRecord> {
         let req = StartTurnRequest {
             account_model_owner: None,
@@ -9025,7 +9593,10 @@ impl RuntimeThreadManager {
         self.start_turn_with_source(
             thread_id,
             req,
-            RuntimeTurnInputSource::GoalContinuation { continuation_index },
+            RuntimeTurnInputSource::GoalContinuation {
+                continuation_index,
+                expected_goal: Box::new(expected_goal),
+            },
             None,
             false,
         )
@@ -9215,7 +9786,7 @@ impl RuntimeThreadManager {
         let continuation_index = u32::try_from(goal.continuation_count.max(1)).unwrap_or(u32::MAX);
         let snapshot = crate::tools::goal::GoalSnapshot::from_thread_goal(&goal);
         let prompt = crate::tools::goal::render_continuation_prompt(&snapshot, continuation_index);
-        self.start_goal_turn(thread_id, prompt, continuation_index)
+        self.start_goal_turn(thread_id, prompt, continuation_index, goal)
             .await?;
         Ok(())
     }
@@ -9357,6 +9928,51 @@ impl RuntimeThreadManager {
         self.emit_agent_mail_event(AGENT_MAIL_EVENT_READ, &envelope)
             .await?;
         Ok(envelope)
+    }
+
+    pub async fn mark_thread_read(&self, thread_id: &str, item_id: &str) -> Result<ThreadRecord> {
+        let store = self.store.clone();
+        let thread_id = thread_id.to_string();
+        let item_id = validated_record_id(item_id, "item id")?.to_string();
+        tokio::task::spawn_blocking(move || -> Result<ThreadRecord> {
+            store
+                .load_thread(&thread_id)
+                .with_context(|| format!("Thread not found: {thread_id}"))?;
+            let Some((item, turn)) = store.thread_item(&thread_id, &item_id)? else {
+                bail!("item {item_id} is not part of thread {thread_id}");
+            };
+            let turn_items = store
+                .list_items_for_turns_map(std::slice::from_ref(&turn.id))?
+                .remove(&turn.id)
+                .unwrap_or_default();
+            let marker = ThreadReadMarker {
+                last_in_turn: turn_items.last().is_some_and(|last| last.id == item_id),
+                watermark_item_id: newest_recorded_item_id(std::slice::from_ref(&turn)),
+                item_id,
+            };
+            let read_order = |item: &TurnItemRecord, turn: &TurnRecord| {
+                (turn.created_at, item.started_at.is_none(), item.started_at)
+            };
+
+            let _thread_mutation = store.thread_mutation.lock();
+            let mut thread = store
+                .load_thread(&thread_id)
+                .with_context(|| format!("Thread not found: {thread_id}"))?;
+            if let Some(current) = thread.last_read.as_ref()
+                && let Some((current_item, current_turn)) =
+                    store.thread_item(&thread_id, &current.item_id)?
+                && read_order(&item, &turn) < read_order(&current_item, &current_turn)
+            {
+                return Ok(thread);
+            }
+            if thread.last_read.as_ref() != Some(&marker) {
+                thread.last_read = Some(marker);
+                store.save_thread(&thread)?;
+            }
+            Ok(thread)
+        })
+        .await
+        .context("thread read marker task panicked")?
     }
 
     /// Withdraw a queued envelope before it starts delivery (#6176). Only
@@ -10305,6 +10921,7 @@ impl RuntimeThreadManager {
             title: None,
             session_id: None,
             saved_session_checkpoint: None,
+            last_read: None,
         };
         self.store.save_thread(&thread)?;
         if let Err(error) = self
@@ -10502,6 +11119,7 @@ impl RuntimeThreadManager {
                     pending_attention_count: pending_approvals
                         .len()
                         .saturating_add(pending_user_inputs.len()),
+                    newest_item_id: turns.map(Vec::as_slice).and_then(newest_recorded_item_id),
                 },
             );
         }
@@ -10520,25 +11138,7 @@ impl RuntimeThreadManager {
         subject: &str,
         detail: String,
     ) -> String {
-        debug_assert!(
-            codewhale_config::notifications::NotificationEvent::parse(kind).is_some(),
-            "notice kind must be a NotificationEvent name: {kind}"
-        );
-        let id = runtime_record_id("notice");
-        let mut notices = self.notices.lock();
-        let list = notices.entry(thread_id.to_string()).or_default();
-        list.push(ActiveNotice {
-            id: id.clone(),
-            kind: kind.to_string(),
-            turn_id: turn_id.to_string(),
-            subject: subject.to_string(),
-            detail,
-            raised_at: Utc::now(),
-        });
-        if list.len() > MAX_NOTICES_PER_THREAD {
-            list.drain(..list.len() - MAX_NOTICES_PER_THREAD);
-        }
-        id
+        push_runtime_notice(&self.notices, thread_id, kind, turn_id, subject, detail)
     }
 
     /// Notices currently raised on a thread, oldest first. Unknown threads
@@ -11224,14 +11824,22 @@ impl RuntimeThreadManager {
             }
 
             let workspace_changed = changes.contains_key("workspace");
-            if workspace_changed
+            let rebuild_engine = workspace_changed || changes.contains_key("system_prompt");
+            if rebuild_engine
                 && active
                     .engines
                     .get(id)
                     .and_then(|state| state.active_turn.as_ref())
                     .is_some()
             {
-                bail!("workspace cannot be changed while the thread has an active turn");
+                bail!(
+                    "{} cannot be changed while the thread has an active turn",
+                    if workspace_changed {
+                        "workspace"
+                    } else {
+                        "system_prompt"
+                    }
+                );
             }
 
             // A posture/mode edit must reach the live engine even while a
@@ -11249,14 +11857,14 @@ impl RuntimeThreadManager {
             } else {
                 thread.updated_at = Utc::now();
                 self.store.save_thread(&thread)?;
-                if workspace_changed {
+                if rebuild_engine {
                     active.lru.retain(|thread_id| thread_id != id);
                     active.engines.remove(id).map(|state| state.engine)
                 } else {
                     None
                 }
             };
-            let posture_engine = if posture_changed && !workspace_changed {
+            let posture_engine = if posture_changed && !rebuild_engine {
                 active.engines.get(id).map(|state| state.engine.clone())
             } else {
                 None
@@ -11636,7 +12244,8 @@ impl RuntimeThreadManager {
     ) -> Result<()> {
         let thread = self.get_thread(thread_id).await?;
         let engine = self.ensure_engine_loaded(&thread).await?;
-        let system_prompt = thread.system_prompt.clone().map(SystemPrompt::Text);
+        let system_prompt =
+            synced_system_prompt(thread.system_prompt.as_deref(), &session.messages);
         let expected = {
             let checkpoint = crate::core::engine::compaction_checkpoint_for_restore(
                 &session.messages,
@@ -11651,8 +12260,8 @@ impl RuntimeThreadManager {
             .send(Op::SyncSession {
                 session_id: Some(thread.id.clone()),
                 messages: session.messages.clone(),
+                system_prompt_override: system_prompt.is_some(),
                 system_prompt,
-                system_prompt_override: thread.system_prompt.is_some(),
                 model: thread.model.clone(),
                 workspace: thread.workspace.clone(),
                 mode: RuntimePolicyProjection::from_persisted(
@@ -12299,6 +12908,7 @@ impl RuntimeThreadManager {
         forked.updated_at = now;
         forked.latest_turn_id = None;
         forked.archived = false;
+        forked.last_read = None;
 
         let source_turns = self.store.list_turns_for_thread(&source.id)?;
         // One read for every turn's items — see `prepared_items_for_turns`: a
@@ -12310,7 +12920,8 @@ impl RuntimeThreadManager {
             .await?;
         let fork_prefix = if saved_transcript_is_compacted(&source_turns, &items_by_turn) {
             (
-                Self::reconstruct_messages_from_turns_with(&source_turns, &items_by_turn)?,
+                self.store
+                    .history_from_records(&source_turns, &items_by_turn)?,
                 source_turns.len(),
             )
         } else {
@@ -12504,6 +13115,37 @@ impl RuntimeThreadManager {
         .context(
             "native anchored fork outcome uncertain; inspect retained source and fork records",
         )?
+    }
+
+    pub(crate) async fn fork_dropping_user_turn_in_sessions_dir(
+        &self,
+        id: &str,
+        turn_id: &str,
+        sessions_dir: &Path,
+    ) -> Result<(
+        ThreadRecord,
+        Option<String>,
+        Vec<codewhale_protocol::runtime::RuntimeImageInput>,
+        Option<std::num::NonZeroU32>,
+    )> {
+        let (admission, _) = self.thread_restore_guard(id).await?;
+        let runtime = self.clone();
+        let id = id.to_string();
+        let turn_id = turn_id.to_string();
+        let dir = sessions_dir.to_path_buf();
+        tokio::spawn(async move {
+            let _admission = admission;
+            let turns = runtime.store.list_turns_for_thread(&id)?;
+            let items_by_turn = runtime.prepared_items_for_turns(&turns)?;
+            let (_, _, depth_from_tail) =
+                runtime.fork_cut_for_user_turn(&turns, &items_by_turn, &turn_id)?;
+            let prepared = runtime
+                .prepare_fork_at_user_message_in_sessions_dir(&id, depth_from_tail, &dir)
+                .await?;
+            runtime.publish_prepared_fork(prepared).await
+        })
+        .await
+        .context("native backtrack outcome uncertain; inspect retained source and fork records")?
     }
 
     /// How many turns a named anchor keeps, the first user turn it drops, and
@@ -12774,6 +13416,7 @@ impl RuntimeThreadManager {
         forked.updated_at = now;
         forked.latest_turn_id = None;
         forked.archived = false;
+        forked.last_read = None;
 
         // The fork keeps only the prefix it was cut at, in a document of its
         // own — see `bind_fork_to_own_session`.
@@ -12852,10 +13495,8 @@ impl RuntimeThreadManager {
             let (prefix, covered_turns) = match retained_messages {
                 Some(retained) => (messages[..retained].to_vec(), kept_turns),
                 None => (
-                    Self::reconstruct_messages_from_turns_with(
-                        &source_turns[..cutoff_turn_idx],
-                        &items_by_turn,
-                    )?,
+                    self.store
+                        .history_from_records(&source_turns[..cutoff_turn_idx], &items_by_turn)?,
                     cutoff_turn_idx,
                 ),
             };
@@ -12919,7 +13560,7 @@ impl RuntimeThreadManager {
         }
         if fork_prefix.is_none() {
             fork_prefix = Some((
-                Self::reconstruct_messages_from_turns_with(
+                self.store.history_from_records(
                     &source_turns[..cutoff_turn_idx],
                     &self.prepared_items_for_turns(&source_turns[..cutoff_turn_idx])?,
                 )?,
@@ -13070,6 +13711,17 @@ impl RuntimeThreadManager {
         history_operation: Option<&RuntimeHistoryOperation>,
         checkpoint_messages: &[Message],
     ) -> Result<()> {
+        let config = self.read_config().clone();
+        let secrets = receipt_secret_values(config).await?;
+        let mut tool_names = HashMap::new();
+        for block in checkpoint_messages[..checkpoint_messages.len().saturating_sub(messages.len())]
+            .iter()
+            .flat_map(|message| &message.content)
+        {
+            if let ContentBlock::ToolUse { name, .. } = block {
+                tool_names.insert(block.tool_call_key(), name.as_str());
+            }
+        }
         // Session seeding writes turns/items and then advances the existing
         // thread pointer as one synchronous record transaction.
         let thread_mutation = self.store.thread_mutation.lock();
@@ -13139,12 +13791,28 @@ impl RuntimeThreadManager {
                                 is_error,
                                 content_blocks,
                             } => {
+                                let name = tool_names
+                                    .get(&block.tool_call_key())
+                                    .copied()
+                                    .unwrap_or_default();
                                 tool_results.push(SeedItem::ToolResult {
                                     tool_use_id: tool_use_id.clone(),
                                     execution_id: execution_id.clone(),
-                                    content: content.clone(),
+                                    content: tool_receipt_detail(name, content, &secrets),
                                     is_error: is_error.unwrap_or(false),
-                                    content_blocks: content_blocks.clone(),
+                                    content_blocks: content_blocks
+                                        .as_ref()
+                                        .filter(|_| name != REQUEST_USER_INPUT_TOOL_NAME)
+                                        .map(|blocks| {
+                                            blocks
+                                                .iter()
+                                                .map(|value| {
+                                                    crate::client::redact_json_model_bound_text(
+                                                        value, &secrets,
+                                                    )
+                                                })
+                                                .collect()
+                                        }),
                                 });
                             }
                             // Other block types in user messages are rare;
@@ -13208,6 +13876,7 @@ impl RuntimeThreadManager {
                                 caller,
                                 thought_signature,
                             } => {
+                                tool_names.insert(block.tool_call_key(), name.as_str());
                                 turn.items.push(SeedItem::ToolUse {
                                     id: id.clone(),
                                     execution_id: execution_id.clone(),
@@ -14073,6 +14742,7 @@ impl RuntimeThreadManager {
                 "Runtime shutdown requested before turn monitoring started",
             )
             .await;
+            self.event_reader_wake.notify_waiters();
             return;
         }
 
@@ -14089,7 +14759,10 @@ impl RuntimeThreadManager {
         .catch_unwind()
         .await;
         let failure = match result {
-            Ok(Ok(())) => return,
+            Ok(Ok(())) => {
+                self.event_reader_wake.notify_waiters();
+                return;
+            }
             Ok(Err(error)) => {
                 let failure = format!("Failed to monitor {}: {error}", kind.label());
                 // An unreadable item or turn under the monitor is the
@@ -14111,6 +14784,7 @@ impl RuntimeThreadManager {
         engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
         self.settle_claimed_turn_failure(&thread_id, &turn_id, &failure)
             .await;
+        self.event_reader_wake.notify_waiters();
     }
 
     fn spawn_claimed_turn_monitor(
@@ -14143,6 +14817,7 @@ impl RuntimeThreadManager {
                 manager
                     .settle_claimed_turn_failure(&turn.thread_id, &turn.id, &failure)
                     .await;
+                manager.event_reader_wake.notify_waiters();
                 return;
             }
 
@@ -14433,6 +15108,13 @@ impl RuntimeThreadManager {
         // dispatch can carry its predecessor's URL, key, model, or policy.
         let _config_admission = self.config_admission.read().await;
         self.ensure_accepting_execution()?;
+        if let RuntimeTurnInputSource::GoalContinuation { expected_goal, .. } = &input_source {
+            anyhow::ensure!(
+                expected_goal.status == codewhale_protocol::ThreadGoalStatus::Active
+                    && self.store.load_goal(thread_id)?.as_ref() == Some(expected_goal.as_ref()),
+                "Goal changed before its automatic turn could start"
+            );
+        }
         let image_blocks = if stored_image_bytes {
             crate::image_attach::prepare_stored_images(&req.images)?
         } else {
@@ -14675,8 +15357,9 @@ impl RuntimeThreadManager {
                 );
             let reasoning_effort = selected_reasoning.map(|effort| {
                 effort
-                    .normalize_for_route(
+                    .normalize_for_route_identity(
                         route.identity.provider,
+                        route.identity.key.as_str(),
                         &route.candidate.endpoint().base_url,
                         &route.model,
                     )
@@ -14709,8 +15392,9 @@ impl RuntimeThreadManager {
             });
             let reasoning_effort = selected_reasoning.map(|effort| {
                 effort
-                    .normalize_for_route(
+                    .normalize_for_route_identity(
                         route.identity.provider,
+                        route.identity.key.as_str(),
                         &route.candidate.endpoint().base_url,
                         &route.model,
                     )
@@ -14739,7 +15423,11 @@ impl RuntimeThreadManager {
         let route_limits = known_route_limits(route.candidate.limits());
         let max_output_tokens = req.max_output_tokens.and_then(|requested| {
             std::num::NonZeroU32::new(crate::route_budget::effective_max_output_tokens_for_turn(
-                provider, &model, route_limits, Some(requested),
+                provider,
+                &model,
+                route_limits,
+                Some(requested),
+                reasoning_effort.as_deref(),
             ))
         });
         let settings = crate::settings::Settings::load().unwrap_or_default();
@@ -14841,6 +15529,12 @@ impl RuntimeThreadManager {
         // durable record keeps the engine aligned with the store; a replaced
         // objective (PUT) still resets counters through the same sync path.
         let turn_goal = self.store.load_goal(thread_id)?;
+        if let RuntimeTurnInputSource::GoalContinuation { expected_goal, .. } = &input_source {
+            anyhow::ensure!(
+                turn_goal.as_ref() == Some(expected_goal.as_ref()),
+                "Goal changed before its automatic turn could start"
+            );
+        }
         let turn_goal_objective = turn_goal
             .as_ref()
             .map(|goal| goal.objective.trim().to_string())
@@ -15627,6 +16321,10 @@ impl RuntimeThreadManager {
                 }
                 manager
             };
+            let mut features = cfg.features();
+            if self.host_profile.is_acp() {
+                features.disable(crate::features::Feature::Mcp);
+            }
             let engine_cfg = EngineConfig {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
@@ -15676,7 +16374,7 @@ impl RuntimeThreadManager {
                 launch_concurrency: cfg.launch_concurrency_for_provider(&route_identity),
                 subagents_enabled: !isolated_chat
                     && cfg.subagents_enabled_for_provider(&route_identity),
-                features: cfg.features(),
+                features,
                 auto_review_policy: cfg.auto_review_policy(),
                 compaction,
                 todos: new_shared_todo_list(),
@@ -15712,6 +16410,7 @@ impl RuntimeThreadManager {
                     persist_services_enabled: false,
                     hook_executor: Some(Arc::clone(&thread_hooks)),
                     handle_store: crate::tools::handle::new_shared_handle_store(),
+                    code_observations: crate::tools::handle::new_shared_handle_store(),
                     rlm_sessions: crate::rlm::session::new_shared_rlm_session_store(),
                     media_originals_dir: crate::media_originals::default_store_dir(),
                 },
@@ -15804,23 +16503,37 @@ impl RuntimeThreadManager {
             let model_client = self.test_model_client.lock().clone();
             #[cfg(not(test))]
             let model_client = None;
+            let subagent_manager = self.subagent_manager().await?;
+            let previous = self.engine_workers.lock().clone();
+            for (owner, old_engine, completion) in previous {
+                if owner == thread.id {
+                    old_engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+                    let _ = old_engine.send(Op::Shutdown).await;
+                    await_retained_completion(&completion).await?;
+                }
+            }
             let (engine, worker) = spawn_engine_with_authoritative_route_config(
                 engine_cfg,
                 &cfg,
                 self.host_profile,
                 Arc::clone(&self.config),
                 model_client,
+                Some(subagent_manager),
+                self.cancel_token.clone(),
             );
+            let engine = self.route_engine_events(&thread, engine).await;
             {
                 let mut workers = self.engine_workers.lock();
-                workers.retain(|(_, worker)| !completion_finished(worker));
-                workers.push((engine.clone(), retained_completion(worker)));
+                workers.retain(|(_, _, worker)| !completion_finished(worker));
+                workers.push((
+                    thread.id.clone(),
+                    engine.clone(),
+                    retained_completion(worker),
+                ));
             }
 
-            let sys_prompt = thread
-                .system_prompt
-                .as_ref()
-                .map(|s| SystemPrompt::Text(s.clone()));
+            let sys_prompt =
+                synced_system_prompt(thread.system_prompt.as_deref(), &session_messages);
             if !session_messages.is_empty() || sys_prompt.is_some() {
                 engine
                     .send(Op::SyncSession {
@@ -15828,9 +16541,9 @@ impl RuntimeThreadManager {
                         // re-sync of the same conversation, never a
                         // conversation boundary.
                         session_id: Some(thread.id.clone()),
+                        system_prompt_override: sys_prompt.is_some(),
                         messages: session_messages,
                         system_prompt: sys_prompt,
-                        system_prompt_override: thread.system_prompt.is_some(),
                         model: route_model.clone(),
                         workspace: thread.workspace.clone(),
                         mode: RuntimePolicyProjection::from_persisted(
@@ -15862,7 +16575,8 @@ impl RuntimeThreadManager {
             // updates. A concurrent workspace/model/session/policy change makes
             // this engine stale; discard it and rebuild from the new snapshot.
             let thread_mutation = self.store.thread_mutation.lock();
-            let record_is_current = self.store.load_thread(&thread.id)? == thread;
+            let record_is_current =
+                thread_execution_state_matches(&self.store.load_thread(&thread.id)?, &thread);
             if !record_is_current {
                 drop(thread_mutation);
                 drop(active);
@@ -15891,6 +16605,179 @@ impl RuntimeThreadManager {
             }
             return Ok(engine);
         }
+    }
+
+    async fn route_engine_events(
+        &self,
+        thread: &ThreadRecord,
+        mut engine: EngineHandle,
+    ) -> EngineHandle {
+        let original = engine.rx_event.clone();
+        let capacity = original.read().await.max_capacity();
+        let (forward, receiver) = mpsc::channel(capacity);
+        engine.rx_event = Arc::new(AsyncRwLock::new(receiver));
+        let identity = Arc::downgrade(&engine.rx_event);
+        let active = Arc::downgrade(&self.active);
+        let wake = self.event_reader_wake.clone();
+        let stop = self.event_pump_stop.clone();
+        let sink = RuntimeWorkerEventSink {
+            thread_id: thread.id.clone(),
+            workspace: thread.workspace.clone(),
+            manager: engine.subagent_manager(),
+            store: self.store.clone(),
+            projection: self.projection_lock(&thread.id),
+            event_emit: self.event_emit.clone(),
+            event_tx: self.event_tx.clone(),
+            notices: self.notices.clone(),
+            owner: Arc::downgrade(&self._process_owner_lock),
+        };
+        let handle = engine.clone();
+        let thread_id = thread.id.clone();
+        let pump = tokio::spawn(async move {
+            'pump: loop {
+                let event = tokio::select! {
+                    biased;
+                    event = async { original.write().await.recv().await } => match event { Some(event) => event, None => break },
+                    _ = stop.cancelled() => break,
+                };
+                if matches!(
+                    &event,
+                    EngineEvent::AgentSpawned { .. }
+                        | EngineEvent::AgentProgress { .. }
+                        | EngineEvent::AgentComplete { .. }
+                ) {
+                    let origin = match sink.publish(event.clone()).await {
+                        Ok(origin) => origin,
+                        Err(error) => {
+                            handle.mark_worker_event_delivery_failed();
+                            tracing::error!(thread_id = %thread_id, "Runtime child event publication failed: {error:#}");
+                            if let Some(_owner) = sink.owner.upgrade() {
+                                if let Some(failure) = RuntimeStoreRecordFailure::from_error(&error)
+                                {
+                                    let _ = sink
+                                        .emit_event(
+                                            &thread_id,
+                                            None,
+                                            None,
+                                            RUNTIME_STORE_FAILURE_EVENT,
+                                            json!(failure.notice(&error, false)),
+                                        )
+                                        .await;
+                                } else {
+                                    let _ = sink.emit_event(&thread_id, None, None, "error", json!({"message": "A background agent receipt could not be recorded."})).await;
+                                }
+                            }
+                            break;
+                        }
+                    };
+                    let owns_origin =
+                        if let (Some(origin), Some(active)) = (origin, active.upgrade()) {
+                            active
+                                .lock()
+                                .await
+                                .engines
+                                .get(&thread_id)
+                                .and_then(|state| state.active_turn.as_ref())
+                                .is_some_and(|turn| turn.turn_id == origin)
+                        } else {
+                            false
+                        };
+                    if !owns_origin {
+                        continue;
+                    }
+                }
+                loop {
+                    let notified = wake.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let Some(active) = active.upgrade() else {
+                        break 'pump;
+                    };
+                    let owns_turn = {
+                        let active = active.lock().await;
+                        active.engines.get(&thread_id).is_some_and(|state| {
+                            state.active_turn.is_some()
+                                && identity.upgrade().is_some_and(|receiver| {
+                                    Arc::ptr_eq(&receiver, &state.engine.rx_event)
+                                })
+                        })
+                    };
+                    if !owns_turn {
+                        match &event {
+                            EngineEvent::ApprovalRequired { id, .. }
+                            | EngineEvent::ElevationRequired { tool_id: id, .. } => {
+                                let _ = handle
+                                    .deny_tool_call_by(
+                                        id,
+                                        crate::approval_log::ApprovalDecider::Host,
+                                    )
+                                    .await;
+                            }
+                            EngineEvent::UserInputRequired { id, .. } => {
+                                let _ = handle.cancel_user_input(id).await;
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                    tokio::select! {
+                        permit = forward.reserve() => match permit {
+                            Ok(permit) => { permit.send(event); break; },
+                            Err(_) => break 'pump,
+                        },
+                        _ = &mut notified => {},
+                        _ = stop.cancelled() => break 'pump,
+                    }
+                }
+            }
+            handle.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+            let _ = handle.try_send(Op::Shutdown);
+        });
+        let mut monitors = self.event_monitors.lock();
+        monitors.retain(|monitor| !completion_finished(monitor));
+        monitors.push(retained_completion(pump));
+        engine
+    }
+
+    pub(crate) async fn attach_subagent_manager(
+        &self,
+        manager: SharedSubAgentManager,
+    ) -> Result<()> {
+        let _loading = self.engine_load.lock().await;
+        let mut selected = self.subagent_manager.lock().await;
+        if let Some(current) = selected.as_ref() {
+            anyhow::ensure!(
+                Arc::ptr_eq(current, &manager),
+                "Runtime already has another worker authority"
+            );
+        } else {
+            anyhow::ensure!(
+                self.active.lock().await.engines.is_empty(),
+                "Runtime engines started before worker authority admission"
+            );
+            *selected = Some(manager);
+        }
+        Ok(())
+    }
+
+    async fn subagent_manager(&self) -> Result<SharedSubAgentManager> {
+        let mut selected = self.subagent_manager.lock().await;
+        if let Some(manager) = selected.as_ref() {
+            return Ok(manager.clone());
+        }
+        let workspace = self.workspace.clone();
+        let manager = tokio::task::spawn_blocking(move || {
+            new_shared_runtime_subagent_manager(workspace, MAX_SUBAGENTS)
+        })
+        .await
+        .context("Runtime worker authority admission failed")??;
+        *selected = Some(manager.clone());
+        Ok(manager)
+    }
+
+    pub(crate) async fn admit_history_execution(&self) -> Result<()> {
+        self.ensure_accepting_execution()?;
+        self.subagent_manager().await.map(drop)
     }
 
     /// The thread's engine only when it is already live in this process.
@@ -15922,13 +16809,28 @@ impl RuntimeThreadManager {
         create: bool,
     ) -> Result<Option<SharedShellManager>> {
         let thread = self.get_thread(thread_id).await?;
+        let (prefer_bwrap, bwrap_extensions, denied_read_paths) = {
+            let cfg = self.read_config();
+            (
+                cfg.prefers_bwrap(),
+                crate::sandbox::BwrapMountExtensions {
+                    read_only_roots: cfg.bwrap_ro_roots.clone(),
+                    device_roots: cfg.bwrap_dev_roots.clone(),
+                },
+                cfg.effective_sandbox_denied_read_paths(),
+            )
+        };
         let mut active = self.active.lock().await;
         let manager = match active.shell_managers.entry(thread_id.to_string()) {
             std::collections::hash_map::Entry::Occupied(entry) => Some(entry.get().clone()),
             std::collections::hash_map::Entry::Vacant(entry) => create.then(|| {
-                entry
-                    .insert(new_shared_shell_manager(thread.workspace.clone()))
-                    .clone()
+                let manager = new_shared_shell_manager(thread.workspace.clone());
+                if let Ok(mut guard) = manager.lock() {
+                    guard.set_prefer_bwrap(prefer_bwrap);
+                    guard.set_bwrap_extensions(bwrap_extensions);
+                    guard.set_denied_read_subpaths(denied_read_paths);
+                }
+                entry.insert(manager).clone()
             }),
         };
         drop(active);
@@ -16025,7 +16927,7 @@ impl RuntimeThreadManager {
 
     fn restore_thread_messages(&self, thread: &ThreadRecord) -> Result<Vec<Message>> {
         let turns = self.store.list_turns_for_thread(&thread.id)?;
-        let (mut messages, covered) = match self.saved_session_prefix(thread, &turns) {
+        let (mut messages, mut covered) = match self.saved_session_prefix(thread, &turns) {
             Ok(prefix) => prefix.unwrap_or_default(),
             Err(error) => {
                 let Some(stale) = error.downcast_ref::<StaleSessionBinding>() else {
@@ -16034,24 +16936,42 @@ impl RuntimeThreadManager {
                 // The binding describes no readable document. The thread's
                 // own turns are its history; drop the dead link (keeping it
                 // in a receipt) instead of stranding the thread (#6144).
-                self.unbind_stale_session(thread, &stale.reason)?;
+                self.unbind_stale_session(thread, &stale.reason, false)?;
                 (Vec::new(), 0)
             }
         };
-        messages.extend(self.reconstruct_messages_from_turns(&turns[covered..])?);
+        let items_by_turn = self.prepared_items_for_turns(&turns[covered..])?;
+        if let Some((settled, history)) = self
+            .store
+            .settled_history(&turns[covered..], &items_by_turn)?
+        {
+            messages = history;
+            covered += settled;
+        }
+        messages.extend(Self::reconstruct_messages_from_turns_with(
+            &turns[covered..],
+            &items_by_turn,
+        )?);
         Ok(messages)
     }
 
     /// Drop `thread`'s saved-session binding when the stored record still
-    /// carries exactly the binding that was found stale, and record the old
-    /// binding in the session reconcile receipts.
-    fn unbind_stale_session(&self, thread: &ThreadRecord, reason: &str) -> Result<()> {
+    /// carries exactly the binding that was found stale (and, with
+    /// `pin_latest_turn`, the same latest turn), and record the old binding in
+    /// the session reconcile receipts. Returns whether the binding was dropped.
+    fn unbind_stale_session(
+        &self,
+        thread: &ThreadRecord,
+        reason: &str,
+        pin_latest_turn: bool,
+    ) -> Result<bool> {
         let _thread_mutation = self.store.thread_mutation.lock();
         let mut stored = self.store.load_thread(&thread.id)?;
         if stored.session_id != thread.session_id
             || stored.saved_session_checkpoint != thread.saved_session_checkpoint
+            || (pin_latest_turn && stored.latest_turn_id != thread.latest_turn_id)
         {
-            return Ok(());
+            return Ok(false);
         }
         crate::session_reconcile::record_thread_unbound(
             &self.session_store_binding().data_dir,
@@ -16061,18 +16981,24 @@ impl RuntimeThreadManager {
         stored.session_id = None;
         stored.saved_session_checkpoint = None;
         stored.updated_at = Utc::now();
-        self.store.save_thread(&stored)
+        self.store.save_thread(&stored)?;
+        Ok(true)
     }
 
-    /// Release a canonical holder whose saved document has moved past it, using
-    /// the same compare-and-swap unbind and reconcile receipt as a stale
-    /// binding found while restoring messages.
+    /// Release a canonical holder that holds nothing its saved document lacks,
+    /// using the same compare-and-swap unbind and reconcile receipt as a stale
+    /// binding found while restoring messages. Fails when the stored record
+    /// changed since `thread` was read.
     pub(crate) fn release_stale_session_holder(
         &self,
         thread: &ThreadRecord,
         reason: &str,
     ) -> Result<()> {
-        self.unbind_stale_session(thread, reason)
+        anyhow::ensure!(
+            self.unbind_stale_session(thread, reason, true)?,
+            "saved holder changed during admission; retry"
+        );
+        Ok(())
     }
 
     /// Unbind every thread in this store that names `session_id` (#6144).
@@ -16258,6 +17184,7 @@ impl RuntimeThreadManager {
         Ok((messages, covered))
     }
 
+    #[cfg(test)]
     fn reconstruct_messages_from_turns(&self, turns: &[TurnRecord]) -> Result<Vec<Message>> {
         // One batch read for the whole set. `list_items_for_turn` scans the
         // store's entire items directory to answer for a single turn, so a
@@ -16265,6 +17192,14 @@ impl RuntimeThreadManager {
         // saved-session link — paid one scan per turn.
         let items_by_turn = self.prepared_items_for_turns(turns)?;
         Self::reconstruct_messages_from_turns_with(turns, &items_by_turn)
+    }
+
+    pub(crate) fn history_from_records(
+        &self,
+        turns: &[TurnRecord],
+        items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
+    ) -> Result<Vec<Message>> {
+        self.store.history_from_records(turns, items_by_turn)
     }
 
     pub(crate) fn reconstruct_messages_from_turns_with(
@@ -16376,6 +17311,7 @@ impl RuntimeThreadManager {
                                 thinking,
                                 signature: None,
                                 state: None,
+                                redacted_data: None,
                             });
                         }
                     }
@@ -16599,6 +17535,8 @@ impl RuntimeThreadManager {
         let mut current_reasoning_item: Option<TurnItemRecord> = None;
         let mut tool_items: HashMap<String, String> = HashMap::new();
         let mut compaction_items: HashMap<String, String> = HashMap::new();
+        let mut completed_compaction_item: Option<String> = None;
+        let mut terminal_received = false;
         let mut turn_usage: Option<Usage> = None;
         let mut turn_effective_route_usage: Option<Usage> = None;
         let mut turn_routed_usage_dropped_records = 0_u64;
@@ -16653,18 +17591,7 @@ impl RuntimeThreadManager {
                 .scope_to_provider_identity(&state.route_identity)
                 .map_err(anyhow::Error::msg)?;
         }
-        #[cfg(test)]
-        let ticket = crate::test_support::env_scope_ticket();
-        let receipt_secrets = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            let _membership = crate::test_support::join_env_scope(ticket);
-            let active_key = receipt_config
-                .active_route_api_key_read_only()
-                .unwrap_or_default();
-            crate::client::configured_model_bound_secret_values(&receipt_config, &active_key)
-        })
-        .await
-        .context("Runtime receipt redaction setup failed")?;
+        let receipt_secrets = receipt_secret_values(receipt_config).await?;
         let mut latest_goal_snapshot: Option<crate::tools::goal::GoalSnapshot> = None;
         // Tool definitions of the finished turn's request surface, from the
         // final TurnComplete receipt. Goal settlement uses it to mirror the
@@ -17228,6 +18155,8 @@ impl RuntimeThreadManager {
                                 } else {
                                     TurnItemLifecycleStatus::Failed
                                 };
+                                let detail =
+                                    tool_receipt_detail(&name, &output.content, &receipt_secrets);
                                 if name == REQUEST_USER_INPUT_TOOL_NAME {
                                     // The engine must return the structured
                                     // answers to the model, but Runtime
@@ -17235,8 +18164,8 @@ impl RuntimeThreadManager {
                                     // clients. Persist only a machine-readable
                                     // redaction marker, never answer labels or
                                     // free-text values.
-                                    item.summary = REDACTED_USER_INPUT_RECEIPT.to_string();
-                                    item.detail = Some(REDACTED_USER_INPUT_RECEIPT.to_string());
+                                    item.summary = detail.clone();
+                                    item.detail = Some(detail);
                                     item.metadata = Some(json!({
                                         "tool_call_id": id,
                                         "tool_name": REQUEST_USER_INPUT_TOOL_NAME,
@@ -17246,15 +18175,9 @@ impl RuntimeThreadManager {
                                     // Durable receipt: credentials a tool
                                     // printed are masked before they reach
                                     // the item store or the event log (B1).
-                                    let content = crate::client::redact_model_bound_text(
-                                        &output.content,
-                                        &receipt_secrets,
-                                    );
-                                    item.summary = summarize_text(
-                                        &format!("{name}: {content}"),
-                                        SUMMARY_LIMIT,
-                                    );
-                                    item.detail = Some(content);
+                                    item.summary =
+                                        summarize_text(&format!("{name}: {detail}"), SUMMARY_LIMIT);
+                                    item.detail = Some(detail);
                                     // `detail` is now the tool output, so the
                                     // call identity persisted at start must be
                                     // carried through metadata. Mark the
@@ -17414,36 +18337,11 @@ impl RuntimeThreadManager {
                     message,
                     messages_before,
                     messages_after,
-                    summary_prompt,
+                    summary_prompt: _,
                     post_input_tokens: _,
                 } => {
-                    // Persist the summary in the legacy thread-record carrier
-                    // so reloads survive LRU eviction/restart. SyncSession
-                    // migrates it into one ordinary history checkpoint and
-                    // strips the carrier from the standing system prompt.
-                    if let Some(summary) =
-                        summary_prompt.as_deref().filter(|s| !s.trim().is_empty())
-                    {
-                        let persist_summary = (|| -> Result<()> {
-                            let _thread_mutation = self.store.thread_mutation.lock();
-                            let mut thread = self.store.load_thread(&thread_id)?;
-                            let merged =
-                                merge_summary_into_prompt(thread.system_prompt.as_deref(), summary);
-                            if thread.system_prompt.as_deref() != Some(merged.as_str()) {
-                                thread.system_prompt = Some(merged);
-                                thread.updated_at = Utc::now();
-                                self.store.save_thread(&thread)?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(e) = persist_summary {
-                            tracing::warn!(
-                                thread_id = %thread_id,
-                                "Failed to persist compaction summary to thread record: {e}"
-                            );
-                        }
-                    }
                     if let Some(item_id) = compaction_items.remove(&id) {
+                        completed_compaction_item = Some(item_id.clone());
                         let mut item = self.store.load_item(&item_id)?;
                         item.status = TurnItemLifecycleStatus::Completed;
                         item.summary = summarize_text(&message, SUMMARY_LIMIT);
@@ -17500,154 +18398,6 @@ impl RuntimeThreadManager {
                         )
                         .await?;
                     }
-                }
-                EngineEvent::AgentSpawned {
-                    owner_session_id,
-                    id,
-                    prompt,
-                    worker_status,
-                    parent_run_id,
-                    spawn_depth,
-                    display_name,
-                    ..
-                } if owner_session_id == thread_id => {
-                    // Hosts name the agent the way the TUI does (#6565).
-                    let name = display_name.as_deref().unwrap_or(&id);
-                    let message = format!(
-                        "Sub-agent {name} spawned: {}",
-                        summarize_text(&prompt, SUMMARY_LIMIT)
-                    );
-                    let item = TurnItemRecord {
-                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                        id: runtime_record_id("item"),
-                        turn_id: turn_id.clone(),
-                        kind: TurnItemKind::Status,
-                        status: TurnItemLifecycleStatus::Completed,
-                        summary: summarize_text(&message, SUMMARY_LIMIT),
-                        detail: Some(message),
-                        metadata: None,
-                        artifact_refs: Vec::new(),
-                        artifacts: Vec::new(),
-                        started_at: Some(Utc::now()),
-                        ended_at: Some(Utc::now()),
-                    };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
-                        &thread_id,
-                        Some(&turn_id),
-                        Some(&item.id),
-                        "agent.spawned",
-                        json!({ "item": item, "agent_id": id, "agent_name": display_name,
-                            "worker_status": worker_status, "parent_run_id": parent_run_id,
-                            "spawn_depth": spawn_depth }),
-                    )
-                    .await?;
-                }
-                EngineEvent::AgentProgress {
-                    owner_session_id,
-                    id,
-                    status,
-                    activity,
-                    parent_run_id,
-                    spawn_depth,
-                } if owner_session_id == thread_id => {
-                    let message = format!("Sub-agent {id}: {status}");
-                    let item = TurnItemRecord {
-                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                        id: runtime_record_id("item"),
-                        turn_id: turn_id.clone(),
-                        kind: TurnItemKind::Status,
-                        status: TurnItemLifecycleStatus::Completed,
-                        summary: summarize_text(&message, SUMMARY_LIMIT),
-                        detail: Some(message),
-                        metadata: None,
-                        artifact_refs: Vec::new(),
-                        artifacts: Vec::new(),
-                        started_at: Some(Utc::now()),
-                        ended_at: Some(Utc::now()),
-                    };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
-                        &thread_id,
-                        Some(&turn_id),
-                        Some(&item.id),
-                        "agent.progress",
-                        json!({ "item": item, "agent_id": id,
-                            "worker_status": activity.worker_status, "step": activity.step,
-                            "parent_run_id": parent_run_id, "spawn_depth": spawn_depth }),
-                    )
-                    .await?;
-                }
-                EngineEvent::AgentComplete {
-                    owner_session_id,
-                    id,
-                    result,
-                    outcome,
-                    parent_run_id,
-                    spawn_depth,
-                    continuable,
-                    usage,
-                    display_name,
-                } if owner_session_id == thread_id => {
-                    let worker_status = outcome
-                        .as_ref()
-                        .map(crate::tools::subagent::subagent_status_name);
-                    let name = display_name.as_deref().unwrap_or(&id);
-                    let message = format!(
-                        "Sub-agent {name} {}: {}",
-                        worker_status.unwrap_or("settled (outcome unconfirmed)"),
-                        summarize_text(&result, SUMMARY_LIMIT)
-                    );
-                    let item = TurnItemRecord {
-                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                        id: runtime_record_id("item"),
-                        turn_id: turn_id.clone(),
-                        kind: TurnItemKind::Status,
-                        status: TurnItemLifecycleStatus::Completed,
-                        summary: summarize_text(&message, SUMMARY_LIMIT),
-                        detail: Some(message),
-                        metadata: None,
-                        artifact_refs: Vec::new(),
-                        artifacts: Vec::new(),
-                        started_at: Some(Utc::now()),
-                        ended_at: Some(Utc::now()),
-                    };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
-                        &thread_id,
-                        Some(&turn_id),
-                        Some(&item.id),
-                        "agent.completed",
-                        json!({ "item": item, "agent_id": id, "agent_name": display_name,
-                            "worker_status": worker_status, "parent_run_id": parent_run_id,
-                            "spawn_depth": spawn_depth, "continuable": continuable,
-                            "usage": usage }),
-                    )
-                    .await?;
-                    self.raise_notice(
-                        &thread_id,
-                        codewhale_config::notifications::NotificationEvent::SubagentTerminal
-                            .as_str(),
-                        &turn_id,
-                        &id,
-                        format!(
-                            "{name} {}",
-                            match outcome.as_ref() {
-                                Some(SubAgentStatus::Completed) => "finished",
-                                Some(
-                                    SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted,
-                                ) => "failed",
-                                Some(
-                                    SubAgentStatus::Cancelled | SubAgentStatus::Interrupted(_),
-                                ) => "stopped",
-                                Some(SubAgentStatus::Running) | None =>
-                                    "settled (outcome unconfirmed)",
-                            }
-                        ),
-                    );
                 }
                 EngineEvent::AgentList {
                     owner_session_id,
@@ -17730,13 +18480,10 @@ impl RuntimeThreadManager {
                     );
 
                     let pending_request = PendingApprovalRequest {
-                        // Replaced by the minted ID at registration. The raw
-                        // provider call ID travels in `tool_call_id`, where it
-                        // is a correlator a snapshot client can match against
-                        // the tool row and never a value the API will accept.
                         id: String::new(),
                         turn_id: turn_id.clone(),
                         tool_name: tool_name.clone(),
+                        input: Some(input.clone()),
                         description: description.clone(),
                         intent_summary: intent_summary.clone(),
                         tool_call_id: Some(id.clone()),
@@ -17826,6 +18573,7 @@ impl RuntimeThreadManager {
                                 "approval_id": approval_id,
                                 "tool_call_id": id,
                                 "tool_name": tool_name,
+                                "input": input,
                                 "summary": summary,
                                 "description": description,
                                 "intent_summary": intent_summary,
@@ -17929,6 +18677,7 @@ impl RuntimeThreadManager {
                                 "approval_id": approval_id,
                                 "tool_call_id": id,
                                 "tool_name": tool_name,
+                                "input": input,
                                 "summary": summary,
                                 "description": description,
                                 "intent_summary": intent_summary,
@@ -17996,6 +18745,7 @@ impl RuntimeThreadManager {
                                 "approval_id": approval_id,
                                 "tool_call_id": id,
                                 "tool_name": tool_name,
+                                "input": input,
                                 "summary": summary,
                                 "description": description,
                                 "intent_summary": intent_summary,
@@ -18360,6 +19110,48 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
+                EngineEvent::RequestImageWindow {
+                    provider,
+                    model,
+                    total,
+                    elided,
+                    cap,
+                    cap_source,
+                    message,
+                } => {
+                    let item = TurnItemRecord {
+                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                        id: runtime_record_id("item"),
+                        turn_id: turn_id.clone(),
+                        kind: TurnItemKind::Status,
+                        status: TurnItemLifecycleStatus::Completed,
+                        summary: summarize_text(&message, SUMMARY_LIMIT),
+                        detail: Some(message),
+                        metadata: Some(json!({
+                            "code": "request_image_window",
+                            "provider": provider,
+                            "model": model,
+                            "total": total,
+                            "elided": elided,
+                            "cap": cap,
+                            "cap_source": cap_source,
+                        })),
+                        artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
+                        started_at: Some(Utc::now()),
+                        ended_at: Some(Utc::now()),
+                    };
+                    self.store.save_item(&item)?;
+                    self.attach_item_to_turn(&turn_id, &item.id)?;
+                    self.emit_event(
+                        &thread_id,
+                        Some(&turn_id),
+                        Some(&item.id),
+                        "item.completed",
+                        json!({ "item": item }),
+                    )
+                    .await?;
+                }
                 EngineEvent::Error { envelope, .. } => {
                     turn_status = Some(RuntimeTurnStatus::Failed);
                     turn_error = Some(envelope.message.clone());
@@ -18395,6 +19187,7 @@ impl RuntimeThreadManager {
                     duration_ms,
                     first_token_ms,
                     request_ms,
+                    finish_reason: _,
                 } => {
                     self.emit_event(
                         &thread_id,
@@ -18513,6 +19306,7 @@ impl RuntimeThreadManager {
                     if let Some(err) = error {
                         turn_error = Some(err);
                     }
+                    terminal_received = true;
                     break;
                 }
                 EngineEvent::GoalUpdated { snapshot } => {
@@ -18669,6 +19463,31 @@ impl RuntimeThreadManager {
 
         self.settle_dynamic_tools_for_terminal_turn(&thread_id, &turn_id)
             .await?;
+
+        if terminal_received
+            && !self.cancel_token.is_cancelled()
+            && let Some(item_id) = completed_compaction_item.as_deref()
+        {
+            let mut messages = engine.get_session_snapshot().await?.messages;
+            for message in &mut messages {
+                crate::core::engine::redact_tool_blocks(message, |text| {
+                    crate::client::redact_model_bound_text(text, &receipt_secrets)
+                });
+            }
+            let store = self.store.clone();
+            let reference =
+                tokio::task::spawn_blocking(move || store.save_settled_history(&messages))
+                    .await
+                    .context("settled history write task failed")??;
+            let mut item = self.store.load_item(item_id)?;
+            let mut metadata = item.metadata.take().unwrap_or_else(|| json!({}));
+            let Some(fields) = metadata.as_object_mut() else {
+                bail!("Compaction item {item_id} has non-object metadata");
+            };
+            fields.insert("settled_history".to_string(), reference);
+            item.metadata = Some(metadata);
+            self.store.save_item(&item)?;
+        }
 
         // Publish the terminal projection as one snapshot boundary. The
         // duplicate scan is offloaded while this guard is held, so public
@@ -19255,6 +20074,18 @@ impl RuntimeThreadManager {
         let thread = self.get_thread(thread_id).await?;
         let config = self.read_config().clone();
         let route = self.resolved_route_for_thread(&config, &thread)?;
+        {
+            let mut selected = self.subagent_manager.lock().await;
+            if let Some(manager) = selected.as_ref() {
+                anyhow::ensure!(
+                    Arc::ptr_eq(manager, &engine.subagent_manager()),
+                    "fixture worker authority differs from Runtime owner"
+                );
+            } else {
+                *selected = Some(engine.subagent_manager());
+            }
+        }
+        let engine = self.route_engine_events(&thread, engine).await;
         let mut active = self.active.lock().await;
         active.engines.insert(
             thread_id.to_string(),
@@ -19495,7 +20326,11 @@ fn enforce_lru_capacity(
         .engines
         .iter()
         .filter_map(|(thread_id, state)| {
-            if state.active_turn.is_some() {
+            let manager = state.engine.subagent_manager();
+            let live_children = manager.try_read().map_or(true, |manager| {
+                manager.live_count_for_session(thread_id) > 0
+            });
+            if state.active_turn.is_some() || live_children {
                 Some(thread_id.clone())
             } else {
                 None
@@ -19569,6 +20404,26 @@ fn tool_kind_for_name(name: &str) -> TurnItemKind {
         return TurnItemKind::FileChange;
     }
     TurnItemKind::ToolCall
+}
+
+pub(crate) fn tool_receipt_detail(name: &str, content: &str, secrets: &[String]) -> String {
+    if name == REQUEST_USER_INPUT_TOOL_NAME {
+        REDACTED_USER_INPUT_RECEIPT.to_string()
+    } else {
+        crate::client::redact_model_bound_text(content, secrets)
+    }
+}
+
+pub(crate) async fn receipt_secret_values(config: Config) -> Result<Vec<String>> {
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        crate::client::active_model_bound_secret_values(&config)
+    })
+    .await
+    .context("Runtime receipt redaction setup failed")
 }
 
 pub fn summarize_text(text: &str, limit: usize) -> String {
@@ -20089,6 +20944,22 @@ pub use turn_artifacts::{
     FileChangeKind, TurnArtifactKind, TurnArtifactRef, TurnWorkspaceArtifacts, TurnWorkspaceReason,
     TurnWorkspaceState,
 };
+
+#[cfg(test)]
+pub(crate) async fn install_mock_engine(
+    manager: &RuntimeThreadManager,
+    thread_id: &str,
+) -> crate::core::engine::MockEngineHandle {
+    let mut harness = crate::core::engine::mock_engine_handle();
+    if let Some(authority) = manager.subagent_manager.lock().await.as_ref() {
+        harness.handle.set_subagent_manager(authority.clone());
+    }
+    manager
+        .install_test_engine(thread_id, harness.handle.clone())
+        .await
+        .expect("install mock engine");
+    harness
+}
 
 #[cfg(test)]
 mod tests;

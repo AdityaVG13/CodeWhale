@@ -9,6 +9,10 @@
 
 use std::sync::OnceLock;
 
+use icu_properties::CodePointSetData;
+use icu_properties::props::{
+    BidiControl, DefaultIgnorableCodePoint, EmojiModifier, ExtendedPictographic, VariationSelector,
+};
 use regex::Regex;
 use serde_json::Value;
 
@@ -33,6 +37,73 @@ pub fn sanitize_stream_chunk(chunk: &str) -> String {
         .chars()
         .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
         .collect()
+}
+
+/// Unicode Bidi_Control: the marks, embeddings, overrides and isolates that reorder how a line is displayed.
+#[must_use]
+pub fn is_bidi_control(ch: char) -> bool {
+    !ch.is_ascii() && CodePointSetData::new::<BidiControl>().contains(ch)
+}
+
+/// `(char index, char)` for each character a reader cannot see: controls other than tab, newline and carriage return, U+2028/U+2029, Bidi_Control and Default_Ignorable code points, except a zero-width joiner inside an emoji sequence, one variation selector after a visible non-ASCII base or in a keycap, and tag characters forming an emoji subdivision flag; visible lookalikes and the non-ignorable format characters U+FFF9-U+FFFB and U+13430-U+1343F are not reported.
+#[must_use]
+pub fn hidden_chars(text: &str) -> Vec<(usize, char)> {
+    let pictographic = CodePointSetData::new::<ExtendedPictographic>();
+    let modifier = CodePointSetData::new::<EmojiModifier>();
+    let selector = CodePointSetData::new::<VariationSelector>();
+    let ignorable = CodePointSetData::new::<DefaultIgnorableCodePoint>();
+    let is_tag = |ch: char| matches!(ch, '\u{e0020}'..='\u{e007f}');
+    let chars: Vec<char> = text.chars().collect();
+    let mut hidden = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if matches!(ch, '\t' | '\n' | '\r' | ' '..='~') {
+            index += 1;
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|at| chars[at]);
+        let next = chars.get(index + 1).copied();
+        if is_tag(ch) {
+            let end = chars[index..]
+                .iter()
+                .position(|&ch| !is_tag(ch))
+                .map_or(chars.len(), |len| index + len);
+            let run = &chars[index..end];
+            let flag = previous == Some('\u{1f3f4}')
+                && run.len() > 1
+                && run.last() == Some(&'\u{e007f}')
+                && run[..run.len() - 1]
+                    .iter()
+                    .all(|ch| matches!(ch, '\u{e0030}'..='\u{e0039}' | '\u{e0061}'..='\u{e007a}'));
+            if !flag {
+                hidden.extend((index..end).map(|at| (at, chars[at])));
+            }
+            index = end;
+            continue;
+        }
+        let visible = if ch == '\u{200d}' {
+            previous.is_some_and(|p| {
+                pictographic.contains(p) || modifier.contains(p) || p == '\u{fe0f}'
+            }) && next.is_some_and(|n| pictographic.contains(n))
+        } else if selector.contains(ch) {
+            previous.is_some_and(|p| {
+                !p.is_ascii() && !p.is_whitespace() && !p.is_control() && !ignorable.contains(p)
+            }) || (ch == '\u{fe0f}'
+                && previous.is_some_and(|p| matches!(p, '0'..='9' | '#' | '*'))
+                && next == Some('\u{20e3}'))
+        } else {
+            !(ch.is_control()
+                || matches!(ch, '\u{2028}' | '\u{2029}')
+                || is_bidi_control(ch)
+                || ignorable.contains(ch))
+        };
+        if !visible {
+            hidden.push((index, ch));
+        }
+        index += 1;
+    }
+    hidden
 }
 
 /// Like [`strip_ansi_into`], but SGR sequences (`ESC [ … m`: colour, bold,

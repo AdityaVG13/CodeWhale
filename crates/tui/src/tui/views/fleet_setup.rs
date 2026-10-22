@@ -1059,8 +1059,12 @@ impl FleetSetupView {
             return Err("The destination changed on disk. Reopen Fleet before saving.".into());
         }
         let dir = target.parent().ok_or("Invalid profile destination")?;
-        let identities = crate::fleet::profile::load_agent_profile_identities_from_dir(dir)
-            .map_err(|err| err.to_string())?;
+        let identities = if self.profile_scope == FleetProfileScope::Project {
+            crate::fleet::profile::load_workspace_agent_profile_identities(&app.workspace)
+        } else {
+            crate::fleet::profile::load_agent_profile_identities_from_dir(dir)
+        }
+        .map_err(|err| err.to_string())?;
         if identities.iter().any(|profile| {
             profile.id.eq_ignore_ascii_case(&assignment.id) && profile.source != *target
         }) {
@@ -2190,7 +2194,11 @@ impl ModalView for FleetSetupView {
             )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_BG))
+            .style(
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .bg(palette::WHALE_BG),
+            )
             .padding(Padding::uniform(1));
 
         let inner = block.inner(popup_area);

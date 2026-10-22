@@ -33,17 +33,23 @@ the turn's own workspace snapshots:
 
 ## Surfaces
 
-All three share one builder (`crates/tui/src/receipts.rs`), so they cannot
-disagree.
+All three share one builder (`crates/tui/src/receipts.rs`), but read different
+records and can report different coverage.
 
 | Surface | What it reads |
 | --- | --- |
-| `/receipts [json] [<turn>]` in the terminal | The current session's transcript and approval log. `json` prints the object in a code block, so it copies out as valid JSON |
-| `codewhale receipts [ID\|--last] [--turn T] [--format md\|json]` | A saved session (id or unique prefix) or a Runtime thread (`thr_…`); with no id, the most recently updated one. `receipt` is an alias |
+| `/receipts [json] [<turn>]` in the terminal | The current session's transcript, approval log, and retained terminal failures. `json` prints the object in a code block, so it copies out as valid JSON |
+| `codewhale receipts [ID\|--last] [--turn T] [--format md\|json]` | A saved session (id or unique prefix), including its retained terminal failures, or a Runtime thread (`thr_…`); with no id, the most recently updated one. `receipt` is an alias |
 | `GET /v1/threads/{id}/receipt`, `GET /v1/threads/{id}/turns/{turn_id}/receipt` | A Runtime thread (the app, `codewhale serve`), behind the normal `/v1` bearer boundary |
 
 All three only read. They never call a provider, run a tool, write a file,
 or change runtime state.
+
+Exec runs that offer tools, including `exec --auto`, save a session in every
+output format, so `codewhale receipts --last` can read their receipts after
+they finish. Resumed sessions and `--output-format stream-json` runs are also
+saved. Other answer-only text and `--json` runs are saved only if conversation
+compaction starts; use `--output-format stream-json` to always keep a session.
 
 `codewhale receipts` reads Runtime threads from the machine's default store
 (`tasks/runtime/`, or `$CODEWHALE_RUNTIME_DIR`). A thread kept in one
@@ -54,10 +60,18 @@ the API reads whatever store its server owns.
 
 | Session kind | Record | Holds |
 | --- | --- | --- |
-| Terminal session | `sessions/<id>.json` | Every tool call and its result text, in order; each prompt's `<turn_meta>` names the posture the turn ran under |
+| Terminal session | `sessions/<id>.json` | Every tool call and its result text, in order; each prompt's `<turn_meta>` names the posture the turn ran under; `turn_outcomes` records terminal turn status and errors |
 | Terminal session | `sessions/<id>/approval_receipts.jsonl` | Every approval ask and decision, with time and who decided |
 | Runtime thread | `tasks/runtime/turns`, `items` | Every tool call with its input, status, start and end time, and structured result (exit code, diff, agent status); each turn's `permission_posture` |
 | Runtime thread | `tasks/runtime/events/<thread>.jsonl` | `approval.required` / `approval.decided`, with the flags that say who decided |
+
+The saved-session CLI and live `/receipts` read terminal turn failures,
+including model errors in exec runs, as `turn_failed` actions and count them
+toward failures even when no tool failed. Truncating the conversation removes
+outcomes beyond the retained history, so later turns cannot inherit their failures.
+Saved sessions keep only the newest 64 recorded failed-turn outcomes. Older outcomes
+and legacy sessions without this record cannot provide a complete terminal
+failure history from tool results alone.
 
 ### Who decided an approval
 
@@ -304,7 +318,10 @@ fingerprints a truncated prefix. A receipt for
 `review --base <base-sha> --path <path>` covers only that selected path at the
 checked-out revision; validate it with the same base, path, and input limit.
 It does not cover the rest of a pull request or prove that separately reviewed
-changes work together.
+changes work together. With `--base`, the reviewer also reads the
+`base..HEAD` commit messages (merges excluded, capped at 16,000 characters) as
+the author's stated intent; the receipt fingerprints the diff, not those
+messages.
 
 ## Builder Rules
 

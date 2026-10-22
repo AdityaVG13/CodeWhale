@@ -13,13 +13,7 @@ use super::{HistoryCell, TRANSCRIPT_RAIL};
 /// well-formed `<archived_context>...</archived_context>` block, or `None`
 /// if the text is regular assistant content.
 pub(super) fn parse_archived_context(text: &str) -> Option<HistoryCell> {
-    let text = text.trim();
-    if !text.starts_with("<archived_context") || !text.ends_with("</archived_context>") {
-        return None;
-    }
-
-    let tag_end = text.find('>')?;
-    let tag = &text[..tag_end];
+    let (tag, summary) = crate::runtime_handoff::archived_context_parts(text)?;
 
     let level = archived_context_attr(tag, "level")
         .and_then(|v| v.parse::<u8>().ok())
@@ -35,10 +29,6 @@ pub(super) fn parse_archived_context(text: &str) -> Option<HistoryCell> {
 
     let timestamp = archived_context_attr(tag, "timestamp").unwrap_or_default();
 
-    let close_tag = text.rfind("</archived_context>")?;
-    let summary_start = tag_end + 1;
-    let summary = text[summary_start..close_tag].trim().to_string();
-
     Some(HistoryCell::ArchivedContext {
         level,
         range,
@@ -46,7 +36,7 @@ pub(super) fn parse_archived_context(text: &str) -> Option<HistoryCell> {
         density,
         model,
         timestamp,
-        summary,
+        summary: summary.to_string(),
     })
 }
 

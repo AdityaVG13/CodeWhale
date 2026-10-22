@@ -2,6 +2,7 @@ use super::*;
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
 use crate::core::ops::{Op, TurnSpec};
 use crate::runtime_threads::RuntimeEventRecord;
+use crate::runtime_threads::install_mock_engine;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use anyhow::{Context, bail};
 use codewhale_models::Role;
@@ -318,6 +319,7 @@ fn saved_session_with_blocks(blocks: Vec<codewhale_models::ContentBlock>) -> Sav
         approval_receipts: Vec::new(),
         work_state: None,
         window_title: None,
+        composer_color: None,
         last_auto_route: None,
         turn_outcomes: Vec::new(),
     }
@@ -455,6 +457,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         title: None,
         session_id: None,
         saved_session_checkpoint: None,
+        last_read: None,
     };
     let turn = TurnRecord {
         decision_receipts: Vec::new(),
@@ -590,7 +593,19 @@ fn messages_from_thread_detail_batches_tool_results() {
         approval_grants: Vec::new(),
     };
 
-    let messages = messages_from_thread_detail(&detail).expect("rebuild thread history");
+    let mut items_by_turn = std::collections::HashMap::new();
+    for item in &detail.items {
+        items_by_turn
+            .entry(item.turn_id.clone())
+            .or_insert_with(Vec::new)
+            .push(item.clone());
+    }
+    let messages =
+        crate::runtime_threads::RuntimeThreadManager::reconstruct_messages_from_turns_with(
+            &detail.turns,
+            &items_by_turn,
+        )
+        .expect("rebuild thread history");
     let roles = messages
         .iter()
         .map(|message| message.role.as_str())
@@ -663,6 +678,7 @@ fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
             title: None,
             session_id: None,
             saved_session_checkpoint: None,
+            last_read: None,
         },
         turns: Vec::new(),
         items: Vec::new(),
@@ -952,12 +968,13 @@ async fn spawn_test_server_with_root_token_and_mobile(
         tokio::task::JoinHandle<()>,
     )>,
 > {
+    let workspace = root.join("workspace");
     spawn_test_server_with_root_token_mobile_workspace(
         root,
         sessions_dir,
         runtime_token,
         mobile_enabled,
-        PathBuf::from("."),
+        workspace,
     )
     .await
 }
@@ -1288,9 +1305,13 @@ async fn build_test_server(
     }
 
     let auth_required = runtime_token.is_some();
-    let sub_agent_manager = overrides
-        .sub_agent_manager
-        .unwrap_or_else(|| runtime_api_sub_agent_manager(&workspace, 2));
+    let sub_agent_manager = match overrides.sub_agent_manager {
+        Some(manager) => manager,
+        None => runtime_api_sub_agent_manager(&workspace, 2)?,
+    };
+    runtime_threads
+        .attach_subagent_manager(sub_agent_manager.clone())
+        .await?;
     // A std listener: the server thread registers it with its own runtime
     // after setup is reported (see `spawn_product_stack_server`).
     let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -1356,6 +1377,7 @@ async fn build_test_server(
         shutdown: overrides.shutdown.clone().unwrap_or_default(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+        provider_connect: Default::default(),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let (owner_frontend, compatibility) = if let Some(socket) = overrides.owner_socket {
@@ -2117,9 +2139,7 @@ async fn web_bootstrap_sets_strict_cookie_once_and_preserves_v1_auth() -> Result
             .send()
             .await?;
         assert_eq!(reloaded.headers()[header::CACHE_CONTROL], "no-store");
-        assert!(reloaded.text().await?.contains(&format!(
-            "name=\"codewhale-web-request\" content=\"{proof}\""
-        )));
+        assert!(!reloaded.text().await?.contains(&proof));
     }
     for method in [reqwest::Method::GET, reqwest::Method::POST] {
         for metadata in [false, true] {
@@ -2657,7 +2677,7 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
     let root = std::env::temp_dir().join(format!("codewhale-fleet-api-{}", Uuid::new_v4()));
     let workspace = root.join("workspace");
     fs::create_dir_all(&workspace)?;
-    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2)?;
     let manager = FleetManager::open(&workspace)?
         .with_sub_agent_manager(sub_agent_manager.clone())
         .with_session_model(DEFAULT_TEXT_MODEL)
@@ -2972,6 +2992,7 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             launch_manifest: None,
         },
         owner_session_id: "session-receipt".to_string(),
+        runtime_origin_turn_id: None,
         actor_kind: "subagent".to_string(),
         parent_run_id: Some("parent_run".to_string()),
         follow_up: AgentRunFollowUpTarget {
@@ -3051,15 +3072,14 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
     )?;
 
     let sessions_dir = root.join("sessions");
-    let Some((addr, _runtime_threads, handle)) =
-        spawn_test_server_with_root_token_mobile_workspace(
-            root.clone(),
-            sessions_dir,
-            None,
-            false,
-            workspace,
-        )
-        .await?
+    let Some((addr, runtime_threads, handle)) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        sessions_dir,
+        None,
+        false,
+        workspace.clone(),
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -3105,6 +3125,60 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
         .status();
     assert_eq!(missing, StatusCode::NOT_FOUND);
 
+    assert!(run.get("runtime_origin_turn_id").is_none());
+    assert!(
+        serde_json::from_value::<AgentWorkerRecord>(run.clone())?
+            .runtime_origin_turn_id
+            .is_none()
+    );
+    let thread = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest::default())
+        .await?;
+    let engine = runtime_threads.get_engine(&thread.id).await?;
+    let actual = engine.subagent_manager();
+    let mut spec = serde_json::from_value::<AgentWorkerSpec>(run["spec"].clone())?;
+    spec.worker_id = "ordinary_receipt".into();
+    spec.run_id = "ordinary_run".into();
+    spec.parent_run_id = None;
+    actual
+        .write()
+        .await
+        .register_worker_for_session_with_origin(
+            spec,
+            &thread.id,
+            None,
+            Some("turn_original_receipt".into()),
+        );
+    let listed: serde_json::Value = client
+        .get(format!("http://{addr}/v1/agent-runs"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let records = listed["runs"].as_array().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["spec"]["worker_id"] == "agent_receipt")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["spec"]["worker_id"] == "ordinary_receipt")
+            .count(),
+        1
+    );
+    let ordinary: serde_json::Value = client
+        .get(format!("http://{addr}/v1/agent-runs/ordinary_run"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(ordinary["owner_session_id"], thread.id);
+    assert_eq!(ordinary["runtime_origin_turn_id"], "turn_original_receipt");
+    runtime_threads.shutdown_and_wait().await?;
     handle.abort();
     Ok(())
 }
@@ -3352,10 +3426,7 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
         }
     };
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     let (release_overlap, wait_for_overlap_release) = oneshot::channel();
@@ -3388,6 +3459,9 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
             .await;
         let _ = tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage {
                     input_tokens: 3,
                     output_tokens: 1,
@@ -3558,10 +3632,7 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
         }
     };
 
-    let mut harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let (submission_tx, submission_rx) = oneshot::channel();
     let (release_completion, wait_for_completion_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
@@ -3656,6 +3727,9 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
         harness
             .tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -3986,10 +4060,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
     // Install a mock engine so the turn completes without calling the real API.
     // The mock handles both SendMessage and CompactContext ops so the
     // compact endpoint tested later also works.
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
@@ -4018,6 +4089,9 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
                         .await;
                     let _ = tx_event
                         .send(EngineEvent::TurnComplete {
+                            turn_id: None,
+                            submission_id: None,
+                            compaction_id: None,
                             usage: Usage {
                                 input_tokens: 10,
                                 output_tokens: 5,
@@ -4039,6 +4113,9 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
                 Op::CompactContext { .. } => {
                     let _ = tx_event
                         .send(EngineEvent::TurnComplete {
+                            turn_id: None,
+                            submission_id: None,
+                            compaction_id: None,
                             usage: Usage {
                                 input_tokens: 0,
                                 output_tokens: 0,
@@ -4166,10 +4243,7 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
         .await?;
     let thread_id = created["id"].as_str().context("thread id")?.to_string();
 
-    let mut harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = send_count.clone();
     let tx_event = harness.tx_event.clone();
@@ -4182,6 +4256,9 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
             sleep(Duration::from_millis(20)).await;
             let _ = tx_event
                 .send(EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage::default(),
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -4303,10 +4380,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
         .build()?;
     let thread = manager.create_thread(Default::default()).await?;
     let other_thread = manager.create_thread(Default::default()).await?;
-    let mut engine = crate::core::engine::mock_engine_handle();
-    manager
-        .install_test_engine(&thread.id, engine.handle.clone())
-        .await?;
+    let mut engine = install_mock_engine(&manager, &thread.id).await;
     let key = "cwc-http-operation-lookup";
     let accepted = client
         .post(format!("http://{addr}/v1/threads/{}/turns", thread.id))
@@ -4407,6 +4481,9 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
     engine
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Default::default(),
             parent_route_usage: Default::default(),
             routed_usage_dropped_records: 0,
@@ -4513,10 +4590,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
         .to_string();
 
     // Install a mock engine so the turn completes without calling the real API.
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
@@ -4539,6 +4613,9 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
             .await;
         let _ = tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage {
                     input_tokens: 5,
                     output_tokens: 3,
@@ -5443,10 +5520,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         .context("missing thread id")?
         .to_string();
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let mut rx_steer = harness.rx_steer;
     let tx_event = harness.tx_event;
@@ -5481,6 +5555,9 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         sleep(Duration::from_millis(60)).await;
         let _ = tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage {
                     input_tokens: 2,
                     output_tokens: 1,
@@ -5524,24 +5601,39 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         .json()
         .await?;
     assert_eq!(steer_resp["id"], turn_id);
-    let deadline = tokio::time::Instant::now() + ci_scaled(Duration::from_secs(10));
-    while !runtime_threads
-        .events_since(&thread_id, None)?
-        .iter()
-        .any(|ev| ev.event == "turn.steered")
-    {
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for the steer on {turn_id} to settle");
+    assert!(matches!(steer_resp["steer_count"].as_u64(), Some(0 | 1)));
+
+    tokio::time::timeout(ci_scaled(Duration::from_secs(10)), async {
+        loop {
+            let events = runtime_threads.events_since(&thread_id, None)?;
+            let delivered = events.iter().any(|event| {
+                event.turn_id.as_deref() == Some(turn_id.as_str()) && event.event == "turn.steered"
+            });
+            let completed = events.iter().any(|event| {
+                event.turn_id.as_deref() == Some(turn_id.as_str())
+                    && event.event == "item.completed"
+                    && event.payload["item"]["detail"] == "please steer"
+            });
+            if delivered && completed {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(25)).await;
         }
-        sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(
-        runtime_threads
-            .test_store()
-            .load_turn(&turn_id)?
-            .steer_count,
-        1
-    );
+    })
+    .await
+    .context("steer delivery did not settle before interrupt")??;
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let settled_turn = detail["turns"]
+        .as_array()
+        .and_then(|turns| turns.iter().find(|turn| turn["id"] == turn_id))
+        .context("steered turn missing from thread detail")?;
+    assert_eq!(settled_turn["steer_count"], 1);
 
     let interrupt_resp: serde_json::Value = client
         .post(format!(
@@ -5988,10 +6080,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
         .context("missing thread id")?
         .to_string();
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
@@ -6020,6 +6109,9 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
             .await;
         let _ = tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage {
                     input_tokens: 4,
                     output_tokens: 2,
@@ -6975,10 +7067,7 @@ async fn session_save_without_an_id_keeps_the_conversation_that_owns_the_snapsho
     // can state it. It stands in for the id the real engine stamps on every
     // snapshot the conversation takes.
     const CONVERSATION_ID: &str = "3f9c7b1e-58b4-4d2a-9f5a-8a1e0c6d2b70";
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
@@ -7375,7 +7464,7 @@ async fn patch_undo_endpoint_refuses_turns_it_cannot_prove() -> Result<()> {
         std::env::temp_dir().join(format!("deepseek-patch-undo-endpoint-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
-        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        spawn_test_server_with_root(root.join("server"), sessions_dir).await?
     else {
         return Ok(());
     };
@@ -8429,10 +8518,7 @@ async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
         .send()
         .await?
         .error_for_status()?;
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let _harness = install_mock_engine(&runtime_threads, &thread_id).await;
     runtime_threads
         .set_active_turn_for_test(&thread_id, Some("turn_live"))
         .await?;
@@ -8558,10 +8644,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
         .context("missing thread id")?
         .to_string();
 
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread_id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread_id).await;
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     let (active_tx, active_rx) = oneshot::channel();
@@ -8594,6 +8677,9 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
             .await;
         let _ = tx_event
             .send(EngineEvent::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: Usage {
                     input_tokens: 2,
                     output_tokens: 1,
@@ -11436,10 +11522,7 @@ async fn submit_user_input_404s_without_entering_engine_mailbox_for_unknown_id()
     let thread = runtime_threads
         .create_thread(CreateThreadRequest::default())
         .await?;
-    let mut harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread.id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&runtime_threads, &thread.id).await;
 
     let response = crate::tls::reqwest_client()
         .post(format!(
@@ -12874,6 +12957,7 @@ fn provider_model_catalog_paginates_all_six_hundred_rows_without_truncation() {
             reasoning_effort: codewhale_config::route::CapabilityState::Unknown,
             reasoning_effort_levels: Vec::new(),
             reasoning_effort_source: None,
+            facts: None,
             output_token_limit: codewhale_config::route::CapabilityState::Unknown,
             id: format!("openrouter/model-{index:03}"),
             image_input: codewhale_config::route::CapabilityState::Unknown,
@@ -12930,6 +13014,7 @@ fn provider_model_catalog_applies_filter_before_cursor_and_rejects_cross_scope_r
             reasoning_effort: codewhale_config::route::CapabilityState::Unknown,
             reasoning_effort_levels: Vec::new(),
             reasoning_effort_source: None,
+            facts: None,
             output_token_limit: codewhale_config::route::CapabilityState::Unknown,
             id: id.to_string(),
             image_input: codewhale_config::route::CapabilityState::Unknown,
@@ -12988,6 +13073,7 @@ fn provider_model_cursor_rejects_catalog_change_between_pages() {
             reasoning_effort: codewhale_config::route::CapabilityState::Unknown,
             reasoning_effort_levels: Vec::new(),
             reasoning_effort_source: None,
+            facts: None,
             output_token_limit: codewhale_config::route::CapabilityState::Unknown,
             id: id.to_string(),
             image_input: codewhale_config::route::CapabilityState::Unknown,
@@ -13011,6 +13097,7 @@ fn provider_model_cursor_rejects_catalog_change_between_pages() {
         reasoning_effort: codewhale_config::route::CapabilityState::Unknown,
         reasoning_effort_levels: Vec::new(),
         reasoning_effort_source: None,
+        facts: None,
         output_token_limit: codewhale_config::route::CapabilityState::Unknown,
         id: "alpha".to_string(),
         image_input: codewhale_config::route::CapabilityState::Unknown,
@@ -13058,6 +13145,7 @@ fn provider_model_cursor_round_trips_multibyte_filter_at_the_allowed_limit() {
             reasoning_effort: codewhale_config::route::CapabilityState::Unknown,
             reasoning_effort_levels: Vec::new(),
             reasoning_effort_source: None,
+            facts: None,
             output_token_limit: codewhale_config::route::CapabilityState::Unknown,
             id: format!("{filter}{suffix}"),
             image_input: codewhale_config::route::CapabilityState::Unknown,
@@ -13968,7 +14056,10 @@ model = "local-model"
         // environment variable name. `credentialWritableReason` is
         // `skip_serializing_if = Option::is_none`, so it is absent for every
         // writable route and is asserted separately below when present.
+        // `browserConnect` is the same kind of fact as `credentialWritable`: a
+        // boolean that says the route has a sign-in flow the client can drive.
         let allowed_fields: std::collections::BTreeSet<_> = [
+            "browserConnect",
             "credentialSource",
             "credentialState",
             "credentialWritable",
@@ -15090,10 +15181,7 @@ api_key = "local-test-key"
             ..Default::default()
         })
         .await?;
-    let harness = crate::core::engine::mock_engine_handle();
-    runtime_threads
-        .install_test_engine(&thread.id, harness.handle.clone())
-        .await?;
+    let harness = install_mock_engine(&runtime_threads, &thread.id).await;
 
     // The loaded thread's route is removed on disk outside this runtime, so
     // any reload now rejects it.
@@ -18158,6 +18246,7 @@ async fn terminal_routes_serve_a_live_engine_session_over_http() -> Result<()> {
         "pane",
         &workspace,
         crate::sandbox::SandboxPolicy::DangerFullAccess,
+        &crate::tools::shell::new_shared_shell_manager(workspace.clone()),
     )
     .map_err(anyhow::Error::msg)?;
 
@@ -19504,10 +19593,7 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
             "input_summary": "silent settlement fixture", "created_at": Utc::now()
         }))?;
         manager.test_store().save_turn(&turn)?;
-        let mut mock = crate::core::engine::mock_engine_handle();
-        manager
-            .install_test_engine(&thread.id, mock.handle.clone())
-            .await?;
+        let mut mock = install_mock_engine(&manager, &thread.id).await;
         let approval = if event_name == "approval.required" {
             Some(manager.register_pending_approval_for_thread_for_test(&thread.id, "request"))
         } else {
@@ -19645,10 +19731,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     .await?
     .context("loopback listener required for image contract proof")?;
     let thread = manager.create_thread(Default::default()).await?;
-    let mut harness = crate::core::engine::mock_engine_handle();
-    manager
-        .install_test_engine(&thread.id, harness.handle.clone())
-        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
     let client = crate::tls::reqwest_client();
     let url = format!("http://{addr}/v1/threads/{}/turns", thread.id);
     let good = runtime_image_fixture(7);
@@ -19724,6 +19807,9 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     harness
         .tx_event
         .send(EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Default::default(),
             parent_route_usage: Default::default(),
             routed_usage_dropped_records: 0,
@@ -19796,10 +19882,7 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
     }
     // Cleanup refuses a loaded or accepted session instead of erasing uncertain work.
     let retained = manager.create_thread(Default::default()).await?;
-    let harness = crate::core::engine::mock_engine_handle();
-    manager
-        .install_test_engine(&retained.id, harness.handle.clone())
-        .await?;
+    let _harness = install_mock_engine(&manager, &retained.id).await;
     assert!(manager.discard_empty_thread(&retained.id).await.is_err());
     assert!(manager.get_thread(&retained.id).await.is_ok());
     server.abort();
@@ -19902,6 +19985,7 @@ fn runtime_image_named_catalog_cursor_binds_identity_endpoint_and_catalog() -> R
             reasoning_effort: codewhale_config::route::CapabilityState::Unknown,
             reasoning_effort_levels: Vec::new(),
             reasoning_effort_source: None,
+            facts: None,
             id: id.into(),
             output_token_limit: codewhale_config::route::CapabilityState::Unknown,
             image_input: codewhale_config::route::CapabilityState::Supported,
@@ -24581,12 +24665,23 @@ mod thread_snapshot_ownership {
         /// Run one real turn whose model writes each `(path, content)` with
         /// `write_file`, then answers. Returns the settled turn record.
         async fn write_turn(&self, thread_id: &str, writes: &[(&str, &str)]) -> Result<Value> {
+            let mut current: std::collections::HashMap<&str, Vec<u8>> = writes
+                .iter()
+                .filter_map(|(path, _)| {
+                    fs::read(self.workspace.join(path)).ok().map(|b| (*path, b))
+                })
+                .collect();
             for (path, content) in writes {
                 let call_id = format!("call_{}", &Uuid::new_v4().simple().to_string()[..12]);
+                let mut args = json!({ "path": path, "content": content });
+                if let Some(bytes) = current.get(path) {
+                    args["expected_hash"] = json!(crate::tools::file::content_hash(bytes));
+                }
+                current.insert(path, content.as_bytes().to_vec());
                 self.mock.push_turn(canned::tool_call_turn(
                     &call_id,
                     "write_file",
-                    &json!({ "path": path, "content": content }).to_string(),
+                    &args.to_string(),
                 ));
             }
             self.mock.push_turn(canned::simple_text_turn("done"));
@@ -25692,7 +25787,7 @@ async fn session_export_keeps_execution_identity_and_rejects_invalid_item_correl
         .seed_thread_from_messages(&thread.id, &original)
         .await?;
     let detail = runtime.get_thread_detail(&thread.id).await?;
-    assert_eq!(messages_from_thread_detail(&detail)?, original);
+    assert_eq!(messages_from_thread_detail(&runtime, &detail)?, original);
 
     // A completed live item contains both sides. It must not become only a
     // result when the same thread is saved through the API's projection.
@@ -25724,7 +25819,7 @@ async fn session_export_keeps_execution_identity_and_rejects_invalid_item_correl
     for turn in &mut coalesced.turns {
         turn.item_ids.retain(|id| id != &result_item.id);
     }
-    assert_eq!(messages_from_thread_detail(&coalesced)?, original);
+    assert_eq!(messages_from_thread_detail(&runtime, &coalesced)?, original);
 
     let client = crate::tls::reqwest_client();
     let exported = client

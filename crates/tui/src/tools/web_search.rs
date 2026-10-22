@@ -1,6 +1,6 @@
 //! Bounded provider-native/configured web search with explicit fallback receipts.
 //! Adapters include Firecrawl, Tavily, Bocha, Metaso, SearXNG, Baidu,
-//! Volcengine, Sofya, and Serply; browsing remains a separate `web.run` workflow.
+//! Volcengine, Sofya, Serply, and DeepSeek; browsing remains a separate `web.run` workflow.
 //! `[search]` example:
 //!   provider = "firecrawl"  # keyless on Firecrawl Cloud; optional api_key
 //!   base_url = `"https://search.example/"`  # DDG-compatible URL or SearXNG instance
@@ -42,6 +42,7 @@ const BAIDU_ENDPOINT: &str = "https://qianfan.baidubce.com/v2/ai_search/web_sear
 const VOLCENGINE_RESPONSES_ENDPOINT: &str = "https://ark.cn-beijing.volces.com/api/v3/responses";
 const SOFYA_ENDPOINT: &str = "https://sofya.co/v1/search";
 const SERPLY_ENDPOINT: &str = "https://api.serply.io/v1/search";
+const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/v1/tools/search";
 const ERROR_BODY_PREVIEW_BYTES: usize = 512;
 const PROVIDER_NATIVE_MIN_TIMEOUT_MS: u64 = 45_000;
 const KIMI_K3_FORMULA_MIN_TIMEOUT_MS: u64 = 180_000;
@@ -497,6 +498,7 @@ pub(crate) fn search_probe_target(
         SearchProvider::Volcengine => (VOLCENGINE_RESPONSES_ENDPOINT, false),
         SearchProvider::Sofya => (SOFYA_ENDPOINT, false),
         SearchProvider::Serply => (SERPLY_ENDPOINT, false),
+        SearchProvider::DeepSeek => (DEEPSEEK_ENDPOINT, false),
     };
 
     let mut url = reqwest::Url::parse(raw).map_err(|_| SearchProbeTargetError::Invalid)?;
@@ -573,7 +575,7 @@ impl ToolSpec for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web and return ranked results with URLs, snippets, session-scoped ref_ids, and an execution receipt. `web.run` opens a result ref_id when the short summary is not enough. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise keyless Firecrawl is the default. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"firecrawl\" | \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\" | \"serply\"` in config.toml. Firecrawl Cloud works keyless with a bounded quota. `fetch_url` retrieves a known canonical URL directly."
+        "Search the web and return ranked results with URLs, snippets, session-scoped ref_ids, and an execution receipt. `web.run` opens a result ref_id when the short summary is not enough. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise keyless Firecrawl is the default. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"firecrawl\" | \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\" | \"serply\" | \"deepseek\"` in config.toml. Firecrawl Cloud works keyless with a bounded quota. `fetch_url` retrieves a known canonical URL directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -1174,6 +1176,66 @@ impl WebSearchTool {
         }
 
         Ok(parse_serply_results(&parsed, max_results))
+    }
+
+    async fn run_deepseek_search(
+        &self,
+        query: &str,
+        max_results: usize,
+        timeout_ms: u64,
+        context: &ToolContext,
+    ) -> AdapterResult<Vec<SearchResult>> {
+        let api_key = deepseek_search_key(context).ok_or_else(|| {
+            ToolError::invalid_input(
+                "DeepSeek search requires an API key. Set `[search] api_key` in config.toml or the DEEPSEEK_API_KEY env var.",
+            )
+        })?;
+        let client = crate::tls::reqwest_client_builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
+            })?;
+        let count = max_results.clamp(1, 50);
+        let payload = json!({
+            "query": query.chars().take(128).collect::<String>(),
+            "count": count,
+        });
+        let resp = client
+            .post(DEEPSEEK_ENDPOINT)
+            .header("Content-Type", "application/json")
+            .bearer_auth(&api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("DeepSeek search request failed: {e}"))
+            })?;
+        let status = resp.status();
+        let body = if adapter::search_selected(context) {
+            adapter::read_response(resp, context).await?
+        } else {
+            resp.text().await.map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read DeepSeek response: {e}"))
+            })?
+        };
+        if !status.is_success() {
+            let message = if status.as_u16() == 402 {
+                "DeepSeek search failed: HTTP 402 — top up your DeepSeek account to continue."
+                    .to_string()
+            } else {
+                let truncated = truncate_error_body(&body.replace(&api_key, "[REDACTED]"));
+                format!(
+                    "DeepSeek search failed: HTTP {}: {truncated}",
+                    status.as_u16()
+                )
+            };
+            return Err(ToolError::execution_failed(message).into());
+        }
+        let parsed: Value = serde_json::from_str(&body).map_err(|e| {
+            ToolError::execution_failed(format!("Failed to parse DeepSeek response: {e}"))
+        })?;
+        Ok(parse_deepseek_results(&parsed, count))
     }
 
     /// Search via Bocha AI Search API (<https://bochaai.com>).
@@ -1800,7 +1862,30 @@ fn register_search_citations(response: &mut SearchResponse, context: &ToolContex
         } else {
             format!("Found {} result(s)", response.count)
         };
+        note_provider_native(
+            &mut response.message,
+            response.receipt.backend,
+            response.count,
+            unchecked_citations(&response.receipt.degraded),
+            response.receipt.requested.max_results,
+            response.unverified_synthesis.is_some(),
+        );
     }
+}
+
+fn deepseek_search_key(context: &ToolContext) -> Option<String> {
+    context
+        .search_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("DEEPSEEK_API_KEY")
+                .ok()
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+        })
 }
 
 /// Reject misconfiguration before cache lookup or network access.
@@ -1842,6 +1927,9 @@ fn preflight_search_provider(context: &ToolContext) -> Result<(), ToolError> {
         ),
         SearchProvider::Serply if !configured_key && !env_key("SERPLY_API_KEY") => not_configured(
             "Serply search is not configured: it requires an API key. Set `[search] api_key` in config.toml or the SERPLY_API_KEY env var.",
+        ),
+        SearchProvider::DeepSeek if deepseek_search_key(context).is_none() => not_configured(
+            "DeepSeek search is not configured: it requires an API key. Set `[search] api_key` in config.toml or the DEEPSEEK_API_KEY env var.",
         ),
         SearchProvider::Searxng
             if configured_search_base_url(context.search_base_url.as_deref()).is_none() =>
@@ -1892,6 +1980,7 @@ const fn default_backend_host(backend: BackendId) -> Option<&'static str> {
         BackendId::Volcengine => Some("ark.cn-beijing.volces.com"),
         BackendId::Sofya => Some("sofya.co"),
         BackendId::Serply => Some("api.serply.io"),
+        BackendId::DeepSeek => Some("api.deepseek.com"),
     }
 }
 
@@ -1925,6 +2014,17 @@ async fn finalize_search_response_for_context(
         .collect::<Vec<_>>();
     raw.results.truncate(usize::from(query.max_results));
     rerank(&mut raw.results);
+    let synthesis = take_provider_native_synthesis(&mut raw);
+    let (unverified, initial): (Vec<_>, Vec<_>) = initial.into_iter().partition(|reason| {
+        matches!(
+            reason,
+            DegradedReason::CitationUnverified { .. } | DegradedReason::CitationUnchecked { .. }
+        )
+    });
+    let unchecked = unverified
+        .iter()
+        .filter(|reason| matches!(reason, DegradedReason::CitationUnchecked { .. }))
+        .count();
     let proposal:Proposal=adapter::transform(crate::extension_host::StockOperation::WebFinalize,
         json!({"requested":{"recency":query.recency.is_some(),"domains":!query.domains.is_empty(),"locale":query.locale.is_some()},
             "capabilities":capabilities,"count":raw.results.len(),"degraded":initial,"domain_extra":domain_extra,"has_note":raw.note.is_some()}),context,budget).await?;
@@ -1970,11 +2070,19 @@ async fn finalize_search_response_for_context(
         )));
     }
     let count = raw.results.len();
-    let message = format!(
+    let mut message = format!(
         "{}{}{}",
         proposal.prefix,
         raw.note.as_deref().unwrap_or_default(),
         proposal.suffix
+    );
+    note_provider_native(
+        &mut message,
+        raw.backend,
+        count,
+        unchecked,
+        query.max_results,
+        synthesis.is_some(),
     );
     Ok(SearchResponse {
         query: query.query.clone(),
@@ -1982,13 +2090,14 @@ async fn finalize_search_response_for_context(
         count,
         message,
         results: raw.results,
+        unverified_synthesis: synthesis,
         receipt: SearchReceipt {
             backend: raw.backend,
             backend_detail: raw.backend_detail,
             requested: query,
             capabilities,
             honored: proposal.honored,
-            degraded: proposal.degraded,
+            degraded: proposal.degraded.into_iter().chain(unverified).collect(),
             latency_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
             cache_hit: false,
         },
@@ -2046,6 +2155,7 @@ fn finalize_search_response(
 
     raw.results.truncate(usize::from(query.max_results));
     rerank(&mut raw.results);
+    let synthesis = take_provider_native_synthesis(&mut raw);
     let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
     let receipt = SearchReceipt {
         backend: raw.backend,
@@ -2064,8 +2174,8 @@ fn finalize_search_response(
         (_, Some(note)) => format!("Found {count} result(s). {note}"),
         (_, None) => format!("Found {count} result(s)"),
     };
-    // The answer sits in the message; say right next to it when the provider
-    // cut it short (#6508).
+    // The answer sits in `unverified_synthesis`; the message still says when
+    // the provider cut it short (#6508).
     if let Some(cut) = receipt
         .degraded
         .iter()
@@ -2073,6 +2183,14 @@ fn finalize_search_response(
     {
         message.push_str(&format!("\n[{}]", cut.message()));
     }
+    note_provider_native(
+        &mut message,
+        receipt.backend,
+        count,
+        unchecked_citations(&receipt.degraded),
+        receipt.requested.max_results,
+        synthesis.is_some(),
+    );
 
     SearchResponse {
         query: query.query,
@@ -2080,8 +2198,53 @@ fn finalize_search_response(
         count,
         message,
         results: raw.results,
+        unverified_synthesis: synthesis,
         receipt,
     }
+}
+
+fn take_provider_native_synthesis(raw: &mut BackendSearch) -> Option<String> {
+    if raw.backend == BackendId::ProviderNative {
+        raw.note.take()
+    } else {
+        None
+    }
+}
+
+fn unchecked_citations(degraded: &[DegradedReason]) -> usize {
+    degraded
+        .iter()
+        .filter(|reason| matches!(reason, DegradedReason::CitationUnchecked { .. }))
+        .count()
+}
+
+fn note_provider_native(
+    message: &mut String,
+    backend: BackendId,
+    count: usize,
+    unchecked: usize,
+    requested: u8,
+    synthesis: bool,
+) {
+    if backend != BackendId::ProviderNative {
+        return;
+    }
+    if unchecked == 0 {
+        message.push_str(&format!(
+            "\n[provider-native search: {count} of {requested} requested source(s) passed link verification and appear in `results`; cite only those, by ref_id"
+        ));
+    } else {
+        let verified = count.saturating_sub(unchecked);
+        message.push_str(&format!(
+            "\n[provider-native search: {count} of {requested} requested source(s) appear in `results`; {verified} passed link verification and {unchecked} were not checked because the [network] policy needs approval for their hosts; cite only those, by ref_id"
+        ));
+    }
+    if synthesis {
+        message.push_str(
+            ". `unverified_synthesis` is the provider model's own summary: its claims and links were not checked and may name pages missing from `results`",
+        );
+    }
+    message.push(']');
 }
 
 pub(crate) fn apply_domain_constraints(
@@ -2270,6 +2433,19 @@ pub(crate) async fn run_backend_search(
                 tool.run_serply_search(&query.query, filters, max_results, timeout_ms, context)
                     .await?,
             ))
+        }
+        SearchProvider::DeepSeek => {
+            check_policy(context.network_policy.as_ref(), "api.deepseek.com")?;
+            Ok(BackendSearch {
+                backend: BackendId::DeepSeek,
+                source: "deepseek".to_string(),
+                backend_detail: None,
+                results: tool
+                    .run_deepseek_search(&query.query, max_results, timeout_ms, context)
+                    .await?,
+                degraded: Vec::new(),
+                note: None,
+            })
         }
         SearchProvider::Bing | SearchProvider::DuckDuckGo => {
             run_scrape_search(provider, query, timeout_ms, context).await
@@ -3043,6 +3219,30 @@ fn parse_serply_results(parsed: &Value, max_results: usize) -> Vec<WebSearchEntr
             })
         })
         .take(max_results)
+        .collect()
+}
+
+fn parse_deepseek_results(parsed: &Value, max_results: usize) -> Vec<SearchResult> {
+    parsed
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let title = first_non_empty_string(item, &["title"])?;
+            let url = first_non_empty_string(item, &["url"])?;
+            Some((
+                title,
+                url,
+                first_non_empty_string(item, &["snippet", "summary"]),
+                first_non_empty_string(item, &["date"]),
+            ))
+        })
+        .take(max_results)
+        .enumerate()
+        .map(|(index, (title, url, snippet, published))| {
+            SearchResult::new(index + 1, title, url, snippet, published)
+        })
         .collect()
 }
 
@@ -3836,6 +4036,10 @@ mod tests {
             ),
             (SearchProvider::Sofya, "https://sofya.co/v1/search"),
             (SearchProvider::Serply, "https://api.serply.io/v1/search"),
+            (
+                SearchProvider::DeepSeek,
+                "https://api.deepseek.com/v1/tools/search",
+            ),
         ];
 
         for (provider, expected) in cases {
@@ -5514,7 +5718,11 @@ mod tests {
                 knob: QueryKnob::Domains
             }
         )));
-        assert!(response.message.contains("Grounded answer."));
+        assert_eq!(
+            response.unverified_synthesis.as_deref(),
+            Some("Grounded answer.")
+        );
+        assert!(!response.message.contains("Grounded answer."));
     }
 
     fn native_backend_search(note: String, degraded: Vec<DegradedReason>) -> BackendSearch {
@@ -5566,7 +5774,12 @@ mod tests {
             native_backend_search(answer.clone(), Vec::new()),
             Instant::now(),
         );
-        assert!(response.message.ends_with("END OF ANSWER"));
+        assert!(
+            response
+                .unverified_synthesis
+                .as_deref()
+                .is_some_and(|synthesis| synthesis.ends_with("END OF ANSWER"))
+        );
         assert!(!response.message.contains("output limit"));
 
         let output = crate::tools::spec::ToolResult::json(&response).expect("json");
@@ -5654,7 +5867,8 @@ mod tests {
 
         assert_eq!(response.count, 1);
         assert_eq!(response.results[0].domain, "docs.example.com");
-        assert_eq!(response.message, "Found 1 result(s)");
+        assert!(response.message.starts_with("Found 1 result(s)\n"));
+        assert!(response.unverified_synthesis.is_none());
         assert!(response.receipt.degraded.iter().any(|reason| matches!(
             reason,
             DegradedReason::PostFiltered {

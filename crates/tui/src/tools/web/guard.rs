@@ -62,12 +62,35 @@ pub(crate) fn is_restricted_ip(ip: &IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_restricted_ip(&IpAddr::V4(v4));
             }
+            // A NAT64 gateway reaches the embedded IPv4 target, so the prefix
+            // must not hide a restricted address.
+            if let Some(v4) = nat64_ipv4(*v6)
+                && is_restricted_ip(&IpAddr::V4(v4))
+            {
+                return true;
+            }
             v6.is_loopback()
                 || v6.is_multicast()
                 || matches!(v6.segments(), [0xfc00..=0xfdff, ..]) // ULA fc00::/7
                 || matches!(v6.segments(), [0xfe80..=0xfebf, ..]) // Link-local fe80::/10
+                || matches!(v6.segments(), [0xfec0..=0xfeff, ..]) // Site-local fec0::/10
+                || matches!(v6.segments(), [0x2002, ..]) // 6to4 2002::/16
+                || matches!(v6.segments(), [0x2001, 0x0000, ..]) // Teredo 2001::/32
+                || matches!(v6.segments(), [0, 0, 0, 0, 0, 0, ..]) // IPv4-compatible ::a.b.c.d
         }
     }
+}
+
+/// The IPv4 target of a well-known-prefix NAT64 address (`64:ff9b::/96`).
+fn nat64_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let segments = v6.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6].iter().all(|s| *s == 0) {
+        let octets = v6.octets();
+        return Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
 }
 
 /// Validate that `url` is a safe fetch target under SSRF and network policy.
@@ -81,23 +104,35 @@ pub(crate) async fn validate_fetch_target(
     context: &ToolContext,
     tool: &str,
 ) -> Result<DnsPin, ToolError> {
+    let host = fetch_target_host(url)?;
+    validate_network_policy(&host, context, tool)?;
+    validate_fetch_destination(host, context.network_policy.as_ref(), tool, true).await
+}
+
+pub(crate) fn fetch_target_host(url: &reqwest::Url) -> Result<String, ToolError> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(ToolError::invalid_input(
             "only http:// and https:// URLs are supported",
         ));
     }
 
-    let host = url
-        .host_str()
+    url.host_str()
         .map(str::to_ascii_lowercase)
-        .ok_or_else(|| ToolError::invalid_input("URL must include a host"))?;
+        .ok_or_else(|| ToolError::invalid_input("URL must include a host"))
+}
 
-    validate_network_policy(&host, context, tool)?;
-
-    // SSRF protection: resolve hostname and reject private/link-local/loopback IPs.
-    // Prevents LLM-prompted requests to cloud metadata (169.254.169.254),
-    // localhost services, and internal networks.
-    if host == "localhost" || host == "localhost.localdomain" {
+pub(crate) async fn validate_fetch_destination(
+    host: String,
+    decider: Option<&NetworkPolicyDecider>,
+    tool: &str,
+    resolve: bool,
+) -> Result<DnsPin, ToolError> {
+    // SSRF protection: reject localhost names and private/link-local/loopback
+    // IP literals; when `resolve` is set, also resolve the hostname and reject
+    // restricted answers. Prevents LLM-prompted requests to cloud metadata
+    // (169.254.169.254), localhost services, and internal networks.
+    let bare = host.strip_suffix('.').unwrap_or(&host);
+    if bare == "localhost" || bare == "localhost.localdomain" || bare.ends_with(".localhost") {
         return Err(ToolError::permission_denied(
             "requests to localhost are not allowed",
         ));
@@ -117,6 +152,9 @@ pub(crate) async fn validate_fetch_target(
         }
         return Ok(None);
     }
+    if !resolve {
+        return Ok(None);
+    }
 
     let addrs = tokio::time::timeout(
         DNS_PREFLIGHT_TIMEOUT,
@@ -131,7 +169,7 @@ pub(crate) async fn validate_fetch_target(
     })?;
     let mut first_valid: Option<IpAddr> = None;
     for addr in addrs {
-        validate_dns_resolved_ip(&host, &addr.ip(), context.network_policy.as_ref(), tool)?;
+        validate_dns_resolved_ip(&host, &addr.ip(), decider, tool)?;
         if first_valid.is_none() {
             first_valid = Some(addr.ip());
         }

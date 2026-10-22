@@ -227,7 +227,7 @@ pub(crate) fn handle_bracketed_paste(app: &mut App, text: &str) {
     // so fast typing / IME commits / autocomplete bursts don't get
     // mis-classified as a paste.
     app.bracketed_paste_seen = true;
-    if app.is_history_search_active() {
+    if app.is_history_search_active() && app.view_stack.is_empty() {
         app.history_search_insert_str(text);
     } else if paste_text_into_provider_picker(app, text) || app.view_stack.handle_paste(text) {
         // Modal consumed the paste (e.g. provider picker key entry).
@@ -913,7 +913,65 @@ pub(crate) async fn handle_mcp_ui_action(
     let action_result = match action {
         crate::tui::app::McpUiAction::Diagnose { name } => {
             let receipt = mcp_server_diagnosis(app, &name);
+            if app.view_stack.extensions_is_top() {
+                open_text_pager(app, name.clone(), receipt.clone());
+            }
             report_mcp_login(app, receipt, StatusToastLevel::Info);
+            return;
+        }
+        crate::tui::app::McpUiAction::Validate => {
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            let configured = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp::load_config_with_workspace_and_plugins(&path, &workspace, plugins.as_ref())
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("MCP config read failed")));
+            let mut names: std::collections::BTreeSet<String> = app
+                .mcp_snapshot
+                .iter()
+                .flat_map(|snapshot| snapshot.servers.iter().map(|server| server.name.clone()))
+                .collect();
+            let mut sections = Vec::new();
+            let config_loaded = match configured {
+                Ok(config) => {
+                    names.extend(config.servers.into_keys());
+                    true
+                }
+                Err(err) => {
+                    sections.push(format!(
+                        "MCP config could not be loaded: {}. Fix it, then run /mcp reload.",
+                        mcp::format_mcp_error_for_display(&err)
+                    ));
+                    false
+                }
+            };
+            if app.mcp_reload_required {
+                sections.push(
+                    "MCP config changed since the live pool loaded. Run /mcp reload to apply it."
+                        .to_string(),
+                );
+            }
+            if names.is_empty() && config_loaded {
+                sections.push(app.tr(MessageId::ExtensionsMcpEmpty).into_owned());
+            }
+            sections.extend(names.iter().map(|name| mcp_server_diagnosis(app, name)));
+            let receipt = sections.join("\n\n");
+            if !app.view_stack.extensions_is_top() {
+                open_mcp_extensions(app);
+            }
+            open_text_pager(
+                app,
+                app.tr(MessageId::ConfigSectionMcp).into_owned(),
+                receipt.clone(),
+            );
+            add_mcp_message(app, receipt);
+            app.needs_redraw = true;
             return;
         }
         crate::tui::app::McpUiAction::Show => Ok(()),
@@ -1054,7 +1112,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 Err(_) => Err(anyhow::anyhow!("MCP import failed")),
             }
         }
-        crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
+        crate::tui::app::McpUiAction::Reload => Ok(()),
         // Dispatched before this match.
         crate::tui::app::McpUiAction::Retry { .. } => Ok(()),
     };
@@ -1263,13 +1321,19 @@ pub(crate) fn handle_shell_job_action(app: &mut App, action: crate::tui::app::Sh
         }
         crate::tui::app::ShellJobAction::Cancel { id } => {
             match manager.kill_for_session(&active_session_id, &id) {
-                Ok(result) => add_shell_job_message(app, format_shell_poll(&result)),
+                Ok(result) => {
+                    manager.mark_cancel_reported(&result);
+                    add_shell_job_message(app, format_shell_poll(&result));
+                }
                 Err(err) => add_shell_job_message(app, format!("Command cancel failed: {err}")),
             }
         }
         crate::tui::app::ShellJobAction::CancelAll => {
             match manager.kill_running_for_session(&active_session_id) {
                 Ok(results) => {
+                    for result in &results {
+                        manager.mark_cancel_reported(result);
+                    }
                     let count = results.len();
                     if count == 0 {
                         add_shell_job_message(app, "No running commands to cancel.".to_string());
@@ -1971,9 +2035,7 @@ pub(crate) async fn handle_view_events(
                         // order (drop = engine/UI desync). A wedge is possible
                         // only while a saturated engine finishes its turn.
                         if respawn {
-                            let _ = engine_handle.send(Op::Shutdown).await;
-                            *engine_handle =
-                                spawn_tui_engine(build_engine_config(app, config), config);
+                            replace_tui_engine(app, config, engine_handle).await;
                         } else {
                             let _ = engine_handle
                                 .send(Op::SetModel {
@@ -2563,8 +2625,13 @@ pub(crate) async fn handle_view_events(
                 // profile cannot block saving a current one. Malformed TOML,
                 // unreadable files, and invalid ids still fail closed because
                 // then we cannot prove there is no collision.
-                let existing_profiles =
-                    crate::fleet::profile::load_agent_profile_identities_from_dir(&profile_dir);
+                let existing_profiles = if scope
+                    == crate::fleet::profile::FleetProfileScope::Project
+                {
+                    crate::fleet::profile::load_workspace_agent_profile_identities(&app.workspace)
+                } else {
+                    crate::fleet::profile::load_agent_profile_identities_from_dir(&profile_dir)
+                };
                 if let Err(err) = &existing_profiles {
                     let message = tr(app.ui_locale, MessageId::FleetProfileIdentityVerifyFailed)
                         .replace("{error}", &format!("{err:#}"));
@@ -3037,13 +3104,7 @@ pub(crate) async fn handle_view_events(
                 refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerClaudeOAuthRequested => {
-                let switched =
-                    run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
-                complete_provider_picker_onboarding_if_switched(
-                    app,
-                    ProviderKind::Anthropic,
-                    switched,
-                );
+                app.pending_claude_login = Some(true);
             }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 let switched =

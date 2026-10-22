@@ -4,6 +4,7 @@ mod cloud;
 mod config_bundles;
 mod credential_handoff;
 mod dispatch;
+mod hashing;
 mod metrics;
 #[cfg(not(target_env = "ohos"))]
 mod update;
@@ -15,7 +16,6 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use codewhale_agent::ModelRegistry;
 use codewhale_app_server::RuntimeControlFrontend;
 use codewhale_config::credentials::{
     clear_provider_api_key_from_config, provider_slot, set_provider_api_key,
@@ -193,6 +193,10 @@ enum Commands {
     /// Run an interactive or non-interactive task.
     Run(RunArgs),
     /// Run Codewhale diagnostics.
+    #[command(
+        override_usage = "codewhale doctor [OPTIONS]",
+        after_help = codewhale_tui::doctor_options_help()
+    )]
     Doctor(TuiPassthroughArgs),
     /// Summarize local session failure signals without raw content.
     #[command(
@@ -246,7 +250,8 @@ Run options such as --model, --provider, --config and --profile work before or a
   codewhale exec --model MODEL \"explain this function\"
 
 Common forwarded flags:
-  --auto                           Enable tool-backed agent mode with auto-approvals
+  --auto                           Enable tools with automatic approvals and Full Access by default
+  --sandbox <POLICY>               Override the sandbox policy for this run
   --json                           Emit summary JSON
   --resume <SESSION_ID>            Resume a previous session by ID or prefix
   --session-id <SESSION_ID>        Resume a previous session by ID or prefix
@@ -254,9 +259,17 @@ Common forwarded flags:
   --output-format <FORMAT>         Output format: text or stream-json
   --hooks                          Opt in to configured hooks (tool_call_before, shell_env)
 
-Plain `codewhale exec` is a one-shot model response. Use `--auto` for
-non-interactive filesystem/shell tool use, matching the supported automation
-path used by stream-json wrappers.
+Plain `codewhale exec` is a one-shot model response: one Engine turn with the
+same system prompt as every other run, and no tools. Use `--auto` for
+non-interactive agent-with-tools execution. Tools are offered only with
+`--auto`, `--yolo`, `--allowed-tools`, or when resuming a session; limits such
+as `--max-turns`, `--disallowed-tools` or `--sandbox`, and the output format,
+never add tools. A reply cut off at the provider's output limit is continued
+in the same turn, at most 8 model steps unless `--max-turns` says otherwise.
+--auto defaults to Full Access: no shell sandbox and trust mode on. Use --sandbox workspace-write to keep the shell sandbox and file-tool workspace restrictions; stricter configured policies also apply. A denied sandbox retry requires --allow-sandbox-elevation or --sandbox danger-full-access.
+Any --sandbox other than danger-full-access (or an equivalent sandbox_mode in config) disables trust mode.
+Runs that offer tools, stream-json runs, and resumed sessions are saved for codewhale sessions, exec --continue, and codewhale receipts <id>. Plain answer-only text/--json runs are not saved unless compaction needs recovery.
+Put flags before the prompt. Put -- before a prompt starting with - or containing literal exec flags.
 ")]
     Exec(TuiPassthroughArgs),
     /// Manage durable Agent fleet runs.
@@ -361,9 +374,9 @@ New integrations should prefer `codewhale app-server`.")]
         after_help = "The browser receives a one-time loopback bootstrap capability, never the Runtime token.\nThe capability is exchanged for a bounded, process-local HttpOnly, SameSite=Strict web session and then invalidated."
     )]
     Web(WebArgs),
-    /// Sign in to your Codewhale account to manage provider API keys in one place.
+    /// Sign in to an existing Codewhale account; new accounts are not open.
     #[command(
-        after_help = "Create an account at https://app.codewhale.net/register or sign in through the browser.\nSave a provider key with `codewhale account keys set deepseek`, then choose Codewhale in /provider to use it across your signed-in devices.\nSigning in does not upload existing local keys. Local use does not require an account."
+        after_help = "New Codewhale accounts are not open, and local use does not require one.\nKeep provider keys on this machine with /provider or `codewhale auth set --provider <provider>`.\nSigning in does not upload existing local keys."
     )]
     Login(LoginArgs),
     /// Remove saved authentication state (every provider key, OAuth login,
@@ -371,10 +384,10 @@ New integrations should prefer `codewhale app-server`.")]
     Logout(LogoutArgs),
     /// Manage authentication credentials and provider mode.
     Auth(AuthArgs),
-    /// Manage your Codewhale account and centrally stored provider keys.
+    /// Manage an existing Codewhale account; new accounts are not open.
     #[command(visible_alias = "cloud")]
     Account(cloud::CloudArgs),
-    /// Offload a coding agent to the Codewhale cloud through your account.
+    /// Run a task on a Codewhale cloud computer (not available: cloud computers and accounts are paused for new users).
     Dispatch(dispatch::DispatchArgs),
     /// Run MCP server mode over stdio.
     McpServer,
@@ -2175,6 +2188,38 @@ fn apply_runtime_set_overrides(cli: &mut Cli) -> Result<()> {
     Ok(())
 }
 
+fn shows_whats_new(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Doctor(_)
+            | Commands::Models(_)
+            | Commands::Sessions(_)
+            | Commands::Receipts(_)
+            | Commands::Setup(_)
+            | Commands::Init(_)
+            | Commands::Install(_)
+            | Commands::Features(_)
+            | Commands::Integrations(_)
+            | Commands::Mcp(_)
+            | Commands::Config(_)
+            | Commands::Model(_)
+            | Commands::Metrics(_)
+            | Commands::Providers(_)
+            | Commands::Account(_)
+            | Commands::Login(_)
+            | Commands::Logout(_)
+            | Commands::Update(_)
+    )
+}
+
+fn argv_requests_machine_output(argv: &[std::ffi::OsString]) -> bool {
+    argv.iter()
+        .skip(1)
+        .filter_map(|arg| arg.to_str())
+        .take_while(|arg| *arg != "--")
+        .any(|arg| (arg.starts_with("--") && arg.contains("json")) || arg.starts_with("json"))
+}
+
 /// `--output-mode` is retired (#6516): accepted so old scripts keep running,
 /// but a caller who passes it is told it does nothing.
 fn retired_output_mode_warning(cli: &Cli) -> Option<&'static str> {
@@ -2333,6 +2378,15 @@ fn run() -> Result<()> {
     // command (or legacy credential migration) can save.
     if matches!(command, Some(Commands::Config(_))) {
         apply_per_run_overrides(&mut store, &cli.overrides)?;
+    }
+    if command.as_ref().is_some_and(shows_whats_new)
+        && !argv_requests_machine_output(&argv)
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+        && let Some(notice) =
+            codewhale_tui::whats_new::plain_cli_notice(store.config.extras.get("update"))
+    {
+        eprintln!("{notice}\n");
     }
 
     match command {
@@ -5729,13 +5783,12 @@ fn provider_source_label(source: ProviderSource) -> String {
 }
 
 fn canonical_model_for_set(model: &str) -> &str {
-    match model.to_ascii_lowercase().as_str() {
-        "pro" | "deepseek-v4pro" => "deepseek-v4-pro",
-        "flash" | "deepseek-v4flash" => "deepseek-v4-flash",
-        "flash-vision" | "deepseek-v4flashvisionexp" => "deepseek-v4-flash-vision-exp",
-        "auto" => "auto",
-        _ => model,
+    let lower = model.to_ascii_lowercase();
+    if lower == "auto" {
+        return "auto";
     }
+    codewhale_config::catalog::reviewed::compatibility_alias("canonical_model_name", &lower)
+        .unwrap_or(model)
 }
 
 /// The provider (and its endpoint) whose model `model set` writes.
@@ -5780,20 +5833,15 @@ fn run_model_command(
     match command {
         ModelCommand::List { provider } => {
             let filter = model_command_provider_hint(provider, top_level_provider);
-            codewhale_tui::maybe_load_persisted_cache();
-            let providers: &[ProviderKind] = match &filter {
-                Some(provider) => std::slice::from_ref(provider),
-                None => ProviderKind::all(),
-            };
-            for provider in providers {
-                for model in codewhale_tui::all_catalog_models_for_provider(*provider) {
+            for (provider, models) in codewhale_tui::route_preferences::list_models(store, filter)?
+            {
+                for model in models {
                     println!("{model} ({})", provider.as_str());
                 }
             }
             Ok(())
         }
         ModelCommand::Resolve { model, provider } => {
-            let registry = ModelRegistry::default();
             // Only `model resolve --provider X` is a hypothetical. The
             // top-level `--provider` is the route this process is actually on,
             // and it is already folded into `resolved_runtime` — treating it as
@@ -5837,7 +5885,48 @@ fn run_model_command(
                     "requested: {}",
                     if source.is_explicit() { model } else { "" }
                 );
-                println!("resolved: {model}");
+                let kind = ProviderKind::parse(provider).unwrap_or(ProviderKind::Custom);
+                let identity = if kind == ProviderKind::Custom {
+                    store.config.named_custom_provider_id().unwrap_or(provider)
+                } else {
+                    provider
+                };
+                let base = if kind == resolved_runtime.provider {
+                    resolved_runtime.base_url.clone()
+                } else {
+                    store
+                        .config
+                        .providers
+                        .for_provider(kind)
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| kind.provider().default_base_url().into())
+                };
+                let candidate = codewhale_tui::route_preferences::resolve_model(
+                    store.path(),
+                    identity,
+                    &base,
+                    Some(model),
+                );
+                println!(
+                    "resolved: {}",
+                    candidate
+                        .as_ref()
+                        .map_or(model, |route| route.wire_model_id().as_str())
+                );
+                match candidate.as_ref() {
+                    Ok(route) => {
+                        if let Some(canonical) = route.canonical_model() {
+                            println!("canonical_model: {}", canonical.as_str());
+                        }
+                        println!("limits: {}", serde_json::to_string(&route.limits())?);
+                        println!(
+                            "capabilities: {}",
+                            serde_json::to_string(&route.capabilities())?
+                        );
+                    }
+                    Err(error) => println!("route_error: {error}"),
+                }
                 println!("provider: {provider}");
                 println!("used_fallback: {}", !source.is_explicit());
                 println!(
@@ -5859,12 +5948,47 @@ fn run_model_command(
             // inside a named route. The subcommand provider wins; otherwise
             // the configured runtime provider remains authoritative. Model
             // text never authorizes switching providers or credential slots.
-            let provider_hint = subcommand_provider.or(Some(resolved_runtime.provider));
-            let resolved = registry.resolve(queried, provider_hint)?;
-            println!("requested: {}", resolved.requested.unwrap_or_default());
-            println!("resolved: {}", resolved.resolved.id);
-            println!("provider: {}", resolved.resolved.provider.as_str());
-            println!("used_fallback: {}", resolved.used_fallback);
+            let provider = subcommand_provider.unwrap_or(resolved_runtime.provider);
+            let identity = if provider == ProviderKind::Custom && subcommand_provider.is_none() {
+                store
+                    .config
+                    .named_custom_provider_id()
+                    .unwrap_or(provider.as_str())
+            } else {
+                provider.as_str()
+            };
+            let base = if provider == resolved_runtime.provider {
+                resolved_runtime.base_url.clone()
+            } else {
+                store
+                    .config
+                    .providers
+                    .for_provider(provider)
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| provider.provider().default_base_url().into())
+            };
+            let candidate = codewhale_tui::route_preferences::resolve_model(
+                store.path(),
+                identity,
+                &base,
+                queried,
+            )?;
+            println!("requested: {}", queried.unwrap_or_default());
+            println!("resolved: {}", candidate.wire_model_id().as_str());
+            println!("provider: {identity}");
+            println!(
+                "used_fallback: {}",
+                queried.is_none() || queried == Some("auto")
+            );
+            if let Some(canonical) = candidate.canonical_model() {
+                println!("canonical_model: {}", canonical.as_str());
+            }
+            println!("limits: {}", serde_json::to_string(&candidate.limits())?);
+            println!(
+                "capabilities: {}",
+                serde_json::to_string(&candidate.capabilities())?
+            );
             println!(
                 "provider_source: {}",
                 if subcommand_provider.is_some() {
@@ -7747,10 +7871,7 @@ verbosity = "concise"
     #[test]
     fn model_set_canonicalizes_deepseek_vision_aliases() {
         for alias in ["flash-vision", "deepseek-v4flashvisionexp"] {
-            assert_eq!(
-                canonical_model_for_set(alias),
-                "deepseek-v4-flash-vision-exp"
-            );
+            assert_eq!(canonical_model_for_set(alias), "deepseek-flash");
         }
         assert_eq!(
             canonical_model_for_set("deepseek-v4-flash-vision-exp"),
@@ -9778,8 +9899,8 @@ verbosity = "concise"
             "login help must describe account sign-in: {help}"
         );
         assert!(
-            help.contains("manage provider API keys"),
-            "login help must explain the account's immediate benefit: {help}"
+            help.contains("New Codewhale accounts are not open"),
+            "login help must not offer accounts that cannot be created: {help}"
         );
         assert!(
             help.contains("Signing in does not upload existing local keys"),
@@ -13160,6 +13281,19 @@ verbosity = "concise"
         assert!(exec.contains("work before or after exec"), "{exec}");
         assert!(exec.contains("codewhale --model MODEL exec"), "{exec}");
         assert!(exec.contains("codewhale exec --model MODEL"), "{exec}");
+        assert!(exec.contains("--sandbox <POLICY>"), "{exec}");
+        assert!(exec.contains("Full Access"), "{exec}");
+        assert!(
+            exec.contains("no shell sandbox and trust mode on"),
+            "{exec}"
+        );
+        assert!(
+            exec.contains("Any --sandbox other than danger-full-access"),
+            "{exec}"
+        );
+        assert!(exec.contains("equivalent sandbox_mode in config"), "{exec}");
+        assert!(exec.contains("Put flags before the prompt"), "{exec}");
+        assert!(exec.contains("codewhale receipts <id>"), "{exec}");
         let rc = help_for(&["codewhale", "rc", "--help"]);
         assert!(rc.contains("hand it to the Codewhale web app"), "{rc}");
     }

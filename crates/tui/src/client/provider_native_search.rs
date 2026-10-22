@@ -313,7 +313,8 @@ enum ResponsesSearchDialect {
 fn search_prompt(request: &ProviderNativeSearchRequest) -> String {
     format!(
         "Search the web for the following query and answer only from web sources. \
-         Use concise prose with citations and prefer at most {} distinct sources.\n\n{}",
+         Use concise prose. Cite as many distinct sources as support the answer, up to {}, \
+         each by the exact URL of a page you retrieved; never guess or construct a URL.\n\n{}",
         request.max_results, request.query
     )
 }
@@ -690,7 +691,10 @@ fn citations_from_text(text: &str) -> Vec<ProviderNativeCitation> {
 fn fallback_title(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .and_then(|parsed| {
+            let host = parsed.host_str()?;
+            Some(format!("{host}{}", parsed.path().trim_end_matches('/')))
+        })
         .unwrap_or_else(|| "Web source".to_string())
 }
 

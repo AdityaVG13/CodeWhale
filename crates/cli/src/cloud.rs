@@ -1498,7 +1498,7 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
             return Err(response_error(&response));
         }
         if response.body.len() as u64 != metadata.size
-            || crate::update::sha256_hex(&response.body) != metadata.sha256
+            || crate::hashing::sha256_hex(&response.body) != metadata.sha256
         {
             bail!(
                 "The downloaded file did not match its saved size and SHA-256; nothing was written"
@@ -1959,7 +1959,7 @@ fn dispatch_stamp(objective: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let seed = format!("{nanos}:{}:{objective}", std::process::id());
-    crate::update::sha256_hex(seed.as_bytes())[..24].to_string()
+    crate::hashing::sha256_hex(seed.as_bytes())[..24].to_string()
 }
 
 pub(crate) enum AccountDispatch {

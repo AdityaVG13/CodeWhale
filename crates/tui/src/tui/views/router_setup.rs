@@ -489,7 +489,7 @@ fn custom_router_help(config: &Config, locale: Locale) -> String {
 [auto.router]\n\
 kind = \"chat\"            # or \"decision\" for Jev\n\
 provider = \"deepseek\"    # decision: \"openrouter\" or \"typesafe\"\n\
-model = \"deepseek-v4-flash\"\n\
+model = \"deepseek-flash\"\n\
 thinking = \"off\"         # chat routers only\n\
 timeout_secs = 4\n\
 # min_confidence = 0.5     # decision routers only\n\n\
@@ -885,7 +885,7 @@ mod tests {
             .expect("fast writes a table");
         assert_eq!(fast.kind.as_deref(), Some("chat"));
         assert_eq!(fast.provider.as_deref(), Some("deepseek"));
-        assert_eq!(fast.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(fast.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(fast.thinking.as_deref(), Some("off"));
 
         assert!(matches!(

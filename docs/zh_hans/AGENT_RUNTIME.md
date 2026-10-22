@@ -78,7 +78,7 @@ Workflow IR 另有一个默认的结构校验上限：最多五层嵌套节点�
 
 ## 事件词汇
 
-Runtime 执行账本持久化的是 worker 自己的事件流，而不是另一套模拟出来的分类。兼容性 API 和类型仍以 `Fleet...` 前缀暴露它。`codewhale exec --output-format stream-json` 会输出 `{"type": "content" | "tool_use" | "tool_result" | "sandbox_denied" | "workflow_event" | "session_capture" | "turn_usage" | "metadata" | "done" | "error"}` 形式的行，它们映射到 Runtime 账本的兼容类型 `FleetWorkerEventPayload`（`RunningTool`、`WorkflowEvent`、`Running`、`Completed`、`Failed` 等）。`workflow_event` 在 Workflow 运行期间携带带类型的 run/phase/task/gate 回执，并作为带类型的 `WorkflowEvent` 保留在 Runtime 执行账本中；终态的 `done` 或 `error` 仍由外层 Runtime worker 负责。一套词汇，两个表面。
+Runtime 执行账本持久化的是 worker 自己的事件流，而不是另一套模拟出来的分类。兼容性 API 和类型仍以 `Fleet...` 前缀暴露它。`codewhale exec --output-format stream-json` 会输出 `{"type": "content" | "tool_use" | "tool_result" | "agent_spawned" | "sandbox_denied" | "workflow_event" | "session_capture" | "service_released" | "turn_usage" | "metadata" | "status" | "request_image_window" | "done" | "error"}` 形式的行，它们映射到 Runtime 账本的兼容类型 `FleetWorkerEventPayload`（`RunningTool`、`WorkflowEvent`、`Running`、`Completed`、`Failed` 等）。`workflow_event` 在 Workflow 运行期间携带带类型的 run/phase/task/gate 回执，并作为带类型的 `WorkflowEvent` 保留在 Runtime 执行账本中；终态的 `done` 或 `error` 仍由外层 Runtime worker 负责。一套词汇，两个表面。
 
 `session_capture` 在 exec 运行把自己的对话记录保存为会话时发出一次，并且只在一个位置携带可恢复的 id：
 
@@ -104,6 +104,7 @@ Runtime 执行账本持久化的是 worker 自己的事件流，而不是另一�
 
 - `turn` 是这次 exec 运行内该模型调用的序号，从 1 开始；`input_tokens`、`output_tokens` 和 `duration_ms` 始终存在。
 - 提供商没有报告的可选 token 字段会被**省略**——绝不输出为 null，也绝不用 0 回填。字段名与终态 `metadata` 回执保持一致：`prompt_cache_hit_tokens` 是提供商的缓存读取计数（Anthropic 的 `cache_read_input_tokens`），`prompt_cache_write_tokens` 是缓存创建计数（`cache_creation_input_tokens`）。`reasoning_tokens` 只出现在会报告它的提供商路径上（OpenAI 兼容的 `completion_tokens_details` / Responses 的 `output_tokens_details`；Anthropic 不报告思考 token 计数）。`reasoning_replay_tokens` 是对 DeepSeek V4 交错思考（interleaved-thinking）重放的客户端估算值。
+- `finish_reason` 是该步骤提供商报告的停止原因（例如 `stop`、`tool_calls` 或 `length`），提供商未报告时省略。
 - 当提供商对某次调用完全没有报告用量时，该次调用的整个事件都会被跳过。做延迟/收敛分析时，应当对 `turn_usage` 事件求和，而不是根据墙钟时间去推断每一步的 token；终态 `metadata` 回执仍然携带累计总数。
 
 ## 与 Claude Code 的收敛（#2972）

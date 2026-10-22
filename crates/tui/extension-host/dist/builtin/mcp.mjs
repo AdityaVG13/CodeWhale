@@ -7805,7 +7805,7 @@ var OAuthTokenRevocationRequestSchema = object({
   token_type_hint: string2().optional()
 }).strip();
 
-// node_modules/@modelcontextprotocol/client/dist/src-xKF0PJN-.mjs
+// node_modules/@modelcontextprotocol/client/dist/src-WCy6ifGf.mjs
 var BRANDS = /* @__PURE__ */ Symbol.for("mcp.sdk.errorBrands");
 function stampErrorBrands(instance, ctor) {
   const brands = /* @__PURE__ */ new Set();
@@ -10052,7 +10052,8 @@ function build() {
     ListResourceTemplatesResultResponseSchema: wireResultResponse(ListResourceTemplatesResultSchema$1),
     ReadResourceResultResponseSchema: wireResultResponse(union([ReadResourceResultSchema$1, InputRequiredResultSchema])),
     CompleteResultResponseSchema: wireResultResponse(CompleteResultSchema$1),
-    DiscoverResultResponseSchema: wireResultResponse(DiscoverResultSchema$1)
+    DiscoverResultResponseSchema: wireResultResponse(DiscoverResultSchema$1),
+    SubscriptionsListenResultResponseSchema: wireResultResponse(SubscriptionsListenResultSchema$1)
   };
 }
 var memo2;
@@ -10538,6 +10539,9 @@ function isSpecRequestMethod(method) {
 }
 function isSpecNotificationMethod(method) {
   return ALL_CODECS.some((codec) => codec.hasNotificationMethod(method));
+}
+function isExtensionReusedRequestMethod(method) {
+  return method === "tasks/get" || method === "tasks/cancel";
 }
 var ALL_CODECS = [rev2025Codec, rev2026Codec];
 var schemas_exports2 = /* @__PURE__ */ __exportAll({
@@ -11580,6 +11584,8 @@ var Protocol = class {
   _transport;
   _requestMessageId = 0;
   _requestHandlers = /* @__PURE__ */ new Map();
+  /** Methods registered with an explicit schema; the era gate in `_onrequest` reads it for the Tasks extension names. */
+  _customSchemaRequestMethods = /* @__PURE__ */ new Set();
   _requestHandlerAbortControllers = /* @__PURE__ */ new Map();
   _notificationHandlers = /* @__PURE__ */ new Map();
   _responseHandlers = /* @__PURE__ */ new Map();
@@ -11863,7 +11869,7 @@ var Protocol = class {
         return;
       }
     }
-    if (isSpecRequestMethod(request.method) && !codec.hasRequestMethod(request.method)) {
+    if (isSpecRequestMethod(request.method) && !codec.hasRequestMethod(request.method) && !(isExtensionReusedRequestMethod(request.method) && this._customSchemaRequestMethods.has(request.method))) {
       sendErrorResponse(ProtocolErrorCode.MethodNotFound, "Method not found");
       return;
     }
@@ -11996,8 +12002,11 @@ var Protocol = class {
   }
   request(request, schemaOrOptions, maybeOptions) {
     const codec = this._resolveOutboundCodec(request.method);
+    if (isStandardSchema(schemaOrOptions)) {
+      if (!isExtensionReusedRequestMethod(request.method)) this._assertOutboundRequestInEra(codec, request.method);
+      return this._requestWithSchemaViaCodec(codec, request, schemaOrOptions, maybeOptions);
+    }
     this._assertOutboundRequestInEra(codec, request.method);
-    if (isStandardSchema(schemaOrOptions)) return this._requestWithSchemaViaCodec(codec, request, schemaOrOptions, maybeOptions);
     const validate2 = codecResultValidator(codec, request.method);
     if (validate2 === void 0) throw new TypeError(`'${request.method}' is not a spec method; pass a result schema as the second argument to request().`);
     return this._requestWithSchemaViaCodec(codec, request, validate2, schemaOrOptions);
@@ -12241,6 +12250,8 @@ var Protocol = class {
       return maybeHandler(parsed.data, ctx);
     };
     else throw new TypeError("setRequestHandler: handler is required");
+    if (typeof schemasOrHandler === "function") this._customSchemaRequestMethods.delete(method);
+    else this._customSchemaRequestMethods.add(method);
     this._requestHandlers.set(method, this._wrapHandler(method, stored));
   }
   /**
@@ -12270,6 +12281,7 @@ var Protocol = class {
   */
   removeRequestHandler(method) {
     this._requestHandlers.delete(method);
+    this._customSchemaRequestMethods.delete(method);
   }
   /**
   * Asserts that a request handler has not already been set for the given method, in preparation for a new one being automatically installed.
@@ -12499,6 +12511,67 @@ function createFetchWithInit(baseFetch = fetch, baseInit) {
       } : baseInit.headers
     });
   };
+}
+var REDIRECT_STATUSES = /* @__PURE__ */ new Set([
+  301,
+  302,
+  303,
+  307,
+  308
+]);
+var MAX_REDIRECTS = 5;
+function isWithinOrigin(from, to) {
+  if (from.protocol === to.protocol && from.host === to.host) return true;
+  return from.protocol === "http:" && to.protocol === "https:" && from.hostname === to.hostname && !from.port && !to.port;
+}
+function redirectTarget(url2, response) {
+  const location = REDIRECT_STATUSES.has(response.status) ? response.headers?.get("location") : void 0;
+  if (!location) return void 0;
+  try {
+    return new URL(location, url2);
+  } catch {
+    return;
+  }
+}
+var leftToFetch = /* @__PURE__ */ new WeakSet();
+function fetchLeavingRedirects(baseFetch) {
+  const copy = (url2, init) => baseFetch(url2, init);
+  leftToFetch.add(copy);
+  return copy;
+}
+function fetchWithinOrigin(baseFetch) {
+  if (leftToFetch.has(baseFetch)) return baseFetch;
+  return async (url2, init) => {
+    if (init?.redirect === "error" || init?.redirect === "manual") return baseFetch(url2, init);
+    const method = (init?.method ?? "GET").toUpperCase();
+    let current = url2;
+    for (let followed = 0; ; followed++) {
+      const response = await baseFetch(current, {
+        ...init,
+        redirect: "manual"
+      });
+      const target = redirectTarget(current, response);
+      if (!target || followed === MAX_REDIRECTS) return response;
+      const from = new URL(current);
+      const keepsMethod = method === "GET" || response.status === 307 || response.status === 308;
+      const keepsUserinfo = !(target.username || target.password) || target.username === from.username && target.password === from.password;
+      if (!keepsMethod || !keepsUserinfo || !isWithinOrigin(from, target)) return response;
+      await response.text?.().catch(() => {
+      });
+      current = target;
+    }
+  };
+}
+function unfollowedRedirect(url2, response) {
+  if (response.type === "opaqueredirect") return "Redirect not followed: this runtime does not expose where it points";
+  const target = redirectTarget(response.url || url2, response);
+  if (!target) return void 0;
+  target.username = target.password = target.search = target.hash = "";
+  if (target.protocol === "http:" && new URL(response.url || url2).protocol === "https:") {
+    target.protocol = "https:";
+    return `Redirect from https to plain http not followed; try ${target.href} as the endpoint`;
+  }
+  return `Redirect to ${target.href} not followed; use that URL as the endpoint if it is the intended server`;
 }
 
 // node_modules/@modelcontextprotocol/client/dist/ajvProvider-97rDpkRx.mjs
@@ -20619,12 +20692,13 @@ async function discoverOAuthProtectedResourceMetadata(serverUrl, opts, fetchFn =
   return OAuthProtectedResourceMetadataSchema.parse(await response.json());
 }
 async function fetchWithCorsRetry(url2, headers, fetchFn = fetch) {
+  const withinOrigin = fetchWithinOrigin(fetchFn);
   try {
-    return await fetchFn(url2, { headers });
+    return await withinOrigin(url2, { headers });
   } catch (error2) {
     if (!(error2 instanceof TypeError) || !CORS_IS_POSSIBLE) throw error2;
     if (headers) try {
-      return await fetchFn(url2, {});
+      return await withinOrigin(url2, {});
     } catch (retryError) {
       if (!(retryError instanceof TypeError)) throw retryError;
       return;
@@ -20642,7 +20716,7 @@ async function tryMetadataDiscovery(url2, protocolVersion, fetchFn = fetch) {
 function shouldAttemptFallback(response, pathname) {
   if (!response) return true;
   if (pathname === "/") return false;
-  return response.status >= 400 && response.status < 500 || response.status === 502;
+  return !response.ok && response.status < 500 || response.status === 502;
 }
 async function discoverMetadataWithFallback(serverUrl, wellKnownType, fetchFn, opts) {
   const issuer = new URL(serverUrl);
@@ -20699,7 +20773,7 @@ async function discoverAuthorizationServerMetadata(authorizationServerUrl, { fet
     if (!response.ok) {
       await response.text?.().catch(() => {
       });
-      if (response.status >= 400 && response.status < 500 || response.status === 502) continue;
+      if (response.status < 500 || response.status === 502) continue;
       throw new Error(`HTTP ${response.status} trying to load ${type === "oauth" ? "OAuth" : "OpenID provider"} metadata from ${endpointUrl}`);
     }
     const parsed = type === "oauth" ? OAuthMetadataSchema.parse(await response.json()) : OpenIdProviderDiscoveryMetadataSchema.parse(await response.json());
@@ -20780,7 +20854,7 @@ async function executeTokenRequest(authorizationServerUrl, { metadata, tokenRequ
       htm: "POST",
       htu: tokenUrl
     }));
-    return (fetchFn ?? fetch)(tokenUrl, {
+    return fetchWithinOrigin(fetchFn ?? fetch)(tokenUrl, {
       method: "POST",
       headers: requestHeaders,
       body: tokenRequestParams
@@ -20864,7 +20938,7 @@ async function registerClient(authorizationServerUrl, { metadata, clientMetadata
     ...clientMetadata,
     ...scope === void 0 ? {} : { scope }
   };
-  const response = await (fetchFn ?? fetch)(registrationUrl, {
+  const response = await fetchWithinOrigin(fetchFn ?? fetch)(registrationUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(submittedMetadata)
@@ -21369,6 +21443,11 @@ function classifyProbeOutcome(outcome, context) {
       return classifyHttpError(outcome, context);
     case "network-error":
       return classifyNetworkError(outcome.error, context);
+    case "unusable-reply":
+      return {
+        kind: "error",
+        error: new SdkError(SdkErrorCode.EraNegotiationFailed, `Version negotiation probe failed: the server answered with an unusable reply (${describeError(outcome.error)})`, { cause: outcome.error }, { cause: outcome.error })
+      };
     case "auth-required":
       return {
         kind: "error",
@@ -21659,6 +21738,10 @@ function buildProbeRequest(id, protocolVersion, clientInfo, capabilities) {
     }) }
   };
 }
+function isUnusableReplyError(error2) {
+  if (error2 instanceof SdkError && error2.code === SdkErrorCode.ClientHttpUnexpectedContent) return true;
+  return error2 instanceof Error && error2.name === "SyntaxError";
+}
 function normalizeReply(reply, timeoutMs) {
   switch (reply.kind) {
     case "response":
@@ -21684,6 +21767,10 @@ function normalizeReply(reply, timeoutMs) {
           statusText: error2.data.statusText
         };
       }
+      if (isUnusableReplyError(error2)) return {
+        kind: "unusable-reply",
+        error: error2
+      };
       return {
         kind: "network-error",
         error: error2
@@ -23305,6 +23392,7 @@ var SSEClientTransport = class {
   _skipIssuerMetadataValidation;
   _fetch;
   _fetchWithInit;
+  _redirectPolicy;
   _dpop;
   _protocolVersion;
   onclose;
@@ -23326,9 +23414,21 @@ var SSEClientTransport = class {
         this._fetch = this._dpop(opts.fetch ?? fetch);
       }
     } else this._authProvider = opts?.authProvider;
+    this._redirectPolicy = opts?.redirectPolicy;
     this._fetchWithInit = createFetchWithInit(opts?.fetch, opts?.requestInit);
+    if (this._redirectPolicy === "follow") this._fetchWithInit = fetchLeavingRedirects(this._fetchWithInit);
   }
   _last401Response;
+  _connectAuthRetried = false;
+  /** `baseFetch` with redirects handled as `redirectPolicy` says. */
+  _redirects(baseFetch) {
+    return this._redirectPolicy === "follow" ? baseFetch : fetchWithinOrigin(baseFetch);
+  }
+  /** Error text for a redirect `response` that was not followed, or `undefined` for any other response. */
+  _unfollowedRedirect(url2, response) {
+    const text = this._redirectPolicy === "follow" ? void 0 : unfollowedRedirect(url2, response);
+    return text && `${text} (redirectPolicy: 'same-origin')`;
+  }
   async _commonHeaders() {
     const headers = new Headers(this._requestInit?.headers || void 0);
     let token;
@@ -23343,7 +23443,8 @@ var SSEClientTransport = class {
   }
   _startOrAuth() {
     const eventSourceFetch = this._eventSourceInit?.fetch;
-    const fetchImpl = eventSourceFetch ? this._dpop?.(eventSourceFetch) ?? eventSourceFetch : this._fetch ?? fetch;
+    const fetchImpl = this._redirects(eventSourceFetch ? this._dpop?.(eventSourceFetch) ?? eventSourceFetch : this._fetch ?? fetch);
+    let redirect;
     return new Promise((resolve, reject) => {
       this._eventSource = new EventSource(this._url.href, {
         ...this._eventSourceInit,
@@ -23354,6 +23455,7 @@ var SSEClientTransport = class {
             ...init,
             headers
           });
+          redirect = this._unfollowedRedirect(url2, response);
           if (response.status === 401) {
             this._last401Response = response;
             if (response.headers.has("www-authenticate")) {
@@ -23368,31 +23470,41 @@ var SSEClientTransport = class {
       this._abortController = new AbortController();
       this._eventSource.onerror = (event) => {
         if (event.code === 401 && this._authProvider) {
-          if (this._authProvider.onUnauthorized && this._last401Response) {
+          if (this._authProvider.onUnauthorized && this._last401Response && !this._connectAuthRetried) {
             const response = this._last401Response;
             this._last401Response = void 0;
+            this._connectAuthRetried = true;
             this._eventSource?.close();
             this._authProvider.onUnauthorized({
               response,
               serverUrl: this._url,
               fetchFn: this._fetchWithInit
             }).then(() => this._startOrAuth().then(resolve, reject), (error$2) => {
+              this._connectAuthRetried = false;
               markAuthSeamEscape(error$2);
               this.onerror?.(error$2);
               reject(error$2);
             });
             return;
           }
-          const error$1 = markAuthSeamEscape(new UnauthorizedError());
+          const retried = this._connectAuthRetried;
+          this._connectAuthRetried = false;
+          const error$1 = markAuthSeamEscape(retried ? new SdkHttpError(SdkErrorCode.ClientHttpAuthentication, "Server returned 401 after re-authentication", {
+            status: 401,
+            statusText: this._last401Response?.statusText ?? ""
+          }) : new UnauthorizedError());
+          this._last401Response = void 0;
           reject(error$1);
           this.onerror?.(error$1);
           return;
         }
-        const error2 = new SseError(event.code, event.message, event);
+        this._connectAuthRetried = false;
+        const error2 = new SseError(event.code, redirect ?? event.message, event);
         reject(error2);
         this.onerror?.(error2);
       };
       this._eventSource.onopen = () => {
+        this._connectAuthRetried = false;
       };
       this._eventSource.addEventListener("endpoint", (event) => {
         const messageEvent = event;
@@ -23460,7 +23572,7 @@ var SSEClientTransport = class {
         body: JSON.stringify(message),
         signal: this._abortController?.signal
       };
-      const response = await (this._fetch ?? fetch)(this._endpoint, init);
+      const response = await this._redirects(this._fetch ?? fetch)(this._endpoint, init);
       if (!response.ok) {
         if (response.status === 401 && this._authProvider) {
           if (response.headers.has("www-authenticate")) {
@@ -23491,7 +23603,7 @@ var SSEClientTransport = class {
           throw markAuthSeamEscape(new UnauthorizedError());
         }
         const text = await response.text?.().catch(() => null);
-        throw new Error(`Error POSTing to endpoint (HTTP ${response.status}): ${text}`);
+        throw new Error(`Error POSTing to endpoint (HTTP ${response.status}): ${this._unfollowedRedirect(this._endpoint, response) ?? text}`);
       }
       await response.text?.().catch(() => {
       });
@@ -23552,6 +23664,7 @@ var StreamableHTTPClientTransport = class {
   _skipIssuerMetadataValidation;
   _fetch;
   _fetchWithInit;
+  _redirectPolicy;
   _sessionId;
   _reconnectionOptions;
   _protocolVersion;
@@ -23582,7 +23695,9 @@ var StreamableHTTPClientTransport = class {
       this._authProvider = adaptOAuthProvider(opts.authProvider, { skipIssuerMetadataValidation: opts.skipIssuerMetadataValidation });
       if (opts.authProvider.dpop) this._fetch = withDpopFromProvider(opts.authProvider)(opts.fetch ?? fetch);
     } else this._authProvider = opts?.authProvider;
+    this._redirectPolicy = opts?.redirectPolicy;
     this._fetchWithInit = createFetchWithInit(opts?.fetch, opts?.requestInit);
+    if (this._redirectPolicy === "follow") this._fetchWithInit = fetchLeavingRedirects(this._fetchWithInit);
     this._sessionId = opts?.sessionId;
     this._protocolVersion = opts?.protocolVersion;
     this._reconnectionOptions = opts?.reconnectionOptions ?? DEFAULT_STREAMABLE_HTTP_RECONNECTION_OPTIONS;
@@ -23633,6 +23748,15 @@ var StreamableHTTPClientTransport = class {
       fetchFn: this._fetchWithInit,
       skipIssuerMetadataValidation: this._skipIssuerMetadataValidation
     });
+  }
+  /** `baseFetch` with redirects handled as `redirectPolicy` says. */
+  _redirects(baseFetch) {
+    return this._redirectPolicy === "follow" ? baseFetch : fetchWithinOrigin(baseFetch);
+  }
+  /** Error text for a redirect `response` that was not followed, or `undefined` for any other response. */
+  _unfollowedRedirect(url2, response) {
+    const text = this._redirectPolicy === "follow" ? void 0 : unfollowedRedirect(url2, response);
+    return text && `${text} (redirectPolicy: 'same-origin')`;
   }
   async _commonHeaders() {
     const headers = new Headers(this._requestInit?.headers || void 0);
@@ -23685,7 +23809,7 @@ var StreamableHTTPClientTransport = class {
       if (resumptionToken) headers.set("last-event-id", resumptionToken);
       const transportSignal = this._abortController?.signal;
       const signal = requestSignal !== void 0 && transportSignal !== void 0 ? anySignal(transportSignal, requestSignal) : requestSignal ?? transportSignal;
-      const response = await (this._fetch ?? fetch)(this._url, {
+      const response = await this._redirects(this._fetch ?? fetch)(this._url, {
         ...this._requestInit,
         method: "GET",
         headers,
@@ -23740,7 +23864,8 @@ var StreamableHTTPClientTransport = class {
           options.onRequestStreamEnd?.();
           return;
         }
-        throw new SdkHttpError(SdkErrorCode.ClientHttpFailedToOpenStream, `Failed to open SSE stream: ${response.statusText}`, {
+        const reason = this._unfollowedRedirect(this._url, response) ?? response.statusText;
+        throw new SdkHttpError(SdkErrorCode.ClientHttpFailedToOpenStream, `Failed to open SSE stream: ${reason}`, {
           status: response.status,
           statusText: response.statusText
         });
@@ -23929,7 +24054,7 @@ var StreamableHTTPClientTransport = class {
         body: JSON.stringify(message),
         signal
       };
-      const response = await (this._fetch ?? fetch)(this._url, init);
+      const response = await this._redirects(this._fetch ?? fetch)(this._url, init);
       if (isHandshake && response.ok) this._sessionId = response.headers.get("mcp-session-id") || void 0;
       if (!response.ok) {
         if (response.status === 401 && this._authProvider) {
@@ -23983,7 +24108,8 @@ var StreamableHTTPClientTransport = class {
           }
         } catch {
         }
-        throw new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, `Error POSTing to endpoint: ${text}`, {
+        const reason = this._unfollowedRedirect(this._url, response) ?? text;
+        throw new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, `Error POSTing to endpoint: ${reason}`, {
           status: response.status,
           statusText: response.statusText,
           text
@@ -24043,10 +24169,10 @@ var StreamableHTTPClientTransport = class {
         headers,
         signal: this._abortController?.signal
       };
-      const response = await (this._fetch ?? fetch)(this._url, init);
+      const response = await this._redirects(this._fetch ?? fetch)(this._url, init);
       await response.text?.().catch(() => {
       });
-      if (!response.ok && response.status !== 405) throw new SdkHttpError(SdkErrorCode.ClientHttpFailedToTerminateSession, `Failed to terminate session: ${response.statusText}`, {
+      if (!response.ok && response.status !== 405) throw new SdkHttpError(SdkErrorCode.ClientHttpFailedToTerminateSession, `Failed to terminate session: ${this._unfollowedRedirect(this._url, response) ?? response.statusText}`, {
         status: response.status,
         statusText: response.statusText
       });

@@ -34,7 +34,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
       - name: Mint Codewhale Agent token

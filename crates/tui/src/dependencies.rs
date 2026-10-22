@@ -115,6 +115,15 @@ fn probe_output(
     capture: bool,
     timeout: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
+    probe_output_bounded(command, capture, timeout, VERSION_PROBE_MAX_OUTPUT)
+}
+
+pub(crate) fn probe_output_bounded(
+    command: &mut Command,
+    capture: bool,
+    timeout: std::time::Duration,
+    max_output: u64,
+) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
     use wait_timeout::ChildExt;
@@ -140,10 +149,10 @@ fn probe_output(
                 .spawn(move || {
                     let mut bytes = Vec::new();
                     let result = pipe
-                        .take(VERSION_PROBE_MAX_OUTPUT + 1)
+                        .take(max_output.saturating_add(1))
                         .read_to_end(&mut bytes)
                         .and_then(|_| {
-                            if bytes.len() as u64 > VERSION_PROBE_MAX_OUTPUT {
+                            if bytes.len() as u64 > max_output {
                                 Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     "version probe output exceeded limit",
@@ -350,10 +359,10 @@ pub fn resolve_pandoc() -> Option<String> {
 
 /// Whether an optional tool whose backend lives on this host (an interpreter,
 /// a converter, an OCR engine) is available: `probe` decides, except that a
-/// conformance replay answers with the recorded host's set so goldens do not
+/// test fixture answers with the recorded host's set so results do not
 /// depend on what the machine running them has installed (test builds only).
 pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> bool {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     if let Some(available) = RECORDED_HOST_TOOLS.with(|cell| {
         cell.borrow()
             .as_ref()
@@ -361,13 +370,13 @@ pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> b
     }) {
         return available;
     }
-    // Only a conformance replay reads the name.
-    #[cfg(not(all(test, unix)))]
+    // Only test fixtures read the name.
+    #[cfg(not(test))]
     let _ = tool;
     probe()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 thread_local! {
     static RECORDED_HOST_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
@@ -375,16 +384,16 @@ thread_local! {
 
 /// Pin [`host_tool_available`] on this thread to a recorded host's tools until
 /// the guard drops.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn pin_recorded_host_tools(tools: Vec<String>) -> RecordedHostToolsGuard {
     RECORDED_HOST_TOOLS.with(|cell| *cell.borrow_mut() = Some(tools));
     RecordedHostToolsGuard
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) struct RecordedHostToolsGuard;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl Drop for RecordedHostToolsGuard {
     fn drop(&mut self) {
         RECORDED_HOST_TOOLS.with(|cell| *cell.borrow_mut() = None);
@@ -1122,6 +1131,8 @@ impl Git {
         "--ignore-submodules=dirty",
     ];
 
+    const REVIEW_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Construct a read-only review command with content conversion disabled.
     /// Review callers also pass [`Self::REVIEW_DIFF_ARGS`] for diffs.
     /// Configured filters otherwise execute even when those flags are present.
@@ -1152,23 +1163,44 @@ impl Git {
         // Probe once for this process's cached executable, before any read.
         // A random value prevents repository config from spoofing support.
         static REVIEW_CONFIG_SUPPORTED: OnceLock<bool> = OnceLock::new();
-        if !*REVIEW_CONFIG_SUPPORTED.get_or_init(|| {
-            let Some(mut probe) = Self::command() else {
-                return false;
-            };
-            let value = uuid::Uuid::new_v4().to_string();
-            probe
-                .current_dir(workspace)
-                .stdin(std::process::Stdio::null())
-                .env_remove("GIT_CONFIG")
-                .env_remove("GIT_CONFIG_PARAMETERS")
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "codewhale.reviewConfigCapability")
-                .env("GIT_CONFIG_VALUE_0", &value)
-                .args(["config", "--get", "codewhale.reviewConfigCapability"]);
-            matches!(probe.output(), Ok(output)
-                if output.status.success() && output.stdout == format!("{value}\n").as_bytes())
-        }) {
+        let supported = match REVIEW_CONFIG_SUPPORTED.get() {
+            Some(supported) => *supported,
+            None => {
+                let supported = match Self::command() {
+                    None => false,
+                    Some(mut probe) => {
+                        let value = uuid::Uuid::new_v4().to_string();
+                        probe
+                            .current_dir(workspace)
+                            .env_remove("GIT_CONFIG")
+                            .env_remove("GIT_CONFIG_PARAMETERS")
+                            .env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "codewhale.reviewConfigCapability")
+                            .env("GIT_CONFIG_VALUE_0", &value)
+                            .args(["config", "--get", "codewhale.reviewConfigCapability"]);
+                        match crate::snapshot::repo::run_bounded_git_with_timeout(
+                            &mut probe,
+                            "config",
+                            Self::REVIEW_CONFIG_TIMEOUT,
+                        ) {
+                            Ok(output) => {
+                                output.status.success()
+                                    && output.stdout == format!("{value}\n").as_bytes()
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                                let context = format!(
+                                    "Cannot safely inspect Git review configuration: {error}"
+                                );
+                                return Err(anyhow::Error::new(error).context(context));
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                };
+                *REVIEW_CONFIG_SUPPORTED.get_or_init(|| supported)
+            }
+        };
+        if !supported {
             anyhow::bail!(
                 "Cannot safely inspect Git review configuration: Git runtime configuration overrides are unavailable; upgrade Git (2.31 or newer)"
             );
@@ -1202,16 +1234,20 @@ impl Git {
     ) -> anyhow::Result<Vec<(String, &'static str)>> {
         use anyhow::{Context, bail};
 
-        let output = Self::review_base(workspace)?
-            .args([
-                "config",
-                "--null",
-                "--name-only",
-                "--get-regexp",
-                r"^filter\..*\.(clean|process|required)$",
-            ])
-            .output()
-            .context("Failed to inspect Git review filters")?;
+        let mut command = Self::review_base(workspace)?;
+        command.args([
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process|required)$",
+        ]);
+        let output = crate::snapshot::repo::run_bounded_git_with_timeout(
+            &mut command,
+            "config",
+            Self::REVIEW_CONFIG_TIMEOUT,
+        )
+        .context("Failed to inspect Git review filters")?;
         let no_filters =
             output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
         if (!output.status.success() && !no_filters)

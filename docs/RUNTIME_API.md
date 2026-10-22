@@ -706,7 +706,11 @@ The editor surface supports `initialize`, `session/new`, `session/list`,
 `session/load` (including durable ID prefixes), `session/prompt`, `session/cancel`,
 model discovery/selection, and the advertised mode/model config options.
 `session/new` creates a durable bare UUID and empty checkpoint without calling a
-provider. At most 64 idle transport bindings are retained; eviction keeps the
+provider. `session/load` replays the saved conversation as `session/update`
+notifications before it responds: user and agent text, then each tool call with
+its final status. Replayed tool results are masked as on the live stream: a
+`request_user_input` answer becomes `User input submitted` and configured
+credentials are redacted. Reasoning and images are not replayed. At most 64 idle transport bindings are retained; eviction keeps the
 durable conversation. Resume deduplicates against the existing thread binding.
 Full histories, tool pairs, signatures, media and partial-effect receipts are
 saved under the same checkpoint guard and session write lease used by HTTP.
@@ -721,6 +725,8 @@ whole compatibility alias family. Final dispatch rechecks the profile, so a
 fabricated alias, hook rewrite or omitted catalog entry cannot bypass it. Plan
 remains read-only under Full Access. Full Access and the ordinary approval
 posture are server-owned read-only options; the editor cannot widen them.
+`approval_policy = "never"` is not an ACP posture, so the server refuses to
+start with it instead of serving it as Ask.
 
 Tool updates begin `pending`. `in_progress` means Core reached final dispatch;
 `completed`/`failed` and typed image blocks come from the actual Core result.
@@ -743,12 +749,18 @@ or typed `max_turn_requests`; Core failure remains an error. Prompts use at most
 50 model steps (a lower configured limit still wins) and Core's bounded final
 report response; this profile does not dispatch autonomous goal continuations.
 
-ACP presently claims its own exclusive canonical Runtime owner. If another
-process holds that store, startup refuses. A saved conversation bound to another
-Runtime store also refuses; authenticated cross-process owner attachment remains
-unqualified and ACP does not copy a live conversation into a random store. This
-does not expose every `/v1/*` steering, job or control method to an ACP editor.
-Use `codewhale app-server --http` for that full runtime API.
+When no process owns the Runtime store, ACP claims its own exclusive canonical
+Runtime owner. When a non-ACP Runtime host already owns it (the desktop app,
+`codewhale app-server --http` or `codewhale serve --http`), ACP attaches to that
+owner as an authenticated guest over its local control socket and serves the
+editor from the owner's store. If that owner exits, the ACP process ends with
+an error naming the exit; pending operation outcomes may be uncertain and are
+not replayed. A second `codewhale serve --acp` in a store another ACP server
+already owns refuses at startup and leaves the first serving. A saved
+conversation bound to another Runtime store also refuses; ACP does not copy a
+live conversation into a random store. This does not expose every `/v1/*`
+steering, job or control method to an ACP editor. Use
+`codewhale app-server --http` for that full runtime API.
 
 
 ## Capability endpoint: `codewhale doctor --json`
@@ -908,13 +920,15 @@ attacker has strictly easier local avenues than this race.
 Web fetches require the session cookie plus an origin-scoped request proof;
 streams use a fresh single-use ticket. The initial redirect carries the proof
 in a fragment, which the client removes and saves in origin-scoped
-`sessionStorage`. On reload or in a second tab, an authenticated `GET /` also
-embeds the proof in a meta tag when `Sec-Fetch-Site` is `same-origin` or `none`
-(direct navigation). The page uses `no-store`, disallows framing, and grants no
-cross-origin read access. This lets a new tab recover without reusing the
-bootstrap URL, including when storage is unavailable. Clients without Fetch
-Metadata can only reuse the fragment or their existing stored proof; recovery
-does not extend the server session or replace an expired cookie.
+`sessionStorage`, so a reload of that tab keeps working when the browser
+allows session storage. The server never puts
+the proof in a page: the session cookie is host-scoped, not port-scoped, so a
+listener on another loopback port can receive it, and the cookie alone must
+not be enough to recover the proof. A new tab opened by typing the address
+therefore has no proof; use the original tab, duplicate it, or restart
+`codewhale web` for a fresh one-time session. The page uses `no-store`,
+disallows framing, and grants no cross-origin read access. Nothing extends the
+server session or replaces an expired cookie.
 Cross-origin Fetch Metadata or a mismatched Origin is rejected on web API
 requests. Explicit bearer and Runtime-token header clients keep their existing
 behavior. Transient stream-ticket failures retry with capped backoff; HTTP
@@ -981,6 +995,11 @@ a TLS or verified transport boundary.
 - `POST /v1/sessions/{id}/resume-thread` returns the open thread that already
   holds the whole saved session (`200`), or seeds a new thread from it (`201`)
   when none does, including when the session grew after that thread opened it.
+  Without a `mode` in the body, a new thread takes the saved mode; a saved mode
+  that is not a Runtime mode, such as `exec`, resumes as `agent`. The new
+  thread's tool results are stored masked as live receipts are: a
+  `request_user_input` answer becomes `User input submitted` and configured
+  credentials are redacted. `GET /v1/sessions/{id}` still returns them unmasked.
 - `GET /v1/sessions/{id}/artifacts` and `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
   (see workspace files and session artifacts above; runtime-turn spills are
   read through `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}`)
@@ -1072,6 +1091,8 @@ and live state comes only from a resumed thread's SSE stream.
 - `PATCH /v1/threads/{id}` (see body shape below)
 - `POST /v1/threads/{id}/resume`
 - `POST /v1/threads/{id}/fork`
+- `POST /v1/threads/{id}/read` — record the newest item a client has shown
+  (body `{"item_id": "<item id>"}`; see "Read markers" below)
 - `GET /v1/threads/{id}/receipt` — what the thread did, one entry per action
   (read-only; shape in [RECEIPTS.md](RECEIPTS.md))
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same, for one turn;
@@ -1128,6 +1149,10 @@ a dashboard keystroke is not a whole-store read per thread. Each item includes
 }
 ```
 
+Rows also carry `last_read_item_id` and `unread` from the thread's read marker
+(see "Read markers" below). Both are `null` for a thread no client has marked
+read.
+
 `branch` is resolved from the thread workspace at request time and may be
 `null` when the workspace is not a Git repository or the branch cannot be read.
 `head` is the current short Git commit for that workspace when available.
@@ -1145,6 +1170,35 @@ manual compaction that sits between them).
 Thread list and summary responses remain flat in v0.8.40, so clients that need
 a graph should reconstruct it from events instead of assuming list order is a
 complete tree.
+
+### Read markers
+
+`POST /v1/threads/{id}/read` with `{"item_id": "<item id>"}` records that a
+client has shown the conversation through that item, in the order
+`GET /v1/threads/{id}` returns items (turn order, then item start time). A
+client sends the id of the newest item it rendered when the person opens or
+reads the conversation. The item must belong to the thread: an unknown thread
+is `404`, and an unknown item or one from another thread is `400`. The
+response is the thread record. Its `last_read` holds `item_id`, `last_in_turn`
+(that item was the last item of its turn when it was marked) and
+`watermark_item_id` (the last item that turn had recorded at that moment).
+
+Marking read changes nothing else: `updated_at`, list order and the thread's
+event stream are untouched, so opening a conversation never moves it to the
+top of a list or makes it unread again. The marker only moves forward:
+marking an item that comes before the current one leaves the marker as it is,
+so a window showing an older snapshot cannot make a read conversation unread.
+Forks start without a marker.
+
+`GET /v1/threads/summary` derives `unread` from the marker: `false` while the
+marked item is still the newest, `true` once any later item exists, and `null`
+when the thread was never marked (older Runtimes had no marker, so existing
+conversations are not all reported unread after an upgrade; clients keep their
+own fallback for those). `last_read_item_id` is the item to place a "new"
+divider after. Known limits: `unread` follows the items each turn records
+while it runs, so a turn that has started but not yet recorded an item does not
+count until it does, and a notice added to a turn after it finished (such as a
+permissions change) does not count.
 
 `GET /v1/threads/running` is the running-work accounting surface
 (#6180): threads with at least one queued or in-progress turn, each with
@@ -1186,6 +1240,10 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 }
 ```
 
+A `system_prompt` change applies from the next turn: a loaded engine is
+unloaded and rebuilt from the thread's history with the new prompt. Like a
+`workspace` change, it is refused while the thread has a running turn.
+
 `model_provider` switches the provider the thread's future turns use. It
 takes a built-in kind (`deepseek`, `xai`, ...) or a configured route name, as
 `/provider` does. `model_provider_id` names one exact `[providers.<id>]` table
@@ -1207,7 +1265,7 @@ latest turn and publishes a `thread.permissions_changed` event (`from`, `to`,
 - `GET /v1/threads/{id}/turns/{turn_id}/artifacts` - what the turn produced: typed references plus the workspace-delta state. See [Turn artifacts](#turn-artifacts).
 - `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}?offset=&limit=&revision=` - read one reference from the workspace, the post-turn snapshot, or the session artifact directory.
 - `POST /v1/threads/{id}/compact` (manual compaction)
-- `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
+- `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box. `{"turn_id": "turn_…"}` instead names the user turn to remove, together with every turn after it, and wins over `depth`; the Runtime resolves it under the thread's restore guard, so a turn another client appends meanwhile cannot move the cut. `400` when the turn is not a user turn of that thread
 - `POST /v1/threads/{id}/fork-at-turn` - fork at one named user turn (`{"turn_id": "turn_…"}`, as `GET /v1/threads/{id}` reports it). The fork *keeps* that turn and every turn before it, and drops the turns after it; naming the last turn therefore keeps the whole conversation. The receipt is `/undo`'s (`thread`, `original_user_text`, `original_user_images`), carrying the *first dropped* user turn's prompt — what was asked next, even when a prompt-less turn such as a manual `/compact` sits between — so a client can put it back in the composer for editing. The source thread, its session document and the workspace are untouched, and there is no file rollback: a fork is a sibling conversation, and rewinding the workspace would rewind the branch left behind with it. Clients should name the turn instead of computing a `depth` — the transcript they render and the turn list this cuts are not the same list (steers, image-only prompts and injected handoffs each sit on one side only), and a client-side count that is off by one forks the wrong prefix while answering `201`. `400` when the turn is not a user turn of that thread.
 - `POST /v1/threads/{id}/patch-undo` - rolls back the files the dropped turns changed, then the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for ownership, the trust, admission and abort rules, and the `error.code` values of a refusal.
 - `POST /v1/threads/{id}/file-revert` - restore exactly one file from one restore point the thread owns (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
@@ -1371,18 +1429,31 @@ ID that has already been settled all return `404` and reach no engine. A `404`
 means the capability is not pending — it is not evidence about how the approval
 was resolved; read `approval.decided` for that.
 
-The raw provider call ID travels separately as `tool_call_id` on
+The Engine tool-execution ID travels separately as `tool_call_id` on
 `pending_approvals[]` and on the approval events. It is a correlator for
 attaching a prompt to the tool row it gates, and never accepted as a decision.
 Each thread-detail `pending_approvals[]` entry is
-`{ "id", "turn_id", "tool_name", "description", "intent_summary"?, "tool_call_id"?, "summary"? }`,
-where `id` is the capability above. `summary` (also on `approval.required`) is
+`{ "id", "turn_id", "tool_name", "input"?, "description", "intent_summary"?, "tool_call_id"?, "summary"? }`,
+where `id` is the capability above. `input` holds the captured tool input. An
+omitted `input` means no captured value is available; an explicit JSON `null`
+remains a captured value. On the authenticated canonical thread surface,
+`approval.required` carries the same captured input.
+`summary` (also on `approval.required`) is
 a one-line description of the gated call built from the tool name and its
 arguments only, never from model text ("Search the web for 'espresso'",
 "Write notes/espresso.md"); paths inside the workspace are workspace-relative.
 Clients show it first and keep the raw arguments behind it. For task and
 automation create/update, `summary` also names the requested trust mode,
-shell, auto-approve, mode and workspace.
+shell, auto-approve, mode and workspace. For a shell command, task gate,
+shell input or verifier whose `curl`/`wget` request body carries a credential
+file or a secret-named variable, or reads stdin fed from one of those or from
+`env`/`printenv`, `summary` reads ``Upload credentials (`…`) with `…` ``; the
+built-in safety gate holds that call, so a session grant or saved allow rule
+cannot answer it. A shell command, shell input or verifier over 64 KiB or
+4,096 words whose text contains `curl` or `wget` anywhere, or one nested too
+deeply to read, is held the same way under its ordinary `summary`. A shell
+command containing a hidden Unicode character is refused before any
+approval is created.
 
 `"remember": true` on an `allow` records a **session grant** for that tool and
 argument class (the approval grouping key: a shell command family for a
@@ -1403,8 +1474,11 @@ emits `approval.grant_added` with `{ "grant": { "grant_id", "tool_name",
 revokes one (emitting `approval.grant_revoked`); the next matching call
 prompts again. Archiving or deleting the thread ends all of its grants
 (archiving emits `approval.grant_revoked` for each; unarchiving does not
-restore them). Grants live in memory for the Runtime process: a restart
-forgets them, and a forced (non-bypassable) prompt is never answered by one.
+restore them). Grants are stored in the Runtime data directory
+(`approval_grants.json`). After a Runtime restart a thread's grants stay
+suspended, and matching calls prompt again, until an authenticated client
+resumes the thread. A grant store that cannot be read holds no grants, so every
+call prompts. A forced (non-bypassable) prompt is never answered by a grant.
 
 **User input**
 - `POST /v1/user-input/{thread_id}/{input_id}` with body
@@ -2413,6 +2487,57 @@ auth mode, consent state and the *kind* of any configured `api_key` value,
 and never resolves a secret, an environment value, or an auth command. It is
 a class and never a value, a path, or an environment variable name.
 
+### `POST /v1/providers/orcarouter/connect` — browser sign-in without a terminal
+
+```json
+// response
+{ "attemptId": "0f3c…", "authorizeUrl": "https://www.orcarouter.ai/auth?…",
+  "expiresIn": 900 }
+```
+
+Runs the same OrcaRouter OAuth 2.0 + PKCE sign-in as `codewhale auth orcarouter`
+for a client that has no terminal. The Engine binds its loopback callback
+(`http://127.0.0.1:<port>/callback`), returns the consent URL, and waits on a
+worker for up to `expiresIn` seconds. The client opens `authorizeUrl` in the
+system browser — never an embedded view — and polls the attempt. When the
+browser comes back, the Engine exchanges the code, refuses a key whose granted
+scope is not `api`, and stores the key through the same seam as the CLI, then
+mirrors the credential markers into the live config the way
+`PUT /v1/providers/{id}/key` does. It does not switch the active provider; use
+`POST /v1/providers/{id}/switch` for that.
+
+The callback listens on the Engine's own computer, so a client offers this
+route only for an Engine on the same computer as the browser. A new `POST`
+cancels the previous attempt, and only the current attempt can be read.
+Refusals: `400` for an id other than `orcarouter`, `409` when the route's
+credential is not writable (the same reason `credentialWritableReason`
+carries), `500` when the callback cannot be bound. `GET /v1/providers` marks a
+route that supports this with `"browserConnect": true`; the field is absent
+otherwise and on Engines without the route.
+
+### `GET /v1/providers/orcarouter/connect/{attemptId}` and `DELETE …` — status and cancel
+
+```json
+{ "attemptId": "0f3c…", "status": "failed", "reason": "key_not_saved" }
+```
+
+`status` is `waiting`, `connected`, `declined` (the user refused in the
+browser), `expired` (no callback in time), `cancelled` or `failed`. `failed`
+carries a `reason`: `authorization_error` (the browser came back with another
+error), `callback_failed`, `not_writable` (the route's credential stopped being
+writable before the exchange; no key was created), `exchange_failed`,
+`scope_refused` or `key_not_saved`. After `scope_refused` or `key_not_saved`,
+OrcaRouter created a key that Codewhale did not keep; the user should revoke
+it under Authorized Apps in OrcaRouter. `exchange_failed` can follow a key
+OrcaRouter created before the response was lost.
+
+`DELETE` cancels an attempt that is still waiting for the browser. Once the
+exchange has started a key may already exist, so the attempt runs on and
+reports `connected`, or `failed` with `key_not_saved`; `DELETE` then answers
+with the current status. An unknown or superseded `attemptId` is `404`. Only
+the `POST` response carries the consent URL; no status, error or log line
+carries it, the key, the code or the verifier.
+
 ### `POST /v1/providers/{id}/switch`
 
 ```json
@@ -2651,7 +2776,7 @@ clients and does not grant or persist permissions.
 distinct identifiers. `approval_id` is the Runtime-minted, single-use capability
 described under **Approvals** — the only value `POST /v1/approvals/{id}` accepts
 — and `approval.required` also repeats it in the legacy `id` field for older
-clients. `tool_call_id` is the provider's raw tool-call ID, present for
+clients. `tool_call_id` is the Engine tool-execution ID, present for
 correlation only. Automatically resolved prompts (thread `auto_approve`, and the
 Auto-Review posture, which never opens a modal) mint an `approval_id` as well, so
 the field has one meaning on every path; those IDs register no waiter and are

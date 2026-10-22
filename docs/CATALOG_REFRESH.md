@@ -16,7 +16,7 @@ Related docs: [`PROVIDERS.md`](./PROVIDERS.md), RFC
 |---|---|
 | Do users need a special model just to refresh models? | **No.** |
 | Does Codewhale auto-update the public model catalog? | **Yes, at runtime**, from [Models.dev](https://models.dev/catalog.json), ~24 h TTL. |
-| Is the offline bundled seed auto-committed in CI? | **No, but it is generated.** A maintainer runs `seed lock` and `seed render` and opens a PR; CI fails a hand edit (`seed render --check`). |
+| Is the offline bundled seed auto-committed in CI? | **No, but it is generated.** A maintainer runs `seed lock` and `seed render` and lands the verified generated slice on main; CI fails a hand edit (`seed render --check`). |
 | Should an LLM rewrite catalog JSON? | **No.** Ingest is deterministic public JSON. An LLM can *review* a PR, not own the source of truth. |
 
 ---
@@ -141,10 +141,10 @@ These stay hand-maintained or release-lane work until a scheduled PR lands:
 
 | Surface | Why it drifts |
 |---|---|
-| `models_dev.bundled.json` | Offline seed, generated from a reviewed spec and a pinned lock (see below); refreshed by PR, not at runtime |
+| `models_dev.bundled.json` | Offline seed, generated from a reviewed spec and a pinned lock (see below); refreshed by a verified maintainer slice, not at runtime |
 | `provider_descriptors.json` default model IDs | Product choice, not pure catalog dump; constant projections are generated |
 | `catalog_corrections.json` `reviewed` | Intrinsic/selector/transport compatibility facts with exact source receipts; generated into the same seed |
-| Rust pricing policy | Vendor billing windows, CNY conversion, withheld/tiered behavior; pure reference observations live in the reviewed supplement |
+| Rust pricing policy | Vendor billing windows, independent USD/CNY rates, withheld/tiered behavior; pure reference observations live in the reviewed supplement |
 | New `ProviderKind` / wire dialect | Needs code, not only JSON |
 
 Runtime live refresh **does not** rewrite those files. Users on a recent
@@ -152,6 +152,24 @@ install with network still see new Models.dev rows; fresh clones offline, CI
 hermetic runs, and first-boot without cache still depend on the seed.
 
 ---
+
+The current quote is frozen at dispatch with its exact provider identity, wire
+ID, endpoint fingerprint, source and rates. Refreshing the catalog does not
+reprice old turns. Live rows carry fetch and expiry clocks separately from an
+upstream update or a declared effective date. After 24 hours a live price is
+stale; a bundled row is a dated estimate, never proof of account access.
+
+The shared decimal calculator selects each request's context tier from its
+entire input, including cache reads and writes. It prices seven published
+classes and subtracts separately charged reasoning/audio subsets from the
+ordinary classes. Missing rates or a required usage breakdown stay unpriced.
+The result is an exact decimal string; display rounding does not change it.
+CNY prices remain separate from USD. These are estimates, not reconciled bills.
+
+Two default wire IDs missing from the 2026-10-12 upstream snapshot remain as
+explicitly dated curated compatibility rows in the seed spec, with their prior
+snapshot receipts. They do not establish present account availability or a
+renamed wire ID. Other removed non-default rows are no longer seeded.
 
 ## Maintainer tooling (no LLM)
 
@@ -206,7 +224,7 @@ first live refresh.
 3. `python3 scripts/catalog_models_dev.py seed lock` writes the lock.
 4. `python3 scripts/catalog_models_dev.py seed render` writes the seed.
 5. Check that default wire IDs still match `DEFAULT_*_MODEL`, run the
-   catalog tests, and open a PR with the report in its body.
+   catalog checks, and land the verified slice on main with its report in the commit.
 
 Optional: use a cheap model to summarize “new / removed / default-risk” in
 the PR body — never as the author of the JSON.

@@ -527,7 +527,7 @@ assert.doesNotMatch(cnbSync, /^\s+tags:/m, "a tag push alone must not start CNB 
 assert.match(cnbSync, /^  workflow_call:/m);
 const cnbPush = namedStep(cnbSync, "Push triggering ref to CNB");
 const cnbPublicGate = cnbPush.indexOf("node scripts/release/verify-release-inventory.js --manifest");
-const cnbTagPush = cnbPush.indexOf('push_with_retry "tag ${TAG}"');
+const cnbTagPush = cnbPush.indexOf('scripts/release/mirror-push.sh cnb "tag ${TAG}"');
 assert.ok(cnbPublicGate >= 0 && cnbTagPush > cnbPublicGate,
   "manual and called tag mirrors must verify the published inventory before pushing");
 assert.match(cnbPush, /verify-remote-tag\.sh/);

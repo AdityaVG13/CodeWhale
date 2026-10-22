@@ -86,7 +86,7 @@ jobs:
     name: Build ${{ matrix.platform }}
     # Both cold macOS artifact builds on 0.10.1 exhausted 90 minutes inside
     # compilation. Keep the full CI build budget; packaging stays capped below.
-    timeout-minutes: 165
+    timeout-minutes: 210
     # FreeBSD is a source-build target validated via `cargo check --target x86_64-unknown-freebsd -p codewhale-cli --locked`
     # (see packaging/freebsd/README.md and docs/INSTALL.md#freebsd). The 7×1 prebuilt matrix stays 7 targets;
     # FreeBSD has no prebuilt asset, no npm binary, and no matrix bloat — it builds from source.
@@ -156,7 +156,7 @@ jobs:
       # No ref: — GITHUB_SHA only. CodeQL treats workflow_call checkout-with-ref
       # and any ref named *sha* as an untrusted checkout (cache-poisoning).
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master 2026-07-18
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-07-18
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -326,6 +326,27 @@ jobs:
           extension=""
           if [[ "${TARGET_PLATFORM}" == windows-* ]]; then extension=.exe; fi
           node scripts/release/stage-compiled-host.mjs --bun "${bun_binary}" --compiled-image "${proof_dir}/codewhale-extension-host${extension}" --native-receipt "${proof_dir}/native-receipt.json" --runtime-closure "${RUNTIME_CLOSURE_DIR}/${TARGET_PLATFORM}.json" --target "${TARGET_PLATFORM}" --version "${RELEASE_VERSION}" --source-sha "${GITHUB_SHA}" --output-dir "compiled-host-${TARGET_PLATFORM}"
+      - name: Check every staged Windows executable import
+        if: startsWith(matrix.platform, 'windows-')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binaries = @('${{ matrix.cli_artifact }}', '${{ matrix.shim_artifact }}', '${{ matrix.compat_tui_artifact }}')
+          $hostDirectory = 'compiled-host-${{ matrix.platform }}'
+          if (Test-Path $hostDirectory) {
+            $binaries += @(Get-ChildItem -Path $hostDirectory -Filter *.exe -Recurse -File | ForEach-Object { $_.FullName })
+          }
+          python scripts/release/check-windows-imports.py --expected-machine '${{ matrix.platform }}' --output '${{ runner.temp }}/windows-imports-${{ matrix.platform }}' @binaries
+          if ($LASTEXITCODE -ne 0) { throw 'Windows static import qualification failed' }
+      - name: Retain Windows import receipts
+        if: always() && startsWith(matrix.platform, 'windows-')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-imports-${{ matrix.platform }}-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-imports-${{ matrix.platform }}/
+          if-no-files-found: warn
+          retention-days: ${{ inputs.retention_days }}
+          overwrite: true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: inputs.compiled_host_delivery && contains(format(',{0},', inputs.compiled_host_targets), format(',{0},', matrix.platform))
         with:
@@ -365,7 +386,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           pattern: '*'
@@ -412,13 +433,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           pattern: '*windows-x64*'
       - name: Install NSIS
         shell: pwsh
-        run: choco install nsis -y --no-progress
+        run: ./scripts/installer/install-nsis.ps1
       - name: Build NSIS installer
         shell: pwsh
         run: |
@@ -453,6 +474,33 @@ jobs:
           if (!(Test-Path "scripts\installer\CodeWhaleSetup.exe")) {
             throw "CodeWhaleSetup.exe was not produced"
           }
+      - name: Check Windows installer and embedded executables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidenceDirectory = '${{ runner.temp }}/windows-installer-imports'
+          $embeddedDirectory = Join-Path $evidenceDirectory 'embedded'
+          New-Item -Path $evidenceDirectory -ItemType Directory -Force | Out-Null
+          & 7z l 'scripts/installer/CodeWhaleSetup.exe' | Out-File (Join-Path $evidenceDirectory 'archive-listing.txt') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS embedded payload inventory failed' }
+          & 7z x 'scripts/installer/CodeWhaleSetup.exe' "-o$embeddedDirectory" '$PLUGINSDIR/*.dll' | Out-File (Join-Path $evidenceDirectory 'archive-extraction.txt') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS embedded plugin extraction failed' }
+          $plugins = @(Get-ChildItem -Path $embeddedDirectory -Filter *.dll -Recurse -File)
+          if ($plugins.Name -notcontains 'System.dll' -or $plugins.Name -notcontains 'nsDialogs.dll') { throw 'Expected MUI2 System and nsDialogs plugin payloads' }
+          $binaries = @(Get-ChildItem -Path scripts/installer -Filter *.exe -File | ForEach-Object { $_.FullName })
+          if ($binaries.Count -lt 3) { throw 'Expected installer, CLI and shim executables' }
+          $binaries += @($plugins | ForEach-Object { $_.FullName })
+          python scripts/release/check-windows-imports.py --output $evidenceDirectory @binaries
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer static import qualification failed' }
+      - name: Retain Windows installer import receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-installer-imports-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-installer-imports/
+          if-no-files-found: warn
+          retention-days: ${{ inputs.retention_days }}
+          overwrite: true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: CodeWhaleSetup.exe
@@ -468,11 +516,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           package-manager-cache: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: intermediate-artifacts
           pattern: '*'
@@ -494,11 +542,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           package-manager-cache: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: codewhale-release-assets
           path: release-assets

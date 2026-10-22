@@ -506,6 +506,7 @@ mod tests {
                 context_tokens: Some(42_000),
                 input_tokens: None,
                 output_tokens: Some(7_000),
+                output_declared: false,
             },
         );
 

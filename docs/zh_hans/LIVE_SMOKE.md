@@ -154,7 +154,8 @@ CW_SMOKE_MODEL="deepseek-v4-pro"
 | `route_source` | 记录*为什么*选中了那条路由 |
 | `reasoning_tokens` | 当回执报告推理时出现；缺失可能反映模型/提供商行为、配置，或 harness 的遗漏，需要旁证 |
 | `tool_catalog_sha256` | 当提供了工具表面（tool surface）时出现 |
-| `approval_posture`、`sandbox_posture` | 与你传入的标志一致 |
+| `approval_posture` | 上面的 `--auto` 命令应为 `auto_tools` |
+| `sandbox_posture` | 沙箱策略及其执行情况：`--auto` 默认是 Full Access；受限策略会标明 `local OS sandbox applied` 或 `policy only; no execution sandbox available`；外部执行后端会标明文件系统/网络隔离未经 Codewhale 验证 |
 | `duration_ms`、`input_tokens`、`output_tokens` | 一次完成的运行中会出现 |
 
 报告回执字段。**不要**粘贴凭据、密钥文件，或提供商的原始错误正文

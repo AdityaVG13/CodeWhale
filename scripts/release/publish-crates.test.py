@@ -82,6 +82,7 @@ class PublishPreflightTests(unittest.TestCase):
             "TEST_UPLOADS": str(self.uploads),
             "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
             "CARGO_NET_OFFLINE": "true",
+            "CARGO_HOME": str(self.root / "cargo-home"),
             "CARGO_TARGET_DIR": str(self.root / "target"),
         }
         self.run_command(["cargo", "generate-lockfile", "--offline"], success=True)

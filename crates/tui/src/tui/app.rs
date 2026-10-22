@@ -710,6 +710,7 @@ pub struct LaunchState {
     /// Claude Code config was detected on this host (probed once at
     /// construction); drives the launch card's migration notice line.
     pub claude_code_detected: bool,
+    pub whats_new: Option<crate::whats_new::WhatsNewNotice>,
 }
 
 /// The launch card's dissolve motion budget. One bounded motion; reduced
@@ -804,6 +805,7 @@ impl LaunchState {
             dissolve_started_ms: None,
             mark_reveal_started_at: None,
             claude_code_detected,
+            whats_new: None,
         }
     }
 
@@ -1580,6 +1582,12 @@ pub struct App {
     pub paused_goal_objective: Option<String>,
     pub history: Vec<HistoryCell>,
     pub history_version: u64,
+    /// Monotonic epoch bumped by every mutation of `tool_cells`,
+    /// `tool_details_by_cell`, or `active_tool_details` (via
+    /// [`App::bump_details_epoch`]). The work-surface file-activity cache
+    /// keys on it together with `history_version`; a mutation that skips the
+    /// bump serves a stale FILES view.
+    pub(crate) details_epoch: u64,
     /// Bumped when destructive reindexing could make a cached Space owner name
     /// a different cell before redraw; ordinary streaming revisions preserve it.
     pub(crate) transcript_identity_epoch: u64,
@@ -1931,6 +1939,7 @@ pub struct App {
     pub launch: LaunchState,
     /// Mouse-selected launch action, consumed by the async UI loop.
     pub pending_launch_action: Option<crate::tui::underwater::LaunchAction>,
+    pub(crate) pending_claude_login: Option<bool>,
     /// Mouse click on the live composer's `[↵]` send target. The async UI loop
     /// consumes it through the same submit dispatcher as Enter.
     pub pending_composer_submit: Option<ComposerSubmitChord>,
@@ -2336,9 +2345,6 @@ pub struct App {
     /// The transcript keeps completed entries until turn flush, but the
     /// sidebar can use these timestamps to let settled live rows expire.
     pub active_tool_entry_completed_at: HashMap<usize, Instant>,
-    /// Active exploring cell entry index (within `active_cell.entries`).
-    /// `None` once the active cell flushes or no exploring entry exists.
-    pub exploring_cell: Option<usize>,
     /// Mapping of exploring tool ids to `(entry index in active_cell, entry
     /// within ExploringCell)`. Used to update individual exploring entries
     /// when their tools complete.
@@ -2363,6 +2369,7 @@ pub struct App {
     /// thinking into the active cell so it groups visually with tool calls
     /// until the next assistant prose chunk flushes the group into history.
     pub streaming_thinking_active_entry: Option<usize>,
+    pub(crate) pending_thinking_translation_cells: HashMap<u64, usize>,
     /// Instant of the last throttled active-cell revision bump for the
     /// in-flight thinking stream (#1620). Reasoning chunks arrive faster than
     /// the eye can read, and each bump invalidates the active cell's wrap
@@ -2403,6 +2410,7 @@ pub struct App {
     pub child_gate_receipts: std::collections::HashMap<String, Vec<(String, String)>>,
     /// User messages queued while a turn is running
     pub queued_messages: VecDeque<QueuedMessage>,
+    pub held_restored_queue: usize,
     /// Draft queued message being edited
     pub queued_draft: Option<QueuedMessage>,
     /// Legacy pending-steer bucket retained for session compatibility. New
@@ -2671,6 +2679,7 @@ pub struct App {
     /// [`session_title`](Self::session_title), which is the session *name*
     /// shown in the composer border and session picker.
     pub window_title: Option<String>,
+    pub composer_color: Option<String>,
     /// Default tab/window title from the `title` config key (or a profile
     /// overlay). Used when the current session has no explicit
     /// [`window_title`](Self::window_title).
@@ -2727,10 +2736,15 @@ impl ToolRunCache {
     /// Refresh [`FilteredProjection`] unless it already matches the current
     /// projection and `collapsed_cells`. `rows` is committed plus active.
     pub(crate) fn refresh_filtered(&mut self, rows: usize, collapsed_cells: &HashSet<usize>) {
-        if self.filtered.built_for == Some(self.generation)
-            && self.filtered.collapsed_cells == *collapsed_cells
-        {
-            return;
+        if self.filtered.built_for == Some(self.generation) {
+            if self.filtered.collapsed_cells == *collapsed_cells {
+                return;
+            }
+            // A raw collapsed-set change (random-replay harness, future
+            // writers) rebuilds the projection without the widget's
+            // generation bump; fold it in so keyed consumers cannot skip
+            // past the changed rows.
+            self.generation = self.generation.wrapping_add(1);
         }
         self.filtered.original.clear();
         self.filtered.summary_slots.clear();
@@ -3450,8 +3464,8 @@ impl App {
     ) {
         let context = self
             .base_hook_context()
-            .with_mode(self.mode.label())
-            .with_previous_mode(previous_mode.label());
+            .with_mode(self.mode.hook_label())
+            .with_previous_mode(previous_mode.hook_label());
         if let Err(error) = self.submit_hooks(HookEvent::ModeChange, context) {
             self.surface_observer_hook_submission_failure(error);
         }
@@ -4279,7 +4293,7 @@ impl App {
                 origin_turn_id: self.runtime_turn_id.clone(),
                 origin_call_id: None,
             })
-            .with_mode(self.mode.label())
+            .with_mode(self.mode.hook_label())
             .with_workspace(self.workspace.clone())
             .with_model(&self.model)
             .with_session_id(self.hooks.session_id())
@@ -4821,87 +4835,69 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Shift all per-cell index maps down by `n` after removing the first
-    /// `n` history cells. Every map key >= n is mapped to key - n; keys < n
-    /// are dropped.
+    /// Remap every per-cell history index after `maybe_fold_history` removes
+    /// the first `n` cells and inserts one placeholder at index 0: an index
+    /// `>= n` becomes `index - n + 1`; an index inside the folded range is
+    /// dropped.
     fn shift_history_maps_down(&mut self, n: usize) {
-        // A folded-range placeholder is inserted at index 0 immediately
-        // after this shift, so surviving completed-output receipts move down
-        // by `n` and then forward by one.
-        self.completed_assistant_outputs.retain_mut(|receipt| {
-            if receipt.history_index >= n {
-                receipt.history_index = receipt.history_index - n + 1;
+        self.bump_details_epoch();
+        let remap = |idx: usize| idx.checked_sub(n).map(|kept| kept + 1);
+        self.completed_assistant_outputs
+            .retain_mut(|receipt| match remap(receipt.history_index) {
+                Some(idx) => {
+                    receipt.history_index = idx;
+                    true
+                }
+                None => false,
+            });
+        self.tool_cells.retain(|_, idx| match remap(*idx) {
+            Some(new) => {
+                *idx = new;
                 true
-            } else {
-                false
             }
+            None => false,
         });
-
-        // tool_cells: HashMap<String, usize>
-        self.tool_cells.retain(|_, idx| {
-            if *idx >= n {
-                *idx -= n;
-                true
-            } else {
-                false
-            }
-        });
-
-        // tool_details_by_cell: HashMap<usize, ToolDetailRecord>
+        self.pending_thinking_translation_cells
+            .retain(|_, idx| match remap(*idx) {
+                Some(new) => {
+                    *idx = new;
+                    true
+                }
+                None => false,
+            });
         self.tool_details_by_cell = std::mem::take(&mut self.tool_details_by_cell)
             .into_iter()
-            .filter_map(|(idx, detail)| {
-                if idx >= n {
-                    Some((idx - n, detail))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(idx, detail)| remap(idx).map(|idx| (idx, detail)))
             .collect();
-
-        // context_references_by_cell
         self.context_references_by_cell = std::mem::take(&mut self.context_references_by_cell)
             .into_iter()
-            .filter_map(|(idx, refs)| {
-                if idx >= n {
-                    Some((idx - n, refs))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(idx, refs)| remap(idx).map(|idx| (idx, refs)))
             .collect();
         self.rebuild_session_context_references();
-
-        // subagent_card_index
-        self.subagent_card_index.retain(|_, idx| {
-            if *idx >= n {
-                *idx -= n;
+        self.subagent_card_index.retain(|_, idx| match remap(*idx) {
+            Some(new) => {
+                *idx = new;
                 true
-            } else {
-                false
             }
+            None => false,
         });
-
-        // last_fanout_card_index
-        if let Some(ref mut idx) = self.last_fanout_card_index {
-            if *idx >= n {
-                *idx -= n;
-            } else {
-                self.last_fanout_card_index = None;
-            }
-        }
-
-        // collapsed_cells
+        self.last_fanout_card_index = self.last_fanout_card_index.and_then(remap);
         self.collapsed_cells = std::mem::take(&mut self.collapsed_cells)
             .into_iter()
-            .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
+            .filter_map(remap)
             .collect();
         self.cell_folds.clear();
         self.expanded_tool_runs = std::mem::take(&mut self.expanded_tool_runs)
             .into_iter()
-            .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
+            .filter_map(remap)
             .collect();
         self.collapsed_cell_map.clear();
+        self.streaming_message_index = self.streaming_message_index.and_then(remap);
+        self.streaming_source_receipt = None;
+        self.ocean_turn_history_start = self.ocean_turn_history_start.saturating_sub(n) + 1;
+        self.ocean_receipt_settle_start = self
+            .ocean_receipt_settle_start
+            .map(|idx| idx.saturating_sub(n) + 1);
     }
 
     /// The name a sub-agent was dispatched under, when it has one (#5287).
@@ -5112,6 +5108,12 @@ impl App {
         rev
     }
 
+    /// Invalidate the work-surface file-activity cache after mutating the
+    /// tool detail maps. Bump at the mutation site, not the call site.
+    pub(crate) fn bump_details_epoch(&mut self) {
+        self.details_epoch = self.details_epoch.wrapping_add(1);
+    }
+
     /// Bring `history_revisions` back into shape (`history_revisions.len() ==
     /// history.len()`). Pushes fresh revs for newly appended cells, truncates
     /// for cells that were removed. **Does not** invalidate existing entries.
@@ -5155,6 +5157,7 @@ impl App {
     /// sites currently doing `app.history.push(...)` followed by
     /// `app.mark_history_updated()` can collapse to one helper.
     pub fn push_history_cell(&mut self, cell: HistoryCell) {
+        self.rebase_active_cell_bindings(1);
         let rev = self.fresh_history_revision();
         self.history.push(cell);
         self.history_revisions.push(rev);
@@ -5169,6 +5172,7 @@ impl App {
         I: IntoIterator<Item = HistoryCell>,
     {
         for cell in cells {
+            self.rebase_active_cell_bindings(1);
             let rev = self.fresh_history_revision();
             self.history.push(cell);
             self.history_revisions.push(rev);
@@ -5350,6 +5354,7 @@ impl App {
             return;
         }
         self.history.truncate(new_len);
+        self.bump_details_epoch();
         if self.history_revisions.len() > new_len {
             self.history_revisions.truncate(new_len);
         }
@@ -5377,6 +5382,8 @@ impl App {
 
     pub(crate) fn prune_transcript_index_state(&mut self, len: usize) {
         self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
+        self.pending_thinking_translation_cells
+            .retain(|_, idx| *idx < len);
         self.collapsed_cells.retain(|idx| *idx < len);
         self.cell_folds.retain(|idx, _| *idx < len);
         self.expanded_tool_runs.retain(|idx| *idx < len);
@@ -5418,6 +5425,8 @@ impl App {
             .truncate(unchanged.min(self.api_message_stamps.len()));
         self.api_message_stamps
             .resize_with(messages.len(), Utc::now);
+        self.session_turn_outcomes
+            .retain(|outcome| outcome.after_message_count <= unchanged);
         self.api_messages = messages;
         unchanged
     }
@@ -5482,12 +5491,15 @@ impl App {
         self.api_messages_mut().truncate(new_len);
         self.api_message_stamps
             .resize_with(self.api_messages.len(), Utc::now);
+        self.session_turn_outcomes
+            .retain(|outcome| outcome.after_message_count <= self.api_messages.len());
     }
 
     pub fn clear_api_messages(&mut self) {
         self.session_journal = crate::session_tree::SessionJournal::new();
         self.api_messages_mut().clear();
         self.api_message_stamps.clear();
+        self.session_turn_outcomes.clear();
     }
 
     #[must_use]
@@ -5584,9 +5596,16 @@ impl App {
         if let Some(detail) = self.tool_details_by_cell.get(&index) {
             return Some(detail);
         }
-        self.active_tool_details
-            .values()
-            .find(|detail| self.tool_cells.get(&detail.tool_id).copied() == Some(index))
+        let active_entry = |tool_id: &str| {
+            self.active_cell
+                .as_ref()
+                .and_then(|active| active.entry_index_for_tool(tool_id))
+                .map(|entry| self.history.len() + entry)
+        };
+        self.active_tool_details.values().find(|detail| {
+            self.tool_cells.get(&detail.tool_id).copied() == Some(index)
+                || active_entry(&detail.tool_id) == Some(index)
+        })
     }
 
     /// Whether a virtual transcript cell can open a meaningful `v` detail
@@ -5808,7 +5827,11 @@ impl App {
             }
             owner.identity_epoch = self.transcript_identity_epoch;
         }
-        for index in self.tool_cells.values_mut() {
+        for index in self
+            .tool_cells
+            .values_mut()
+            .chain(self.pending_thinking_translation_cells.values_mut())
+        {
             if *index >= boundary {
                 *index = index.saturating_add(added);
             }
@@ -5868,10 +5891,10 @@ impl App {
             return;
         };
         if active.is_empty() {
-            self.exploring_cell = None;
             self.exploring_entries.clear();
             self.active_tool_details.clear();
             self.active_tool_entry_completed_at.clear();
+            self.bump_details_epoch();
             self.streaming_thinking_active_entry = None;
             self.bump_active_cell_revision();
             return;
@@ -5912,8 +5935,9 @@ impl App {
                 .entry(cell_index)
                 .or_insert(detail);
         }
+        self.bump_details_epoch();
 
-        self.exploring_cell = None;
+        crate::tui::tool_routing::release_oldest_tool_detail_outputs(self);
         self.exploring_entries.clear();
 
         for cell in drained {
@@ -6583,11 +6607,15 @@ impl App {
     }
 
     pub fn pop_queued_message(&mut self) -> Option<QueuedMessage> {
-        self.queued_messages.pop_front()
+        self.queued_messages.remove(self.held_restored_queue)
     }
 
     pub fn remove_queued_message(&mut self, index: usize) -> Option<QueuedMessage> {
-        self.queued_messages.remove(index)
+        let message = self.queued_messages.remove(index)?;
+        if index < self.held_restored_queue {
+            self.held_restored_queue -= 1;
+        }
+        Some(message)
     }
 
     pub fn queued_message_count(&self) -> usize {
@@ -6609,6 +6637,7 @@ impl App {
         let Some(msg) = self.queued_messages.pop_back() else {
             return false;
         };
+        self.held_restored_queue = self.held_restored_queue.min(self.queued_messages.len());
         self.input = msg.display.clone();
         self.cursor_position = char_count(&self.input);
         self.selected_attachment_index = None;
@@ -6766,7 +6795,10 @@ impl App {
             return Vec::new();
         }
         match self.enter_with_double_tap() {
-            Some(SubmitDisposition::Steer) => self.queued_messages.drain(..).collect(),
+            Some(SubmitDisposition::Steer) => {
+                self.held_restored_queue = 0;
+                self.queued_messages.drain(..).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -7192,15 +7224,26 @@ impl App {
             crate::config::legacy_deepseek_alias_effort_for_route(provider, base_url, model)
         });
         self.reasoning_effort = if let Some(requested) = self.reasoning_effort_preference {
-            requested.normalize_for_route(provider, base_url, wire_model)
+            requested.normalize_for_route_identity(
+                provider,
+                self.provider_identity_for_persistence(),
+                base_url,
+                wire_model,
+            )
         } else if let Some(effort) = inferred {
             ReasoningEffort::from_setting(effort)
                 .normalize_for_route(provider, base_url, wire_model)
-        } else if let Some(default) = ReasoningEffort::catalog_default(provider, wire_model) {
+        } else if let Some(default) =
+            ReasoningEffort::catalog_default(provider, base_url, wire_model)
+        {
             default
         } else {
-            self.reasoning_effort
-                .normalize_for_route(provider, base_url, wire_model)
+            self.reasoning_effort.normalize_for_route_identity(
+                provider,
+                self.provider_identity_for_persistence(),
+                base_url,
+                wire_model,
+            )
         };
         self.invalidate_route_receipts_for_reasoning_change();
     }
@@ -7529,6 +7572,7 @@ impl App {
     pub(crate) fn reasoning_effort_api_value_for_replay(
         &self,
         provider: ProviderKind,
+        identity: &str,
         base_url: &str,
         model: &str,
     ) -> Option<&'static str> {
@@ -7538,7 +7582,9 @@ impl App {
         } else {
             self.reasoning_effort
         };
-        requested.api_value_for_route(provider, base_url, model)
+        requested
+            .normalize_for_route_identity(provider, identity, base_url, model)
+            .api_value_for_provider(provider)
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {

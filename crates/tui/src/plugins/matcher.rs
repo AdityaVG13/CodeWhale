@@ -83,17 +83,30 @@ fn effective_keywords(candidate: &KeywordCandidate<'_>) -> Vec<String> {
 /// matching here. Change both together; kept sorted so the two diff cleanly.
 pub(crate) const GENERIC_TERM_STOPLIST: &[&str] = &[
     "accessibility",
+    "agent",
+    "agents",
     "automation",
     "browser",
     "browsers",
     "chrome",
+    "code",
     "codebase",
+    "codes",
+    "data",
     "docs",
     "documentation",
     "extension",
     "extensions",
+    "mcp",
+    "mcps",
+    "model",
+    "models",
     "screenshot",
     "screenshots",
+    "session",
+    "sessions",
+    "tool",
+    "tools",
     "web",
     "website",
     "wiki",
@@ -102,8 +115,6 @@ pub(crate) const GENERIC_TERM_STOPLIST: &[&str] = &[
 /// Admissibility for a match term: long enough to be a word, free of control
 /// characters, and not a generic word from [`GENERIC_TERM_STOPLIST`].
 ///
-/// Everything else a catalog author declares stays matchable (`mcp`, `agent`,
-/// `model`, …): the stoplist is a short shared list, not a per-host judgment.
 /// The remaining noise controls are the send-time toast's shared tips switch
 /// and per-session budget, and per-plugin dismissal. There is no score
 /// threshold on the proactive path (see `recommend.rs`).
@@ -173,12 +184,12 @@ mod tests {
             super::match_plugin_keyword("help with finance", &candidates),
             Some((0, "finance".into()))
         );
-        // Declared terms are the catalog author's call (#6290 rework): `mcp`
-        // matches when declared, and the receipt names it.
-        assert_eq!(
-            super::match_plugin_keyword("help with mcp", &candidates),
-            Some((0, "mcp".into()))
-        );
+        for draft in [
+            "help with mcp",
+            "why did my mcp servers get stuck at connecting",
+        ] {
+            assert_eq!(super::match_plugin_keyword(draft, &candidates), None);
+        }
     }
 
     fn candidate<'a>(
@@ -224,7 +235,7 @@ mod tests {
 
     #[test]
     fn domains_match_inside_pasted_urls() {
-        let domains = vec!["figma.com".to_string()];
+        let domains = vec!["figma.com".to_string(), "mcp.example.com".to_string()];
         let none: Vec<String> = Vec::new();
         let candidates = [candidate("design-app", &domains, &none)];
         assert_eq!(
@@ -236,6 +247,10 @@ mod tests {
             Some(0)
         );
         assert_eq!(match_plugin_keyword("open figma please", &candidates), None);
+        assert_eq!(
+            match_plugin_keyword("open https://mcp.example.com/tools", &candidates),
+            Some(0)
+        );
     }
 
     #[test]
@@ -259,20 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn declared_vocabulary_matches_and_only_mechanics_filter_terms() {
-        // Declared keywords are the catalog author's call (#6290 rework):
-        // `mcp`, `agent`, `model`, … match when declared. The remaining
-        // filters are mechanical (>= 3 characters, no control characters),
-        // the shared generic-term stoplist, the `/`-command guard, and the
-        // code-hosting homepage exclusion.
-        let words = [
-            "mcp", "plugin", "skill", "agent", "tool", "code", "data", "model", "session",
-        ];
+    fn declared_vocabulary_respects_shared_policy_and_mechanical_guards() {
+        let words = ["convex", "supabase", "stripe"];
         let keywords = words
             .iter()
             .map(|word| word.to_string())
             .collect::<Vec<_>>();
-        let candidates = [candidate("mcp", &[], &keywords)];
+        let candidates = [candidate("convex", &[], &keywords)];
         for word in words {
             assert_eq!(
                 match_plugin_keyword(&format!("please help with {word}"), &candidates),
@@ -315,13 +323,20 @@ mod tests {
             "fix the accessibility of the login form",
             "open the browser and check the web page",
             "update the docs and the wiki",
+            "why did my mcp servers get stuck at connecting",
+            "ask the agent to use tools and models",
+            "read the code and data in these sessions",
         ] {
             assert_eq!(match_plugin_keyword(draft, &candidates), None, "{draft}");
         }
         // A plugin named with a generic word is not matchable by that name.
         let none: Vec<String> = Vec::new();
-        let named = [candidate("browser", &[], &none)];
-        assert_eq!(match_plugin_keyword("open the browser", &named), None);
+        for term in GENERIC_TERM_STOPLIST {
+            let draft = format!("help with {term}");
+            assert_eq!(match_plugin_keyword(&draft, &candidates), None, "{term}");
+            let named = [candidate(term, &[], &none)];
+            assert_eq!(match_plugin_keyword(&draft, &named), None, "{term}");
+        }
         // A specific term on the same plugin still matches.
         let specific = vec!["accessibility".to_string(), "computer use".to_string()];
         let candidates = [candidate("computer-use", &[], &specific)];

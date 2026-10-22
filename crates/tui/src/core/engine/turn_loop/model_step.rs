@@ -18,7 +18,14 @@ impl Engine {
         } = prepared;
         let child_job = self.child_job();
         if let Some(job) = child_job.as_ref() {
-            if let Err(error) = job.project(&self.session.messages, job.steps()).await {
+            if let Err(error) = job
+                .project(
+                    &self.session.messages,
+                    job.steps(),
+                    stream_request.system.as_ref(),
+                )
+                .await
+            {
                 return PhaseResult::Return((
                     TurnOutcomeStatus::Failed,
                     Some(format!(
@@ -103,6 +110,11 @@ impl Engine {
             .saturating_add(transport_retries.load(std::sync::atomic::Ordering::Relaxed));
         let stream = match stream_result {
             Ok(s) => {
+                // Physical-cache population, nested execution and result
+                // projection alone do not establish model delivery.
+                self.session
+                    .working_set
+                    .observe_navigation_delivery(&stream_request.messages);
                 if let Some(job) = child_job.as_ref() {
                     job.provider_responded();
                 }
@@ -175,6 +187,15 @@ impl Engine {
                         Ok(false) => {}
                     }
                 }
+                if self.rlm_host.is_none()
+                    && let Some(rejection) =
+                        crate::llm_client::image_count_rejection(&format!("{e:#}").to_lowercase())
+                    && let Some(result) = self
+                        .recover_image_count_rejection(progress, &stream_request, rejection, &e)
+                        .await
+                {
+                    return result;
+                }
                 if let Some(recovery) = self.recover_child_request(progress, &e).await {
                     return recovery;
                 }
@@ -201,23 +222,9 @@ impl Engine {
                     && is_image_input_rejection_message(&message)
                     && self.active_route_capabilities.image_input != CapabilityState::Unsupported
                     && !progress.image_rejection_recovered
+                    && crate::image_attach::count_request_images(&stream_request.messages) > 0
                 {
-                    progress.image_rejection_recovered = true;
-                    // This path tells the user itself; the resend must
-                    // not announce the same omission a second time.
-                    progress.image_omission_notified = true;
-                    self.active_route_capabilities.image_input = CapabilityState::Unsupported;
-                    crate::logging::warn(format!(
-                        "model {} rejected image content; resending with images replaced by text",
-                        self.session.model
-                    ));
-                    let status = codewhale_localization::tr(
-                        codewhale_localization::resolve_locale(&self.config.locale_tag),
-                        codewhale_localization::MessageId::ImageInputRejectedResent,
-                    )
-                    .replace("{model}", &self.session.model);
-                    let _ = self.send_event(Event::status(status)).await;
-                    return PhaseResult::Retry;
+                    return self.resend_without_images(progress).await;
                 }
                 let display_message = self.decorate_auth_error_message(
                     initial_stream_error_user_message(&self.config.locale_tag, &e),
@@ -331,6 +338,7 @@ impl Engine {
             current_thinking,
             current_thinking_signature,
             current_thinking_state,
+            mut completed_thinking,
             mut tool_uses,
             usage,
             usage_reported,
@@ -397,6 +405,7 @@ impl Engine {
         // fail by name when there is none) instead of passing for a finished
         // answer or being re-requested unchanged. The diagnostics above keep
         // the reason the provider sent.
+        let provider_finish_reason = stop_reason.clone();
         let stop_reason = if stop_contradicts_output_ceiling(
             stop_reason.as_deref(),
             usage_reported.then_some(usage.output_tokens),
@@ -433,6 +442,38 @@ impl Engine {
             job.response_settled(!response_stream_failed);
         }
         turn.add_parent_usage(&usage);
+        if let Some(child) = self.child_host.as_mut()
+            && child.fork_cache_checked
+            && !child.fork_trial_first_response_logged
+            && !child_reporting
+        {
+            child.fork_trial_first_response_logged = true;
+            #[allow(clippy::print_stderr)]
+            if crate::prompt_zones::fork_trial_diag_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "codewhale_fork_trial": "first_response",
+                        "agent_id": child.authority.owner_agent_id,
+                        "inherited": child.fork_cache_inherited.is_some(),
+                        "usage_reported": usage_reported,
+                        "stream_failed": response_stream_failed,
+                        "input": usage.input_tokens,
+                        "hit": usage.prompt_cache_hit_tokens,
+                        "miss": usage.prompt_cache_miss_tokens,
+                        "system_bytes": serde_json::to_vec(&stream_request.system).ok().map(|bytes| bytes.len()),
+                        "tools_bytes": serde_json::to_vec(&stream_request.tools).ok().map(|bytes| bytes.len()),
+                        "history_bytes": serde_json::to_vec(&stream_request.messages).ok().map(|bytes| bytes.len()),
+                    })
+                );
+            }
+        }
+        if self.child_host.is_none()
+            && let Ok(mut cell) = self.live_header.lock()
+            && let Some(snapshot) = cell.as_mut()
+        {
+            snapshot.last_hit_tokens = usage.prompt_cache_hit_tokens;
+        }
         turn.note_parent_prompt_len(self.session.messages.len());
         self.session.latest_parent_input_tokens = turn.latest_parent_input_tokens;
         if usage_reported {
@@ -453,6 +494,7 @@ impl Engine {
                         u64::try_from(request_dispatched_at.elapsed().as_millis())
                             .unwrap_or(u64::MAX),
                     ),
+                    finish_reason: provider_finish_reason,
                 })
                 .await;
         }
@@ -629,11 +671,20 @@ impl Engine {
                 ));
             }
         }
+        // A flushed redacted block or non-blank thinking is received content,
+        // the same rule `current_thinking` follows.
         let stream_died_with_nothing = stream_errors > 0
             && !terminal_stream_error
             && tool_uses.is_empty()
             && current_text_visible.trim().is_empty()
             && current_thinking.trim().is_empty()
+            && completed_thinking.iter().all(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Thinking { thinking, redacted_data: None, .. }
+                        if thinking.trim().is_empty()
+                )
+            })
             && !pending_message_complete;
         let pending_resume = match pending_resume {
             Some(resume) => Some(resume),
@@ -689,6 +740,10 @@ impl Engine {
                     // variable is still empty at this point and will be
                     // rebuilt on the next round.
                     let mut resume_blocks: Vec<ContentBlock> = Vec::new();
+                    // Thinking blocks the stream already terminated stay in
+                    // the retry prefix, in wire order, ahead of the block
+                    // that was still open when the stream died.
+                    resume_blocks.append(&mut completed_thinking);
                     // A wire-only placeholder must not ride into the
                     // retry prefix as stored reasoning either.
                     let thinking_is_placeholder_only =
@@ -700,6 +755,7 @@ impl Engine {
                             thinking: current_thinking.clone(),
                             signature: current_thinking_signature.clone(),
                             state: current_thinking_state.clone(),
+                            redacted_data: None,
                         });
                     }
                     if !current_text_visible.is_empty() {
@@ -880,6 +936,12 @@ impl Engine {
         // that compatibility value to the outgoing JSON only. Persisting
         // it here leaked an invented "(reasoning omitted)" block into the
         // transcript and every provider-neutral session replay.
+        // `completed_thinking` holds every thinking/redacted block the
+        // stream already terminated, in wire order; the guard below keeps
+        // a trailing block whose stop event never arrived. Both must
+        // survive — Anthropic replays the whole thinking sequence
+        // unmodified.
+        content_blocks.append(&mut completed_thinking);
         let thinking_is_placeholder_only =
             crate::client::is_reasoning_replay_placeholder(&current_thinking);
         if (!current_thinking.is_empty() && !thinking_is_placeholder_only)
@@ -889,6 +951,7 @@ impl Engine {
                 thinking: current_thinking.clone(),
                 signature: current_thinking_signature.clone(),
                 state: current_thinking_state.clone(),
+                redacted_data: None,
             });
         }
 
@@ -989,8 +1052,9 @@ impl Engine {
                 ContentBlock::Thinking {
                     thinking,
                     state,
+                    redacted_data,
                     ..
-                } if !thinking.trim().is_empty() || state.is_some()
+                } if !thinking.trim().is_empty() || state.is_some() || redacted_data.is_some()
             )
         });
 
@@ -1040,6 +1104,71 @@ impl Engine {
             prepared_output_tokens: stream_request.max_tokens,
         })
     }
+    async fn resend_without_images(
+        &mut self,
+        progress: &mut TurnLoopProgress,
+    ) -> PhaseResult<AcceptedModelStep> {
+        progress.image_rejection_recovered = true;
+        // This path tells the user itself; the resend must
+        // not announce the same omission a second time.
+        progress.image_omission_notified = true;
+        self.active_route_capabilities.image_input = CapabilityState::Unsupported;
+        crate::logging::warn(format!(
+            "model {} rejected image content; resending with images replaced by text",
+            self.session.model
+        ));
+        let status = codewhale_localization::tr(
+            codewhale_localization::resolve_locale(&self.config.locale_tag),
+            codewhale_localization::MessageId::ImageInputRejectedResent,
+        )
+        .replace("{model}", &self.session.model);
+        let _ = self.send_event(Event::status(status)).await;
+        PhaseResult::Retry
+    }
+
+    async fn recover_image_count_rejection(
+        &mut self,
+        progress: &mut TurnLoopProgress,
+        request: &codewhale_models::MessageRequest,
+        rejection: crate::llm_client::ImageCountRejection,
+        error: &anyhow::Error,
+    ) -> Option<PhaseResult<AcceptedModelStep>> {
+        let sent = crate::image_attach::count_request_images(&request.messages);
+        let model = self.session.model.clone();
+        let cap = self.learn_image_cap(&model, sent, rejection)?;
+        if cap == 0 {
+            if self.active_route_capabilities.image_input != CapabilityState::Unsupported
+                && !progress.image_rejection_recovered
+            {
+                return Some(self.resend_without_images(progress).await);
+            }
+        } else if progress.image_count_recoveries < MAX_IMAGE_COUNT_RECOVERIES {
+            progress.image_count_recoveries = progress.image_count_recoveries.saturating_add(1);
+            return Some(PhaseResult::Retry);
+        }
+        let hint = codewhale_localization::tr(
+            codewhale_localization::resolve_locale(&self.config.locale_tag),
+            codewhale_localization::MessageId::ImageCountRejected,
+        )
+        .replace("{model}", &model)
+        .replace("{count}", &sent.to_string());
+        let detail = self.decorate_auth_error_message(initial_stream_error_user_message(
+            &self.config.locale_tag,
+            error,
+        ));
+        let display_message = format!("{hint}\n{detail}");
+        progress.turn_error = Some(display_message.clone());
+        let _ = self
+            .send_event(Event::error(
+                crate::error_taxonomy::ErrorEnvelope::image_count_exceeded(display_message),
+            ))
+            .await;
+        Some(PhaseResult::Return((
+            TurnOutcomeStatus::Failed,
+            progress.turn_error.take(),
+        )))
+    }
+
     async fn recover_child_request(
         &mut self,
         progress: &mut TurnLoopProgress,

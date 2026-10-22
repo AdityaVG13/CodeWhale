@@ -483,7 +483,7 @@ impl HotbarSetupView {
         };
 
         for (idx, row) in self.actions_for_source(source).iter().enumerate() {
-            lines.push(self.action_row_line(source, idx, row, 80));
+            lines.push(self.action_row_line(source, idx, row, 80, true));
         }
 
         lines.push(Line::from(""));
@@ -606,6 +606,7 @@ impl HotbarSetupView {
         idx: usize,
         row: &HotbarSetupActionRow,
         max_width: u16,
+        show_description: bool,
     ) -> Line<'static> {
         let selected = idx == self.selected_action_idx(source);
         let marker = crate::tui::glyphs::selection_marker(selected);
@@ -634,9 +635,14 @@ impl HotbarSetupView {
         } else {
             String::new()
         };
+        let (prefix, description) = if show_description {
+            (prefix.as_str(), row.metadata.description.as_str())
+        } else {
+            (prefix.trim_end(), "")
+        };
         let text = crate::tui::ui_text::semantic_truncate_with_affixes(
-            &prefix,
-            &row.metadata.description,
+            prefix,
+            description,
             &suffix,
             usize::from(max_width),
         );
@@ -663,7 +669,7 @@ impl HotbarSetupView {
             .render(area, buf);
     }
 
-    fn render_action_list(&self, area: Rect, buf: &mut Buffer) {
+    fn render_action_list(&self, area: Rect, buf: &mut Buffer, show_descriptions: bool) {
         let Some(source) = self.selected_source() else {
             EmptyState::new("No actions", "No hotbar action sources are available.")
                 .render(area, buf);
@@ -693,7 +699,7 @@ impl HotbarSetupView {
         let visible_range =
             action_list_visible_range(self.selected_action_idx(source), rows.len(), visible_rows);
         for idx in visible_range {
-            lines.push(self.action_row_line(source, idx, rows[idx], area.width));
+            lines.push(self.action_row_line(source, idx, rows[idx], area.width, show_descriptions));
         }
         Paragraph::new(lines)
             .style(Style::default().fg(palette::TEXT_PRIMARY))
@@ -972,7 +978,7 @@ impl ModalView for HotbarSetupView {
             height: content.height.saturating_sub(header_height),
         };
         let layout = ListDetailLayout::split(body, 34);
-        self.render_action_list(layout.list, buf);
+        self.render_action_list(layout.list, buf, layout.stacked);
         self.render_action_detail(layout.detail, buf);
     }
 
@@ -1521,7 +1527,7 @@ mod tests {
         };
 
         let text = view
-            .action_row_line(HotbarActionCategory::App, 0, &row, 58)
+            .action_row_line(HotbarActionCategory::App, 0, &row, 58, true)
             .to_string();
         assert!(crate::tui::ui_text::text_display_width(&text) <= 58);
         assert!(text.contains("Open a detailed…"), "{text:?}");

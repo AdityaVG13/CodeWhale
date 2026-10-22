@@ -233,7 +233,7 @@ pub(super) fn assign<T: CloudTransport, W: Write>(
             bail!("The Codewhale service returned Work for a different Agent");
         }
         if let Some(context) = task_context {
-            let digest = crate::update::sha256_hex(&serde_json::to_vec(context)?);
+            let digest = crate::hashing::sha256_hex(&serde_json::to_vec(context)?);
             if item.task_context_digest != digest {
                 return Err(CloudTransportError::new("The Work reply does not confirm the requested source context; replay the same message and context", std::io::Error::other("task context mismatch")).into());
             }

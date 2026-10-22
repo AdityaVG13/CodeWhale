@@ -71,10 +71,7 @@ pub(crate) fn safe_text(
         || raw.contains('`')
         || raw.contains("](")
         || raw.contains("\\/")
-        || raw.chars().any(|ch| {
-            (ch.is_control() && !ch.is_whitespace())
-                || matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
-        })
+        || !codewhale_sanitize::sanitize::hidden_chars(raw).is_empty()
     {
         return Err(invalid());
     }

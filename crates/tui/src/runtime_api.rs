@@ -88,7 +88,7 @@ use crate::task_manager::{
 };
 use crate::tools::subagent::{
     AgentWorkerRecord, AgentWorkerStatus, SharedSubAgentManager, SubAgentStatus,
-    new_shared_subagent_manager_with_timeout,
+    new_shared_runtime_subagent_manager,
 };
 #[cfg(test)]
 pub(super) use codewhale_models::{ContentBlock, Message};
@@ -226,6 +226,7 @@ pub struct RuntimeApiState {
     /// Serializes provider switches: each one saves, applies and, when the
     /// apply is refused, takes back its own save before the next one starts.
     provider_switches: Arc<tokio::sync::Mutex<()>>,
+    provider_connect: secrets::ProviderConnect,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -240,6 +241,7 @@ struct RuntimeWorkspaceScope {
     canonical: PathBuf,
     directory: Arc<std::fs::File>,
     mcp: Mutex<Option<(u64, Arc<Mutex<McpPool>>)>>,
+    mcp_policy: parking_lot::Mutex<Value>,
     lsp: std::sync::OnceLock<Arc<crate::lsp::LspManager>>,
     owner: SharedRuntimeThreadManager,
     cleanup_runtime: tokio::runtime::Handle,
@@ -445,6 +447,7 @@ impl RuntimeWorkspaceScopes {
                 canonical,
                 directory,
                 mcp: Mutex::new(None),
+                mcp_policy: parking_lot::Mutex::new(Value::Null),
                 lsp: std::sync::OnceLock::new(),
                 owner: owner.owner.clone(),
                 cleanup_runtime: owner.cleanup_runtime.clone(),
@@ -819,13 +822,15 @@ impl codewhale_app_server::RuntimeOwnerFrontend for CapturedRuntimeFrontend {
             // the global signal registration or stop shared schedulers/managers.
             let shutdown = RuntimeServerShutdown::default();
             state.shutdown = shutdown.clone();
-            let app =
+            let app = with_loopback_host_guard(
                 build_router(state).merge(codewhale_app_server::runtime_compatibility_router(
                     compatibility,
                     &options.cors_origins,
                     resolved.token.clone(),
                     Some(workspace),
-                ));
+                )),
+                resolved.token.is_none(),
+            );
             let ready = RuntimeFrontendReady {
                 endpoint,
                 auth_required: resolved.token.is_some(),
@@ -1090,6 +1095,13 @@ struct ThreadSummary {
     /// thread snapshot. Clients use this typed fact for attention grouping;
     /// lifecycle prose and turn-status strings are not an authority signal.
     pending_attention_count: usize,
+    last_read_item_id: Option<String>,
+    unread: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkThreadReadRequest {
+    item_id: String,
 }
 
 /// `GET /v1/skills` row. Routing metadata (`invocation`, `aliases`,
@@ -1367,15 +1379,11 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
     }
 }
 
-fn runtime_api_sub_agent_manager(workspace: &FsPath, workers: usize) -> SharedSubAgentManager {
-    let max_agents = workers.max(1);
-    new_shared_subagent_manager_with_timeout(
-        workspace.to_path_buf(),
-        max_agents,
-        max_agents,
-        Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
-        max_agents,
-    )
+fn runtime_api_sub_agent_manager(
+    workspace: &FsPath,
+    workers: usize,
+) -> Result<SharedSubAgentManager> {
+    new_shared_runtime_subagent_manager(workspace.to_path_buf(), workers)
 }
 
 #[derive(Debug, Serialize)]
@@ -1729,7 +1737,9 @@ pub(crate) fn open_runtime_threads_for_host(
     // Publish the same exact endpoint-scoped catalog as interactive startup
     // before the server admits turns. A cached model list alone does not make
     // its capabilities available to route resolution.
+    crate::models_dev_live::maybe_load_persisted_cache();
     crate::provider_catalog_live::maybe_load_persisted_cache_for_config(config);
+    crate::models_dev_live::spawn_background_refresh();
     Ok((manager, workshop_activation))
 }
 
@@ -1860,6 +1870,10 @@ pub async fn run_http_server(
     let existing_binding: Option<crate::runtime_threads::RuntimeStoreBinding> = None;
     #[cfg(any(unix, windows))]
     if let Some(control) = published {
+        anyhow::ensure!(
+            !(acp_selected && control.routing().is_some_and(|routing| routing.acp_only)),
+            "Another `codewhale serve --acp` already owns this runtime, and a second ACP server cannot attach to it. Close the other editor's agent session and try again, or set CODEWHALE_RUNTIME_DIR to a different directory."
+        );
         validate_selected_owner(&control, selected_store.clone()).await?;
         let observed_owner = control.receipt().clone();
         let client = match options.control_frontend.as_ref() {
@@ -1969,6 +1983,13 @@ pub async fn run_http_server(
         existing_binding.as_ref(),
     )?;
     let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
+    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers)?;
+    runtime_threads
+        .attach_subagent_manager(sub_agent_manager.clone())
+        .await?;
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
     if let Some(tap) = options.runtime_event_tap {
         tap(runtime_threads.subscribe_events());
     }
@@ -2018,7 +2039,6 @@ pub async fn run_http_server(
     };
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
-    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let shutdown = RuntimeServerShutdown::default();
     // Opening a thread is every client's first read, and the store can only
     // answer it after one pass over the whole items directory (an item's
@@ -2031,9 +2051,7 @@ pub async fn run_http_server(
             tracing::warn!(%error, "thread item index warm-up failed");
         }
     });
-    let workspace_scopes =
-        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
-    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
+
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -2061,6 +2079,7 @@ pub async fn run_http_server(
         shutdown: shutdown.clone(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+        provider_connect: Default::default(),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -2086,6 +2105,7 @@ pub async fn run_http_server(
         runtime_token.clone(),
         Some(listener_workspace),
     ));
+    let app = with_loopback_host_guard(app, runtime_token.is_none());
     let owned_stdio = matches!(
         options.control_frontend.as_ref(),
         Some(
@@ -2389,9 +2409,17 @@ async fn run_attached_frontend(
                 | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
         )
     ) {
-        return client
+        let forwarded = client
             .forward(tokio::io::stdin(), tokio::io::stdout())
             .await;
+        if acp_selected && let Err(error) = forwarded.as_ref() {
+            eprintln!("error: {error}");
+            for cause in error.chain().skip(1) {
+                eprintln!("  caused by: {cause}");
+            }
+            std::process::exit(1);
+        }
+        return forwarded;
     }
     if matches!(
         options.control_frontend.as_ref(),
@@ -2482,6 +2510,41 @@ fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn with_loopback_host_guard(app: Router, unauthenticated: bool) -> Router {
+    if unauthenticated {
+        app.layer(middleware::from_fn(require_loopback_host_header))
+    } else {
+        app
+    }
+}
+
+async fn require_loopback_host_header(request: Request, next: middleware::Next) -> Response {
+    let loopback = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(host_header_is_loopback);
+    if loopback {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        "This unauthenticated Runtime only answers requests addressed to 127.0.0.1, ::1 or localhost.",
+    )
+        .into_response()
+}
+
+fn host_header_is_loopback(value: &str) -> bool {
+    let host = match value.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(host, _)| host),
+        None => value.rsplit_once(':').map_or(value, |(host, _)| host),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn is_loopback_bind_host(host: &str) -> bool {
@@ -2694,6 +2757,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(targets::list_targets).post(targets::create_target),
         )
         .route("/v1/targets/switch", post(targets::switch_target))
+        .route("/v1/tailnet", get(targets::tailnet_inventory))
+        .route(
+            "/v1/fleet/placement",
+            post(targets::placement_preview).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/v1/remote", get(targets::remote_status))
         .route("/v1/remote/connect", post(targets::remote_connect))
         .route(
@@ -2777,6 +2845,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/threads/{id}/agent-mail/{message_id}/read",
             post(mark_agent_mail_read),
         )
+        .route("/v1/threads/{id}/read", post(mark_thread_read))
         .route(
             "/v1/threads/{id}/agent-mail/{message_id}/cancel",
             post(cancel_agent_mail),
@@ -2945,6 +3014,14 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .layer(DefaultBodyLimit::max(
                     secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
                 )),
+        )
+        .route(
+            "/v1/providers/{id}/connect",
+            post(secrets::start_provider_connect),
+        )
+        .route(
+            "/v1/providers/{id}/connect/{attempt_id}",
+            get(secrets::get_provider_connect).delete(secrets::cancel_provider_connect),
         )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
@@ -3478,6 +3555,14 @@ async fn list_threads_summary(
         let facts = facts.get(&thread.id);
         let latest_status = facts.and_then(|facts| facts.latest_turn_status.clone());
         let pending_attention_count = facts.map_or(0, |facts| facts.pending_attention_count);
+        let newest_item_id = facts.and_then(|facts| facts.newest_item_id.as_deref());
+        let unread = thread.last_read.as_ref().map(|marker| {
+            !marker.last_in_turn || marker.watermark_item_id.as_deref() != newest_item_id
+        });
+        let last_read_item_id = thread
+            .last_read
+            .as_ref()
+            .map(|marker| marker.item_id.clone());
         let latest_input_summary =
             facts.and_then(|facts| facts.latest_turn_input_summary.as_deref());
 
@@ -3523,6 +3608,8 @@ async fn list_threads_summary(
             latest_turn_id: thread.latest_turn_id,
             latest_turn_status: latest_status,
             pending_attention_count,
+            last_read_item_id,
+            unread,
         });
     }
 
@@ -4308,70 +4395,85 @@ fn fleet_sse_event(event: &FleetRuntimeEvent) -> SseEvent {
 }
 
 async fn list_fleet_runs(State(state): State<RuntimeApiState>) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let runs: Vec<_> = ledger_state
-        .runs
-        .values()
-        .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
-        .collect::<Result<Vec<_>, _>>()?;
-    let status = manager
-        .status()
-        .map_err(|err| ApiError::internal(format!("Failed to read Fleet status: {err}")))?;
-    Ok(Json(json!({
-        "status": fleet_status_json(&status),
-        "runs": runs,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let runs: Vec<_> = ledger_state
+            .runs
+            .values()
+            .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
+            .collect::<Result<Vec<_>, _>>()?;
+        let status = manager
+            .status()
+            .map_err(|err| ApiError::internal(format!("Failed to read Fleet status: {err}")))?;
+        Ok::<_, ApiError>(json!({
+            "status": fleet_status_json(&status),
+            "runs": runs,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet run listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_run(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let run = ledger_state
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
-    Ok(Json(fleet_run_detail_json(&manager, run, &ledger_state)?))
+    let detail = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let run = ledger_state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
+        fleet_run_detail_json(&manager, run, &ledger_state)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet run read task failed: {error}")))??;
+    Ok(Json(detail))
 }
 
 async fn list_fleet_run_workers(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let run = ledger_state
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
-    let workers = run
-        .worker_specs
-        .iter()
-        .map(|worker| {
-            manager
-                .inspect_worker(&worker.id)
-                .map(|inspection| fleet_worker_json(&inspection))
-                .map_err(|err| {
-                    ApiError::internal(format!(
-                        "Failed to inspect Fleet worker {}: {err}",
-                        worker.id
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(json!({
-        "run_id": run_id,
-        "workers": workers,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let run = ledger_state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
+        let workers = run
+            .worker_specs
+            .iter()
+            .map(|worker| {
+                manager
+                    .inspect_worker(&worker.id)
+                    .map(|inspection| fleet_worker_json(&inspection))
+                    .map_err(|err| {
+                        ApiError::internal(format!(
+                            "Failed to inspect Fleet worker {}: {err}",
+                            worker.id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "workers": workers,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet worker listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_worker(
@@ -4488,104 +4590,121 @@ async fn list_fleet_run_receipts(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    if !ledger_state.runs.contains_key(&run_id) {
-        return Err(ApiError::not_found(format!(
-            "Fleet run '{run_id}' not found"
-        )));
-    }
-    let run_id_parsed = FleetRunId::from(run_id.clone());
-    let receipts: Vec<Value> = ledger_state
-        .receipts
-        .values()
-        .filter(|r| r.run_id == run_id_parsed)
-        .map(fleet_receipt_json)
-        .collect();
-    Ok(Json(json!({
-        "run_id": run_id,
-        "receipts": receipts,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        if !ledger_state.runs.contains_key(&run_id) {
+            return Err(ApiError::not_found(format!(
+                "Fleet run '{run_id}' not found"
+            )));
+        }
+        let run_id_parsed = FleetRunId::from(run_id.clone());
+        let receipts: Vec<Value> = ledger_state
+            .receipts
+            .values()
+            .filter(|r| r.run_id == run_id_parsed)
+            .map(fleet_receipt_json)
+            .collect();
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "receipts": receipts,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet receipt listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_run_receipt(
     State(state): State<RuntimeApiState>,
     Path((run_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let key = format!("{run_id}:{task_id}");
-    let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
-        ApiError::not_found(format!(
-            "no receipt found for run '{run_id}' task '{task_id}'"
-        ))
-    })?;
-    Ok(Json(fleet_receipt_json(receipt)))
+    let receipt = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let key = format!("{run_id}:{task_id}");
+        let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no receipt found for run '{run_id}' task '{task_id}'"
+            ))
+        })?;
+        Ok::<_, ApiError>(fleet_receipt_json(receipt))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet receipt read task failed: {error}")))??;
+    Ok(Json(receipt))
 }
 
 async fn inspect_fleet_run_receipt_evidence(
     State(state): State<RuntimeApiState>,
     Path((run_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let key = format!("{run_id}:{task_id}");
-    let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
-        ApiError::not_found(format!(
-            "no receipt found for run '{run_id}' task '{task_id}'"
-        ))
-    })?;
-    // Locate the most recent Receipt-kind artifact.
-    let receipt_artifact = receipt
-        .artifacts
-        .iter()
-        .rfind(|a| a.kind == FleetArtifactKind::Receipt)
-        .ok_or_else(|| {
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let key = format!("{run_id}:{task_id}");
+        let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
             ApiError::not_found(format!(
-                "no verifier evidence file for run '{run_id}' task '{task_id}'"
+                "no receipt found for run '{run_id}' task '{task_id}'"
             ))
         })?;
-    // Receipt artifacts are workspace-relative paths recorded by the verifier;
-    // reject absolute paths and `..` escapes before joining onto the workspace.
-    // An EMPTY recorded path is not a path at all: joining it would resolve
-    // to the workspace directory itself and read it as a file.
-    if receipt_artifact.path.as_os_str().is_empty() {
-        return Err(ApiError::not_found(format!(
-            "no verifier evidence file recorded for run '{run_id}' task '{task_id}'"
-        )));
-    }
-    if !crate::fleet::artifacts::path_is_confined(&receipt_artifact.path) {
-        return Err(ApiError::bad_request(format!(
-            "evidence path for run '{run_id}' task '{task_id}' escapes the workspace"
-        )));
-    }
-    let (raw, size_bytes) = crate::fleet::artifacts::read_verified(
-        &state.workspace,
-        receipt_artifact,
-        MAX_RECEIPT_EVIDENCE_READ_BYTES,
-    )
-    .map_err(|err| {
-        ApiError::bad_request(format!("Receipt evidence could not be verified: {err}"))
-    })?;
-    let truncated = size_bytes > MAX_RECEIPT_EVIDENCE_READ_BYTES;
-    // Parse as JSON if possible; fall back to a raw string representation.
-    let content: Value = serde_json::from_slice(&raw)
-        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
-    Ok(Json(json!({
-        "run_id": run_id,
-        "task_id": task_id,
-        "path": receipt_artifact.path,
-        "checksum": receipt_artifact.checksum,
-        "size_bytes": size_bytes,
-        "truncated": truncated,
-        "content": content,
-    })))
+        // Locate the most recent Receipt-kind artifact.
+        let receipt_artifact = receipt
+            .artifacts
+            .iter()
+            .rfind(|a| a.kind == FleetArtifactKind::Receipt)
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "no verifier evidence file for run '{run_id}' task '{task_id}'"
+                ))
+            })?;
+        // Receipt artifacts are workspace-relative paths recorded by the verifier;
+        // reject absolute paths and `..` escapes before joining onto the workspace.
+        // An EMPTY recorded path is not a path at all: joining it would resolve
+        // to the workspace directory itself and read it as a file.
+        if receipt_artifact.path.as_os_str().is_empty() {
+            return Err(ApiError::not_found(format!(
+                "no verifier evidence file recorded for run '{run_id}' task '{task_id}'"
+            )));
+        }
+        if !crate::fleet::artifacts::path_is_confined(&receipt_artifact.path) {
+            return Err(ApiError::bad_request(format!(
+                "evidence path for run '{run_id}' task '{task_id}' escapes the workspace"
+            )));
+        }
+        let (raw, size_bytes) = crate::fleet::artifacts::read_verified(
+            &state.workspace,
+            receipt_artifact,
+            MAX_RECEIPT_EVIDENCE_READ_BYTES,
+        )
+        .map_err(|err| {
+            ApiError::bad_request(format!("Receipt evidence could not be verified: {err}"))
+        })?;
+        let truncated = size_bytes > MAX_RECEIPT_EVIDENCE_READ_BYTES;
+        // Parse as JSON if possible; fall back to a raw string representation.
+        let content: Value = serde_json::from_slice(&raw)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "task_id": task_id,
+            "path": receipt_artifact.path,
+            "checksum": receipt_artifact.checksum,
+            "size_bytes": size_bytes,
+            "truncated": truncated,
+            "content": content,
+        }))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal(format!("Fleet receipt evidence read task failed: {error}"))
+    })??;
+    Ok(Json(response))
 }
 
 fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError> {
@@ -6280,52 +6399,62 @@ async fn mcp_pool_handle(
             .workspace_scopes
             .mcp_generation
             .load(std::sync::atomic::Ordering::SeqCst);
+        let policy = mcp_pool_policy(&state.config.read());
         if let Some((admitted, pool)) = slot.as_ref() {
-            if *admitted == generation {
+            let policy_changed = *state.workspace_scope.mcp_policy.lock() != policy;
+            if *admitted == generation && !policy_changed {
                 return Ok(Some(pool.clone()));
             }
             let mut held = pool.clone().lock_owned().await;
             let current = state.clone();
             #[cfg(test)]
             let env_ticket = crate::test_support::env_scope_ticket();
-            codewhale_app_server::daemon_socket::owner_work(move || {
-                #[cfg(test)]
-                let _membership = crate::test_support::join_env_scope(env_ticket);
-                // Keep the exact scope/owner alive through synchronous disk
-                // reload even if this request is cancelled after admission.
-                current.workspace_scope.validate_sync()?;
-                let path = current.config.read().mcp_config_path();
-                let plugins = current
-                    .plugin_discovery
-                    .registry_for_workspace(&current.workspace);
-                held.switch_workspace_config_source(&path, &current.workspace, plugins)
-            })
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+            if policy_changed {
+                let (rebuilt, admitted_policy) =
+                    codewhale_app_server::daemon_socket::owner_work(move || {
+                        #[cfg(test)]
+                        let _membership = crate::test_support::join_env_scope(env_ticket);
+                        load_mcp_management_pool(&current)
+                    })
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(format!("Failed to load MCP config: {error}"))
+                    })?;
+                held.shutdown_all().await;
+                *held = rebuilt;
+                *state.workspace_scope.mcp_policy.lock() = admitted_policy;
+            } else {
+                codewhale_app_server::daemon_socket::owner_work(move || {
+                    #[cfg(test)]
+                    let _membership = crate::test_support::join_env_scope(env_ticket);
+                    // Keep the exact scope/owner alive through synchronous disk
+                    // reload even if this request is cancelled after admission.
+                    current.workspace_scope.validate_sync()?;
+                    let path = current.config.read().mcp_config_path();
+                    let plugins = current
+                        .plugin_discovery
+                        .registry_for_workspace(&current.workspace);
+                    held.switch_workspace_config_source(&path, &current.workspace, plugins)
+                })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            }
             slot.as_mut().expect("retained pool").0 = generation;
         } else if create {
             let current = state.clone();
             #[cfg(test)]
             let env_ticket = crate::test_support::env_scope_ticket();
-            let pool = codewhale_app_server::daemon_socket::owner_work(move || {
-                #[cfg(test)]
-                let _membership = crate::test_support::join_env_scope(env_ticket);
-                current.workspace_scope.validate_sync()?;
-                let path = current.config.read().mcp_config_path();
-                let plugins = current
-                    .plugin_discovery
-                    .registry_for_workspace(&current.workspace);
-                let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
-                    &path,
-                    &current.workspace,
-                    plugins,
-                )?
-                .with_backend(crate::mcp::McpBackend::from_config(&current.config.read()));
-                pool.dynamic_servers = current.workspace_scopes.dynamic_servers.clone();
-                Ok(pool)
-            })
-            .await
-            .map_err(|error| ApiError::internal(format!("Failed to load MCP config: {error}")))?;
+            let (pool, admitted_policy) =
+                codewhale_app_server::daemon_socket::owner_work(move || {
+                    #[cfg(test)]
+                    let _membership = crate::test_support::join_env_scope(env_ticket);
+                    load_mcp_management_pool(&current)
+                })
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load MCP config: {error}"))
+                })?;
+            *state.workspace_scope.mcp_policy.lock() = admitted_policy;
             *slot = Some((generation, Arc::new(Mutex::new(pool))));
         } else {
             return Ok(None);
@@ -6333,6 +6462,41 @@ async fn mcp_pool_handle(
         // A concurrent global mutation may have settled during disk work.
         // Repeat validation under the same pool; no second connection owner.
     }
+}
+
+fn mcp_pool_policy(config: &Config) -> Value {
+    json!([
+        config
+            .network
+            .clone()
+            .map(crate::config::NetworkPolicyToml::into_runtime),
+        config.mcp_oauth_callback_port,
+        config.mcp_oauth_callback_url,
+    ])
+}
+
+fn load_mcp_management_pool(state: &RuntimeApiState) -> Result<(McpPool, Value)> {
+    state.workspace_scope.validate_sync()?;
+    let path = state.config.read().mcp_config_path();
+    let plugins = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let mut pool =
+        McpPool::from_config_path_with_workspace_and_plugins(&path, &state.workspace, plugins)?;
+    let config = state.config.read();
+    pool = pool
+        .with_backend(crate::mcp::McpBackend::from_config(&config))
+        .with_oauth_callback(
+            config.mcp_oauth_callback_port,
+            config.mcp_oauth_callback_url.clone(),
+        );
+    if let Some(network) = config.network.clone() {
+        pool = pool.with_network_policy(
+            crate::network_policy::NetworkPolicyDecider::with_default_audit(network.into_runtime()),
+        );
+    }
+    pool.dynamic_servers = state.workspace_scopes.dynamic_servers.clone();
+    Ok((pool, mcp_pool_policy(&config)))
 }
 
 fn mcp_connection_outcome(
@@ -7608,6 +7772,9 @@ struct UndoTurnRequest {
     /// How many turns back to undo (default 0 = last turn only).
     #[serde(default)]
     depth: Option<usize>,
+    /// The user turn to undo, with every turn after it. Wins over `depth`.
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7626,12 +7793,25 @@ async fn undo_thread_turn(
     Path(id): Path<String>,
     Json(req): Json<UndoTurnRequest>,
 ) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
-    let depth = req.depth.unwrap_or(0);
-    let (forked_thread, original_user_text, original_user_images, _) = state
-        .runtime_threads
-        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
-        .await
-        .map_err(map_thread_err)?;
+    let (forked_thread, original_user_text, original_user_images, _) = match req.turn_id {
+        Some(turn_id) => {
+            state
+                .runtime_threads
+                .fork_dropping_user_turn_in_sessions_dir(&id, &turn_id, &state.sessions_dir)
+                .await
+        }
+        None => {
+            state
+                .runtime_threads
+                .fork_at_user_message_in_sessions_dir(
+                    &id,
+                    req.depth.unwrap_or(0),
+                    &state.sessions_dir,
+                )
+                .await
+        }
+    }
+    .map_err(map_thread_err)?;
     Ok((
         StatusCode::CREATED,
         Json(UndoTurnResponse {
@@ -8565,18 +8745,42 @@ async fn retry_thread_turn(
     Json(req): Json<RetryTurnRequest>,
 ) -> Result<(StatusCode, Json<RetryTurnResponse>), ApiError> {
     let depth = req.depth.unwrap_or(0);
-    let (forked_thread, original_user_text, original_user_images, max_output_tokens) = state
+    let (reservation, _) = state
         .runtime_threads
-        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
+        .thread_restore_guard(&id)
         .await
         .map_err(map_thread_err)?;
-
-    let retry_prompt = req.prompt.or(original_user_text).unwrap_or_default();
-    if retry_prompt.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "No user message to retry — the dropped turn had no user text",
-        ));
-    }
+    let runtime = state.runtime_threads.clone();
+    let sessions_dir = state.sessions_dir.clone();
+    let prompt = req.prompt;
+    let (forked_thread, retry_prompt, original_user_images, max_output_tokens) =
+        tokio::spawn(async move {
+            let _reservation = reservation;
+            let prepared = runtime
+                .prepare_fork_at_user_message_in_sessions_dir(&id, depth, &sessions_dir)
+                .await
+                .map_err(map_thread_err)?;
+            let retry_prompt = prompt
+                .or_else(|| prepared.original_user_text().map(str::to_string))
+                .unwrap_or_default();
+            if retry_prompt.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "No user message to retry — the dropped turn had no user text",
+                ));
+            }
+            let (forked_thread, _, original_user_images, max_output_tokens) = runtime
+                .publish_prepared_fork(prepared)
+                .await
+                .map_err(map_thread_err)?;
+            Ok((
+                forked_thread,
+                retry_prompt,
+                original_user_images,
+                max_output_tokens,
+            ))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Retry fork task failed: {e}")))??;
 
     let turn = state
         .runtime_threads
@@ -8745,6 +8949,19 @@ async fn mark_agent_mail_read(
         .await
         .map_err(map_agent_mail_err)?;
     Ok(Json(envelope))
+}
+
+async fn mark_thread_read(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<MarkThreadReadRequest>,
+) -> Result<Json<ThreadRecord>, ApiError> {
+    let thread = state
+        .runtime_threads
+        .mark_thread_read(&id, &req.item_id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(thread))
 }
 
 /// Withdraw a queued envelope before delivery (#6176). Idempotent: a
@@ -9007,11 +9224,6 @@ async fn upsert_thread_goal(
     } else {
         StatusCode::OK
     };
-    // Emit a replayable goal-updated event so SSE subscribers can react.
-    let _ = state
-        .runtime_threads
-        .emit_goal_updated_event(&id, goal.clone())
-        .await;
     // Inject the goal into a cached engine (if any) and dispatch the kickoff
     // turn while the thread is idle. Errors are advisory: the goal record is
     // already durable and a subsequent turn still carries it.
@@ -9040,7 +9252,6 @@ async fn delete_thread_goal(
     if !deleted {
         return Err(ApiError::not_found(format!("thread '{id}' has no goal")));
     }
-    let _ = state.runtime_threads.emit_goal_cleared_event(&id).await;
     state
         .runtime_threads
         .sync_engine_goal_status(&id)
@@ -9089,10 +9300,6 @@ async fn complete_thread_goal(
             message: format!("goal for thread '{id}' changed concurrently; retry"),
             code: None,
         })?;
-    let _ = state
-        .runtime_threads
-        .emit_goal_updated_event(&id, updated.clone())
-        .await;
     state
         .runtime_threads
         .sync_engine_goal_status(&id)
@@ -9142,10 +9349,6 @@ async fn block_thread_goal(
             message: format!("goal for thread '{id}' changed concurrently; retry"),
             code: None,
         })?;
-    let _ = state
-        .runtime_threads
-        .emit_goal_updated_event(&id, updated.clone())
-        .await;
     state
         .runtime_threads
         .sync_engine_goal_status(&id)
@@ -9824,10 +10027,10 @@ fn take_compat_turn_event(
         return None;
     }
     *last_seq = event.seq;
-    Some((
-        map_compat_stream_event(event),
-        event.event == "turn.completed",
-    ))
+    let terminal = event.event == "turn.completed"
+        || (event.event == crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT
+            && event.payload.get("terminal").and_then(Value::as_bool) == Some(true));
+    Some((map_compat_stream_event(event), terminal))
 }
 
 fn runtime_event_payload(event: crate::runtime_threads::RuntimeEventRecord) -> serde_json::Value {
@@ -10447,6 +10650,8 @@ struct ProviderEntry {
         skip_serializing_if = "Option::is_none"
     )]
     credential_writable_reason: Option<&'static str>,
+    #[serde(rename = "browserConnect", skip_serializing_if = "std::ops::Not::not")]
+    browser_connect: bool,
 }
 
 /// Stable, non-secret wire projection of provider readiness.
@@ -10506,6 +10711,8 @@ struct ProviderModelEntry {
     reasoning_effort: codewhale_config::route::CapabilityState,
     reasoning_effort_levels: Vec<String>,
     reasoning_effort_source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    facts: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10789,7 +10996,43 @@ fn provider_model_entry_for_api(
         reasoning_effort: CapabilityState::Unknown,
         reasoning_effort_levels: Vec::new(),
         reasoning_effort_source: None,
+        facts: None,
     };
+    let base = config.base_url_for_route(identity);
+    let offering = crate::provider_lake::configured_catalog_offering_for_route(
+        config,
+        provider,
+        identity.key.as_str(),
+        &base,
+        &entry.id,
+    );
+    let resolved =
+        crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(&entry.id))
+            .ok();
+    if let Some(offering) = offering.as_ref() {
+        let pricing = codewhale_config::pricing::OfferingPricing::from_catalog_offering(offering);
+        entry.facts = Some(serde_json::json!({
+            "wire_model_id": offering.wire_model_id,
+            "canonical_model_id": offering.canonical_model,
+            "name": offering.name,
+            "family": offering.family,
+            "status": offering.status,
+            "advertised_limits": offering.limit,
+            "effective_limits": resolved.as_ref().map(|route| route.candidate.limits()),
+            "effective_context": resolved.as_ref().map(|route| route.context_window),
+            "capabilities": resolved.as_ref().map(|route| route.candidate.capabilities()),
+            "reasoning": offering.reasoning,
+            "reasoning_options": offering.reasoning_options,
+            "modalities": offering.modalities,
+            "temperature": offering.temperature,
+            "source": offering.source,
+            "fact_sources": offering.fact_sources,
+            "pricing_status": pricing.as_ref().map(|pricing| pricing.status_label_at(codewhale_config::catalog::now_unix())),
+            "pricing": pricing,
+            "upstream_last_updated": offering.last_updated,
+            "account_access": "unverified",
+        }));
+    }
     // A provider kind and a familiar model name do not establish the
     // capabilities of a different endpoint or named compatible route.
     if provider == ProviderKind::Custom || config.provider_uses_custom_endpoint(identity) {
@@ -10823,10 +11066,13 @@ fn provider_model_entry_for_api(
         if metadata.reasoning == Some(false) {
             entry.reasoning_effort = CapabilityState::Unsupported;
         }
-    } else if let Some(efforts) = ReasoningEffort::catalog_effort_values(provider, &entry.id) {
+    } else if let Some(efforts) = offering
+        .as_ref()
+        .and_then(ReasoningEffort::catalog_effort_values_for_offering)
+    {
         entry.reasoning_effort_levels = efforts
             .into_iter()
-            .filter(|effort| *effort != ReasoningEffort::Off)
+            .filter(|effort| !matches!(effort, ReasoningEffort::Off | ReasoningEffort::Auto))
             .map(|effort| effort.as_setting().to_string())
             .collect();
         entry.reasoning_effort_source = Some("catalog");
@@ -11099,6 +11345,7 @@ fn provider_entry_for_api(
         credential_source: writeability.source,
         credential_writable: writeability.writable,
         credential_writable_reason: writeability.reason,
+        browser_connect: identity.provider == ProviderKind::Orcarouter && writeability.writable,
     }
 }
 
@@ -11120,6 +11367,7 @@ async fn list_providers(
             default_model: String::new(), has_model_catalog: false,
             credential_state: ProviderCredentialState::Legacy, credential_source: secrets::ProviderCredentialSource::None,
             credential_writable: false, credential_writable_reason: Some("This configured route is unavailable; repair its exact provider definition before using it."),
+            browser_connect: false,
         }));
         Ok(Json(ProvidersResponse {
             current_provider_id: active_identity.as_ref().and_then(|identity| identity.persisted_id()).map(str::to_string),
@@ -12003,7 +12251,8 @@ async fn set_config(
 /// This route projects it for HTTP clients — current values resolved from
 /// the owning store (settings.toml via [`crate::settings::Settings`],
 /// config.toml, or the notifications table), labels and descriptions
-/// resolved through the locale pack. Writes stay on `POST /v1/config`;
+/// resolved through the locale pack: the `?locale=` the client displays,
+/// else the configured `locale`. Writes stay on `POST /v1/config`;
 /// this route never invents a value, an option, or a validator.
 #[derive(Debug, Serialize)]
 struct SettingsSchemaResponse {
@@ -12120,8 +12369,14 @@ fn toml_value_at_path<'a>(document: &'a toml::Value, segments: &[&str]) -> Optio
     Some(current)
 }
 
+#[derive(Debug, Deserialize)]
+struct SettingsSchemaQuery {
+    locale: Option<String>,
+}
+
 async fn get_settings_schema(
     State(state): State<RuntimeApiState>,
+    Query(query): Query<SettingsSchemaQuery>,
 ) -> Result<Json<SettingsSchemaResponse>, ApiError> {
     use codewhale_config::notifications::NotificationSetting;
     use codewhale_config::settings_schema::{
@@ -12131,7 +12386,13 @@ async fn get_settings_schema(
 
     let config = state.config.read().clone();
     let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
-    let locale = resolve_locale(&settings.locale);
+    let locale = resolve_locale(
+        query
+            .locale
+            .as_deref()
+            .filter(|tag| !tag.trim().is_empty())
+            .unwrap_or(&settings.locale),
+    );
     let notifications = config.notifications_config();
 
     // Conditional pairs share the TUI's rule: exactly one member is shown,
@@ -13137,7 +13398,10 @@ base_url = "http://127.0.0.1:9/v1"
         .await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2)?;
+        runtime_threads
+            .attach_subagent_manager(sub_agent_manager.clone())
+            .await?;
         let workspace_scopes =
             RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
         let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
@@ -13172,6 +13436,7 @@ base_url = "http://127.0.0.1:9/v1"
             shutdown: RuntimeServerShutdown::default(),
             git_writes: Arc::new(tokio::sync::Mutex::new(())),
             provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+            provider_connect: Default::default(),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

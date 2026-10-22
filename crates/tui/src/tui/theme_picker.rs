@@ -368,6 +368,7 @@ impl ModalView for ThemePickerView {
             .saturating_sub(header_rows)
             .max(1);
         let source_count = self.controller.visible().len();
+        let number_width = source_count.to_string().len();
         let selected_visible = self.controller.selected_visible();
         let max_start = source_count.saturating_sub(visible_rows);
         let start = selected_visible
@@ -447,7 +448,10 @@ impl ModalView for ThemePickerView {
 
             let mut spans: Vec<Span> = Vec::with_capacity(8);
             spans.push(Span::styled(format!(" {pointer} "), row_style));
-            spans.push(Span::styled(format!("{}. ", visible_idx + 1), number_style));
+            spans.push(Span::styled(
+                format!("{:>number_width$}. ", visible_idx + 1),
+                number_style,
+            ));
             spans.push(Span::styled(format!("{:<22}", option.label), row_style));
             spans.extend(swatch);
             spans.push(Span::raw("  "));

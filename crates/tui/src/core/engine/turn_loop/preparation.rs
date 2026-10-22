@@ -220,11 +220,115 @@ impl Engine {
                     .await;
         }
 
-        let active_tools = active_tools_for_request(
+        let mut active_tools = active_tools_for_request(
             &progress.tool_catalog,
             &progress.active_tool_names,
             strict_tool_mode,
         );
+        let fork_route = client.effective_route_envelope(&self.session.model, chrono::Utc::now());
+        let fork_receipt = client.cache_route_receipt();
+        let fork_job = self.child_job();
+        let child_reporting = self.child_report();
+        let mut fork_header_changed = false;
+        if let Some(child) = self.child_host.as_mut() {
+            if child.fork_cache_inherited.as_ref().is_some_and(|snapshot| {
+                client.wire_format()
+                    != Some(codewhale_config::provider::WireFormat::ChatCompletions)
+                    || client.model() != self.session.model
+                    || fork_receipt.is_none()
+                    || snapshot.route_receipt.as_ref() != fork_receipt.as_ref()
+                    || snapshot.model != fork_route.model
+                    || snapshot.provider != fork_route.provider
+                    || snapshot.provider_identity != fork_route.provider_identity
+                    || snapshot.endpoint_fingerprint != fork_route.endpoint_fingerprint
+            }) {
+                child.fork_cache_inherited = None;
+                child.fork_cache_prefix.clear();
+                self.session.system_prompt = Some(child.system_prompt.clone());
+                fork_header_changed = true;
+            }
+            if !child.fork_cache_checked && turn.step == 0 && !child_reporting {
+                child.fork_cache_checked = true;
+                let snapshot = fork_job
+                    .as_ref()
+                    .filter(|job| job.fork_context)
+                    .and_then(|_| child.authority.runtime.fork_context.as_ref())
+                    .and_then(|context| {
+                        context
+                            .live_header
+                            .lock()
+                            .ok()
+                            .and_then(|cell| cell.clone())
+                    });
+                if client.model() == self.session.model
+                    && let Some(wire) = client.wire_format()
+                {
+                    let decision = crate::prompt_zones::resolve_fork_inherit(
+                        crate::prompt_zones::fork_inherit_enabled(),
+                        snapshot.as_ref(),
+                        &fork_route.model,
+                        fork_route.provider,
+                        &fork_route.provider_identity,
+                        wire,
+                        fork_route.endpoint_fingerprint.as_deref(),
+                        fork_receipt.as_ref(),
+                        active_tools.as_deref().unwrap_or_default(),
+                        self.session.messages.len(),
+                    );
+                    #[allow(clippy::print_stderr)]
+                    if crate::prompt_zones::fork_trial_diag_enabled() {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "codewhale_fork_trial": "decision",
+                                "agent_id": child.authority.owner_agent_id,
+                                "inherited": decision.inherit,
+                                "reason": decision.reason,
+                                "prefix": decision.prefix_tools.len(),
+                                "parent_n": snapshot.as_ref().map_or(0, |value| value.active_names.len()),
+                            })
+                        );
+                    }
+                    if decision.inherit
+                        && let Some(snapshot) = snapshot
+                    {
+                        self.session.system_prompt = snapshot.system.clone();
+                        child.fork_cache_prefix = decision
+                            .prefix_tools
+                            .iter()
+                            .map(|tool| tool.name.clone())
+                            .collect();
+                        let prefix = &child.fork_cache_prefix;
+                        progress.tool_catalog.sort_by_key(|tool| {
+                            prefix
+                                .iter()
+                                .position(|name| name == &tool.name)
+                                .unwrap_or(prefix.len())
+                        });
+                        child.fork_cache_inherited = Some(snapshot);
+                        fork_header_changed = true;
+                    }
+                }
+            }
+            if let Some(tools) = active_tools.as_mut() {
+                let prefix = &child.fork_cache_prefix;
+                tools.sort_by_key(|tool| {
+                    prefix
+                        .iter()
+                        .position(|name| name == &tool.name)
+                        .unwrap_or(prefix.len())
+                });
+            }
+        }
+        if fork_header_changed {
+            self.session.last_system_prompt_hash =
+                Some(system_prompt_hash(self.session.system_prompt.as_ref()));
+            self.session.pending_prefix_change_reason = Some("fork-cache".to_string());
+            self.emit_session_updated().await;
+            if self.cancel_token.is_cancelled() {
+                return PhaseResult::Return((TurnOutcomeStatus::Interrupted, None));
+            }
+        }
         // The report already has a bounded text-only captured request. It
         // cannot authorize an extra paid summarizer or mutate its evidence.
         if !self.child_report() {
@@ -245,6 +349,14 @@ impl Engine {
             }
         }
 
+        // Resolve `auto` reasoning_effort to a concrete tier (#663).
+        let effective_reasoning_effort = resolve_auto_effort(
+            self.session.reasoning_effort.as_deref(),
+            self.api_provider,
+            &self.api_config.active_route_base_url(),
+            &self.config.model,
+        );
+
         // The guard measures what the compaction gate measures: the honest
         // estimate, lifted to the provider's last bill plus the growth
         // since it. The ×1.5-inflated overflow estimate, compared against
@@ -261,13 +373,23 @@ impl Engine {
             )
             .and_then(|tokens| usize::try_from(tokens).ok())
             .unwrap_or(0);
-        if let Some(budget) = route_context_budget_for_route(
-            self.api_provider,
-            &self.session.model,
-            self.active_route_limits,
-            estimated_input,
-        ) {
-            let input_budget = usize::try_from(budget.input_budget_ceiling).unwrap_or(usize::MAX);
+        if !self.child_report()
+            && let Some(budget) = route_context_budget_for_route(
+                self.api_provider,
+                &self.session.model,
+                self.active_route_limits,
+                estimated_input,
+            )
+        {
+            let input_budget = usize::try_from(
+                crate::route_budget::route_admission_input_ceiling(
+                    self.api_provider,
+                    &self.session.model,
+                    self.active_route_limits,
+                )
+                .unwrap_or(budget.input_budget_ceiling),
+            )
+            .unwrap_or(usize::MAX);
             let triggered = estimated_input > input_budget;
             let output_ceiling =
                 crate::route_budget::output_ceiling_source(self.api_provider, &self.session.model);
@@ -293,6 +415,7 @@ impl Engine {
                     &self.session.model,
                     self.active_route_limits,
                     turn.max_output_tokens,
+                    effective_reasoning_effort.as_deref(),
                 ),
                 reserved_response_headroom_tokens = budget.output_cap_tokens,
                 safety_headroom_tokens = crate::context_budget::CONTEXT_HEADROOM_TOKENS,
@@ -306,78 +429,16 @@ impl Engine {
                 "resolved route context budget"
             );
             if triggered {
-                if progress.context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
-                    let message = context_overflow_exhausted_message(
-                        self.config.terminal_chrome_enabled,
-                        turn.stop_diagnostics.emergency_compaction_attempts,
-                        estimated_input,
-                        input_budget,
-                    );
-                    progress.turn_error = Some(message.clone());
-                    let _ = self
-                        .send_event(Event::error(ErrorEnvelope::context_overflow(message)))
-                        .await;
-                    return PhaseResult::Return((
-                        TurnOutcomeStatus::Failed,
-                        progress.turn_error.take(),
-                    ));
-                }
-
-                if self
-                    .recover_context_overflow(
-                        client.as_ref(),
-                        active_tools.as_deref(),
-                        "preflight token budget",
+                return self
+                    .context_budget_overflow(
                         turn,
-                    )
-                    .await
-                {
-                    progress.context_recovery_attempts =
-                        progress.context_recovery_attempts.saturating_add(1);
-                    return PhaseResult::Retry;
-                }
-                if self.cancel_token.is_cancelled() {
-                    return PhaseResult::Return((TurnOutcomeStatus::Interrupted, None));
-                }
-                // One failure, one true sentence (experience mark 2): a
-                // provider that refused the recovery request is the
-                // cause, and a history with nothing to summarize is a
-                // window problem, not a failed compaction.
-                if let Some(rejection) = turn.context_recovery_rejection.take() {
-                    let display_message = self.decorate_auth_error_message(
-                        initial_stream_error_user_message(&self.config.locale_tag, &rejection),
-                    );
-                    let mut envelope = crate::error_taxonomy::envelope_for_llm_error(
-                        rejection,
-                        display_message.clone(),
-                    );
-                    envelope.message = display_message.clone();
-                    let _ = self.send_event(Event::error(envelope)).await;
-                    return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(display_message)));
-                }
-                let message = if crate::compaction::has_compactable_history(&self.session.messages)
-                {
-                    "The request still exceeds this model's context budget and automatic recovery did not complete. The conversation is saved; retry or choose a larger context route.".to_string()
-                } else {
-                    let prefix_tokens = crate::compaction::estimate_input_tokens_for_pressure(
-                        &[],
-                        self.session.system_prompt.as_ref(),
-                    );
-                    super::context::context_does_not_fit_message(
-                        self.config.terminal_chrome_enabled,
-                        self.api_provider == crate::config::ProviderKind::Ollama,
-                        &self.session.model,
+                        progress,
+                        client,
+                        active_tools.as_deref(),
                         estimated_input,
                         input_budget,
-                        prefix_tokens,
                     )
-                };
-                let _ = self
-                    .send_event(Event::error(ErrorEnvelope::context_overflow(
-                        message.clone(),
-                    )))
                     .await;
-                return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(message)));
             }
         }
 
@@ -385,18 +446,6 @@ impl Engine {
         // request and inject them as a synthetic user message so the
         // model sees compile errors before its next reasoning step.
         self.flush_pending_lsp_diagnostics().await;
-
-        // Build the request. Tool selection goes through the same
-        // helper that seeded this turn and that `/preview-request`
-        // reports, so a deferred tool activated mid-turn is reflected
-        // identically in both places.
-        // Resolve `auto` reasoning_effort to a concrete tier (#663).
-        let effective_reasoning_effort = resolve_auto_effort(
-            self.session.reasoning_effort.as_deref(),
-            self.api_provider,
-            &self.api_config.active_route_base_url(),
-            &self.config.model,
-        );
 
         // Check prefix-cache stability before building the request.
         // This detects system-prompt or tool-set drift that would
@@ -549,6 +598,10 @@ impl Engine {
         // `take` is what keeps this request-scoped: the nudge is spent
         // here and never reaches `self.session.messages`.
         let request_nudge = progress.reasoning_only_nudge.take();
+        // Build the request. Tool selection goes through the same
+        // helper that seeded this turn and that `/preview-request`
+        // reports, so a deferred tool activated mid-turn is reflected
+        // identically in both places.
         let mut request = prepare_primary_turn_request(PrimaryTurnRequest {
             model: self.session.model.clone(),
             messages: {
@@ -566,6 +619,7 @@ impl Engine {
                 &self.session.model,
                 self.active_route_limits,
                 turn.max_output_tokens,
+                effective_reasoning_effort.as_deref(),
             ),
             system: self.session.system_prompt.clone(),
             tools: active_tools.clone(),
@@ -608,9 +662,15 @@ impl Engine {
         // outbound copy is rewritten, and it is rewritten to text that says
         // why rather than being dropped.
         let fresh_images = crate::image_attach::images_since_last_user_prompt(&request.messages);
+        let image_provider = self.image_route_provider_key();
+        let (image_input, image_cap) = self.request_image_policy(
+            &image_provider,
+            &self.session.model,
+            self.active_route_capabilities.image_input,
+        );
         let stripped_images = crate::image_attach::strip_images_when_unsupported(
             &mut request.messages,
-            self.active_route_capabilities.image_input,
+            image_input,
             &self.session.model,
         );
         if stripped_images > 0 {
@@ -629,6 +689,60 @@ impl Engine {
                 let _ = self.send_event(Event::status(status)).await;
             }
         }
+        if let Some(cap) = image_cap {
+            let window = crate::image_attach::cap_request_images(&mut request.messages, cap);
+            self.note_request_image_window(image_provider, window).await;
+        }
+        let report = self.child_report();
+        let request_input = crate::compaction::estimate_request_input_tokens(
+            &request.messages,
+            request.system.as_ref(),
+            request.tools.as_deref(),
+        );
+        let request_input = if report {
+            request_input
+        } else {
+            request_input.max(estimated_input)
+        };
+        let output_cap = crate::route_budget::request_output_cap_for_input(
+            self.api_provider,
+            &self.session.model,
+            self.active_route_limits,
+            request.max_tokens,
+            u64::try_from(request_input).unwrap_or(u64::MAX),
+        )
+        .filter(|cap| {
+            *cap == request.max_tokens
+                || u64::from(*cap) >= crate::tools::subagent::budget_handback::MIN_HAND_BACK_OUTPUT
+        });
+        let Some(output_cap) = output_cap else {
+            if report {
+                return PhaseResult::Return((
+                    TurnOutcomeStatus::Failed,
+                    Some(
+                        "bounded Core report request does not fit the route context window".into(),
+                    ),
+                ));
+            }
+            progress.reasoning_only_nudge = request_nudge;
+            let input_budget = crate::route_budget::route_admission_input_ceiling(
+                self.api_provider,
+                &self.session.model,
+                self.active_route_limits,
+            )
+            .map_or(0, |ceiling| usize::try_from(ceiling).unwrap_or(usize::MAX));
+            return self
+                .context_budget_overflow(
+                    turn,
+                    progress,
+                    client,
+                    active_tools.as_deref(),
+                    request_input,
+                    input_budget,
+                )
+                .await;
+        };
+        request.max_tokens = output_cap;
         let tool_request_snapshot =
             crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request_with_surface(
                 &turn.id,
@@ -647,6 +761,61 @@ impl Engine {
         // first call) so we can resend it on a transparent retry below
         // when the wire dies before any content was streamed (#103).
         let stream_request = request;
+        let cache_receipt = client.cache_route_receipt();
+        if self.child_host.is_none()
+            && (client.wire_format()
+                != Some(codewhale_config::provider::WireFormat::ChatCompletions)
+                || client.model() != stream_request.model
+                || cache_receipt.is_none())
+            && let Ok(mut cell) = self.live_header.lock()
+        {
+            *cell = None;
+        }
+
+        if self.child_host.is_none()
+            && crate::prompt_zones::fork_inherit_enabled()
+            && client.wire_format() == Some(codewhale_config::provider::WireFormat::ChatCompletions)
+            && client.model() == stream_request.model
+            && cache_receipt.is_some()
+            && let Some(tools_json) = crate::prompt_zones::wire_tool_catalog_json(
+                stream_request.tools.as_deref().unwrap_or_default(),
+            )
+            && let Ok(mut cell) = self.live_header.lock()
+        {
+            let route = client.effective_route_envelope(&stream_request.model, chrono::Utc::now());
+            let prior = cell.as_ref().filter(|old| {
+                old.model == route.model
+                    && old.provider == route.provider
+                    && old.provider_identity == route.provider_identity
+                    && old.endpoint_fingerprint == route.endpoint_fingerprint
+            });
+            let carried = crate::prompt_zones::carry_hot_forward(
+                prior,
+                &stream_request.system,
+                &tools_json,
+                &stream_request.messages,
+                cache_receipt.as_ref(),
+            );
+            *cell = Some(crate::prompt_zones::LiveHeaderSnapshot {
+                system: stream_request.system.clone(),
+                tools_json,
+                active_names: stream_request
+                    .tools
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect(),
+                model: route.model,
+                provider: route.provider,
+                provider_identity: route.provider_identity,
+                endpoint_fingerprint: route.endpoint_fingerprint,
+                route_receipt: cache_receipt,
+                history: stream_request.messages.clone(),
+                last_hit_tokens: carried,
+            });
+        }
+
         // Superfast Decision Gate (shadow mode, off by default). When
         // SUPERFAST_ENABLED is set, this spawns a detached task that asks
         // a small System One decision model about the user's turn and only
@@ -713,6 +882,79 @@ impl Engine {
             fleet_report_response,
         })
     }
+    async fn context_budget_overflow(
+        &mut self,
+        turn: &mut TurnContext,
+        progress: &mut TurnLoopProgress,
+        client: &SharedModelClient,
+        tools: Option<&[codewhale_models::Tool]>,
+        estimated_input: usize,
+        input_budget: usize,
+    ) -> PhaseResult<PreparedModelStep> {
+        if progress.context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
+            let message = context_overflow_exhausted_message(
+                self.config.terminal_chrome_enabled,
+                turn.stop_diagnostics.emergency_compaction_attempts,
+                estimated_input,
+                input_budget,
+            );
+            progress.turn_error = Some(message.clone());
+            let _ = self
+                .send_event(Event::error(ErrorEnvelope::context_overflow(message)))
+                .await;
+            return PhaseResult::Return((TurnOutcomeStatus::Failed, progress.turn_error.take()));
+        }
+
+        if self
+            .recover_context_overflow(client.as_ref(), tools, "preflight token budget", turn)
+            .await
+        {
+            progress.context_recovery_attempts =
+                progress.context_recovery_attempts.saturating_add(1);
+            return PhaseResult::Retry;
+        }
+        if self.cancel_token.is_cancelled() {
+            return PhaseResult::Return((TurnOutcomeStatus::Interrupted, None));
+        }
+        // One failure, one true sentence (experience mark 2): a
+        // provider that refused the recovery request is the
+        // cause, and a history with nothing to summarize is a
+        // window problem, not a failed compaction.
+        if let Some(rejection) = turn.context_recovery_rejection.take() {
+            let display_message = self.decorate_auth_error_message(
+                initial_stream_error_user_message(&self.config.locale_tag, &rejection),
+            );
+            let mut envelope =
+                crate::error_taxonomy::envelope_for_llm_error(rejection, display_message.clone());
+            envelope.message = display_message.clone();
+            let _ = self.send_event(Event::error(envelope)).await;
+            return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(display_message)));
+        }
+        let message = if crate::compaction::has_compactable_history(&self.session.messages) {
+            "The request still exceeds this model's context budget and automatic recovery did not complete. The conversation is saved; retry or choose a larger context route.".to_string()
+        } else {
+            let prefix_tokens = crate::compaction::estimate_request_input_tokens(
+                &[],
+                self.session.system_prompt.as_ref(),
+                tools,
+            );
+            super::context::context_does_not_fit_message(
+                self.config.terminal_chrome_enabled,
+                self.api_provider == crate::config::ProviderKind::Ollama,
+                &self.session.model,
+                estimated_input,
+                input_budget,
+                prefix_tokens,
+            )
+        };
+        let _ = self
+            .send_event(Event::error(ErrorEnvelope::context_overflow(
+                message.clone(),
+            )))
+            .await;
+        PhaseResult::Return((TurnOutcomeStatus::Failed, Some(message)))
+    }
+
     /// The same pure primary request builder and the same dispatch phase,
     /// with a whole bounded RLM history and no autonomous recovery producer.
     async fn prepare_rlm_model_step(
@@ -760,10 +1002,23 @@ impl Engine {
             self.active_route_limits,
             usize::try_from(estimated).unwrap_or(usize::MAX),
         )
-        .is_some_and(|budget| estimated > budget.input_budget_ceiling)
-        {
+        .is_some_and(|budget| {
+            estimated
+                > crate::route_budget::route_admission_input_ceiling(
+                    self.api_provider,
+                    &self.session.model,
+                    self.active_route_limits,
+                )
+                .unwrap_or(budget.input_budget_ceiling)
+        }) {
             return PhaseResult::Return((TurnOutcomeStatus::Failed, Some("RLM whole round history exceeds the captured route context budget; history was not truncated".into())));
         }
+        let reasoning_effort = resolve_auto_effort(
+            self.session.reasoning_effort.as_deref(),
+            self.api_provider,
+            &self.api_config.active_route_base_url(),
+            &self.config.model,
+        );
         let mut request = prepare_primary_turn_request(PrimaryTurnRequest {
             model: self.session.model.clone(),
             messages: self.messages_with_turn_metadata(),
@@ -772,20 +1027,24 @@ impl Engine {
                 &self.session.model,
                 self.active_route_limits,
                 turn.max_output_tokens,
+                reasoning_effort.as_deref(),
             ),
             system: self.session.system_prompt.clone(),
             tools: None,
             tool_choice: None,
-            reasoning_effort: resolve_auto_effort(
-                self.session.reasoning_effort.as_deref(),
-                self.api_provider,
-                &self.api_config.active_route_base_url(),
-                &self.config.model,
-            ),
+            reasoning_effort,
         });
-        request.max_tokens = request
-            .max_tokens
-            .min(client.effective_max_output_tokens(&self.session.model));
+        let Some(output_cap) = crate::route_budget::request_output_cap_for_input(
+            self.api_provider,
+            &self.session.model,
+            self.active_route_limits,
+            request.max_tokens,
+            estimated,
+        ) else {
+            return PhaseResult::Return((TurnOutcomeStatus::Failed, Some("RLM whole round history leaves no output room in the captured route context window; history was not truncated".into())));
+        };
+        request.max_tokens =
+            output_cap.min(client.effective_max_output_tokens(&self.session.model));
         let snapshot =
             crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request_with_surface(
                 &turn.id,

@@ -468,7 +468,8 @@ impl Engine {
         let child = context_override
             .as_ref()
             .or_else(|| registry.map(|registry| registry.context()))
-            .and_then(|context| context.child_host.clone());
+            .and_then(|context| context.child_host.clone())
+            .filter(|_| tool_name != EXECUTE_TOOLS_TOOL_NAME);
         let execution = Self::execute_tool_admitted(
             lock,
             supports_parallel,
@@ -713,17 +714,19 @@ impl Engine {
             if let Some(context) = context
                 && (context.acp_host.is_some() || context.child_host.is_some())
             {
-                let spec = registry
-                    .and_then(|registry| registry.get(&tool_name))
-                    .ok_or_else(|| {
-                        ToolError::not_available("ACP call has no admitted registered tool")
-                    })?;
-                crate::tools::registry::enforce_tool_authority(
-                    &tool_name,
-                    &tool_input,
-                    spec.as_ref(),
-                    context,
-                )?;
+                if context.acp_host.is_some() || tool_name != EXECUTE_TOOLS_TOOL_NAME {
+                    let spec = registry
+                        .and_then(|registry| registry.get(&tool_name))
+                        .ok_or_else(|| {
+                            ToolError::not_available("ACP call has no admitted registered tool")
+                        })?;
+                    crate::tools::registry::enforce_tool_authority(
+                        &tool_name,
+                        &tool_input,
+                        spec.as_ref(),
+                        context,
+                    )?;
+                }
                 crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
                     .map_err(ToolError::not_available)?;
             }

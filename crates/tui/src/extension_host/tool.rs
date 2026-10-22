@@ -345,7 +345,7 @@ impl ToolSpec for HostToolSpec {
         let deadline = self.manager.options.supervision.tool_call_deadline;
         // An invocation ticket (so the tool may ask the core to run tools for
         // it) exists only when the turn loop is serving a permission gate for
-        // exactly this tool's call. Otherwise (a sub-agent, a call nested in
+        // exactly this tool's call. Otherwise (a call nested in
         // `execute_tools`, a test) the tool has no way to ask for anything.
         let invocation: Option<InvocationGuard> = context
             .execution

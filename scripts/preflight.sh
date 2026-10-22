@@ -7,6 +7,11 @@
 #   scripts/preflight.sh --full     also run the cargo-backed runtime-contract and
 #                                   persistence-backlog ratchets and the two
 #                                   version-stamped fixture tests (minutes, offline)
+#   scripts/preflight.sh --clippy   also run the Lint job's clippy step exactly as
+#                                   CI runs it. Separate from --full because a
+#                                   workspace --all-targets --all-features clippy
+#                                   is far slower than everything else here, and it
+#                                   is the one Lint step nothing else covered.
 #   scripts/preflight.sh --base REF compare feature receipts against REF
 #                                   (default: merge base with origin/main)
 #
@@ -25,10 +30,12 @@
 #     persistence-backlog)
 #   - feature release-note receipts      add each feat commit's #issue to
 #     for this branch's own commits      CHANGELOG.md in the same PR
+#   - clippy (with --clippy)            the Lint job's exact command; fix the lint
 set -uo pipefail
 
 mode="write"
 full=0
+clippy=0
 base=""
 if [[ "$(basename "$0")" == "pre-push" ]]; then
   # git passes <remote> <url>; the hook only ever checks.
@@ -39,9 +46,10 @@ while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --check) mode="check"; shift ;;
     --full) full=1; shift ;;
+    --clippy) clippy=1; shift ;;
     --base) base="${2:?--base needs a ref}"; shift 2 ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
-    *) echo "usage: $0 [--check] [--full] [--base REF]" >&2; exit 2 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    *) echo "usage: $0 [--check] [--full] [--clippy] [--base REF]" >&2; exit 2 ;;
   esac
 done
 
@@ -90,6 +98,18 @@ if [[ "${full}" == "1" ]]; then
     "regenerate the stale fixture the failing test names, then commit it" \
     scripts/dev-cargo.sh nextest run --locked --lib -p codewhale-config -p codewhale-tui \
     -E 'test(golden_providers_export_matches_registry) | test(status_public_output_and_read_only_state_match_baseline)'
+fi
+if [[ "${clippy}" == "1" ]]; then
+  # Exactly the Lint job's clippy step. Two main-side failures in one night were
+  # a redundant closure and an unformatted test that this would have caught;
+  # the Lint job is what turns main red, so run its command, not a subset.
+  step "clippy (Lint job's command)" \
+    "fix the lint, or run the same command to see it in full: cargo clippy --workspace --all-targets --all-features --locked" \
+    cargo clippy --workspace --all-targets --all-features --locked -- \
+    -D warnings \
+    -A clippy::uninlined_format_args \
+    -A clippy::too_many_arguments \
+    -A clippy::unnecessary_map_or
 fi
 
 if [[ -z "${base}" ]]; then

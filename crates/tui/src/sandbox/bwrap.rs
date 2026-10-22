@@ -314,9 +314,7 @@ fn existing_directory(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 pub fn detect_denial(exit_code: i32, stderr: &str) -> bool {
     exit_code != 0
-        && (stderr
-            .lines()
-            .any(|line| line.trim_start().starts_with("bwrap:"))
+        && (super::bwrap_setup_failure(stderr).is_some()
             || stderr.contains("Read-only file system"))
 }
 

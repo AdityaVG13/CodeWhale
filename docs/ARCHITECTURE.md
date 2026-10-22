@@ -179,9 +179,14 @@ rather than a traced write path.
   runtime code asks the terminal UI for a terminal effect. It never depends on
   the TUI, `ratatui` or `crossterm`; `scripts/check-command-crate-boundaries.py`
   enforces that and ratchets the runtime -> UI references still in `crates/tui`.
-- **`crates/secrets`** - OS keyring integration for API key storage, plus the
-  shared output sanitizer (`sanitize`) and redaction (`redact`) that UI and
-  runtime code both call.
+- **`crates/secrets`** - Secret storage. API keys and MCP OAuth tokens live in
+  a private file store (`~/.codewhale/secrets/secrets.json`, mode `0600` on
+  Unix) by default; the OS keyring is used only when
+  `CODEWHALE_SECRET_BACKEND=system` opts in, and a keyring that fails its probe
+  falls back to the file store. Account sessions always use the file store.
+  The crate also re-exports the shared output sanitizer (`sanitize`) and
+  redaction (`redact`) from `crates/sanitize`, which UI and runtime code both
+  call.
 - **`crates/state`** - SQLite thread/session persistence layer.
 - **`crates/telemetry`** - Anonymous, user-disableable aggregate usage
   counting; the only crate allowed to build or send a telemetry payload
@@ -192,6 +197,30 @@ rather than a traced write path.
   Fleet/Workflow work (`codewhale lane list/status/attach/logs/stop`).
 - **`crates/release`** / **`crates/build-support`** - Release checks and build
   plumbing.
+
+### Embedded turn terminal ownership
+
+`TurnComplete` is the authoritative terminal event; `Error` remains advisory.
+The engine and protocol projection preserve the operation's original identity:
+
+- Model turns echo their actual `TurnStarted.turn_id` and the submitted
+  `submission_id` on completion, failure and interruption. Runtime self-starts
+  carry no host submission token.
+- A route-install failure or an `edit_last_turn` rejection before
+  `TurnStarted` emits a failed terminal with the rejected `submission_id` and
+  no `turn_id`. It does not claim a previous turn. Image and constitution
+  rejections in `handle_send_message` still emit only `Error`.
+- Manual compaction terminals carry only their `compaction_id`, including route
+  rejection and cancellation. Automatic compaction remains part of its owning
+  model turn. Purge operations carry none of these identities.
+
+Wire fields are optional and default to absent for older producers. An embedded
+host must match an owned receipt before closing a pending operation; it must
+not infer ownership from advisory errors, an absent ID, or whichever request
+happens to be busy. Hosts also need their own engine-incarnation fence: these
+IDs do not authorize an event from an evicted runtime to mutate its
+replacement. This contract adds no model prompt/context contributor and no
+second turn loop.
 
 ### LLM Integration
 
@@ -315,7 +344,7 @@ drives turns through Chat Completions.
 1. Before sending user input, the TUI writes a checkpoint snapshot to `~/.codewhale/sessions/checkpoints/latest.json`
 2. Startup remains fresh by default; prior sessions are resumed explicitly via `--resume`/`--continue` (or `Ctrl+R` in TUI)
 3. While degraded/offline, new prompts are queued in-memory and mirrored to `~/.codewhale/sessions/checkpoints/offline_queue.json`
-4. Queue edits (`/queue ...`) are persisted continuously so drafts and queued prompts survive restarts
+4. Queue edits (`/queue ...`) are persisted continuously so drafts and queued prompts survive restarts. Messages restored from an earlier launch or another session are held: they are sent only by `/queue send <n>` and discarded by `/queue clear`
 5. Successful turn completion clears the active checkpoint and writes a durable session snapshot
 6. Action-capable turns also take pre/post-turn side-git workspace snapshots under `~/.codewhale/snapshots/<project_hash>/<worktree_hash>/.git`; `/restore N` and `revert_turn` restore file state without changing conversation history or the user's `.git`
 

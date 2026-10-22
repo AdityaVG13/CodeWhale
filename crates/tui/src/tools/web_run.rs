@@ -10,7 +10,7 @@ use super::spec::{
 use super::web::extract::{DocumentKind, ExtractedDocument, extract_document};
 #[cfg(test)]
 use super::web::fetch::fetch_readable_with_initial_pin;
-use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch_readable};
+use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, Readable, fetch_readable};
 #[cfg(test)]
 use super::web::guard::DnsPin;
 use super::web::overflow::bound_text as bound_web_text;
@@ -214,6 +214,7 @@ struct WebPage {
     links: Vec<WebLink>,
     pdf_pages: Option<Vec<Vec<String>>>,
     truncated: bool,
+    partial: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -291,6 +292,10 @@ struct PageViewResult {
     total_lines: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    partial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
     content: String,
     links: Vec<WebLink>,
 }
@@ -1293,6 +1298,7 @@ fn page_from_search(query: &str, results: &[NormalizedSearchResult]) -> WebPage 
         links,
         pdf_pages: None,
         truncated: false,
+        partial: None,
     }
 }
 
@@ -1328,7 +1334,7 @@ async fn fetch_page_with(
         },
     )
     .await?;
-    page_from_document(readable.payload, readable.document, context)
+    page_from_readable(readable.payload, readable.document, context)
 }
 
 #[cfg(test)]
@@ -1349,7 +1355,7 @@ async fn fetch_page_with_initial_pin(
         },
     )
     .await?;
-    page_from_document(readable.payload, readable.document, context)
+    page_from_readable(readable.payload, readable.document, context)
 }
 
 /// Reject non-2xx responses, then extract one readable document.
@@ -1371,9 +1377,26 @@ async fn document_from_fetched(
         &payload.url,
         Some(&payload.content_type),
         &payload.bytes,
+        payload.truncated,
         Some(context),
     )
     .await
+}
+
+fn page_from_readable(
+    payload: super::web::fetch::FetchedPayload,
+    document: Readable<ExtractedDocument>,
+    context: &ToolContext,
+) -> Result<WebPage, ToolError> {
+    match document {
+        Readable::Document(document) => page_from_document(payload, document, context),
+        Readable::Partial(page) => {
+            page_from_document(payload, page.document, context).map(|web_page| WebPage {
+                partial: Some(page.note),
+                ..web_page
+            })
+        }
+    }
 }
 
 fn page_from_document(
@@ -1396,6 +1419,7 @@ fn page_from_document(
                 links,
                 pdf_pages: None,
                 truncated: payload.truncated,
+                partial: None,
             })
         }
         DocumentKind::Markdown => {
@@ -1408,6 +1432,7 @@ fn page_from_document(
                 links,
                 pdf_pages: None,
                 truncated: payload.truncated,
+                partial: None,
             })
         }
         DocumentKind::Text => Ok(WebPage {
@@ -1418,6 +1443,7 @@ fn page_from_document(
             links: Vec::new(),
             pdf_pages: None,
             truncated: payload.truncated,
+            partial: None,
         }),
         DocumentKind::Pdf => {
             let pages = document.pdf_pages.unwrap_or_default();
@@ -1429,6 +1455,7 @@ fn page_from_document(
                 links: Vec::new(),
                 pdf_pages: Some(pages),
                 truncated: payload.truncated,
+                partial: None,
             })
         }
         DocumentKind::Media => {
@@ -1455,6 +1482,7 @@ fn page_from_document(
                 links: Vec::new(),
                 pdf_pages: None,
                 truncated: payload.truncated,
+                partial: None,
             })
         }
     }
@@ -1532,6 +1560,8 @@ fn render_view(
         line_end: end,
         total_lines: total,
         truncated: page.truncated,
+        partial: page.partial.is_some(),
+        note: page.partial.clone(),
         content,
         links: page.links.clone(),
     }
@@ -1864,6 +1894,7 @@ mod tests {
             links: Vec::new(),
             pdf_pages: None,
             truncated: false,
+            partial: None,
         }
     }
 

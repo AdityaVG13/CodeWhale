@@ -64,6 +64,15 @@ fn set_api_messages_installs_the_shared_snapshot_without_copying() {
     });
     assert_eq!(snapshot.len(), 1);
     assert_eq!(app.api_messages.len(), 2);
+    app.session_turn_outcomes = vec![
+        crate::session_manager::SavedTurnOutcome::failed("shared failure", 1),
+        crate::session_manager::SavedTurnOutcome::failed("replaced failure", 2),
+    ];
+    let replacement = Arc::new(vec![snapshot[0].clone(), snapshot[0].clone()]);
+    app.set_api_messages(Arc::clone(&replacement));
+    assert!(Arc::ptr_eq(&app.api_messages, &replacement));
+    assert_eq!(app.session_turn_outcomes.len(), 1);
+    assert_eq!(app.session_turn_outcomes[0].error, "shared failure");
 }
 
 #[test]
@@ -429,6 +438,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Zai,
+            ProviderKind::Zai.as_str(),
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
@@ -440,6 +450,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Minimax,
+            ProviderKind::Minimax.as_str(),
             crate::config::DEFAULT_MINIMAX_BASE_URL,
             crate::config::DEFAULT_MINIMAX_MODEL,
         ),
@@ -450,6 +461,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Zai,
+            ProviderKind::Zai.as_str(),
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
@@ -468,6 +480,7 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::OpenaiCodex,
+            ProviderKind::OpenaiCodex.as_str(),
             crate::config::DEFAULT_OPENAI_CODEX_BASE_URL,
             crate::config::DEFAULT_OPENAI_CODEX_MODEL,
         ),
@@ -479,6 +492,7 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Moonshot,
+            ProviderKind::Moonshot.as_str(),
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
         ),
@@ -1504,8 +1518,20 @@ fn reasoning_effort_preserves_grok_46_ladder_only_on_exact_xai_route() {
             "https://gateway.example/v1",
             model,
         ),
-        ReasoningEffort::Medium,
-        "catalog effort lists are model metadata; the Chat wire still omits them on a custom endpoint"
+        ReasoningEffort::High,
+        "a custom endpoint must not inherit the official catalog effort ladder"
+    );
+    let custom = "https://gateway.example/v1";
+    assert!(ReasoningEffort::offering_for_reasoning(ProviderKind::Xai, custom, model).is_none());
+    assert!(ReasoningEffort::catalog_effort_values(ProviderKind::Xai, custom, model).is_none());
+    assert_eq!(
+        crate::tui::model_picker::picker_efforts_for_route(ProviderKind::Xai, custom, model, false),
+        vec![
+            ReasoningEffort::Auto,
+            ReasoningEffort::Off,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ]
     );
 }
 
@@ -4620,7 +4646,7 @@ fn expanded_tool_scenario() {
 
         app.shift_history_maps_down(3);
 
-        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([3]));
+        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([4]));
     }
     // from expanded_tool_runs_prune_when_history_is_truncated
     {
@@ -7881,10 +7907,7 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
             wire_model_id: model.to_string(),
             endpoint_key: "chat".to_string(),
             reasoning_options: vec![serde_json::json!({ "type": "effort", "values": values })],
-            source: codewhale_config::catalog::CatalogSource::Live {
-                base_url_fingerprint: "models-dev-capabilities".to_string(),
-                fetched_at,
-            },
+            source: codewhale_config::catalog::CatalogSource::ModelsDevLive { fetched_at },
             ..Default::default()
         }
     };

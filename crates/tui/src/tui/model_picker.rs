@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, Paragraph, Widget},
 };
 
-use codewhale_config::catalog::{CatalogRefreshError, CatalogSource, CatalogStatus};
+use codewhale_config::catalog::{CatalogSource, CatalogStatus};
 use codewhale_config::model_reference::ModelReferenceCard;
 use codewhale_config::pricing::OfferingPricing;
 
@@ -33,9 +33,7 @@ use crate::model_profile::{
     resolved_capability_profile_with_overrides,
 };
 use crate::models_dev_live::{self, ModelsDevFreshness};
-use crate::provider_lake::{
-    catalog_offering_for_model, catalog_offering_for_model_identity, configured_providers,
-};
+use crate::provider_lake::{catalog_offering_for_model_identity, configured_providers};
 use crate::reasoning_preference::ReasoningEffort;
 use crate::settings::PinnedModel;
 use crate::tui::app::{App, StatusToastLevel};
@@ -358,6 +356,15 @@ enum DefaultSection {
 /// Most rows the default view's recent section shows.
 const RECENT_ROW_LIMIT: usize = 8;
 
+/// Most rows one custom relay's own roster contributes to the default view.
+///
+/// A relay has no bundled snapshot to browse: its roster exists only in the
+/// listing that route itself answered. Hiding all of it but the configured
+/// default is what made `/model` show one row for a route the provider panel
+/// had just listed a dozen for. The bound keeps a gateway fronting a thousand
+/// models from taking the view over.
+const CUSTOM_ROSTER_ROWS_IN_DEFAULT_VIEW: usize = 20;
+
 /// A fresh live roster for the row's exact route omits its id. Only a fresh
 /// roster may say so: a stale one lags the provider (and would condemn ids it
 /// simply never saw). The row stays selectable and nothing is rewritten.
@@ -395,6 +402,7 @@ enum PickerPricing {
     /// The route explicitly does not expose authoritative token pricing.
     Unavailable,
     Known(String),
+    Status(&'static str),
     #[default]
     Unknown,
 }
@@ -2357,6 +2365,29 @@ fn assign_default_sections(
             row.default_rank = Some((DefaultSection::ProviderDefault, usize::MAX));
         }
     }
+    // A custom relay's roster is the reason the route was configured, and the
+    // default view used to hide every one of its rows but the provider default
+    // -- the panel listed the route's dozen models and `/model` showed one.
+    // Surface the route's own live rows, bounded per route so a large gateway
+    // cannot take the view over.
+    let mut shown_per_route: BTreeMap<String, usize> = BTreeMap::new();
+    for row in rows.iter_mut() {
+        if row.default_rank.is_some()
+            || row.provider != Some(ProviderKind::Custom)
+            || !matches!(row.metadata.source, Some(CatalogSource::Live { .. }))
+        {
+            continue;
+        }
+        let Some(identity) = row_provider_identity(row).map(str::to_string) else {
+            continue;
+        };
+        let shown = shown_per_route.entry(identity).or_default();
+        if *shown >= CUSTOM_ROSTER_ROWS_IN_DEFAULT_VIEW {
+            continue;
+        }
+        *shown += 1;
+        row.default_rank = Some((DefaultSection::ProviderDefault, usize::MAX));
+    }
 }
 
 /// Model ids this exact route was used with recently, so a model picked
@@ -2465,12 +2496,13 @@ fn push_provider_model_rows(
             model_ids.push(declaration.id.clone());
         }
     }
+    let readiness_scope =
+        crate::provider_readiness::RouteReadinessScope::for_route(config, admitted);
     for id in model_ids {
         if id == "auto" {
             continue;
         }
-        let readiness =
-            crate::provider_readiness::resolve_for_model(config, admitted, &id, provider_health);
+        let readiness = readiness_scope.resolve(config, &id, provider_health);
         let selectable = readiness.can_attempt();
         let readiness_label = readiness.label();
         let roster_entry = if provider == ProviderKind::OpenaiCodex {
@@ -2599,14 +2631,14 @@ fn provider_catalog_receipt_for_route(
     .ok()?;
     (admitted.provider == provider).then_some(())?;
     let identity = admitted.key.as_str();
+    let base_url = config.base_url_for_route(&admitted);
     // One predicate with the active-provider refresh: any route whose roster
-    // is probed (named live gateways and custom hosts) reports its freshness
-    // here, so a widened probe cannot leave this receipt behind.
-    if !crate::provider_catalog_live::provider_owns_live_catalog(provider) {
+    // is probed (named live gateways, custom hosts, and builtin names on a
+    // private endpoint) reports its freshness here, so a widened probe cannot
+    // leave this receipt behind.
+    if !crate::provider_catalog_live::provider_owns_live_catalog(provider, &base_url) {
         return None;
     }
-
-    let base_url = config.base_url_for_route(&admitted);
     let endpoint_matches = match source {
         Some(CatalogSource::Live {
             base_url_fingerprint,
@@ -2655,7 +2687,7 @@ fn push_auto_model_row(rows: &mut Vec<ModelPickerRow>, app: &App, config: &Confi
 }
 
 fn auto_picker_hint(app: &App, config: &Config) -> String {
-    let inventory = match crate::model_inventory::ModelInventory::from_config(config) {
+    let inventory = match crate::model_inventory::ModelInventory::auto_router_only(config) {
         Ok(inventory) => inventory,
         Err(reason) => {
             return format!("{} · {reason}", app.tr(MessageId::ModelPickerAutoLocalHint));
@@ -3110,13 +3142,18 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
     // harness, so it sits before the limits/modality chips — the chip budget
     // sheds from the tail, and a squeezed row must never lose the stance.
     chips.push(
-        if row.metadata.reasoning {
+        if row.metadata.reasoning_unknown {
+            "reasoning unknown"
+        } else if row.metadata.reasoning {
             "reasoning"
         } else {
             "no reasoning"
         }
         .to_string(),
     );
+    if let PickerPricing::Status(status) = row.metadata.pricing {
+        chips.push(format!("price {status}"));
+    }
     // #5239/#5441: an unverified window still drives budgets, but the chip
     // must not lend it a verified reading. Honesty rides as its own chip
     // *after* the stance so a squeezed row sheds the marker before it ever
@@ -3437,7 +3474,10 @@ fn input_price_per_million(row: &ModelPickerRow) -> Option<f64> {
             .as_ref()
             .and_then(|price| price.parse().ok());
     }
-    if matches!(row.metadata.pricing, PickerPricing::Unavailable) {
+    if matches!(
+        row.metadata.pricing,
+        PickerPricing::Unavailable | PickerPricing::Status(_)
+    ) {
         return None;
     }
     offering_for_row(row)
@@ -3504,7 +3544,10 @@ fn effective_picker_metadata_with_codex(
         (identity.provider == kind).then_some(identity)
     });
     if provider.is_some() && captured.is_none() {
-        return EffectivePickerMetadata::default();
+        return EffectivePickerMetadata {
+            reasoning_unknown: true,
+            ..EffectivePickerMetadata::default()
+        };
     }
     let offering = captured.as_ref().and_then(|identity| {
         let base_url = config.base_url_for_route(identity);
@@ -3538,7 +3581,9 @@ fn effective_picker_metadata_with_codex(
                 PickerPricing::Unknown
             },
             display_name: None,
-            reasoning_unknown: false,
+            reasoning_unknown: registry
+                .as_ref()
+                .is_none_or(|meta| meta.reasoning.is_none()),
             declared_input_price: None,
             source: None,
         };
@@ -3548,7 +3593,10 @@ fn effective_picker_metadata_with_codex(
         .as_ref()
         .expect("provider metadata admission checked");
     let identity = admitted.key.as_str();
-    let context_override = config.context_window_for_provider_config(admitted);
+    let context_override = config
+        .model_context_windows_for(admitted)
+        .and_then(|windows| windows.get(id).copied())
+        .or_else(|| config.context_window_for_provider_config(admitted));
     let base_url = config.base_url_for_route(admitted);
     if let Some(declared) =
         crate::provider_lake::configured_model_for_route(config, provider, identity, &base_url, id)
@@ -3592,6 +3640,7 @@ fn effective_picker_metadata_with_codex(
     {
         return EffectivePickerMetadata {
             context_window: context_override,
+            reasoning_unknown: true,
             ..EffectivePickerMetadata::default()
         };
     }
@@ -3674,8 +3723,14 @@ fn effective_picker_metadata_with_codex(
         let label = card.price_label();
         (label != "unknown").then_some(label)
     });
+    let pricing_status = card
+        .as_ref()
+        .and_then(|card| card.pricing.as_ref())
+        .map(|pricing| pricing.status_label_at(codewhale_config::catalog::now_unix()));
     let pricing = if provider == ProviderKind::OpenaiCodex {
         PickerPricing::Unavailable
+    } else if let Some(status @ ("stale" | "unverified" | "unavailable")) = pricing_status {
+        PickerPricing::Status(status)
     } else if let Some(label) = card_price {
         PickerPricing::Known(label)
     } else if crate::pricing::has_pricing_for_provider(provider, id) {
@@ -3715,7 +3770,15 @@ fn effective_picker_metadata_with_codex(
         vision,
         pricing,
         display_name: codex_metadata.and_then(|model| model.display_name.clone()),
-        reasoning_unknown: false,
+        reasoning_unknown: if provider == ProviderKind::OpenaiCodex {
+            codex_metadata.is_none_or(|metadata| metadata.reasoning.is_none())
+        } else {
+            offering
+                .as_ref()
+                .map_or(profile.reasoning == SupportState::Unknown, |offering| {
+                    offering.reasoning.is_none()
+                })
+        },
         declared_input_price: None,
         source: card.map(|card| card.source),
     }
@@ -3799,7 +3862,9 @@ fn render_picker_model_hint(
         None => {}
     }
 
-    if metadata.reasoning {
+    if metadata.reasoning_unknown {
+        parts.push("reasoning unknown".to_string());
+    } else if metadata.reasoning {
         parts.push("reasoning".to_string());
     }
 
@@ -3812,6 +3877,7 @@ fn render_picker_model_hint(
     match &metadata.pricing {
         PickerPricing::Unavailable => {}
         PickerPricing::Known(label) => parts.push(label.clone()),
+        PickerPricing::Status(status) => parts.push(format!("price {status}")),
         PickerPricing::Unknown => parts.push("price unknown".to_string()),
     }
     let provider_live_source = matches!(metadata.source.as_ref(), Some(CatalogSource::Live { .. }));
@@ -3819,7 +3885,22 @@ fn render_picker_model_hint(
         Some(CatalogSource::Live { .. }) => {
             parts.push(provider_catalog_source_label(provider_catalog_receipt))
         }
-        Some(CatalogSource::ModelsDevLive { .. }) => parts.push("live".to_string()),
+        Some(CatalogSource::ModelsDevLive { fetched_at }) => {
+            let now = codewhale_config::catalog::now_unix();
+            let age_secs = now.saturating_sub(*fetched_at);
+            if models_dev_live::status().freshness == ModelsDevFreshness::Failed {
+                parts.push("refresh failed; cached catalog".to_string());
+            } else {
+                let status = if *fetched_at > now {
+                    CatalogStatus::Unknown
+                } else if age_secs >= models_dev_live::DEFAULT_MODELS_DEV_TTL_SECS {
+                    CatalogStatus::Stale { age_secs }
+                } else {
+                    CatalogStatus::Fresh
+                };
+                parts.push(provider_catalog_source_label(Some(&(status, true))));
+            }
+        }
         Some(CatalogSource::Bundled | CatalogSource::CodewhaleBundled { .. }) => {
             parts.push("bundled".to_string())
         }
@@ -3832,10 +3913,7 @@ fn render_picker_model_hint(
     if !provider_live_source
         && let Some((CatalogStatus::Failed { reason }, _)) = provider_catalog_receipt
     {
-        parts.push(format!(
-            "refresh failed ({})",
-            catalog_refresh_error_label(*reason)
-        ));
+        parts.push(format!("refresh failed ({})", reason.label()));
     }
     if provider == Some(ProviderKind::OpenaiCodex) {
         parts.push(match codex_freshness {
@@ -3865,21 +3943,9 @@ fn provider_catalog_source_label(receipt: Option<&(CatalogStatus, bool)>) -> Str
             format!("stale catalog ({age_hours}h)")
         }
         CatalogStatus::Failed { reason } => {
-            format!("refresh failed ({})", catalog_refresh_error_label(*reason))
+            format!("refresh failed ({})", reason.label())
         }
         CatalogStatus::Unknown => "catalog freshness unknown".to_string(),
-    }
-}
-
-fn catalog_refresh_error_label(error: CatalogRefreshError) -> &'static str {
-    match error {
-        CatalogRefreshError::Unauthorized => "unauthorized",
-        CatalogRefreshError::Forbidden => "forbidden",
-        CatalogRefreshError::NotFound => "not found",
-        CatalogRefreshError::RateLimited => "rate limited",
-        CatalogRefreshError::InvalidResponse => "invalid response",
-        CatalogRefreshError::EmptyList => "empty list",
-        CatalogRefreshError::Network => "network error",
     }
 }
 
@@ -4590,7 +4656,9 @@ fn route_picker_efforts(
         // effort tiers. Keep the existing wire-compatible route ladder.
         return CODEX_PICKER_EFFORTS.to_vec();
     }
-    if let Some(catalog_efforts) = catalog_picker_efforts(provider, wire_model) {
+    if let Some(offering) = ReasoningEffort::offering_for_reasoning(provider, base_url, wire_model)
+        && let Some(catalog_efforts) = catalog_picker_efforts(&offering)
+    {
         return catalog_efforts;
     }
     if matches!(provider, crate::config::ProviderKind::Deepseek) {
@@ -4608,10 +4676,8 @@ fn route_picker_efforts(
 /// skipped. Returns `None` when the catalog has no usable effort list so the
 /// caller can keep the provider default rather than inventing tiers.
 fn catalog_picker_efforts(
-    provider: ProviderKind,
-    wire_model: &str,
+    offering: &codewhale_config::catalog::CatalogOffering,
 ) -> Option<Vec<ReasoningEffort>> {
-    let offering = catalog_offering_for_model(provider, wire_model)?;
     let mut efforts = Vec::new();
     let mut saw_effort_list = false;
     let mut has_toggle = false;
@@ -4625,8 +4691,6 @@ fn catalog_picker_efforts(
             has_toggle = true;
             continue;
         }
-        // Prefer explicit effort lists; also accept thinking-mode lists whose
-        // values map onto our tiers (adaptive→auto, disabled→off, always_on→max).
         if option_type != "effort" && option_type != "thinking" {
             continue;
         }
@@ -4648,14 +4712,9 @@ fn catalog_picker_efforts(
     if !saw_effort_list || efforts.is_empty() {
         return None;
     }
-    // A Models.dev `toggle` beside the ladder means reasoning can also be
-    // switched off (#6396).
     if has_toggle && !efforts.contains(&ReasoningEffort::Off) {
         efforts.insert(0, ReasoningEffort::Off);
     }
-    // Always offer Auto when the catalog published discrete tiers so the
-    // operator can still leave the choice to the route default. Do not invent
-    // Off unless the catalog said so — some models are always-on.
     if !efforts.contains(&ReasoningEffort::Auto) {
         efforts.insert(0, ReasoningEffort::Auto);
     }
@@ -4665,7 +4724,7 @@ fn catalog_picker_efforts(
 fn catalog_effort_value(raw: &str) -> Option<ReasoningEffort> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "off" | "disabled" | "false" => Some(ReasoningEffort::Off),
-        "none" => Some(ReasoningEffort::Off), // Muse "none" maps to Off in our enum but display as "none"
+        "none" => Some(ReasoningEffort::Off),
         "minimal" | "minimum" => Some(ReasoningEffort::Minimal),
         "low" | "light" => Some(ReasoningEffort::Low),
         "medium" | "mid" => Some(ReasoningEffort::Medium),
@@ -4739,6 +4798,7 @@ fn default_picker_effort_idx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codewhale_config::catalog::CatalogRefreshError;
 
     #[test]
     fn picker_ladder_drops_rungs_that_resolve_to_an_offered_tier() {
@@ -5754,8 +5814,11 @@ mod tests {
         );
 
         // A real catalog/readiness refresh replaces cached presentation facts.
-        let mut offering =
-            catalog_offering_for_model(ProviderKind::Deepseek, "deepseek-v4-pro").unwrap();
+        let mut offering = crate::provider_lake::catalog_offering_for_model(
+            ProviderKind::Deepseek,
+            "deepseek-v4-pro",
+        )
+        .unwrap();
         offering.limit.as_mut().unwrap().context = Some(777_000);
         crate::provider_lake::set_live_snapshot(
             codewhale_config::catalog::CatalogSnapshot {
@@ -6084,6 +6147,75 @@ model = "deepseek/deepseek-v4-flash"
         app.model = "z-ai/glm-5.3".to_string();
         app.active_route_base_url = crate::config::DEFAULT_OPENROUTER_BASE_URL.to_string();
         (config, app, home, workspace)
+    }
+
+    /// A custom relay's roster exists only in the listing that route itself
+    /// answered, so nothing else can fill its rows in. Filtering every one of
+    /// them out of the default view left `/model` showing a single row for a
+    /// route the provider panel had just listed a dozen for.
+    #[test]
+    fn a_custom_relays_live_roster_reaches_the_default_view() {
+        let _env = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let (config, app, home, _workspace) = resumed_openrouter_session_with_named_custom_routes();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        crate::provider_catalog_live::reset_cache_for_test();
+        crate::provider_lake::clear_live_snapshot();
+
+        // The listing the relay answered, recorded the way the probe records
+        // it. `command_code` is not the session's route, so the row can only
+        // reach the default view through the relay-roster rule.
+        let base_url = "https://command.example.test/v1";
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(base_url);
+        let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
+            ProviderKind::Custom,
+            "command_code",
+            base_url,
+        );
+        let offering = |id: &str| codewhale_config::catalog::CatalogOffering {
+            provider: "command_code".to_string(),
+            wire_model_id: id.to_string(),
+            source: codewhale_config::catalog::CatalogSource::Live {
+                base_url_fingerprint: fingerprint.clone(),
+                fetched_at: 7,
+            },
+            ..Default::default()
+        };
+        let roster: Vec<_> = (0..CUSTOM_ROSTER_ROWS_IN_DEFAULT_VIEW + 5)
+            .map(|index| offering(&format!("relay-{index}")))
+            .collect();
+        crate::provider_catalog_live::record_success_if_current(
+            &ticket,
+            codewhale_config::catalog::ProviderCatalogDelta {
+                provider: "command_code".to_string(),
+                base_url_fingerprint: fingerprint,
+                fetched_at: 7,
+                offerings: roster,
+            },
+        )
+        .expect("the relay listing is recorded");
+
+        let picker = ModelPickerView::new(&app, &config);
+        assert_eq!(picker.view, ModelListView::Configured);
+        let visible: Vec<_> = picker
+            .visible_model_rows()
+            .iter()
+            .filter(|row| {
+                row.provider == Some(ProviderKind::Custom)
+                    && row_provider_identity(row) == Some("command_code")
+                    && row.id.starts_with("relay-")
+            })
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(
+            visible.len(),
+            CUSTOM_ROSTER_ROWS_IN_DEFAULT_VIEW,
+            "the relay's own roster shows in the default view, bounded per route: {visible:?}"
+        );
+        assert!(
+            visible.contains(&"relay-0".to_string()),
+            "the first listed row is offered: {visible:?}"
+        );
     }
 
     #[test]

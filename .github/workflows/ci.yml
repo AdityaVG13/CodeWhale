@@ -1,12 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [master, main]
   pull_request:
-    branches: [master, main]
-  schedule:
-    - cron: '31 6 * * 1'
+    branches: [main]
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -25,12 +21,6 @@ permissions:
   contents: read
 
 concurrency:
-  # PRs still share one group so a new push cancels the superseded head.
-  # Push/schedule/dispatch on main must be keyed by SHA: with cancel-in-progress
-  # false, GitHub still cancels a *pending* run in the same group when a new
-  # one queues. That is how 31 of the last 40 main CI runs vanished without a
-  # verdict (test bankruptcy, 2026-08-19). Each SHA gets its own group so
-  # every commit on main actually finishes.
   group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -214,7 +204,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Check version drift
@@ -240,8 +230,15 @@ jobs:
         # each other consistent while a contributor nobody remembered stayed
         # invisible. Nine were missing from 0.10.0. This derives the expected
         # set from the commit range instead (authors, co-author trailers, and
-        # `Harvested from PR #N by @handle`), so forgetting someone is red.
+        # `Harvested from PR #N by @handle`), so forgetting someone is red in
+        # final validation. Pull requests only report it: credit is written
+        # on main when the PR merges.
+        id: credit
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python3 scripts/check-contributor-credit.py
+      - name: Explain contributor credit on a pull request
+        if: github.event_name == 'pull_request' && steps.credit.outcome == 'failure'
+        run: echo "::notice title=Contributor credit::The names above are credited by a maintainer when this pull request merges. You do not need to edit docs/CONTRIBUTORS.md, CHANGELOG.md or web/lib/release-credits.ts."
       - name: Check bundled plugin claims
         # The 0.10.0 section claimed Computer Use 0.4.0 at revision ca6be22
         # while the tree shipped 0.11.2 at d8640b17f275 -- three upstream
@@ -285,7 +282,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Install data parser
@@ -303,7 +300,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check Lighthouse SSH policy
         run: python3 scripts/tencent-lighthouse/test_bootstrap_ssh.py
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Test reusable GitHub review action
@@ -381,7 +378,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2
@@ -414,7 +411,7 @@ jobs:
         working-directory: extensions/vscode
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           # The extension targets VS Code >=1.90, whose extension host is
           # Node 20, and its @types/node pin is ^20. Build and test on the
@@ -431,7 +428,7 @@ jobs:
         run: npm test
       # @vscode/vsce 4 is a build-only packager that requires Node >=22. The
       # extension itself still compiles and tests on Node 20 above.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Package VS Code extension
@@ -474,7 +471,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 24
       - name: Hermetic safety and authorization tests
@@ -633,7 +630,9 @@ jobs:
       # command that lands the fix in that PR. It stays advisory in exactly
       # two cases: the PR's merge base fails the same check (inherited debt,
       # re-checked on a throwaway checkout of the base), or the PR comes from
-      # a fork. Pushes to main, schedule and dispatch have no base and block.
+      # a fork. Dispatch has no base and blocks. Runtime-contract and
+      # persistence-backlog measure for many minutes, so only final
+      # validation runs them.
       - name: Resolve ratchet merge base
         if: needs.changes.outputs.heavy == 'true' && github.event_name == 'pull_request'
         shell: bash
@@ -681,14 +680,12 @@ jobs:
       # single budget is measured. Fetch the locked graph once here so the
       # measurement below is deterministic on every branch.
       - name: Fetch locked dependency graph for offline measurement
-        if: needs.changes.outputs.heavy == 'true'
+        if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request'
         run: cargo fetch --locked
       # Provider-free local measurement. The checker forces Cargo offline and
       # the measurement script runs only locked, ignored Rust metric tests.
       - name: Check runtime-contract budget
-        if: needs.changes.outputs.heavy == 'true'
-        # Blocking for same-repo PRs; see the ratchet note above.
-        continue-on-error: ${{ github.event_name == 'pull_request' && needs.changes.outputs.trusted != 'true' }}
+        if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request'
         run: >-
           bash scripts/ratchet-gate.sh --name runtime-contract
           --update "python3 scripts/check-runtime-contract-budget.py --update --allow-increase"
@@ -702,9 +699,7 @@ jobs:
           python3 scripts/test_measure_persistence_backlog.py
           python3 scripts/test_check_persistence_backlog_budget.py
       - name: Check persistence-backlog budget
-        if: needs.changes.outputs.heavy == 'true'
-        # Blocking for same-repo PRs; see the ratchet note above.
-        continue-on-error: ${{ github.event_name == 'pull_request' && needs.changes.outputs.trusted != 'true' }}
+        if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request'
         run: >-
           bash scripts/ratchet-gate.sh --name persistence-backlog
           --update "python3 scripts/check-persistence-backlog-budget.py --update"
@@ -783,21 +778,21 @@ jobs:
   test:
     name: Test
     needs: changes
-    # Required contexts "Test (ubuntu-latest)" / "Test (macos-latest)" /
+    # Contexts "Test (ubuntu-latest)" / "Test (macos-latest)" /
     # "Test (windows-latest)" derive from job name + matrix.os and are
     # independent of runs-on. For light changes the macOS/Windows legs only
     # echo a skip line, so run them on ubuntu instead of queueing for scarce
-    # macOS/Windows runners. Heavy pull requests run the Linux lane directly;
-    # non-PR release/main pushes use CNB for Linux.
+    # macOS/Windows runners. Pull requests run only the Linux leg here; the
+    # required "Test (windows-latest)" context comes from test-windows-pr.
     # The ternary is safe: matrix.os is always a non-empty literal, so
     # runs-on can never evaluate to empty.
     # A cold GitHub-hosted Mac spent 77-80 minutes in Test on 2026-09-23
     # (fork PRs #6431, #6417), too close to the old 90-minute limit.
     # On 2026-10-04 a PR leg spent 111 minutes compiling with no cache and
     # was cancelled at 120 with 12,356 tests passed and none failed. The
-    # limit stays a literal (release-workflows.test.js, #5496); 165 bounds
-    # hangs for every leg until the CI speed redesign lands.
-    timeout-minutes: 165
+    # limit stays a literal (release-workflows.test.js, #5496); 210 bounds
+    # cold compilation and the complete suite without disabling test deadlines.
+    timeout-minutes: 210
     # macOS legs go to the self-hosted Mac ONLY when all three hold: the
     # change is heavy, the event is trusted (not a fork PR), and the
     # CW_SELF_HOSTED_MAC repo variable is 'true'. That variable is the kill
@@ -810,11 +805,11 @@ jobs:
       # other one. We need both conclusions to diagnose and release safely.
       fail-fast: false
       matrix:
-        # Linux workspace tests run directly for pull requests. CNB remains
-        # the Linux lane for non-PR release/main pushes. The explicit manual
+        # Pull requests run the Linux workspace suite only; the macOS and
+        # Windows suites run in final validation. The explicit manual
         # libtest qualification uses one hosted Ubuntu job, never a fork PR or
-        # self-hosted runner; normal dispatches and PRs keep all three legs.
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        # self-hosted runner; normal dispatches keep all three legs.
+        os: ${{ fromJSON((github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')) && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - name: Skip tests for light change
         if: needs.changes.outputs.heavy != 'true'
@@ -828,51 +823,22 @@ jobs:
       - name: Install NSIS for Windows installer regression
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
         shell: pwsh
-        # Bounded retry, not a weaker check (#5403). Every observed failure here
-        # was Chocolatey's feed, not the code: a 504 from the V2 API, and
-        # "package was not found with the source(s) listed". A single attempt
-        # made `Test (windows-latest)` — a required check on every PR — report
-        # on community.chocolatey.org's availability instead of on the tree.
-        # NSIS must still install for the regression below to run; this only
-        # survives a transient outage.
-        #
-        # A feed failure also makes `choco install` exit 0 without installing
-        # anything ("Chocolatey installed 0/0 packages" after a V2 feed 504),
-        # so an attempt only counts when `makensis.exe` exists where the installer
-        # regression looks for it (Program Files; choco does not put it on PATH).
-        # Without that check the retry reported success on an unprovisioned
-        # runner and the regression below failed as an unattributable exit
-        # code instead of this step naming the outage (2026-09-24).
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $delays = @(0, 20, 45)
-          for ($attempt = 0; $attempt -lt $delays.Count; $attempt++) {
-            if ($delays[$attempt] -gt 0) {
-              Write-Host "NSIS install attempt $($attempt + 1) after $($delays[$attempt])s backoff"
-              Start-Sleep -Seconds $delays[$attempt]
-            }
-            choco install nsis -y --no-progress
-            $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if ($LASTEXITCODE -eq 0 -and $makensis) {
-              Write-Host "NSIS installed on attempt $($attempt + 1)"
-              exit 0
-            }
-            Write-Host "::warning::NSIS is still unavailable after attempt $($attempt + 1) (choco exit $LASTEXITCODE)"
-          }
-          Write-Host "::error::NSIS could not be provisioned from Chocolatey after $($delays.Count) attempts"
-          exit 1
+        run: ./scripts/installer/install-nsis.ps1
       - name: Test Windows installer PATH regression
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
         shell: pwsh
         run: ./scripts/installer/installer-path-regression.tests.ps1 -AllowUserPathMutation
       - uses: dtolnay/rust-toolchain@stable
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
-      - name: Omit macOS test debug metadata
+      - name: Install macOS LLVM tools
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest'
+        run: rustup component add llvm-tools --toolchain stable
+      - name: Omit macOS build debug metadata
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest'
         shell: bash
         # Match the existing full-workspace CNB gate. Keep debug assertions and
-        # every test; only disposable test debug tables change on this lane.
-        run: echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
+        # every test; only disposable build debug tables change on this lane.
+        run: printf '%s\n' 'CARGO_PROFILE_DEV_DEBUG=0' 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
       - uses: mozilla-actions/sccache-action@v0.0.11
         id: sccache
         continue-on-error: true
@@ -909,7 +875,7 @@ jobs:
         run: |
           python3 -B scripts/test_check_command_config_proof.py
           sh scripts/check-portable-config.sh
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         # The extension-host integration tests spawn the real bundle under
         # Node >= 22.19; CODEWHALE_EXT_HOST_TESTS below makes a missing Node a
         # failure instead of a silent skip.
@@ -1022,6 +988,7 @@ jobs:
           if [ -n "$monitor" ]; then kill "$monitor" 2>/dev/null || true; fi
           exit "$status"
         env:
+          CARGO_BUILD_JOBS: '1'
           QA_PTY_DIAGNOSTICS_DIR: ${{ runner.temp }}/pty-failures
           CODEWHALE_EXT_HOST_TESTS: '1'
           CODEWHALE_EXT_HOST_BUN_TESTS: '1'
@@ -1059,6 +1026,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && matrix.os == 'ubuntu-latest'
         shell: bash
         env:
+          CARGO_BUILD_JOBS: '1'
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           CODEWHALE_EXT_HOST_TESTS: '1'
           CODEWHALE_EXT_HOST_BUN_TESTS: '1'
@@ -1235,6 +1203,42 @@ jobs:
         shell: bash
         run: rm -f "$RUNNER_TEMP/cw-build-lock.hold"
 
+  test-windows-pr:
+    name: Test (windows-latest)
+    needs: changes
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 60
+    runs-on: ${{ needs.changes.outputs.heavy == 'true' && 'windows-latest' || 'ubuntu-latest' }}
+    steps:
+      - name: Skip Windows check for light change
+        if: needs.changes.outputs.heavy != 'true'
+        run: echo "No executable Rust changes detected; preserving required Test context."
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs.heavy == 'true'
+      - name: Test Windows installer PATH helper
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: ./scripts/installer/update-user-path.tests.ps1
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.heavy == 'true'
+      - name: Check every workspace target compiles on Windows
+        if: needs.changes.outputs.heavy == 'true'
+        shell: bash
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: Lockfile drift guard
+        if: needs.changes.outputs.heavy == 'true'
+        run: git diff --exit-code -- Cargo.lock
+      - name: Record what this pull request leg covers
+        if: needs.changes.outputs.heavy == 'true'
+        shell: bash
+        run: |
+          {
+            echo "## Test (windows-latest) on a pull request"
+            echo
+            echo "Compiled every workspace target for Windows with warnings denied and ran the installer PATH helper tests."
+            echo "The Windows and macOS test suites run in final validation, before a release, not on pull requests."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   macos-budget:
     # Fork PRs build cold on a GitHub-hosted Mac, and the RSS budget and the
     # offline eval each rebuild codewhale-tui there. Inside Test that cost
@@ -1256,7 +1260,7 @@ jobs:
     if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && ((github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice') || !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true'))
     # Cold hosted builds consumed 73 minutes before eval could start (F run
     # 37497498829). Match Test's compile allowance; RSS/eval limits stay intact.
-    timeout-minutes: 165
+    timeout-minutes: 210
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -1312,7 +1316,7 @@ jobs:
           echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
           echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
           node-version: 22
@@ -1433,3 +1437,21 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -Dwarnings
+
+  cargo-deny:
+    name: cargo-deny
+    needs: changes
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/cargo-deny.yml
+
+  security-audit:
+    name: Security audit
+    needs: changes
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/security-audit.yml
+
+  ohos:
+    name: OpenHarmony
+    needs: changes
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/ohos.yml

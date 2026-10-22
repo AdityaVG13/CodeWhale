@@ -1,7 +1,7 @@
 #[tokio::test]
 async fn mcp_boot_catalog_refresh_declares_prefix_before_mailbox_delivery() {
     let tmp = tempdir().expect("tempdir");
-    let (mut engine, _handle) = Engine::new(
+    let (mut engine, handle) = Engine::new(
         EngineConfig {
             workspace: tmp.path().to_path_buf(),
             ..Default::default()
@@ -32,6 +32,31 @@ async fn mcp_boot_catalog_refresh_declares_prefix_before_mailbox_delivery() {
         engine.session.pending_prefix_change_reason.as_deref(),
         Some("mcp-session-boot")
     );
+
+    tx.try_send(McpBootUpdate::Finished {
+        generation: 1,
+        authority_errors: Arc::new(HashMap::new()),
+        connection_errors: HashMap::new(),
+    })
+    .expect("queue finished");
+    engine.drain_mcp_boot_updates().await;
+    assert!(!engine.mcp_boot_in_flight);
+    assert!(engine.mcp_boot_rx.is_none());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut events = handle.rx_event.write().await;
+        loop {
+            if let Event::McpSessionBoot {
+                generation: 1,
+                finished: true,
+                ..
+            } = events.recv().await.expect("event channel")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a settlement drained during a turn must still reach the UI");
 }
 
 #[tokio::test]
@@ -77,7 +102,7 @@ async fn stale_boot_finished_does_not_clear_a_newer_receiver() {
         workspace: tmp.path().to_path_buf(),
         ..Default::default()
     };
-    let (mut engine, _handle) = Engine::new(engine_config, &Config::default());
+    let (mut engine, handle) = Engine::new(engine_config, &Config::default());
     let (_newer_tx, newer_rx) = tokio::sync::mpsc::channel(16);
     engine.mcp_event_generation = 2;
     engine.mcp_boot_generation = Some(2);
@@ -95,6 +120,45 @@ async fn stale_boot_finished_does_not_clear_a_newer_receiver() {
     assert_eq!(engine.mcp_boot_generation, Some(2));
     assert!(engine.mcp_boot_in_flight);
     assert!(engine.mcp_boot_rx.is_some());
+
+    engine.mcp_pool = Some(Arc::new(AsyncMutex::new(
+        McpPool::new(McpConfig::default()),
+    )));
+    engine.mcp_event_generation = 3;
+    engine
+        .mcp_connection_errors
+        .insert("current".into(), "newer receipt".into());
+    engine
+        .apply_mcp_boot_update(McpBootUpdate::Finished {
+            generation: 2,
+            authority_errors: Arc::new(HashMap::new()),
+            connection_errors: HashMap::from([("stale".into(), "older receipt".into())]),
+        })
+        .await;
+    assert!(!engine.mcp_boot_in_flight);
+    assert!(engine.mcp_boot_rx.is_none());
+    assert_eq!(
+        engine
+            .mcp_connection_errors
+            .get("current")
+            .map(String::as_str),
+        Some("newer receipt")
+    );
+    assert!(!engine.mcp_connection_errors.contains_key("stale"));
+    let event = tokio::time::timeout(Duration::from_secs(1), async {
+        handle.rx_event.write().await.recv().await
+    })
+    .await
+    .expect("the owned pass must settle under a fresh event generation")
+    .expect("settled event");
+    assert!(matches!(
+        event,
+        Event::McpSessionBoot {
+            generation: 4,
+            finished: true,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -116,11 +180,13 @@ async fn bootstrap_and_retry_mcp_use_the_engine_owned_pool() {
         ..Default::default()
     };
     let (engine, handle) = Engine::new(engine_config, &Config::default());
+    while engine.tx_event.try_send(Event::status("occupied")).is_ok() {}
+    assert_eq!(engine.tx_event.capacity(), 0);
     let task = tokio::spawn(async move { engine.run().await });
 
-    let boot_update = handle
-        .bootstrap_mcp()
+    let boot_update = tokio::time::timeout(Duration::from_secs(10), handle.bootstrap_mcp())
         .await
+        .expect("bootstrap must not await event capacity")
         .expect("boot snapshots the engine pool");
     let boot_generation = boot_update.generation;
     let boot = boot_update.snapshot;
@@ -140,10 +206,12 @@ async fn bootstrap_and_retry_mcp_use_the_engine_owned_pool() {
         .and_then(|server| server.error.clone())
         .expect("boot preserves the sibling connection diagnosis");
 
-    let retry_update = handle
-        .retry_mcp_server("alpha")
-        .await
-        .expect("a failed per-server retry still returns the live snapshot");
+    let retry_update =
+        tokio::time::timeout(Duration::from_secs(5), handle.retry_mcp_server("alpha"))
+            .await
+            .expect("retry must not await event capacity")
+            .expect("a failed per-server retry still returns the live snapshot");
+    let retry_generation = retry_update.generation;
     assert!(
         retry_update.generation > boot_generation,
         "a direct retry needs a newer generation receipt than boot"
@@ -170,6 +238,54 @@ async fn bootstrap_and_retry_mcp_use_the_engine_owned_pool() {
         Some(&sibling_error),
         "retrying one server must not erase a sibling diagnosis"
     );
+
+    let (generation, snapshot, connecting, finished) =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut events = handle.rx_event.write().await;
+            loop {
+                if let Event::McpSessionBoot {
+                    generation,
+                    snapshot,
+                    connecting,
+                    finished,
+                } = events.recv().await.expect("event channel")
+                {
+                    break (generation, snapshot, connecting, finished);
+                }
+            }
+        })
+        .await
+        .expect("latest MCP settlement must survive event queue saturation");
+    assert_eq!(generation, retry_generation);
+    assert_eq!(snapshot, retry);
+    assert!(connecting.is_empty());
+    assert!(finished);
+
+    std::fs::write(&config_path, r#"{"servers":{}}"#).expect("empty MCP config");
+    let empty = tokio::time::timeout(Duration::from_secs(2), handle.reload_mcp(config_path))
+        .await
+        .expect("empty reload must not await event capacity")
+        .expect("empty reload");
+    assert!(empty.snapshot.servers.is_empty());
+    let event = tokio::time::timeout(Duration::from_secs(2), async {
+        handle.rx_event.write().await.recv().await
+    })
+    .await
+    .expect("empty pool must settle the old UI prediction")
+    .expect("empty settlement");
+    let Event::McpSessionBoot {
+        generation,
+        snapshot,
+        connecting,
+        finished,
+    } = event
+    else {
+        panic!("expected empty MCP settlement");
+    };
+    assert_eq!(generation, empty.generation);
+    assert!(snapshot.servers.is_empty());
+    assert!(connecting.is_empty());
+    assert!(finished);
 
     handle.send(Op::Shutdown).await.expect("shutdown");
     task.await.expect("engine task");
@@ -387,10 +503,10 @@ fn turn_metadata_carries_the_narrowing_only_on_a_narrowed_turn() {
 /// first, and it is delivered exactly once.
 ///
 /// This exercises the engine's own shell manager through the same
-/// `drain_shell_completion_events` both delivery sites use — the next-turn
-/// boundary drain in `Engine::send_message` and the late drain in the turn
-/// loop — so the exactly-once guarantee holds across them rather than within
-/// one of them.
+/// `drain_shell_completion_events` every delivery site uses — turn start in
+/// `Engine::send_message`, the step boundary after a tool batch, and the
+/// finishing drains in the turn loop — so the exactly-once guarantee holds
+/// across them rather than within one of them.
 #[tokio::test]
 async fn background_completion_after_a_turn_is_delivered_once_on_the_next_turn() {
     let tmp = tempdir().expect("tempdir");

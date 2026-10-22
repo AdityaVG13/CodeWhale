@@ -105,6 +105,7 @@ pub struct PreparedCompactionEnvelope {
     /// request that omits it shares no cacheable prefix with the turn it
     /// summarizes and re-bills the whole history uncached.
     pub reasoning_effort: Option<String>,
+    pub image_cap: Option<usize>,
     /// User-visible progress sink supplied by the host that owns the run
     /// (the interactive engine, typically). `None` keeps every notice in the
     /// log only — the pass itself never depends on it.
@@ -118,6 +119,7 @@ impl std::fmt::Debug for PreparedCompactionEnvelope {
             .field("session_id", &self.session_id)
             .field("tools", &self.tools)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("image_cap", &self.image_cap)
             .field("notice_sink", &self.notice_sink.as_ref().map(|_| "<sink>"))
             .finish()
     }
@@ -131,6 +133,7 @@ impl PartialEq for PreparedCompactionEnvelope {
             && self.session_id == other.session_id
             && self.tools == other.tools
             && self.reasoning_effort == other.reasoning_effort
+            && self.image_cap == other.image_cap
     }
 }
 
@@ -142,6 +145,7 @@ impl PreparedCompactionEnvelope {
             session_id: None,
             tools: None,
             reasoning_effort: None,
+            image_cap: None,
             notice_sink: None,
         }
     }
@@ -508,6 +512,36 @@ pub(crate) fn is_compaction_checkpoint_message(message: &Message) -> bool {
         || user_text_of(message).is_some_and(|text| is_legacy_compaction_summary_text(&text))
 }
 
+/// Whether this history already carries a provenance-stamped checkpoint.
+///
+/// A stamped carrier postdates stamping, so within that history only the
+/// stamped form is a checkpoint: a user turn whose text merely starts with a
+/// legacy summary header (a pasted transcript, for example) is content. A
+/// history without one (a legacy session, or any session not yet compacted)
+/// keeps the loose form, so a pasted legacy header still reads as a
+/// checkpoint at a session's first compaction. The signal is the history's content, not the session's age: it
+/// is one-way and destructible (`/edit` or a host rewind can truncate away
+/// the only stamped carrier), and typed input cannot forge the two-block
+/// form.
+#[must_use]
+pub(crate) fn history_is_post_provenance(messages: &[Message]) -> bool {
+    messages.iter().any(is_wire_compaction_checkpoint_message)
+}
+
+/// Era-aware checkpoint recognition for the recompaction family: the loose
+/// legacy fallback applies only in a history with no stamped carrier.
+#[must_use]
+pub(crate) fn is_compaction_checkpoint_message_in_era(
+    message: &Message,
+    post_provenance: bool,
+) -> bool {
+    if post_provenance {
+        is_wire_compaction_checkpoint_message(message)
+    } else {
+        is_compaction_checkpoint_message(message)
+    }
+}
+
 /// Request-time recognition: exactly the header text block plus the
 /// provenance block. User text merely quoting a marker keeps its original
 /// wire position. Checkpoints saved before the handoff note still pass, so
@@ -696,6 +730,17 @@ pub fn estimate_input_tokens_for_pressure(
     message_tokens
         .saturating_add(system_tokens)
         .saturating_add(framing_overhead)
+}
+
+#[must_use]
+pub(crate) fn estimate_request_input_tokens(
+    messages: &[Message],
+    system: Option<&SystemPrompt>,
+    tools: Option<&[Tool]>,
+) -> usize {
+    estimate_input_tokens_for_pressure(messages, system).saturating_add(tools.map_or(0, |tools| {
+        serde_json::to_string(tools).map_or(0, |schema| schema.len().div_ceil(4))
+    }))
 }
 
 fn estimate_retained_floor_conservative(
@@ -1447,6 +1492,7 @@ pub async fn compact_messages_safe(
             system_prompt,
             prepared.tools.as_deref(),
             prepared.reasoning_effort.as_deref(),
+            prepared.image_cap,
             prepared.notice_sink.as_deref(),
             &mut quality_retries,
             invocation_usage,
@@ -1535,7 +1581,23 @@ fn is_orphaned_result_block(block: &ContentBlock) -> bool {
     )
 }
 
+/// Test convenience: derive the era from the slice itself. Production
+/// callers pass [`retained_user_messages_in_era`] the era of the history the
+/// slice belongs to — retention runs on the pre-round prefix, whose carrier
+/// may sit inside the round.
+#[cfg(test)]
 pub(crate) fn retained_user_messages(messages: &[Message], max_tokens: usize) -> Vec<Message> {
+    retained_user_messages_in_era(history_is_post_provenance(messages), messages, max_tokens)
+}
+
+/// `post_provenance` must be derived from the history the slice belongs to,
+/// not from the slice itself: retention runs on the pre-round prefix, whose
+/// carrier may sit inside the round.
+pub(crate) fn retained_user_messages_in_era(
+    post_provenance: bool,
+    messages: &[Message],
+    max_tokens: usize,
+) -> Vec<Message> {
     let mut selected: Vec<Message> = Vec::new();
     let mut remaining = max_tokens;
     for msg in messages.iter().rev() {
@@ -1552,7 +1614,7 @@ pub(crate) fn retained_user_messages(messages: &[Message], max_tokens: usize) ->
         {
             continue;
         }
-        if is_compaction_checkpoint_message(msg) {
+        if is_compaction_checkpoint_message_in_era(msg, post_provenance) {
             continue;
         }
         let tokens: usize = msg
@@ -1613,6 +1675,7 @@ async fn compact_messages(
         None,
         None,
         None,
+        None,
         &mut quality_retries,
         &mut invocation_usage,
     )
@@ -1627,6 +1690,7 @@ async fn compact_messages_with_metadata(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    image_cap: Option<usize>,
     notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
@@ -1642,6 +1706,7 @@ async fn compact_messages_with_metadata(
         system_prompt,
         tools,
         reasoning_effort,
+        image_cap,
         notice_sink,
         quality_retries,
         invocation_usage,
@@ -1834,9 +1899,9 @@ fn drop_oldest_history_messages(messages: &mut Vec<Message>) -> bool {
 /// Known limit: `tool_choice: "none"` keeps the summary from executing tools.
 /// Anthropic Messages documents a `tool_choice` change as invalidating the
 /// cached *message* blocks (system and tools stay cached), so on those routes
-/// the history is still re-read uncached. The Responses (Codex) builder does
-/// not send this field; its cache effect on Chat Completions routes has not
-/// been measured live.
+/// the history is still re-read uncached. The Responses builder forwards
+/// `none` (and sends `auto` for every other choice); its cache effect on
+/// Responses and Chat Completions routes has not been measured live.
 pub(crate) fn compaction_summary_request(
     history: Vec<Message>,
     config: &CompactionConfig,
@@ -1877,6 +1942,7 @@ async fn create_summary(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    image_cap: Option<usize>,
     notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
@@ -1894,6 +1960,20 @@ async fn create_summary(
         logging::warn(format!(
             "Compaction omitted {stripped_images} image block(s) unsupported by its route"
         ));
+    }
+    if let Some(cap) = image_cap {
+        let window = crate::image_attach::cap_request_images(&mut request_messages, cap);
+        if window.elided > 0 {
+            let message = format!(
+                "Making room: the summary request sends the newest {} of {} images; {} older go as text notes (limit {} per request).",
+                window.total - window.elided,
+                window.total,
+                window.elided,
+                window.cap,
+            );
+            logging::warn(&message);
+            deliver_compaction_notice(notice_sink, message);
+        }
     }
     request_messages.push(Message {
         role: Role::User,
@@ -1919,13 +1999,47 @@ async fn create_summary(
         // much output the model may need instead of imposing a smaller,
         // compaction-only ceiling that can be consumed by hidden reasoning.
         let cost_route = client.effective_route_envelope(&config.model, chrono::Utc::now());
+        let ceiling = client.effective_max_output_tokens(&cost_route.model);
+        let summary_floor = crate::route_budget::route_output_reservation(
+            cost_route.provider,
+            &cost_route.model,
+            client.route_limits(),
+        )
+        .min(ceiling)
+            / 2;
+        let max_tokens = match crate::route_budget::request_output_cap_for_input(
+            cost_route.provider,
+            &cost_route.model,
+            client.route_limits(),
+            ceiling,
+            u64::try_from(estimate_request_input_tokens(
+                &request_messages,
+                system_prompt,
+                tools,
+            ))
+            .unwrap_or(u64::MAX),
+        ) {
+            Some(cap) if cap >= summary_floor => cap,
+            _ => {
+                if !drop_oldest_history_messages(&mut request_messages) {
+                    anyhow::bail!(
+                        "The summary request for making room leaves too little output room in this route's context window, and no older history is left to drop."
+                    );
+                }
+                logging::warn(
+                    "Compaction summary input leaves too little output room in the context \
+                     window; dropped the oldest history item and retrying",
+                );
+                continue;
+            }
+        };
         let request = compaction_summary_request(
             request_messages.clone(),
             config,
             system_prompt,
             tools,
             reasoning_effort,
-            client.effective_max_output_tokens(&cost_route.model),
+            max_tokens,
         );
 
         // Capture the session scope before awaiting so a late response cannot
@@ -3375,6 +3489,7 @@ mod tests {
                             thinking: "retained reasoning ".repeat(2000),
                             signature: None,
                             state: None,
+                            redacted_data: None,
                         },
                     );
                 }
@@ -4000,6 +4115,7 @@ mod tests {
                     ContentBlock::Thinking {
                         signature: None,
                         state: None,
+                        redacted_data: None,
                         thinking: thinking.clone(),
                     },
                     ContentBlock::ToolUse {

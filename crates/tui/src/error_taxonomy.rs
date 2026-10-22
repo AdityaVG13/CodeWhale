@@ -156,6 +156,17 @@ impl ErrorEnvelope {
         )
     }
 
+    #[must_use]
+    pub fn image_count_exceeded(message: impl Into<String>) -> Self {
+        Self::new(
+            ErrorCategory::InvalidInput,
+            ErrorSeverity::Error,
+            true,
+            "image_count_exceeded",
+            message,
+        )
+    }
+
     /// A stop Codewhale applied to itself (step ceiling, per-turn wall clock).
     /// The turn failed, so the card is an error, but the session stays usable:
     /// sending another message continues, so it is `recoverable` and does not

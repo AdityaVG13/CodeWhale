@@ -122,6 +122,50 @@ pub struct TurnContext {
     /// request (capability, auth, unreachable). The turn then fails on that
     /// cause, not on the context budget the recovery was trying to fix.
     pub(crate) context_recovery_rejection: Option<anyhow::Error>,
+
+    pub(crate) auto_review_denials: AutoReviewDenials,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AutoReviewDenials {
+    consecutive: usize,
+    recent: std::collections::VecDeque<bool>,
+    stop: Option<String>,
+}
+
+impl AutoReviewDenials {
+    const CONSECUTIVE: usize = 3;
+    const WINDOW: usize = 50;
+    const WINDOW_DENIALS: usize = 10;
+
+    pub(crate) fn record(&mut self, denied: bool) {
+        if self.stop.is_some() {
+            return;
+        }
+        self.consecutive = if denied { self.consecutive + 1 } else { 0 };
+        if self.recent.len() == Self::WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(denied);
+        let denials = self.recent.iter().filter(|denied| **denied).count();
+        let summary = if self.consecutive >= Self::CONSECUTIVE {
+            format!("Auto-Review denied {} actions in a row", self.consecutive)
+        } else if denials >= Self::WINDOW_DENIALS {
+            format!(
+                "Auto-Review denied {denials} of the last {} actions",
+                self.recent.len()
+            )
+        } else {
+            return;
+        };
+        self.stop = Some(format!(
+            "{summary}, so the turn was stopped. Change the request, or switch to Ask."
+        ));
+    }
+
+    pub(crate) fn stop(&self) -> Option<&str> {
+        self.stop.as_deref()
+    }
 }
 
 impl TurnContext {
@@ -159,6 +203,7 @@ impl TurnContext {
             compaction_refusal_notified: false,
             pending_route: None,
             context_recovery_rejection: None,
+            auto_review_denials: AutoReviewDenials::default(),
         }
     }
 
@@ -220,7 +265,8 @@ impl TurnContext {
     /// pressure. Child-model usage must call [`Self::add_usage`] directly so
     /// it cannot masquerade as the parent request's context size.
     pub fn add_parent_usage(&mut self, usage: &Usage) {
-        self.latest_parent_input_tokens = (usage.input_tokens > 0).then_some(usage.input_tokens);
+        let latest = usage.request_usages.last().unwrap_or(usage);
+        self.latest_parent_input_tokens = (latest.input_tokens > 0).then_some(latest.input_tokens);
         self.add_usage(usage);
         add_usage_to(&mut self.parent_route_usage, usage);
     }
@@ -244,6 +290,19 @@ impl TurnContext {
 }
 
 pub(crate) fn add_usage_to(total: &mut Usage, delta: &Usage) {
+    if total.request_usages.is_empty() && (total.input_tokens > 0 || total.output_tokens > 0) {
+        total.request_usages.push(total.clone());
+    }
+    if total.request_usages.len() <= 1024 {
+        if delta.request_usages.is_empty() {
+            total.request_usages.push(delta.clone());
+        } else {
+            let remaining = 1025 - total.request_usages.len();
+            total
+                .request_usages
+                .extend(delta.request_usages.iter().take(remaining).cloned());
+        }
+    }
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
     total.prompt_cache_hit_tokens =
@@ -257,6 +316,10 @@ pub(crate) fn add_usage_to(total: &mut Usage, delta: &Usage) {
         delta.prompt_cache_write_tokens,
     );
     total.reasoning_tokens = add_optional_usage(total.reasoning_tokens, delta.reasoning_tokens);
+    total.input_audio_tokens =
+        add_optional_usage(total.input_audio_tokens, delta.input_audio_tokens);
+    total.output_audio_tokens =
+        add_optional_usage(total.output_audio_tokens, delta.output_audio_tokens);
     total.reasoning_replay_tokens =
         add_optional_usage(total.reasoning_replay_tokens, delta.reasoning_replay_tokens);
     if let Some(delta) = delta.server_tool_use.as_ref() {

@@ -449,7 +449,7 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
     handle
         .send(Op::EditLastTurn {
             new_message: "edited prompt".to_string(),
-            submission_id: None,
+            submission_id: Some("sub-edit-rejected".to_string()),
         })
         .await
         .expect("send edit");
@@ -461,6 +461,9 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
         let mut events = handle.rx_event.write().await;
         while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
             match event {
+                Event::TurnStarted { .. } => {
+                    panic!("rejected edit must not start a turn");
+                }
                 Event::Error { envelope, .. } => {
                     assert_eq!(envelope.code, "edit_last_turn_no_user_prompt");
                     assert!(!envelope.recoverable);
@@ -471,7 +474,17 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
                     );
                     saw_edit_error = true;
                 }
-                Event::TurnComplete { status, error, .. } => {
+                Event::TurnComplete {
+                    turn_id,
+                    submission_id,
+                    compaction_id,
+                    status,
+                    error,
+                    ..
+                } => {
+                    assert!(turn_id.is_none());
+                    assert_eq!(submission_id.as_deref(), Some("sub-edit-rejected"));
+                    assert!(compaction_id.is_none());
                     assert_eq!(status, TurnOutcomeStatus::Failed);
                     assert!(
                         error
@@ -764,6 +777,7 @@ fn route_context_scenario() {
             context_tokens: Some(128_000),
             input_tokens: None,
             output_tokens: Some(32_768),
+            output_declared: false,
         };
         let budget = route_context_budget_for_route(
             ProviderKind::Openrouter,
@@ -786,6 +800,7 @@ fn route_input_limit_blocks_oversized_preflight_before_transport() {
         context_tokens: Some(1_000_000),
         input_tokens: Some(128_000),
         output_tokens: Some(64_000),
+        output_declared: false,
     };
     let estimated_input = 200_000;
     let budget = route_context_budget_for_route(
@@ -862,6 +877,7 @@ async fn preflight_guard_measures_honest_input_against_the_input_ceiling() {
         ),
         input_tokens: None,
         output_tokens: Some(output_cap),
+        output_declared: false,
     });
     let ceiling = route_context_budget_for_route(
         engine.api_provider,
@@ -933,6 +949,7 @@ fn kimi_catalog_output_ceiling_does_not_collapse_input_budget() {
         context_tokens: Some(262_144),
         input_tokens: None,
         output_tokens: Some(262_144),
+        output_declared: false,
     };
 
     let budget =
@@ -954,6 +971,7 @@ fn effective_max_scenario() {
             context_tokens: Some(1_000_000),
             input_tokens: None,
             output_tokens: Some(8_192),
+            output_declared: false,
         };
 
         assert_eq!(
@@ -972,6 +990,7 @@ fn effective_max_scenario() {
             context_tokens: Some(32_000),
             input_tokens: None,
             output_tokens: None,
+            output_declared: false,
         };
 
         let cap = effective_max_output_tokens_for_route(
@@ -993,6 +1012,7 @@ fn effective_max_scenario() {
             context_tokens: Some(2_048),
             input_tokens: None,
             output_tokens: None,
+            output_declared: false,
         };
 
         assert_eq!(
@@ -1053,6 +1073,7 @@ fn codex_route_without_output_metadata_uses_oauth_capability_floor() {
         context_tokens: Some(272_000),
         input_tokens: None,
         output_tokens: None,
+        output_declared: false,
     };
 
     assert_eq!(
@@ -1074,6 +1095,7 @@ fn reasoning_max_does_not_add_a_second_deepseek_v4_output_reservation() {
         context_tokens: Some(327_680),
         input_tokens: None,
         output_tokens: None,
+        output_declared: false,
     };
     let cap = effective_max_output_tokens_for_route(
         ProviderKind::Vllm,
@@ -1323,6 +1345,7 @@ fn oversized_tool_output_is_recoverable_before_serial_and_parallel_fanout() {
                         context_tokens: Some(64_000),
                         input_tokens: None,
                         output_tokens: Some(4_096),
+                        output_declared: false,
                     });
                     let mut registry = crate::tools::ToolRegistry::new(ToolContext::new(home));
                     registry.register(Arc::new(OutputTool {
@@ -1584,6 +1607,7 @@ fn codex_tool_retention_uses_oauth_route_window_not_asmall_contract_model_window
         context_tokens: Some(272_000),
         input_tokens: None,
         output_tokens: None,
+        output_declared: false,
     };
 
     // The budget follows the route's 272K window (3% of it, 32,640

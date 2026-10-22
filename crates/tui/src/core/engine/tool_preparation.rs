@@ -60,9 +60,10 @@ pub(super) fn prepare_tool_call(
         }
         // K1/K2 stopgap: Computer Use consent and `app_script` need a human
         // decision. Never auto-approve them, and refuse them outright in a
-        // posture that cannot open the approval card (Full Access,
-        // Auto-Review, Never) — otherwise the model's own tool call would be
-        // the consent.
+        // posture that has no person at the card (Auto-Review, Never). Full
+        // Access is not such a posture: it has a UI, so it asks. Denying there
+        // made the most permissive posture the one posture where Computer Use
+        // could never be authorized at all.
         if let Some(inner) = computer_use_batch_hidden_gate(name, &input) {
             return Err(ToolError::permission_denied(format!(
                 "Computer Use {inner} cannot run inside {name}: consent and scripts need their own approval card. Call it on its own so the user can decide."
@@ -73,11 +74,12 @@ pub(super) fn prepare_tool_call(
                 let context = registry.context();
                 (context.auto_approve, context.approval_mode)
             });
-            let card_available = !session_auto_approve
-                && posture.is_none_or(|(auto_approve, approval_mode)| {
-                    !auto_approve && approval_mode == ApprovalMode::Suggest
-                });
-            if !card_available {
+            let can_ask = posture.is_none_or(|(auto_approve, approval_mode)| {
+                approval_mode == ApprovalMode::Suggest
+                    || auto_approve
+                    || approval_mode == ApprovalMode::Bypass
+            });
+            if !can_ask {
                 let label = posture.map_or("Full Access", |(auto_approve, approval_mode)| {
                     if auto_approve {
                         ApprovalMode::Bypass.permission_chip_label()
@@ -86,7 +88,7 @@ pub(super) fn prepare_tool_call(
                     }
                 });
                 return Err(ToolError::permission_denied(format!(
-                    "Computer Use call {name} needs your own approval: consent and scripts cannot be granted by a model tool call, and the current {label} posture cannot show an approval card. Switch to Ask mode to review it."
+                    "Computer Use call {name} needs your own approval, and the current {label} posture has no one to ask: consent and scripts cannot be granted by a model tool call. Switch to Ask or Full Access to review it."
                 )));
             }
             return Ok(PreparedToolPolicy {
@@ -609,23 +611,19 @@ mod tests {
         ));
     }
 
-    /// K1: the model cannot grant itself Computer Use consent. In a posture
-    /// that cannot show a human card the call is refused at preparation; in
-    /// Ask it always requires approval, is never session auto-approved, and a
-    /// session grant for one app does not cover another.
+    /// K1: the model cannot grant itself Computer Use consent. A posture with
+    /// no person at the card refuses at preparation; Ask and Full Access both
+    /// reach the card, always require approval, are never session
+    /// auto-approved, and a session grant for one app does not cover another.
     #[test]
-    fn model_issued_computer_use_consent_is_rejected_without_a_human_card() {
+    fn model_issued_computer_use_consent_never_auto_approves() {
         let consent = "mcp_plugin-12-computer-use-computer_consent";
         let allow_safari =
             json!({"action": "allow", "app": "Safari", "bundle_id": "com.apple.Safari"});
         let foreground = json!({"action": "allow", "scope": "foreground"});
 
-        // Full Access (session bit, or the registry context) and every
-        // no-card posture refuse the call before any approval routing.
+        // Postures with nobody at the card refuse before approval routing.
         for (session_auto, context_auto, mode) in [
-            (true, false, ApprovalMode::Suggest),
-            (false, true, ApprovalMode::Suggest),
-            (false, false, ApprovalMode::Bypass),
             (false, false, ApprovalMode::Auto),
             (false, false, ApprovalMode::Never),
         ] {
@@ -654,8 +652,30 @@ mod tests {
                 );
             }
         }
-        // No registry: the session bit alone decides.
-        assert!(prepare_tool_call(consent, allow_safari.clone(), None, true).is_err());
+        // Full Access shows the card instead of refusing it. The call still
+        // requires approval and is never auto-approved, so a posture cannot
+        // stand in for the person's answer.
+        for (session_auto, context_auto, mode) in [
+            (true, false, ApprovalMode::Suggest),
+            (false, true, ApprovalMode::Suggest),
+            (false, false, ApprovalMode::Bypass),
+        ] {
+            let root = tempdir().expect("tempdir");
+            let mut context = ToolContext::new(root.path().to_path_buf());
+            context.auto_approve = context_auto;
+            context.approval_mode = mode;
+            let registry = ToolRegistry::new(context);
+            let prepared =
+                prepare_tool_call(consent, allow_safari.clone(), Some(&registry), session_auto)
+                    .expect("Full Access reaches the consent card");
+            assert_eq!(prepared.call.approval, ApprovalRequirement::Required);
+            assert!(!prepared.auto_approve, "{mode:?}");
+            assert!(super::super::turn_loop::registered_tool_approval_required(
+                &prepared.call.name,
+                prepared.call.approval,
+                prepared.auto_approve,
+            ));
+        }
 
         // Ask posture: a Required card that names the app, bundle and scope.
         let root = tempdir().expect("tempdir");

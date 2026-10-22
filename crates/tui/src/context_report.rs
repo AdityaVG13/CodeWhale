@@ -1354,6 +1354,7 @@ mod tests {
             context_tokens: Some(route_window),
             input_tokens: None,
             output_tokens: None,
+            output_declared: false,
         };
         let resolved = crate::route_runtime::resolve_context_window(
             ProviderKind::Deepseek,

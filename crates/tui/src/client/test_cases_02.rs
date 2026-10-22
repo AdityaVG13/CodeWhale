@@ -249,6 +249,7 @@
                         thinking: "Inspect the saved tool state".to_string(),
                         signature: None,
                         state: None,
+                        redacted_data: None,
                     },
                     ContentBlock::ToolUse {
                         execution_id: None,
@@ -447,14 +448,14 @@
         let expected_names = crate::core::engine::default_active_native_tool_names()
             .iter()
             .copied()
-            // Children can inspect the shared goal, but only its owning
-            // session can create it or change its completion state.
+            // Children discover goal inspection via search; only the
+            // owning session can create a goal or change its
+            // completion state, so those never ride the child surface.
             .filter(|name| !matches!(*name, "create_goal" | "update_goal"))
             .chain([crate::core::engine::tool_catalog::TOOL_SEARCH_NAME])
             .map(str::to_string)
             .collect();
         assert_eq!(source_names, expected_names);
-        assert!(source_names.contains("get_goal"));
         assert!(!source_names.contains("create_goal"));
         assert!(!source_names.contains("update_goal"));
 
@@ -865,7 +866,7 @@
         };
         let client = CodewhaleClient::new(&config).expect("openrouter client");
         let auth = client
-            .http_error_with_route_context(401, "Invalid API key", None)
+            .http_error_with_route_context(401, "Invalid API key", None, None)
             .to_string();
         assert!(auth.contains("provider: openrouter"), "{auth}");
         assert!(auth.contains("openrouter.ai"), "{auth}");
@@ -877,7 +878,7 @@
         assert!(!auth.contains("or-rejected-key-1234567890"), "{auth}");
 
         let model = client
-            .http_error_with_route_context(404, "model not found: nope", None)
+            .http_error_with_route_context(404, "model not found: nope", None, None)
             .to_string();
         assert!(model.contains("provider route: openrouter"), "{model}");
         assert!(model.contains("host: openrouter.ai"), "{model}");
@@ -903,7 +904,7 @@
         assert_eq!(client.subscription_limit_guidance, None);
         let body =
             r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#;
-        let plain = client.http_error_with_route_context(429, body, None);
+        let plain = client.http_error_with_route_context(429, body, None, None);
         assert!(matches!(plain, LlmError::QuotaExhausted(_)), "{plain:?}");
         assert!(!plain.to_string().contains("codewhale auth"), "{plain}");
 
@@ -912,7 +913,7 @@
             Some("a@example.com (plus)"),
         ));
         let guided = client
-            .http_error_with_route_context(429, body, None)
+            .http_error_with_route_context(429, body, None, None)
             .to_string();
         assert!(
             guided.contains("The usage limit has been reached"),
@@ -928,7 +929,7 @@
         );
         assert!(!guided.contains("or-quota-key-1234567890"), "{guided}");
         // Ordinary rate limits stay retryable and unannotated.
-        let rate = client.http_error_with_route_context(429, "Too Many Requests", None);
+        let rate = client.http_error_with_route_context(429, "Too Many Requests", None, None);
         assert!(rate.is_retryable());
         assert!(!rate.to_string().contains("codewhale auth"), "{rate}");
     }
@@ -962,7 +963,7 @@
         let body =
             r#"{"error":{"code":"credit_balance_exhausted","message":"credit balance exhausted"}}"#;
         let error = client
-            .http_error_with_route_context(402, body, None)
+            .http_error_with_route_context(402, body, None, None)
             .to_string();
         assert!(!error.contains("codewhale auth"), "{error}");
     }
@@ -1045,6 +1046,7 @@
         let error = client.http_error_with_route_context(
             429,
             r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}"#,
+            None,
             None,
         );
         assert!(matches!(error, LlmError::QuotaExhausted(_)));

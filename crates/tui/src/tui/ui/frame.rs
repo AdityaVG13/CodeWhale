@@ -1259,6 +1259,7 @@ pub(crate) fn build_session_snapshot(
     session.work_state = work_state;
     session.last_auto_route = app.auto_route_for_persistence();
     session.window_title.clone_from(&app.window_title);
+    session.composer_color.clone_from(&app.composer_color);
     app.current_session_metadata = Some(session.metadata.clone());
     // Claim ownership of this session for the process. From here on the
     // Runtime API refuses external renames/archives of it with a typed 409
@@ -2230,8 +2231,12 @@ pub(crate) fn context_usage_snapshot_for_window(app: &App, max: u32) -> Option<(
     // A submitted first turn has started the conversation even before the
     // engine mirrors its messages back, and so has any provider usage; those
     // keep the real pressure reading.
-    let conversation_started =
-        !app.api_messages.is_empty() || app.is_loading || count_user_history_cells(app) > 0;
+    let conversation_started = !app.api_messages.is_empty()
+        || app.is_loading
+        || app
+            .history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. }));
     if !conversation_started
         && app.session.last_prompt_tokens.unwrap_or(0) == 0
         && app.last_billed_input_tokens.unwrap_or(0) == 0

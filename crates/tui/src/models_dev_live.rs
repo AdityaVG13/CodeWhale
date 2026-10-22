@@ -236,13 +236,15 @@ pub fn maybe_load_persisted_cache() {
     let Some(cache) = load_cache_file(&path) else {
         return;
     };
-    // Live only when the cache is recent by a trustworthy clock *and* came
-    // from the source this process would fetch now. A cache written for
-    // another mirror or override file still publishes (offline startups keep
-    // rows) but as stale, so the next refresh replaces it.
-    let freshness = if within_ttl(cache.fetched_at, now_unix())
-        && cache.source_fingerprint == current_source_fingerprint()
-    {
+    // The cache belongs to the selected source. Another mirror or override
+    // cannot supply fallback facts for this selection.
+    if cache.source_fingerprint != current_source_fingerprint() {
+        mark_failed(ModelsDevRefreshError::InvalidResponse(
+            "cached catalog belongs to a different source".into(),
+        ));
+        return;
+    }
+    let freshness = if within_ttl(cache.fetched_at, now_unix()) {
         ModelsDevFreshness::Live
     } else {
         ModelsDevFreshness::Stale
@@ -344,7 +346,10 @@ pub fn spawn_background_refresh() {
     if env_truthy(ENV_DISABLE_FETCH) && std::env::var(ENV_MODELS_DEV_PATH).is_err() {
         return;
     }
-    tokio::spawn(async {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async {
         match refresh(false).await {
             Ok(count) => {
                 tracing::debug!(
@@ -815,7 +820,7 @@ mod tests {
         let stale = PersistedModelsDevCache {
             schema_version: CACHE_SCHEMA_VERSION,
             fetched_at: 1, // far in the past → stale
-            source_fingerprint: "stale-fp".into(),
+            source_fingerprint: current_source_fingerprint(),
             source_label: "https://models.dev/catalog.json".into(),
             body: FIXTURE.into(),
         };
@@ -863,7 +868,7 @@ mod tests {
         };
         save_cache_file(&cache, &foreign).expect("save");
         maybe_load_persisted_cache();
-        assert_eq!(status().freshness, ModelsDevFreshness::Stale);
+        assert_eq!(status().freshness, ModelsDevFreshness::Failed);
 
         // From the current source, but stamped far in the future.
         let future = PersistedModelsDevCache {

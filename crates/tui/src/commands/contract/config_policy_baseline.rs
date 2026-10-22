@@ -54,6 +54,14 @@ fn normalize(message: &str, temp: &TempDir) -> String {
     if let Some(home) = crate::config::effective_home_dir() {
         text = text.replace(home.to_str().unwrap(), "<TEST_HOME>");
     }
+    // Catalog freshness depends on the bundled snapshot's age against the
+    // wall clock, so it cannot be part of a stable baseline.
+    while let Some(start) = text.find(" · Catalog: ") {
+        let Some(end) = text[start..].find(" · Cloud facts:") else {
+            break;
+        };
+        text.replace_range(start..start + end, "");
+    }
     text
 }
 

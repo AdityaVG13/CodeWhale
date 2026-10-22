@@ -858,8 +858,14 @@ def cmd_seed_lock(args: argparse.Namespace) -> None:
 def cmd_seed_render(args: argparse.Namespace) -> None:
     spec = load_seed_spec(Path(args.spec))
     lock = read_json_file(Path(args.lock))
-    reviewed = read_json_file(Path(args.corrections)).get("reviewed")
-    rendered = render_seed(spec, lock, reviewed)
+    corrections = read_json_file(Path(args.corrections))
+    providers = {provider["id"] for provider in spec["providers"]}
+    models = {(provider["id"], model["id"]) for provider in spec["providers"] for model in provider["models"]}
+    missing = [str(rule.get("provider")) for rule in corrections.get("providers", []) if rule.get("provider") not in providers]
+    missing.extend(f"{row.get('provider')}/{row.get('id')}" for row in corrections.get("models", []) if (row.get("provider"), row.get("id")) not in models)
+    if missing:
+        die("seed corrections name absent targets: " + ", ".join(missing))
+    rendered = render_seed(spec, lock, corrections.get("reviewed"))
     target = Path(args.out)
     if args.check:
         current = target.read_text(encoding="utf-8") if target.is_file() else ""

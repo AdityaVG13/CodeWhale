@@ -32,7 +32,10 @@ pub enum SandboxPolicy {
     /// The process can read any file but cannot write anywhere.
     /// Useful for analysis tools that need broad read access.
     #[serde(rename = "read-only")]
-    ReadOnly,
+    ReadOnly {
+        #[serde(default)]
+        network_access: bool,
+    },
 
     /// Indicates the process is already running in an external sandbox.
     ///
@@ -102,6 +105,12 @@ impl Default for SandboxPolicy {
 }
 
 impl SandboxPolicy {
+    pub fn read_only() -> Self {
+        SandboxPolicy::ReadOnly {
+            network_access: false,
+        }
+    }
+
     /// Create a workspace-write policy with network access enabled.
     pub fn workspace_with_network() -> Self {
         SandboxPolicy::WorkspaceWrite {
@@ -152,8 +161,8 @@ impl SandboxPolicy {
     pub fn has_network_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
-            SandboxPolicy::ReadOnly => false,
-            SandboxPolicy::ExternalSandbox { network_access }
+            SandboxPolicy::ReadOnly { network_access }
+            | SandboxPolicy::ExternalSandbox { network_access }
             | SandboxPolicy::WorkspaceWrite { network_access, .. } => *network_access,
         }
     }
@@ -173,10 +182,14 @@ impl SandboxPolicy {
     pub fn posture_label(&self) -> String {
         match self {
             SandboxPolicy::DangerFullAccess => "full access (sandbox disabled)".to_string(),
-            SandboxPolicy::ReadOnly => {
-                "read-only (shell writes are blocked; ordinary approval does not change this)"
-                    .to_string()
-            }
+            SandboxPolicy::ReadOnly { network_access } => format!(
+                "read-only (shell writes are blocked;{} ordinary approval does not change this)",
+                if *network_access {
+                    " network allowed;"
+                } else {
+                    ""
+                }
+            ),
             SandboxPolicy::ExternalSandbox { network_access } => format!(
                 "external sandbox (host-managed; network {})",
                 if *network_access {
@@ -217,7 +230,7 @@ impl SandboxPolicy {
         if enforcement == SandboxEnforcement::ExternalBackend {
             let requested_policy = match self {
                 SandboxPolicy::DangerFullAccess => "full-access",
-                SandboxPolicy::ReadOnly => "read-only",
+                SandboxPolicy::ReadOnly { .. } => "read-only",
                 SandboxPolicy::ExternalSandbox { .. } => "external-sandbox",
                 SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
             };
@@ -304,7 +317,7 @@ impl SandboxPolicy {
             // Full write access or read-only - no enumeration needed
             SandboxPolicy::DangerFullAccess
             | SandboxPolicy::ExternalSandbox { .. }
-            | SandboxPolicy::ReadOnly => vec![],
+            | SandboxPolicy::ReadOnly { .. } => vec![],
 
             // Workspace write - enumerate all writable paths
             SandboxPolicy::WorkspaceWrite {
@@ -570,7 +583,7 @@ mod tests {
     fn posture_labels_name_the_binding_fact() {
         // This label is shared by interactive and non-interactive postures, so
         // state only the invariant. The denial hint names the Ask-only path.
-        let read_only = SandboxPolicy::ReadOnly.posture_label();
+        let read_only = SandboxPolicy::read_only().posture_label();
         assert!(read_only.contains("read-only"), "{read_only}");
         assert!(read_only.contains("ordinary approval"), "{read_only}");
 
@@ -600,8 +613,8 @@ mod tests {
         assert!(local.starts_with("workspace-write"), "{local}");
         assert!(local.contains("local OS sandbox applied"), "{local}");
 
-        let unavailable =
-            SandboxPolicy::ReadOnly.posture_label_with_enforcement(SandboxEnforcement::Unavailable);
+        let unavailable = SandboxPolicy::read_only()
+            .posture_label_with_enforcement(SandboxEnforcement::Unavailable);
         assert!(
             unavailable.contains("policy only; no execution sandbox available"),
             "{unavailable}"
@@ -671,8 +684,8 @@ mod tests {
                 SandboxPolicy::default().posture_label(),
             );
             assert_eq!(
-                SandboxPolicy::ReadOnly.posture_label_with_no_new_privs(flag),
-                SandboxPolicy::ReadOnly.posture_label(),
+                SandboxPolicy::read_only().posture_label_with_no_new_privs(flag),
+                SandboxPolicy::read_only().posture_label(),
             );
         }
     }
@@ -717,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_read_only_policy() {
-        let policy = SandboxPolicy::ReadOnly;
+        let policy = SandboxPolicy::read_only();
         assert!(!policy.has_full_disk_write_access());
         assert!(!policy.has_network_access());
         assert!(policy.should_sandbox());

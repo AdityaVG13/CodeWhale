@@ -3,24 +3,31 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 
 use super::adapter::{self, AdapterFailure, AdapterResult};
 use super::contract::{BackendId, BackendSearch, DegradedReason, QueryCapabilities, SearchQuery};
 use super::contract::{CapabilityState as QueryCapabilityState, SearchResult};
 use crate::client::ProviderNativeSearchRequest;
 use crate::config::SearchProvider;
+use crate::network_policy::Decision;
 use crate::tools::spec::{ToolContext, ToolError};
 
 const SEARCH_BACKEND_CONFIGURATION_HINT: &str = concat!(
     "Check network access, or configure `[search] provider` and `[search] api_key` in ",
-    "config.toml. Keyed providers include tavily, bocha, metaso, baidu, volcengine, serply, ",
+    "config.toml. Keyed providers include tavily, bocha, metaso, baidu, volcengine, serply, deepseek, ",
     "and sofya; metaso also accepts METASO_API_KEY, tavily accepts TAVILY_API_KEY, baidu ",
     "accepts BAIDU_SEARCH_API_KEY, volcengine accepts VOLCENGINE_API_KEY / ",
-    "VOLCENGINE_ARK_API_KEY / ARK_API_KEY, serply accepts SERPLY_API_KEY, and sofya ",
+    "VOLCENGINE_ARK_API_KEY / ARK_API_KEY, serply accepts SERPLY_API_KEY, deepseek accepts ",
+    "DEEPSEEK_API_KEY, and sofya ",
     "accepts SOFYA_API_KEY. SearXNG needs a trusted self-hosted `[search] base_url`. For a ",
     "keyless route, use the default `[search] provider = \"firecrawl\"` or ",
     "`[search] provider = \"bing\"`."
 );
+
+const LINK_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const LINK_CHECK_CONCURRENCY: usize = 4;
+const LINK_CHECK_RESERVE: Duration = Duration::from_millis(250);
 
 #[async_trait]
 pub(crate) trait SearchBackend: Send + Sync {
@@ -46,6 +53,7 @@ pub(crate) enum ConfiguredSearchBackend<'a> {
     Volcengine(BackendContext<'a>),
     Sofya(BackendContext<'a>),
     Serply(BackendContext<'a>),
+    DeepSeek(BackendContext<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +79,7 @@ impl<'a> ConfiguredSearchBackend<'a> {
             SearchProvider::Volcengine => Self::Volcengine(backend),
             SearchProvider::Sofya => Self::Sofya(backend),
             SearchProvider::Serply => Self::Serply(backend),
+            SearchProvider::DeepSeek => Self::DeepSeek(backend),
         }
     }
 
@@ -87,6 +96,7 @@ impl<'a> ConfiguredSearchBackend<'a> {
             Self::Volcengine(_) => SearchProvider::Volcengine,
             Self::Sofya(_) => SearchProvider::Sofya,
             Self::Serply(_) => SearchProvider::Serply,
+            Self::DeepSeek(_) => SearchProvider::DeepSeek,
         }
     }
 
@@ -102,7 +112,8 @@ impl<'a> ConfiguredSearchBackend<'a> {
             | Self::Baidu(context)
             | Self::Volcengine(context)
             | Self::Sofya(context)
-            | Self::Serply(context) => context,
+            | Self::Serply(context)
+            | Self::DeepSeek(context) => context,
         }
     }
 }
@@ -317,6 +328,7 @@ impl SearchBackend for ConfiguredSearchBackend<'_> {
             SearchProvider::Volcengine => BackendId::Volcengine,
             SearchProvider::Sofya => BackendId::Sofya,
             SearchProvider::Serply => BackendId::Serply,
+            SearchProvider::DeepSeek => BackendId::DeepSeek,
         }
     }
 
@@ -375,11 +387,7 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
         }
     }
 
-    async fn search(
-        &self,
-        query: &SearchQuery,
-        _deadline: Instant,
-    ) -> AdapterResult<BackendSearch> {
+    async fn search(&self, query: &SearchQuery, deadline: Instant) -> AdapterResult<BackendSearch> {
         if !self
             .context
             .route_capabilities
@@ -418,6 +426,13 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
             )))
             .into());
         }
+        if query.recency.is_some() {
+            return Err((ToolError::not_available(format!(
+                "{} native web search cannot enforce a recency window",
+                client.provider().as_str()
+            )))
+            .into());
+        }
         let host = client.host().ok_or_else(|| {
             ToolError::execution_failed("provider-native search endpoint has no valid host")
         })?;
@@ -451,7 +466,7 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
         let results = crate::tools::web_search::normalize_captured_entries(
             entries,
             self.context,
-            _deadline.saturating_duration_since(Instant::now()),
+            deadline.saturating_duration_since(Instant::now()),
         )
         .await?
         .into_iter()
@@ -466,7 +481,7 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
             )
         })
         .collect();
-        Ok(BackendSearch {
+        let mut raw = BackendSearch {
             backend: BackendId::ProviderNative,
             source: format!(
                 "provider-native/{}/{}",
@@ -481,8 +496,133 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
                 Vec::new()
             },
             note: response.answer,
-        })
+        };
+        crate::tools::web_search::apply_domain_constraints(query, self.capabilities(), &mut raw);
+        let (results, unverified) = verify_citations(
+            std::mem::take(&mut raw.results),
+            &query.query,
+            self.context,
+            deadline,
+        )
+        .await;
+        raw.results = results;
+        raw.degraded.extend(unverified);
+        Ok(raw)
     }
+}
+
+async fn verify_citations(
+    results: Vec<SearchResult>,
+    query: &str,
+    context: &ToolContext,
+    deadline: Instant,
+) -> (Vec<SearchResult>, Vec<DegradedReason>) {
+    let needle = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let needle = needle.as_str();
+    let checks = futures_util::stream::iter(results)
+        .map(|result| async move {
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(LINK_CHECK_RESERVE)
+                .min(LINK_CHECK_TIMEOUT);
+            let outcome = match super::citations::normalize_http_url(&result.url) {
+                Some(url) if repeats_query(&url, needle) => LinkCheck::Failed(
+                    "the address repeats the search query, so it was not requested".to_string(),
+                ),
+                Some(_) if budget.is_zero() => LinkCheck::Deadline,
+                Some(url) => match host_needing_approval(&url, context) {
+                    Some(host) => LinkCheck::NeedsApproval(host),
+                    None => {
+                        match super::fetch::reachable_status(&url, budget, context, "web_search")
+                            .await
+                        {
+                            Ok(status) => LinkCheck::Status(status),
+                            Err(
+                                ToolError::PermissionDenied { message }
+                                | ToolError::InvalidInput { message },
+                            ) => LinkCheck::Failed(message),
+                            Err(_) => LinkCheck::Failed("no usable response".to_string()),
+                        }
+                    }
+                },
+                None => LinkCheck::Failed("not an http(s) address with a host".to_string()),
+            };
+            (result, outcome)
+        })
+        .buffered(LINK_CHECK_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut kept = Vec::new();
+    let mut unverified = Vec::new();
+    for (result, outcome) in checks {
+        let reason = match outcome {
+            LinkCheck::Status(status) if (200..300).contains(&status) => {
+                kept.push(result);
+                continue;
+            }
+            LinkCheck::Status(status) => format!("HTTP {status}"),
+            LinkCheck::Failed(message) => message,
+            LinkCheck::Deadline => "not checked before the search deadline".to_string(),
+            LinkCheck::NeedsApproval(host) => {
+                unverified.push(DegradedReason::CitationUnchecked {
+                    url: citation_label(&result.url),
+                    reason: format!(
+                        "the [network] policy needs approval for {host}; run `/network allow {host}` to have it checked"
+                    ),
+                });
+                kept.push(result);
+                continue;
+            }
+        };
+        unverified.push(DegradedReason::CitationUnverified {
+            url: citation_label(&result.url),
+            reason,
+        });
+    }
+    (kept, unverified)
+}
+
+enum LinkCheck {
+    Status(u16),
+    Failed(String),
+    Deadline,
+    NeedsApproval(String),
+}
+
+fn host_needing_approval(url: &str, context: &ToolContext) -> Option<String> {
+    let decider = context.network_policy.as_ref()?;
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
+    matches!(decider.evaluate(&host, "web_search"), Decision::Prompt).then_some(host)
+}
+
+fn repeats_query(url: &str, needle: &str) -> bool {
+    !needle.is_empty()
+        && reqwest::Url::parse(url).is_ok_and(|url| {
+            url.query_pairs().any(|(_, value)| {
+                value
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+                    .contains(needle)
+            })
+        })
+}
+
+fn citation_label(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -585,6 +725,7 @@ mod tests {
             (SearchProvider::Volcengine, BackendId::Volcengine),
             (SearchProvider::Sofya, BackendId::Sofya),
             (SearchProvider::Serply, BackendId::Serply),
+            (SearchProvider::DeepSeek, BackendId::DeepSeek),
         ];
 
         for (provider, expected) in cases {
@@ -619,6 +760,7 @@ mod tests {
                 QueryCapabilityState::Unsupported,
             ),
             (SearchProvider::Sofya, QueryCapabilityState::Unsupported),
+            (SearchProvider::DeepSeek, QueryCapabilityState::Unsupported),
         ];
         for (provider, expected_locale) in cases {
             let mut context = ToolContext::new(std::path::PathBuf::from("."));
@@ -921,6 +1063,7 @@ mod tests {
             "baidu",
             "volcengine",
             "serply",
+            "deepseek",
             "sofya",
         ] {
             assert!(
@@ -938,6 +1081,7 @@ mod tests {
         assert!(message.contains("VOLCENGINE_ARK_API_KEY"));
         assert!(message.contains("ARK_API_KEY"));
         assert!(message.contains("SERPLY_API_KEY"));
+        assert!(message.contains("DEEPSEEK_API_KEY"));
         assert!(message.contains("SOFYA_API_KEY"));
         assert!(message.contains("[search] base_url"));
         assert!(message.contains("provider = \"firecrawl\""));

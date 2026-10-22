@@ -12,8 +12,8 @@ use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::app::{App, ToolDetailRecord, ToolEvidence};
 use crate::tui::history::{
-    ExecCell, ExecSource, ExploringEntry, GenericToolCell, HistoryCell, McpToolCell,
-    PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
+    ExecCell, ExecSource, ExecWait, ExploringCell, ExploringEntry, GenericToolCell, HistoryCell,
+    McpToolCell, PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
     WebSearchCell, output_looks_like_diff, summarize_mcp_output, summarize_tool_args,
     summarize_tool_output,
 };
@@ -45,35 +45,24 @@ pub(super) fn handle_tool_call_started(
     }
 
     if is_exploring_tool(semantic_name) {
-        let label = exploring_label(semantic_name, input);
-        // ensure_exploring + append_to_exploring keeps all parallel exploring
-        // starts in a single ExploringCell entry.
-        let active = app.active_cell.as_mut().expect("active_cell just ensured");
-        let entry_idx = active.ensure_exploring();
-        app.active_tool_entry_completed_at.remove(&entry_idx);
-        let inner = active
-            .append_to_exploring(
-                id.clone(),
-                ExploringEntry {
+        let label = exploring_label(semantic_name, input, &app.workspace);
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::Exploring(ExploringCell {
+                entries: vec![ExploringEntry {
                     label,
                     status: ToolStatus::Running,
                     error: None,
-                },
-            )
-            .map_or(0, |(_, inner)| inner);
-        app.exploring_cell = Some(entry_idx);
-        let virtual_index = app.history.len() + entry_idx;
-        app.exploring_entries
-            .insert(id.clone(), (virtual_index, inner));
-        register_tool_cell(app, &id, name, input, virtual_index);
-        app.mark_history_updated();
+                }],
+            })),
+        );
+        let virtual_index = app.tool_cells[&id];
+        app.exploring_entries.insert(id, (virtual_index, 0));
         return;
     }
-
-    // Non-exploring tool: each is its own entry inside the active cell. We
-    // intentionally do NOT clear `exploring_cell` here — the active cell can
-    // hold both an exploring aggregate AND independent tool entries
-    // simultaneously, which is exactly the case CX#7 fixes.
 
     if is_exec_tool(semantic_name) {
         let command = exec_target_from_input(input);
@@ -109,9 +98,10 @@ pub(super) fn handle_tool_call_started(
                     shell_task_id: None,
                     owner_agent_id: None,
                     owner_agent_name: None,
-                    started_at: Some(Instant::now()),
+                    started_at: None,
                     duration_ms: None,
                     stale_elapsed_since_output_ms: None,
+                    waiting: None,
                     source,
                     description: None,
                     interaction: Some(summary.clone()),
@@ -147,9 +137,10 @@ pub(super) fn handle_tool_call_started(
                 shell_task_id: None,
                 owner_agent_id: None,
                 owner_agent_name: None,
-                started_at: Some(Instant::now()),
+                started_at: None,
                 duration_ms: None,
                 stale_elapsed_since_output_ms: None,
+                waiting: None,
                 source,
                 description: input
                     .get("description")
@@ -327,6 +318,55 @@ fn push_active_tool_cell(
     app.mark_history_updated();
 }
 
+pub(crate) fn hold_exec_cards_for_approval(app: &mut App, tool_id: &str) {
+    if !crate::tools::subagent::SubAgentManager::is_child_approval_id(tool_id) {
+        let queued: Vec<usize> = app
+            .tool_cells
+            .iter()
+            .filter(|(id, _)| id.as_str() != tool_id)
+            .map(|(_, &index)| index)
+            .filter(|&index| {
+                matches!(
+                    app.cell_at_virtual_index(index),
+                    Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+                        if exec.status == ToolStatus::Running
+                            && exec.started_at.is_none()
+                            && exec.waiting.is_none()
+                )
+            })
+            .collect();
+        for index in queued {
+            set_exec_card_waiting(app, index, Some(ExecWait::Queue));
+        }
+    }
+    if let Some(&index) = app.tool_cells.get(tool_id) {
+        set_exec_card_waiting(app, index, Some(ExecWait::Approval));
+    }
+}
+
+pub(crate) fn start_exec_card(app: &mut App, tool_id: &str) {
+    if let Some(&index) = app.tool_cells.get(tool_id) {
+        set_exec_card_waiting(app, index, None);
+    }
+}
+
+fn set_exec_card_waiting(app: &mut App, index: usize, waiting: Option<ExecWait>) {
+    let is_change = matches!(
+        app.cell_at_virtual_index(index),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+            if exec.status == ToolStatus::Running
+                && (exec.waiting != waiting || (waiting.is_none() && exec.started_at.is_none()))
+    );
+    if !is_change {
+        return;
+    }
+    if let Some(HistoryCell::Tool(ToolCell::Exec(exec))) = app.cell_at_virtual_index_mut(index) {
+        exec.waiting = waiting;
+        exec.started_at = waiting.is_none().then(Instant::now);
+        app.needs_redraw = true;
+    }
+}
+
 fn register_tool_cell(
     app: &mut App,
     tool_id: &str,
@@ -350,6 +390,7 @@ fn register_tool_cell(
         // cell index.
         app.active_tool_details.insert(tool_id.to_string(), record);
     }
+    app.bump_details_epoch();
 }
 
 /// Per-record ceiling on a retained tool output (#5472 finding 3).
@@ -411,12 +452,13 @@ fn store_tool_detail_output(
         detail.output = Some(payload);
     }
     release_oldest_tool_detail_outputs(app);
+    app.bump_details_epoch();
 }
 
 /// Hold the retained-output total under [`TOOL_DETAIL_TOTAL_BUDGET_BYTES`] by
 /// dropping the oldest cells' outputs. The records themselves stay, so the
 /// inspector still lists the call and its input.
-fn release_oldest_tool_detail_outputs(app: &mut App) {
+pub(super) fn release_oldest_tool_detail_outputs(app: &mut App) {
     let mut total = 0usize;
     for detail in app.tool_details_by_cell.values() {
         total = total.saturating_add(detail.output.as_ref().map_or(0, String::len));
@@ -771,6 +813,7 @@ pub(super) fn handle_tool_call_complete(
     // live in the active cell or in finalized history; the path is the same.
     if let Some((cell_index, entry_index)) = app.exploring_entries.remove(id) {
         app.tool_cells.remove(id);
+        app.bump_details_epoch();
         store_tool_detail_output(app, id, cell_index, result);
         if let Some(HistoryCell::Tool(ToolCell::Exploring(cell))) =
             app.cell_at_virtual_index_mut(cell_index)
@@ -809,6 +852,7 @@ pub(super) fn handle_tool_call_complete(
         push_orphan_tool_completion(app, id, name, result);
         return;
     };
+    app.bump_details_epoch();
 
     store_tool_detail_output(app, id, cell_index, result);
     let in_active = cell_index >= app.history.len();
@@ -1561,6 +1605,7 @@ fn push_orphan_tool_completion(
             },
         },
     );
+    app.bump_details_epoch();
 
     // The virtual-index rebase this path used to do inline now lives in
     // `App::add_message`, so every mid-turn history insert gets it — not just
@@ -1571,15 +1616,14 @@ fn push_orphan_tool_completion(
 fn tool_status_from_result(result: &Result<ToolResult, ToolError>) -> ToolStatus {
     match result.as_ref() {
         Ok(tool_result) if is_deferred_schema_hydration(tool_result) => ToolStatus::Hydrated,
-        Ok(tool_result) => match tool_result.metadata.as_ref() {
-            Some(meta)
-                if meta
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| s == "Running") =>
-            {
-                ToolStatus::Running
-            }
+        Ok(tool_result) => match tool_result
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("status"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("Running") => ToolStatus::Running,
+            Some("Killed") => ToolStatus::Stopped,
             _ => {
                 if tool_result.success {
                     ToolStatus::Success
@@ -1642,20 +1686,23 @@ pub(super) fn refreshes_workspace_context_on_completion(name: &str) -> bool {
     )
 }
 
-pub(super) fn exploring_label(name: &str, input: &serde_json::Value) -> String {
+pub(super) fn exploring_label(
+    name: &str,
+    input: &serde_json::Value,
+    workspace: &std::path::Path,
+) -> String {
     let fallback = format!("{name} tool");
     let obj = input.as_object();
+    let path = || {
+        obj.and_then(|o| o.get("path"))
+            .and_then(|v| v.as_str())
+            .map(|path| crate::utils::workspace_relative(path, workspace))
+    };
     match name {
-        "read_file" => obj
-            .and_then(|o| o.get("path"))
-            .and_then(|v| v.as_str())
-            .map_or(fallback, |path| format!("Reading {path}")),
-        "list_dir" => obj
-            .and_then(|o| o.get("path"))
-            .and_then(|v| v.as_str())
-            .map_or("Listing directory".to_string(), |path| {
-                format!("Listing {path}")
-            }),
+        "read_file" => path().map_or(fallback, |path| format!("Reading {path}")),
+        "list_dir" => path().map_or("Listing directory".to_string(), |path| {
+            format!("Listing {path}")
+        }),
         "grep_files" => {
             let pattern = obj
                 .and_then(|o| o.get("pattern"))
@@ -2771,6 +2818,7 @@ mod tests {
             started_at: None,
             duration_ms: Some(120),
             stale_elapsed_since_output_ms: None,
+            waiting: None,
             source: ExecSource::Assistant,
             description: None,
             interaction: None,
@@ -2833,17 +2881,24 @@ mod tests {
         // 200 records x 64 KiB = 12.8 MiB, well past the 8 MiB budget.
         let record_count = 200usize;
         for index in 0..record_count {
-            app.tool_details_by_cell.insert(
-                index,
+            let tool_id = format!("tool-{index}");
+            super::handle_tool_call_started(
+                &mut app,
+                &tool_id,
+                "read_file",
+                &serde_json::json!({ "path": format!("file-{index}.txt") }),
+            );
+            app.active_tool_details.insert(
+                tool_id.clone(),
                 ToolDetailRecord {
-                    tool_id: format!("tool-{index}"),
-                    tool_name: "Bash".to_string(),
+                    tool_id,
+                    tool_name: "read_file".to_string(),
                     input: serde_json::Value::Null,
                     output: Some("y".repeat(super::TOOL_DETAIL_OUTPUT_MAX_BYTES)),
                 },
             );
         }
-        super::release_oldest_tool_detail_outputs(&mut app);
+        app.flush_active_cell();
 
         let retained: usize = app
             .tool_details_by_cell

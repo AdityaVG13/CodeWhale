@@ -409,12 +409,12 @@ impl HelpView {
             .copied()
             .unwrap_or(label_cap);
         let inline_capacity = inner_width.saturating_sub(label_width + 4);
-        let inline = shed_to_width(&entry.description, inline_capacity);
-        let full = shed_to_width(&entry.description, inner_width);
+        let inline = shed_to_width(&entry.description, inline_capacity, self.locale);
+        let full = shed_to_width(&entry.description, inner_width, self.locale);
         let repaired = (full != inline && !full.is_empty()).then(|| full.to_string());
         match (entry.usage.as_deref(), repaired) {
             (None, repaired) => repaired,
-            (Some(usage), None) => Some(shed_to_width(usage, inner_width).to_string()),
+            (Some(usage), None) => Some(shed_to_width(usage, inner_width, self.locale).to_string()),
             (Some(usage), Some(description)) => {
                 // They join at a joint `shed_to_width` already sheds on, and
                 // the description leads: repairing the shed is what this slot
@@ -422,7 +422,7 @@ impl HelpView {
                 // spend itself on the argument shape and drop the sentence
                 // the row could not print.
                 let joined = format!("{description} — {usage}");
-                Some(shed_to_width(&joined, inner_width).to_string())
+                Some(shed_to_width(&joined, inner_width, self.locale).to_string())
             }
         }
     }
@@ -816,7 +816,7 @@ const FIELD_JOINTS: [&str; 6] = [" (", "; ", " — ", ". ", ": ", ", "];
 /// share prefixes. So the description sheds its alias parenthetical first,
 /// then trailing clauses at its own joints, and finally itself. The label is
 /// never shed at all: it is the string the user has to type.
-fn shed_to_width(text: &str, max_width: usize) -> Cow<'_, str> {
+fn shed_to_width(text: &str, max_width: usize, locale: Locale) -> Cow<'_, str> {
     let trimmed = text.trim_end();
     if max_width == 0 {
         return Cow::Borrowed("");
@@ -879,7 +879,7 @@ fn shed_to_width(text: &str, max_width: usize) -> Cow<'_, str> {
         } else {
             oversize_clause
         };
-        shed_to_words(source, max_width)
+        shed_to_words(source, max_width, locale)
     } else {
         Cow::Borrowed(best)
     }
@@ -905,9 +905,9 @@ fn widest_char_prefix(text: &str, max_width: usize) -> &str {
 /// The scan used to stop on a space, so the last word was never included
 /// even when it fitted, and the two-pass short-word trim then left a simple
 /// verb + modifier + noun phrase without the noun — `/automation` read
-/// `Manage durable scheduled`. If that prefix lost the head noun, intervening
-/// modifiers are dropped so the noun survives.
-fn shed_to_words(text: &str, max_width: usize) -> Cow<'_, str> {
+/// `Manage durable scheduled`. In English, if that prefix lost the head noun,
+/// intervening modifiers are dropped so the noun survives.
+fn shed_to_words(text: &str, max_width: usize, locale: Locale) -> Cow<'_, str> {
     let mut end = 0usize;
     for (idx, ch) in text.char_indices() {
         if ch == ' ' && text[..idx].width() <= max_width {
@@ -940,7 +940,9 @@ fn shed_to_words(text: &str, max_width: usize) -> Cow<'_, str> {
         head = &head[..cut];
     }
     let head = head.trim_end_matches([' ', ',', ';', ':', '—', '-']);
-    if let Some(kept) = keep_simple_head_noun(text, head, max_width) {
+    if locale == Locale::En
+        && let Some(kept) = keep_simple_head_noun(text, head, max_width)
+    {
         return kept;
     }
     Cow::Borrowed(head)
@@ -1308,7 +1310,7 @@ impl ModalView for HelpView {
                         let pad = label_width.saturating_sub(entry.label.width());
                         let desc_capacity =
                             inner_width.saturating_sub(cursor.width() + label_width + 2);
-                        let desc = shed_to_width(&entry.description, desc_capacity);
+                        let desc = shed_to_width(&entry.description, desc_capacity, self.locale);
                         // The label is the string you type and the description
                         // qualifies it. They were both TEXT_PRIMARY, so the
                         // row said everything at one weight and the eye had
@@ -1822,7 +1824,7 @@ mod tests {
     fn shedding_never_leaves_a_parenthesis_open() {
         let text = "Attach media  (aliases: /image, /media)";
         for width in 4..text.len() {
-            let shed = shed_to_width(text, width);
+            let shed = shed_to_width(text, width, Locale::En);
             let opens = shed.matches('(').count();
             let closes = shed.matches(')').count();
             assert_eq!(opens, closes, "unbalanced at width {width}: {shed:?}");
@@ -1836,7 +1838,7 @@ mod tests {
     #[test]
     fn a_jointless_description_sheds_to_whole_words() {
         let text = "Move the active branch to an existing session entry";
-        let shed = shed_to_width(text, 26);
+        let shed = shed_to_width(text, 26, Locale::En);
         assert!(text.starts_with(&*shed), "{shed:?}");
         assert!(!shed.is_empty());
         assert!(!shed.ends_with(" an"), "{shed:?}");
@@ -2538,7 +2540,7 @@ mod tests {
 
 #[cfg(test)]
 mod shed_to_words_script_tests {
-    use super::{shed_to_words, widest_char_prefix};
+    use super::{Locale, shed_to_words, widest_char_prefix};
     use unicode_width::UnicodeWidthStr;
 
     /// Japanese, Chinese and Thai do not put spaces between words, so a
@@ -2552,7 +2554,7 @@ mod shed_to_words_script_tests {
             "切換背景顧問",
         ] {
             for width in [8usize, 12, 20, 30] {
-                let shed = shed_to_words(text, width);
+                let shed = shed_to_words(text, width, Locale::En);
                 assert!(
                     !shed.is_empty(),
                     "{text:?} at {width}: description rendered blank",
@@ -2575,7 +2577,7 @@ mod shed_to_words_script_tests {
     #[test]
     fn an_overlong_first_word_sheds_to_characters_rather_than_nothing() {
         let text = "Internationalisation settings";
-        let shed = shed_to_words(text, 10);
+        let shed = shed_to_words(text, 10, Locale::En);
         assert!(!shed.is_empty(), "long first word rendered blank");
         assert!(shed.width() <= 10, "{shed:?}");
     }
@@ -2585,7 +2587,7 @@ mod shed_to_words_script_tests {
     #[test]
     fn english_still_sheds_on_word_boundaries() {
         let text = "Toggle the background advisor for this session";
-        let shed = shed_to_words(text, 24);
+        let shed = shed_to_words(text, 24, Locale::En);
         assert!(shed.width() <= 24, "{shed:?}");
         assert!(!shed.ends_with(' '), "{shed:?}");
         assert!(
@@ -2615,7 +2617,7 @@ mod shed_to_words_script_tests {
         // 35 is the description slot at 60 columns (measured).
         // 36 is the full phrase.
         for width in [24usize, 28, 32, 35, 36] {
-            let shed = shed_to_words(text, width);
+            let shed = shed_to_words(text, width, Locale::En);
             assert!(
                 shed.contains("automations"),
                 "width {width} dropped the head noun: {shed:?}"
@@ -2631,7 +2633,7 @@ mod shed_to_words_script_tests {
         // one column over the 35-column slot, so last-resort word shed must
         // run on that clause, not on the alias list.
         let aliased = "Manage durable scheduled automations  (aliases: /automations, /scheduled)";
-        let shed = super::shed_to_width(aliased, 35);
+        let shed = super::shed_to_width(aliased, 35, Locale::En);
         assert!(
             shed.contains("automations"),
             "aliased row dropped the head noun: {shed:?}"

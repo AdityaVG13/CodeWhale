@@ -989,8 +989,13 @@ fn undo_refuses_lossy_shared_prefix_and_first_line_labels() {
 }
 
 #[test]
-fn undo_refuses_a_unique_lossy_prompt_even_without_a_collision() {
-    for prompt in ["x".repeat(101), "edit a.txt\nwith a second line".into()] {
+fn undo_matches_unique_truncated_and_multiline_prompt_snippets() {
+    for prompt in [
+        "x".repeat(101),
+        "edit a.txt\nwith a second line".into(),
+        "edit a.txt \nwith trailing whitespace".into(),
+        "\nwith an empty first line".into(),
+    ] {
         let fx = UndoFixture::new();
         fx.write("a.txt", "a0");
         fx.snapshot(
@@ -1002,9 +1007,35 @@ fn undo_refuses_a_unique_lossy_prompt_even_without_a_collision() {
             &crate::core::turn::format_snapshot_label("post-turn", 1, Some(&prompt)),
             "s1",
         );
+        fx.snapshot("pre-turn:2: update a.txt again", "s1");
+        fx.write("a.txt", "a2");
+        fx.snapshot("post-turn:2: update a.txt again", "s1");
         let mut app = fx.app("s1");
         push_exchange(&mut app, &prompt);
-        assert_undo_identity_refused(&fx, &mut app);
+        push_exchange(&mut app, "update a.txt again");
+        app.session_turn_outcomes = vec![
+            crate::session_manager::SavedTurnOutcome::failed("first failure", 2),
+            crate::session_manager::SavedTurnOutcome::failed("second failure", 4),
+        ];
+
+        let result = super::execute("/undo", &mut app);
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_eq!(fx.read("a.txt"), "a1");
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.api_messages.len(), 2);
+        assert_eq!(app.session_turn_outcomes.len(), 1);
+        assert_eq!(app.session_turn_outcomes[0].error, "first failure");
+
+        if prompt.starts_with('\n') {
+            assert_undo_identity_refused(&fx, &mut app);
+            continue;
+        }
+
+        let result = super::execute("/undo", &mut app);
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_eq!(fx.read("a.txt"), "a0");
+        assert!(app.history.is_empty() && app.api_messages.is_empty());
+        assert!(app.session_turn_outcomes.is_empty());
     }
 }
 
@@ -1052,6 +1083,10 @@ fn undo_refuses_missing_prompt_labels_and_multipart_requests() {
             });
         }
         assert_undo_identity_refused(&fx, &mut app);
+        if kind > 0 {
+            push_exchange(&mut app, "edit a.txt");
+            assert_undo_identity_refused(&fx, &mut app);
+        }
     }
 }
 

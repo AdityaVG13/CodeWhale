@@ -324,6 +324,7 @@ pub enum CardRail {
     Bottom,
     /// Single-line card — no rail at all.
     Single,
+    Indent,
 }
 
 /// Map a [`CardRail`] position to its rail glyph. Returned as a `&str`
@@ -335,6 +336,7 @@ pub fn rail_glyph(rail: CardRail) -> &'static str {
         CardRail::Middle => "\u{2502}", // │
         CardRail::Bottom => "\u{2570}", // ╰
         CardRail::Single => "",
+        CardRail::Indent => " ",
     }
 }
 

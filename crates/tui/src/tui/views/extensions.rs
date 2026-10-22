@@ -1993,9 +1993,19 @@ impl ExtensionsView {
                 format!("{} · {}{action} · {}", item.label, item.state, item.detail)
             }
             Some(VisibleEntry::Problem(problem)) => problem.to_string(),
-            Some(VisibleEntry::Empty) | None => {
-                tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
-            }
+            Some(VisibleEntry::Empty) | None => self.empty_message(),
+        }
+    }
+
+    fn empty_message(&self) -> String {
+        if self.query.is_empty() {
+            tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
+        } else {
+            localize(
+                self.locale,
+                MessageId::ExtensionsNoMatches,
+                &[("query", &self.query)],
+            )
         }
     }
 }
@@ -2227,13 +2237,41 @@ impl ModalView for ExtensionsView {
         if body.width == 0 || body.height < 5 {
             return;
         }
+        let spacious = body.height >= 16;
+        let status = if spacious && self.pending_remove.is_none() {
+            self.selected_item().map_or_else(
+                || self.selected_status(),
+                |item| {
+                    format!(
+                        "{} · {}\n{}\n{}",
+                        item.label, item.state, item.description, item.detail
+                    )
+                },
+            )
+        } else {
+            self.selected_status()
+        };
+        let status = Paragraph::new(status)
+            .style(Style::default().fg(if self.pending_remove.is_some() {
+                palette::STATUS_WARNING
+            } else {
+                palette::TEXT_MUTED
+            }))
+            .wrap(Wrap { trim: false });
+        let status_height = if spacious {
+            u16::try_from(status.line_count(body.width))
+                .unwrap_or(u16::MAX)
+                .clamp(3, (body.height / 3).max(3))
+        } else {
+            1
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
-                Constraint::Length(if body.height >= 16 { 3 } else { 1 }),
+                Constraint::Length(status_height),
                 Constraint::Length(1),
             ])
             .split(body);
@@ -2377,15 +2415,7 @@ impl ModalView for ExtensionsView {
                     Some(codewhale_palette::ChromeInk::Failure),
                 )),
                 VisibleEntry::Empty => parts.push((
-                    if self.query.is_empty() {
-                        tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
-                    } else {
-                        localize(
-                            self.locale,
-                            MessageId::ExtensionsNoMatches,
-                            &[("query", &self.query)],
-                        )
-                    },
+                    self.empty_message(),
                     Some(codewhale_palette::ChromeInk::MetadataHint),
                 )),
             }
@@ -2418,27 +2448,7 @@ impl ModalView for ExtensionsView {
             hits.rows.push((row_area, entry_index));
         }
 
-        let status = if rows[3].height > 1 && self.pending_remove.is_none() {
-            self.selected_item().map_or_else(
-                || self.selected_status(),
-                |item| {
-                    format!(
-                        "{} · {}\n{}\n{}",
-                        item.label, item.state, item.description, item.detail
-                    )
-                },
-            )
-        } else {
-            self.selected_status()
-        };
-        Paragraph::new(status)
-            .style(Style::default().fg(if self.pending_remove.is_some() {
-                palette::STATUS_WARNING
-            } else {
-                palette::TEXT_MUTED
-            }))
-            .wrap(Wrap { trim: false })
-            .render(rows[3], buf);
+        status.render(rows[3], buf);
         let mut compact_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),

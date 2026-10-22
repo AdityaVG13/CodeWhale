@@ -358,7 +358,7 @@ pub(crate) fn sandbox_policy_for_turn(
     network_access: SandboxNetworkAccess,
 ) -> SandboxPolicy {
     let default = if mode == AppMode::Plan {
-        SandboxPolicy::ReadOnly
+        SandboxPolicy::read_only()
     } else if approval_mode == ApprovalMode::Bypass {
         SandboxPolicy::DangerFullAccess
     } else {
@@ -369,7 +369,7 @@ pub(crate) fn sandbox_policy_for_turn(
     // Only stricter scopes clamp the posture-derived default: a configured
     // danger-full-access value must not silently loosen Ask or Auto-Review.
     match (default, configured_mode) {
-        (SandboxPolicy::ReadOnly, _) | (_, Some("read-only")) => SandboxPolicy::ReadOnly,
+        (SandboxPolicy::ReadOnly { .. }, _) | (_, Some("read-only")) => SandboxPolicy::read_only(),
         (SandboxPolicy::DangerFullAccess, Some("workspace-write")) => {
             workspace_write_policy(workspace, network_access)
         }
@@ -639,16 +639,16 @@ fn carve_out_relative_path_allowed(relative: &Path) -> bool {
 fn is_carve_out_excluded_name(name: &str) -> bool {
     // The shared `.git` rule, so a Windows alias (`.git.`, `GIT~1`) is
     // excluded here exactly as the workspace file routes exclude it.
-    if crate::snapshot::is_git_metadata_name(OsStr::new(name)) {
-        return true;
-    }
-    // Runtime/project state and credential-bearing directories. `.codewhale`
-    // holds session state plus MCP/hook configuration — editing it changes
-    // what runs, so it keeps the modal.
-    if matches!(
-        name,
-        ".codewhale" | ".ssh" | ".aws" | ".gnupg" | ".kube" | ".docker"
-    ) {
+    // `.codewhale` holds session state plus MCP/hook configuration — editing
+    // it changes what runs, so it keeps the modal.
+    crate::snapshot::is_git_metadata_name(OsStr::new(name))
+        || name == ".codewhale"
+        || is_credential_file_name(name)
+}
+
+pub(crate) fn is_credential_file_name(name: &str) -> bool {
+    // Credential-bearing directories.
+    if matches!(name, ".ssh" | ".aws" | ".gnupg" | ".kube" | ".docker") {
         return true;
     }
     // Environment files and well-known credential stores.
@@ -1096,7 +1096,7 @@ mod tests {
                 Some("read-only"),
                 SandboxNetworkAccess::Restricted
             ),
-            SandboxPolicy::ReadOnly
+            SandboxPolicy::read_only()
         );
         // The external sandbox no longer claims network unconditionally; it
         // reports what was actually granted.
@@ -1206,7 +1206,7 @@ mod tests {
                 Some("danger-full-access"),
                 SandboxNetworkAccess::Restricted
             ),
-            SandboxPolicy::ReadOnly
+            SandboxPolicy::read_only()
         );
     }
 

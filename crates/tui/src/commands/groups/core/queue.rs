@@ -123,6 +123,7 @@ fn clear_queue(app: &mut App) -> CommandResult {
     let queued = app.queued_message_count();
     let had_draft = app.queued_draft.take().is_some();
     app.queued_messages.clear();
+    app.held_restored_queue = 0;
     if queued == 0 && !had_draft {
         return CommandResult::message(tr(locale, MessageId::CmdQueueAlreadyEmpty));
     }

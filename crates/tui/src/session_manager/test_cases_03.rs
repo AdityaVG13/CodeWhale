@@ -296,16 +296,32 @@
         let tmp = tempdir().expect("tempdir");
 
         let messages = vec![make_test_message("user", "Hello")];
-        let session = create_saved_session(&messages, "test-model", tmp.path(), 50, None);
+        let mut session = create_saved_session(&messages, "test-model", tmp.path(), 50, None);
+        session.turn_outcomes.push(SavedTurnOutcome::failed("shared failure", 1));
 
         let new_messages = vec![
             make_test_message("user", "Hello"),
             make_test_message("assistant", "Hi!"),
         ];
 
-        let updated = update_session(session, &new_messages, 100, None);
+        let mut updated = update_session(session, &new_messages, 100, None);
         assert_eq!(updated.messages.len(), 2);
         assert_eq!(updated.metadata.total_tokens, 100);
+        assert_eq!(updated.turn_outcomes.len(), 1);
+        let original_leaf = updated.leaf_id.clone().unwrap();
+        updated.turn_outcomes.push(SavedTurnOutcome::failed("old branch failure", 2));
+        let alternate = vec![
+            make_test_message("user", "Hello"),
+            make_test_message("assistant", "Different answer"),
+        ];
+        let mut updated = update_session(updated, &alternate, 110, None);
+        assert_eq!(updated.turn_outcomes.len(), 1);
+        assert_eq!(updated.turn_outcomes[0].error, "shared failure");
+        updated.turn_outcomes.push(SavedTurnOutcome::failed("alternate failure", 2));
+        updated.journal_branch_to(&original_leaf).expect("switch sibling branch");
+        assert_eq!(updated.messages, new_messages);
+        assert_eq!(updated.turn_outcomes.len(), 1);
+        assert_eq!(updated.turn_outcomes[0].error, "shared failure");
     }
 
     #[test]
@@ -1513,6 +1529,25 @@
             assert!(
                 !archived.contains(&id.as_str()),
                 "{id} is inside the cap and must stay active"
+            );
+        }
+        for index in 0..(MAX_SESSIONS + 3) {
+            let session = create_saved_session_with_mode(
+                &[make_test_message("user", &format!("exec run {index}"))],
+                "test-model",
+                tmp.path(),
+                0,
+                None,
+                Some("exec"),
+            );
+            manager.save_session(&session).expect("save exec session");
+        }
+        let listed = manager.list_sessions().expect("sessions after exec runs");
+        assert_eq!(listed.len(), 2 * (MAX_SESSIONS + 3));
+        for is_exec in [false, true] {
+            assert_eq!(
+                listed.iter().filter(|session| !session.archived && (session.mode.as_deref() == Some("exec")) == is_exec).count(),
+                MAX_SESSIONS,
             );
         }
     }

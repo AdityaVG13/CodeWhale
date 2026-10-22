@@ -30,12 +30,21 @@ notes="$(printf '%s\n' "${section}" | awk '
   !in_contributors { print }
 ')"
 
+summary="$(printf '%s\n' "${notes}" | awk '/^### / { in_details = 1 } !in_details { print }')"
+details="$(printf '%s\n' "${notes}" | awk '/^### / { in_details = 1 } in_details { print }')"
+if [[ -z "${summary//[[:space:]]/}" ]]; then
+  summary="${notes}"
+  details=""
+fi
+
+printf "## What's in %s\n\n" "${tag}"
+if [[ -n "${summary}" ]]; then
+  printf '%s\n' "${summary}"
+else
+  printf '%s\n' "See the changelog link below for this release's notes."
+fi
+
 cat <<EOF
-> **Codewhale** is the public product from Shannon Labs. The \`codewhale\`
-> command, npm package, and release-asset names remain lowercase technical
-> identifiers. The legacy npm package \`deepseek-tui\` is deprecated and
-> receives no further releases. Users coming from v0.8.x legacy \`deepseek\` /
-> \`deepseek-tui\` names should migrate with \`docs/REBRAND.md\`.
 
 ## Install
 
@@ -150,13 +159,11 @@ shasum -a 256 -c codewhale-bundles-sha256.txt --ignore-missing
 shasum -a 256 -c codewhale-artifacts-sha256.txt --ignore-missing
 \`\`\`
 
-## What's in ${tag}
 EOF
 
-if [[ -n "${notes}" ]]; then
-  printf '%s\n' "${notes}"
-else
-  printf '%s\n' "See the changelog link below for this release's notes."
+if [[ -n "${details}" ]]; then
+  printf '%s\n\n' '<details>' '<summary>Full release notes</summary>'
+  printf '%s\n\n' "${details}" '</details>'
 fi
 
 cat <<EOF

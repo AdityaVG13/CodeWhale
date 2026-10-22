@@ -1688,6 +1688,12 @@ impl TaskManager {
             plugin_registry,
             binding,
         )?);
+        let workspace = cfg.default_workspace.clone();
+        let workers = tokio::task::spawn_blocking(move || {
+            crate::tools::subagent::new_shared_worker_authority(workspace)
+        })
+        .await?;
+        runtime_threads.attach_subagent_manager(workers).await?;
         Self::start_with_runtime_manager(cfg, api_config, runtime_threads).await
     }
 
@@ -1792,7 +1798,7 @@ impl TaskManager {
         {
             let mut state = manager.state.lock().await;
             let _transaction = manager.lock_store().await?;
-            manager.refresh_locked(&mut state)?;
+            manager.refresh_locked_offloaded(&mut state).await?;
             manager.recover_dead_executions_locked(&mut state)?;
             manager.persist_queue_locked(&state.queue)?;
         }
@@ -2120,7 +2126,7 @@ impl TaskManager {
         {
             let mut state = self.state.lock().await;
             let _transaction = self.lock_store().await?;
-            self.refresh_locked(&mut state)?;
+            self.refresh_locked_offloaded(&mut state).await?;
             if self.cancel_token.is_cancelled() {
                 bail!("Task manager is shutting down; admission is closed");
             }
@@ -2387,7 +2393,7 @@ impl TaskManager {
     ) -> Result<TaskCancellation> {
         let mut state = self.state.lock().await;
         let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_locked_offloaded(&mut state).await?;
         let id = match (owner_session_id, operator_execution_scope) {
             (Some(owner_session_id), Some(execution_scope)) => resolve_task_id_visible_to_operator(
                 &state.tasks,
@@ -2520,7 +2526,7 @@ impl TaskManager {
     ) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
         let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_locked_offloaded(&mut state).await?;
         let id = resolve_task_id(&state.tasks, id_or_prefix)?;
         let updated = {
             let task = state
@@ -2941,7 +2947,7 @@ impl TaskManager {
         let urgent = execution_event_persist_urgent(&event);
         let mut state = self.state.lock().await;
         let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_locked_offloaded(&mut state).await?;
         if state
             .pending_events
             .get(task_id)
@@ -3158,7 +3164,7 @@ impl TaskManager {
     async fn flush_task(&self, task_id: &str) -> Result<()> {
         let mut state = self.state.lock().await;
         let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_locked_offloaded(&mut state).await?;
         let task = state
             .tasks
             .get(task_id)
@@ -3176,7 +3182,7 @@ impl TaskManager {
     ) -> Result<()> {
         let mut state = self.state.lock().await;
         let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_locked_offloaded(&mut state).await?;
         state.running_cancel.remove(task_id);
         let task = state
             .tasks
@@ -3428,11 +3434,14 @@ impl TaskManager {
         }
     }
 
-    fn refresh_locked(&self, state: &mut ManagerState) -> Result<()> {
+    async fn refresh_locked_offloaded(&self, state: &mut ManagerState) -> Result<()> {
         // Callers go on to change `state`; a failed persist must not leave a
         // diverged view that a read-only caller would trust.
         state.read_snapshot = None;
-        let loaded = load_state(&self.tasks_dir, &self.queue_path)?;
+        let (tasks_dir, queue_path) = (self.tasks_dir.clone(), self.queue_path.clone());
+        let loaded = tokio::task::spawn_blocking(move || load_state(&tasks_dir, &queue_path))
+            .await
+            .context("Task store load was interrupted")??;
         self.apply_loaded_locked(state, loaded)
     }
 
@@ -3453,7 +3462,7 @@ impl TaskManager {
         // Taken under the lock and before the load, so any later write
         // changes it.
         let snapshot = ReadSnapshot::read(&self.tasks_dir, &self.queue_path);
-        self.refresh_locked(state)?;
+        self.refresh_locked_offloaded(state).await?;
         if snapshot.settled(std::time::SystemTime::now()) {
             state.read_snapshot = Some(snapshot);
         }
@@ -4125,9 +4134,9 @@ mod tests {
 
     fn test_config(root: PathBuf) -> TaskManagerConfig {
         TaskManagerConfig {
+            default_workspace: root.join("workspace"),
             data_dir: root,
             worker_count: 1,
-            default_workspace: PathBuf::from("."),
             default_model: "deepseek-v4-flash".to_string(),
             default_mode: "agent".to_string(),
             allow_shell: false,

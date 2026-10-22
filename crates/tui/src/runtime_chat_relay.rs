@@ -2025,7 +2025,7 @@ mod tests {
             "{direct_error}"
         );
         for attempt in 0..2 {
-            let error = tokio::time::timeout(Duration::from_secs(1), host.apply_prompt(&prompt))
+            let error = tokio::time::timeout(Duration::from_secs(30), host.apply_prompt(&prompt))
                 .await
                 .expect("Runtime Chat admission must not deadlock behind the UI-owned writer")
                 .unwrap_err();

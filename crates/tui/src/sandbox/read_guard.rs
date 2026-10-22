@@ -295,7 +295,7 @@ impl ReadDenylist {
         let resolved = canonicalize_best_effort(requested);
         let via_symlink = resolved != literal;
 
-        for candidate in [&literal, &resolved] {
+        for candidate in std::iter::once(&literal).chain(via_symlink.then_some(&resolved)) {
             if self.deny_env_files && is_env_file(candidate) {
                 return Err(ReadDenial {
                     requested: requested.to_path_buf(),
@@ -434,6 +434,7 @@ fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
         crate::oauth::auth_file_path(),
         "Codex CLI login (resolved auth file)",
     ));
+    out.extend(runtime_daemon_socket_dirs());
     let Some(home) = dirs::home_dir() else {
         return out;
     };
@@ -571,6 +572,48 @@ fn default_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
 
     out.extend(ambient);
     out
+}
+
+fn runtime_daemon_socket_dirs() -> Vec<(PathBuf, &'static str)> {
+    use codewhale_app_server::daemon_socket::{SocketPathInputs, resolve_socket_path};
+    let live = SocketPathInputs::from_environment(None).unwrap_or_else(|_| SocketPathInputs {
+        xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        user_home: codewhale_paths::user_home(),
+        macos: cfg!(target_os = "macos"),
+        ..SocketPathInputs::default()
+    });
+    let layouts = [
+        live.clone(),
+        SocketPathInputs {
+            codewhale_home_override: None,
+            ..live.clone()
+        },
+        SocketPathInputs {
+            codewhale_home_override: None,
+            xdg_runtime_dir: None,
+            ..live.clone()
+        },
+        SocketPathInputs {
+            codewhale_home_override: None,
+            xdg_runtime_dir: None,
+            macos: false,
+            ..live
+        },
+    ];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for layout in &layouts {
+        if let Ok(socket) = resolve_socket_path(layout)
+            && let Some(dir) = socket.parent()
+            && !dirs.iter().any(|seen| seen == dir)
+        {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| (dir, "Codewhale runtime daemon socket and owner receipt"))
+        .collect()
 }
 
 fn machine_wide_denied_subtrees() -> Vec<(PathBuf, &'static str)> {
@@ -737,6 +780,10 @@ fn fold_component(component: &std::ffi::OsStr) -> OsString {
 /// (`Path::starts_with` is already component-wise; the case folding is what
 /// forces the manual walk.)
 fn path_is_within(candidate: &Path, root: &Path) -> bool {
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        return candidate.starts_with(root);
+    }
+
     let mut root_components = root.components().map(|c| fold_component(c.as_os_str()));
     let mut candidate_components = candidate
         .components()

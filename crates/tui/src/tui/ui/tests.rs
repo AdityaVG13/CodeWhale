@@ -1260,6 +1260,7 @@ fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
     app.low_motion = false;
     app.fancy_animations = true;
     app.constrained_frame_rate = false;
+    app.is_loading = true;
 
     use crate::tui::display_refresh::DrawCadenceTier;
     assert_eq!(
@@ -2788,7 +2789,10 @@ fn plain_mcp_show_refreshes_discovery_counts() {
         !mcp_ui_action_refreshes_discovery(&McpUiAction::Show),
         "plain /mcp snapshots the engine-owned live pool, not a UI discovery pool"
     );
-    assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Validate));
+    assert!(
+        !mcp_ui_action_refreshes_discovery(&McpUiAction::Validate),
+        "validate reports the last observed live pool, not a UI discovery pool"
+    );
     assert!(!mcp_ui_action_refreshes_discovery(&McpUiAction::Login {
         name: "fixture".to_string(),
         scopes: Vec::new(),
@@ -6663,6 +6667,7 @@ fn running_exec_cell() -> HistoryCell {
         started_at: None,
         duration_ms: Some(20),
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -7336,6 +7341,17 @@ fn paste_burst_does_not_leak_into_composer_while_a_modal_owns_keys() {
         "composer must not gain leaked burst text under a modal: {:?}",
         app.input
     );
+    app.start_history_search();
+    let query = app.history_search_query().unwrap().to_owned();
+    handle_bracketed_paste(&mut app, "中文输入");
+    assert_eq!(app.history_search_query(), Some(query.as_str()));
+    let before = app.input.clone();
+    route_key_to_view_stack(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('中'), KeyModifiers::NONE),
+        Instant::now(),
+    );
+    assert_eq!(app.input, before);
 }
 
 #[test]
@@ -7757,6 +7773,7 @@ fn restored_reasoning_and_answer_clear_prior_fold_ownership() {
                     .join("\n"),
                 signature: None,
                 state: None,
+                redacted_data: None,
             },
             codewhale_models::ContentBlock::Text {
                 text: "restored final answer".to_string(),
@@ -9331,6 +9348,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         approval_receipts: Vec::new(),
         work_state: None,
         window_title: None,
+        composer_color: None,
         last_auto_route: None,
         turn_outcomes: Vec::new(),
     }
@@ -10000,10 +10018,10 @@ fn backtrack_prefill_rehydrates_attachment_rows() {
 
     assert_eq!(app.input, user_text);
     assert_eq!(app.composer_attachment_count(), 1);
-    // The rewind leaves files alone: the footer says so and names `/undo`.
+    // The rewind leaves files alone: the footer says so and names `/restore`.
     assert_eq!(
         app.status_message.as_deref(),
-        Some("Files not changed. /undo puts them back. Conversation rewound.")
+        Some("Files not changed. Use /restore. Conversation rewound.")
     );
 }
 
@@ -10021,6 +10039,7 @@ fn refresh_shell_exec_live_output_finalizes_restored_missing_shell_job() {
         started_at: None,
         duration_ms: Some(1_234),
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -10057,6 +10076,7 @@ fn shell_live_output_update_matches_exact_task_id_only() {
         started_at: None,
         duration_ms: Some(111),
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -10073,6 +10093,7 @@ fn shell_live_output_update_matches_exact_task_id_only() {
         started_at: None,
         duration_ms: None,
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -10169,6 +10190,7 @@ fn shell_live_output_update_marks_stale_running_job_static() {
         started_at: Some(Instant::now() - Duration::from_secs(90)),
         duration_ms: Some(90_000),
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -10252,6 +10274,7 @@ fn shell_live_output_update_finalizes_background_exec_output() {
         started_at: None,
         duration_ms: None,
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -10343,6 +10366,7 @@ fn shell_live_output_update_skips_finalized_exec_cell() {
         started_at: None,
         duration_ms: Some(10),
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -16066,6 +16090,9 @@ fn user_input_completion_preserves_newer_question_and_dispatch() {
     observe_human_request_settlement(
         &mut app,
         &EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -16100,6 +16127,9 @@ fn user_input_turn_end_cancel_and_disconnect_retire_question_views() {
             _ => observe_human_request_settlement(
                 &mut app,
                 &EngineEvent::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id: None,
                     usage: Usage::default(),
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -18679,6 +18709,9 @@ fn local_cancel_marks_late_stream_events_for_suppression() {
     ));
     assert!(!suppress_engine_event_after_local_cancel(
         &EngineEvent::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: Usage::default(),
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
@@ -18699,6 +18732,76 @@ fn local_cancel_marks_late_stream_events_for_suppression() {
     assert!(!suppress_engine_event_after_local_cancel(
         &stream_drop_approval_event()
     ));
+}
+
+#[test]
+fn turn_end_outbox_uses_the_terminal_events_owner() {
+    let mut app = create_test_app();
+    app.runtime_turn_id = Some("turn-model".to_string());
+
+    let model_terminal = EngineEvent::TurnComplete {
+        turn_id: Some("turn-model".to_string()),
+        submission_id: None,
+        compaction_id: None,
+        usage: Usage::default(),
+        parent_route_usage: Usage::default(),
+        routed_usage_dropped_records: 0,
+        status: crate::core::events::TurnOutcomeStatus::Completed,
+        error: None,
+        tool_catalog: None,
+        base_url: None,
+    };
+    let model = super::event_loop::turn_end_lifecycle_event(
+        &app,
+        super::event_loop::TurnEndLifecycleReceipt::capture(&model_terminal)
+            .expect("terminal lifecycle data"),
+        Duration::from_millis(37),
+    );
+    assert_eq!(model.kind, "turn.completed");
+    assert_eq!(model.turn_id.as_deref(), Some("turn-model"));
+
+    let rejected_terminal = EngineEvent::TurnComplete {
+        turn_id: None,
+        submission_id: Some("submission-rejected".to_string()),
+        compaction_id: None,
+        usage: Usage::default(),
+        parent_route_usage: Usage::default(),
+        routed_usage_dropped_records: 0,
+        status: crate::core::events::TurnOutcomeStatus::Failed,
+        error: Some("route rejected".to_string()),
+        tool_catalog: None,
+        base_url: None,
+    };
+    let rejected = super::event_loop::turn_end_lifecycle_event(
+        &app,
+        super::event_loop::TurnEndLifecycleReceipt::capture(&rejected_terminal)
+            .expect("terminal lifecycle data"),
+        Duration::ZERO,
+    );
+    assert_eq!(rejected.kind, "turn.failed");
+    assert!(rejected.turn_id.is_none());
+
+    let compaction_terminal = EngineEvent::TurnComplete {
+        turn_id: None,
+        submission_id: None,
+        compaction_id: Some("compact-manual".to_string()),
+        usage: Usage::default(),
+        parent_route_usage: Usage::default(),
+        routed_usage_dropped_records: 0,
+        status: crate::core::events::TurnOutcomeStatus::Completed,
+        error: None,
+        tool_catalog: None,
+        base_url: None,
+    };
+    let manual_compaction = super::event_loop::turn_end_lifecycle_event(
+        &app,
+        super::event_loop::TurnEndLifecycleReceipt::capture(&compaction_terminal)
+            .expect("terminal lifecycle data"),
+        Duration::ZERO,
+    );
+    assert_eq!(manual_compaction.kind, "turn.completed");
+    assert!(manual_compaction.turn_id.is_none());
+    assert_eq!(app.runtime_turn_id.as_deref(), Some("turn-model"));
 }
 
 /// A turn the Engine stopped itself (here its per-turn wall-clock budget)
@@ -20278,7 +20381,7 @@ async fn redaction_confirmation_restores_history_before_first_local_provider_req
     app.input = "What color did I give you?".to_string();
     app.cursor_position = app.input.chars().count();
     app.auto_submit_initial_input = true;
-    let engine = spawn_tui_engine_with_session(&mut app, &config)
+    let engine = spawn_tui_engine_with_session(&mut app, &config, None)
         .await
         .unwrap();
     for confirming in [false, true] {
@@ -20296,7 +20399,7 @@ async fn redaction_confirmation_restores_history_before_first_local_provider_req
     }
     config.record_redaction_confirmation().unwrap();
     engine.send(Op::Shutdown).await.unwrap();
-    let replacement = spawn_tui_engine_with_session(&mut app, &config)
+    let replacement = spawn_tui_engine_with_session(&mut app, &config, None)
         .await
         .unwrap();
     let snapshot = replacement.get_session_snapshot().await.unwrap();
@@ -21782,6 +21885,7 @@ fn spillover_pager_uses_session_artifact_for_specialized_bash_cell() {
         started_at: None,
         duration_ms: None,
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
         description: None,
         interaction: None,
@@ -21849,6 +21953,7 @@ fn terminal_pause_has_live_owner_only_for_running_exec_cells() {
             started_at: Some(Instant::now()),
             duration_ms: None,
             stale_elapsed_since_output_ms: None,
+            waiting: None,
             source: ExecSource::Assistant,
             description: None,
             interaction: Some("interactive".to_string()),
@@ -22853,6 +22958,11 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
             code_execution_requests: Some(2),
             tool_search_requests: Some(1),
         }),
+
+        input_audio_tokens: None,
+        output_audio_tokens: None,
+
+        request_usages: Vec::new(),
     };
 
     // The shared producer emits every class.
@@ -25021,10 +25131,7 @@ fn apply_loaded_session_restores_artifact_registry() {
 }
 
 #[test]
-fn parallel_exploring_tool_starts_share_one_active_entry() {
-    // Three exploring tools start in any order; they must collapse into one
-    // entry inside the active cell rather than three separate cells. This is
-    // the central CX#7 contract for the most common parallel case.
+fn parallel_exploring_tool_starts_keep_distinct_active_entries() {
     let mut app = create_test_app();
 
     handle_tool_call_started(
@@ -25049,26 +25156,20 @@ fn parallel_exploring_tool_starts_share_one_active_entry() {
     // History must remain empty: nothing flushes until the turn ends.
     assert_eq!(app.history.len(), 0, "no history cells written mid-turn");
     let active = app.active_cell.as_ref().expect("active cell created");
-    assert_eq!(
-        active.entry_count(),
-        1,
-        "all exploring starts share one entry"
-    );
-    let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[0] else {
-        panic!("expected exploring cell")
-    };
-    assert_eq!(explore.entries.len(), 3);
-    for entry in &explore.entries {
-        assert_eq!(entry.status, ToolStatus::Running);
+    assert_eq!(active.entry_count(), 3);
+    for (index, id) in ["t-a", "t-b", "t-c"].into_iter().enumerate() {
+        assert_eq!(active.entry_index_for_tool(id), Some(index));
+        let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[index] else {
+            panic!("expected exploring cell")
+        };
+        assert_eq!(explore.entries.len(), 1);
+        assert_eq!(explore.entries[0].status, ToolStatus::Running);
+        assert_eq!(app.tool_detail_record_for_cell(index).unwrap().tool_id, id);
     }
 }
 
 #[test]
-fn out_of_order_completes_finalize_one_history_cell_per_turn() {
-    // Three parallel tools complete in reverse order; we then signal turn
-    // complete and assert exactly one tool history cell exists (the
-    // finalized active group). This proves the active cell didn't bounce
-    // mid-turn and that the flush path correctly migrates entries.
+fn out_of_order_completes_preserve_each_tool_history_cell() {
     let mut app = create_test_app();
 
     handle_tool_call_started(
@@ -25098,33 +25199,40 @@ fn out_of_order_completes_finalize_one_history_cell_per_turn() {
     // Still nothing in history: the active cell holds everything.
     assert_eq!(app.history.len(), 0);
     let active = app.active_cell.as_ref().expect("active cell still present");
-    let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[0] else {
-        panic!("expected exploring cell")
-    };
-    assert!(
-        explore
-            .entries
-            .iter()
-            .all(|e| e.status == ToolStatus::Success),
-        "all exploring entries should be Success after their tools complete"
-    );
+    assert_eq!(active.entry_count(), 3);
+    for cell in active.entries() {
+        let HistoryCell::Tool(ToolCell::Exploring(explore)) = cell else {
+            panic!("expected exploring cell")
+        };
+        assert_eq!(explore.entries.len(), 1);
+        assert_eq!(explore.entries[0].status, ToolStatus::Success);
+    }
 
     // Flush via the explicit helper (mirrors what TurnComplete does).
     app.flush_active_cell();
 
     assert!(app.active_cell.is_none(), "active cell cleared after flush");
-    // The flushed group is exactly one history cell — the merged exploring
-    // aggregate. This is the heart of CX#7: parallel work renders as ONE
-    // finalized cell, regardless of completion order.
     let tool_cells = app
         .history
         .iter()
         .filter(|c| matches!(c, HistoryCell::Tool(_)))
         .count();
-    assert_eq!(
-        tool_cells, 1,
-        "exactly one tool history cell after parallel turn"
-    );
+    assert_eq!(tool_cells, 3);
+    for (index, (id, output)) in [
+        ("t-1", "contents A"),
+        ("t-2", "contents B"),
+        ("t-3", "two hits"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let detail = app.tool_detail_record_for_cell(index).unwrap();
+        assert_eq!(detail.tool_id, id);
+        assert_eq!(detail.output.as_deref(), Some(output));
+    }
+    let groups = crate::tui::history::detect_tool_runs(&app.history, 3);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].count, 3);
 }
 
 #[test]
@@ -25154,7 +25262,7 @@ fn mixed_parallel_tools_render_in_single_active_cell() {
 
     assert_eq!(app.history.len(), 0);
     let active = app.active_cell.as_ref().expect("active cell present");
-    // 3 entries: exploring aggregate (1) + exec + generic.
+    // 3 entries: exploring + exec + generic.
     assert_eq!(active.entry_count(), 3);
 
     handle_tool_call_complete(&mut app, "shell-1", "exec_shell", &ok_result("ok"));
@@ -25413,19 +25521,27 @@ fn tool_details_survive_active_cell_flush() {
 
 #[test]
 fn exploring_label_uses_progressive_for_read_file() {
-    let label = exploring_label("read_file", &serde_json::json!({"path": "src/foo.rs"}));
+    let label = exploring_label(
+        "read_file",
+        &serde_json::json!({"path": "src/foo.rs"}),
+        std::path::Path::new(""),
+    );
     assert_eq!(label, "Reading src/foo.rs");
 }
 
 #[test]
 fn exploring_label_uses_progressive_for_list_dir() {
-    let label = exploring_label("list_dir", &serde_json::json!({"path": "crates/tui/src/"}));
+    let label = exploring_label(
+        "list_dir",
+        &serde_json::json!({"path": "crates/tui/src/"}),
+        std::path::Path::new(""),
+    );
     assert_eq!(label, "Listing crates/tui/src/");
 }
 
 #[test]
 fn exploring_label_uses_progressive_for_list_dir_no_path() {
-    let label = exploring_label("list_dir", &serde_json::json!({}));
+    let label = exploring_label("list_dir", &serde_json::json!({}), std::path::Path::new(""));
     assert_eq!(label, "Listing directory");
 }
 
@@ -25434,13 +25550,18 @@ fn exploring_label_for_grep_quotes_pattern_with_searching_for() {
     let label = exploring_label(
         "grep_files",
         &serde_json::json!({"pattern": "TranscriptScroll"}),
+        std::path::Path::new(""),
     );
     assert_eq!(label, "Searching for `TranscriptScroll`");
 }
 
 #[test]
 fn exploring_label_for_list_files_uses_progressive() {
-    let label = exploring_label("list_files", &serde_json::json!({}));
+    let label = exploring_label(
+        "list_files",
+        &serde_json::json!({}),
+        std::path::Path::new(""),
+    );
     assert_eq!(label, "Listing files");
 }
 
@@ -25912,6 +26033,7 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
             started_at: None,
             duration_ms: Some(2400),
             stale_elapsed_since_output_ms: None,
+            waiting: None,
             source: ExecSource::Assistant,
             description: None,
             interaction: None,
@@ -26073,6 +26195,7 @@ fn turn_inspector_timeline_numbers_semantic_entries_and_checkpoint_actions() {
             started_at: None,
             duration_ms: Some(1250),
             stale_elapsed_since_output_ms: None,
+            waiting: None,
             source: ExecSource::Assistant,
             description: None,
             interaction: None,
@@ -26380,6 +26503,7 @@ fn turn_handoff_markdown_renders_compact_sections_for_active_turn() {
             started_at: None,
             duration_ms: Some(2400),
             stale_elapsed_since_output_ms: None,
+            waiting: None,
             source: ExecSource::Assistant,
             description: None,
             interaction: None,
@@ -33769,6 +33893,7 @@ fn collapsing_session_history(turns: usize) -> Vec<HistoryCell> {
 #[ignore = "timing benchmark, not a correctness gate"]
 #[allow(clippy::print_stderr)]
 fn bench_full_frame_scroll_cost_by_history_length() {
+    let retained_details = std::env::var_os("CODEWHALE_RENDER_DETAILS").is_some();
     for collapsed in [false, true] {
         let shape = if collapsed { "collapsed" } else { "plain" };
         for turns in [100usize, 1_000, 5_000] {
@@ -33779,6 +33904,21 @@ fn bench_full_frame_scroll_cost_by_history_length() {
                 app.history = collapsing_session_history(turns);
             } else {
                 app.history = long_session_history(turns);
+            }
+            if retained_details {
+                for (index, cell) in app.history.iter().enumerate() {
+                    if let HistoryCell::Tool(ToolCell::Generic(cell)) = cell {
+                        app.tool_details_by_cell.insert(
+                            index,
+                            ToolDetailRecord {
+                                tool_id: format!("bench-{index}"),
+                                tool_name: cell.name.clone(),
+                                input: serde_json::json!({"path": format!("{}.txt", cell.name)}),
+                                output: cell.output.clone(),
+                            },
+                        );
+                    }
+                }
             }
             app.resync_history_revisions();
             let config = Config::default();
@@ -33824,8 +33964,55 @@ fn bench_full_frame_scroll_cost_by_history_length() {
                 app.history.len(),
                 started.elapsed() / frames
             );
+            eprintln!(
+                "FRAME_PARITY {shape} {turns} details={retained_details} {}",
+                crate::hashing::sha256_hex(format!("{:?}", terminal.backend().buffer()))
+            );
         }
     }
+}
+
+/// The keyed steady-state short-circuit must not survive a projection change
+/// that never bumps `history_version`: the random-replay harness (and any
+/// future raw writer) can toggle `collapsed_cells` directly, and the frame
+/// must still reflect it (#6652).
+#[test]
+fn keyed_steady_frames_rerender_after_a_raw_projection_toggle() {
+    use crate::tui::app::ToolCollapseMode;
+
+    let mut app = create_test_app();
+    app.tool_collapse_mode = ToolCollapseMode::Compact;
+    app.tool_collapse_threshold = 3;
+    app.history = collapsing_session_history(40);
+    app.resync_history_revisions();
+    let config = Config::default();
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    let render = |app: &mut crate::tui::app::App, terminal: &mut Terminal<TestBackend>| {
+        terminal
+            .draw(|frame| {
+                let _ = super::frame::render(frame, app, &config);
+            })
+            .unwrap();
+        crate::hashing::sha256_hex(format!("{:?}", terminal.backend().buffer()))
+    };
+    let first = render(&mut app, &mut terminal);
+    let steady = render(&mut app, &mut terminal);
+    assert_eq!(first, steady, "keyed steady frame must be byte-identical");
+    let hidden = app
+        .tool_run_cache
+        .filtered
+        .original
+        .iter()
+        .rev()
+        .nth(1)
+        .copied()
+        .expect("collapsed projection has rendered rows");
+    app.collapsed_cells.insert(hidden);
+    let toggled = render(&mut app, &mut terminal);
+    assert_ne!(
+        steady, toggled,
+        "raw collapsed_cells toggle must change the rendered frame"
+    );
 }
 
 #[test]

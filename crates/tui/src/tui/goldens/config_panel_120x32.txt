@@ -26,7 +26,7 @@
                     │                                                         │                                         
                     │                                                         │                                         
   system | terminal | shoreline | shoreline-light | underwater | underwater-retro | dark | light | grayscale |…         
-  Preview:  ● ask   agent                                                                                               
+  Preview:  ● ask   work                                                                                                
   type=filter, Up/Down=select, Enter=edit, Esc=close                                                                    
  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         

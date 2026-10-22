@@ -1,14 +1,10 @@
 {
   "_about": "Codewhale's corrections to Models.dev rows (#6396). Applied to the bundled seed and to live Models.dev rows alike, above both and below signed cloud facts and provider rosters, so a correction holds on every install, online or offline. Corrections only fix rows that exist: they never add or hide one. Each entry says why; a correction whose value now equals upstream is stale and should be deleted. See docs/CATALOG_REFRESH.md.",
-  "revision": "2026-09-26",
+  "revision": "2026-10-12",
   "providers": [
     {
       "provider": "deepseek",
       "pricing_withheld": "DeepSeek bills by time of day (off-peak rates and a weekend rule). The time-aware table in crates/tui/src/pricing.rs prices these routes; one flat catalog rate would disagree with it."
-    },
-    {
-      "provider": "xai",
-      "pricing_withheld": "xAI doubles its rates once a prompt passes 200K tokens. A flat catalog rate would understate every long session."
     },
     {
       "provider": "xiaomi-mimo",
@@ -66,59 +62,8 @@
       "pricing_withheld": "Codewhale's default Z.ai route is the GLM Coding Plan (DEFAULT_ZAI_BASE_URL, api.z.ai/api/coding/paas/v4), which bills credit multipliers, not USD per token; see the seed's pending_release_metadata."
     },
     {
-      "provider": "openrouter",
-      "id": "deepseek/deepseek-v4-pro",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "openrouter",
-      "id": "deepseek/deepseek-v4-flash",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "together",
-      "id": "deepseek-ai/DeepSeek-V4-Pro",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "together",
-      "id": "deepseek-ai/DeepSeek-V4-Flash",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "fireworks",
-      "id": "accounts/fireworks/models/deepseek-v4-pro",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
       "provider": "novita",
       "id": "deepseek/deepseek-v4-pro",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "novita",
-      "id": "deepseek/deepseek-v4-flash",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "siliconflow",
-      "id": "deepseek-ai/DeepSeek-V4-Pro",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "siliconflow",
-      "id": "deepseek-ai/DeepSeek-V4-Flash",
-      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
-    },
-    {
-      "provider": "novita",
-      "id": "deepseek/deepseek-v4-pro",
-      "max_output": 384000,
-      "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 for Novita (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
-    },
-    {
-      "provider": "novita",
-      "id": "deepseek/deepseek-v4-flash",
       "max_output": 384000,
       "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 for Novita (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
     },
@@ -127,16 +72,6 @@
       "id": "grok-4.3",
       "reasoning_options": [],
       "reason": "xAI documents no reasoning_effort control for grok-4.3, so Codewhale sends none (6be755f31 / #6501); Models.dev lists an effort ladder."
-    },
-    {
-      "provider": "minimax",
-      "id": "MiniMax-M3",
-      "pricing_withheld": "MiniMax doubles M3 rates once a prompt passes 512K tokens. A flat catalog rate would understate long sessions."
-    },
-    {
-      "provider": "minimax-anthropic",
-      "id": "MiniMax-M3",
-      "pricing_withheld": "MiniMax doubles M3 rates once a prompt passes 512K tokens. A flat catalog rate would understate long sessions."
     },
     {
       "provider": "minimax",
@@ -409,6 +344,16 @@
         "cache_read_per_m": 0.25
       },
       "reason": "Arcee publishes no cache rate (docs.arcee.ai/get-started/pricing), so cache hits bill at the input rate, as in the reviewed table in crates/tui/src/pricing.rs; Models.dev lists a 0.06 cache-read rate."
+    },
+    {
+      "provider": "fireworks",
+      "id": "accounts/fireworks/models/deepseek-v4-pro",
+      "pricing": {
+        "input_per_m": 1.74,
+        "output_per_m": 3.48,
+        "cache_read_per_m": 0.145
+      },
+      "reason": "Fireworks hosts DeepSeek V4 Pro at its own published rates, as in the reviewed table in crates/tui/src/pricing.rs; Models.dev lists a flat 1.2/1.2 rate with a 0.6 cache-read rate for this deployment."
     }
   ],
   "reviewed": {
@@ -425,6 +370,58 @@
         ],
         "reasoning": true,
         "source": "preserved reviewed bundled model facts; see source_receipts",
+        "family": "Anthropic"
+      },
+      "claude-fable-5-1": {
+        "context_window": 1000000,
+        "max_output": 128000,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "Anthropic"
+      },
+      "claude-opus-5-5": {
+        "context_window": 1000000,
+        "max_output": 128000,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "Anthropic"
+      },
+      "claude-sonnet-5-5": {
+        "context_window": 1000000,
+        "max_output": 128000,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "Anthropic"
+      },
+      "claude-haiku-5-5": {
+        "context_window": 1000000,
+        "max_output": 128000,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
         "family": "Anthropic"
       },
       "claude-haiku-4-5": {
@@ -690,6 +687,48 @@
         "source": "preserved reviewed bundled model facts; see source_receipts",
         "family": "OpenAi"
       },
+      "gpt-6-sol": {
+        "context_window": 1050000,
+        "max_output": 128000,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "OpenAi"
+      },
+      "gpt-6.1-sol": {
+        "context_window": 1050000,
+        "max_output": 128000,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "OpenAi"
+      },
+      "gpt-6-luna": {
+        "context_window": 1050000,
+        "max_output": 128000,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "OpenAi"
+      },
       "kimi-k2.7-code": {
         "context_window": 262144,
         "max_output": 32768,
@@ -752,6 +791,32 @@
         "supported_parameters": [],
         "reasoning": true,
         "source": "preserved reviewed bundled model facts; see source_receipts",
+        "family": "XiaomiMimo"
+      },
+      "mimo-v2.6-pro": {
+        "context_window": 1048576,
+        "max_output": 131072,
+        "modalities": [
+          "text",
+          "image",
+          "audio"
+        ],
+        "supported_parameters": [],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "XiaomiMimo"
+      },
+      "mimo-v2.6-flash": {
+        "context_window": 1048576,
+        "max_output": 131072,
+        "modalities": [
+          "text",
+          "image",
+          "audio"
+        ],
+        "supported_parameters": [],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
         "family": "XiaomiMimo"
       },
       "minimax-m2.7": {
@@ -841,6 +906,45 @@
         ],
         "reasoning": true,
         "source": "preserved reviewed bundled model facts; see source_receipts",
+        "family": "Meta"
+      },
+      "muse-spark-1.3": {
+        "context_window": 1048576,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "Meta"
+      },
+      "muse-spark-1.3-contributor": {
+        "context_window": 1048576,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "family": "Meta"
+      },
+      "muse-wonder-1.0": {
+        "context_window": 1048576,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
         "family": "Meta"
       },
       "qwen/qwen3.6-flash": {
@@ -1457,6 +1561,12 @@
         "max_output": 65536,
         "family": "Google"
       },
+      "gemini-3.8-flash": {
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "context_window": 1048576,
+        "max_output": 65536,
+        "family": "Google"
+      },
       "gemini-3.6-flash": {
         "source": "preserved exact cited model lookup; see source_receipts",
         "context_window": 1048576,
@@ -1479,6 +1589,11 @@
         "source": "preserved exact cited model lookup; see source_receipts",
         "context_window": 1048576,
         "max_output": 65536,
+        "family": "Google"
+      },
+      "gemini-4-argon": {
+        "source": "official vendor model docs, verified 2026-10-17; see source_receipts",
+        "context_window": 1048576,
         "family": "Google"
       },
       "gemini-3-pro-preview": {
@@ -1568,6 +1683,56 @@
         "canonical_id": "deepseek-v4-flash",
         "context_window": 1000000,
         "reasoning": true
+      },
+      "deepseek-ai/deepseek-v4-pro-0813": {
+        "context_window": 1048576,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing and ModelScope model card, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
+      },
+      "deepseek-ai/deepseek-v4.1-flash-1017": {
+        "context_window": 1048576,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
+      },
+      "deepseek-ai/deepseek-v4.1-flash": {
+        "context_window": 1048576,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing and ModelScope model card, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
+      },
+      "deepseek-ai/deepseek-v4-flash-0731": {
+        "context_window": 1048576,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
       },
       "thinkingmachines/inkling": {
         "source": "preserved exact reasoning fact; see source_receipts",
@@ -1672,6 +1837,9 @@
       "deepseek-ai/deepseek-v4pro": "deepseek-v4-pro",
       "deepseek/deepseek-v4-pro": "deepseek-v4-pro",
       "deepseek/deepseek-v4pro": "deepseek-v4-pro",
+      "deepseek-flash": "deepseek-flash",
+      "deepseek-ai/deepseek-flash": "deepseek-flash",
+      "deepseek/deepseek-flash": "deepseek-flash",
       "deepseek-v4-flash": "deepseek-v4-flash",
       "deepseek-v4flash": "deepseek-v4-flash",
       "deepseek-ai/deepseek-v4-flash": "deepseek-v4-flash",
@@ -1686,6 +1854,9 @@
       "gpt-5.6-sol": "gpt_56",
       "gpt-5.6-terra": "gpt_56",
       "gpt-5.6-luna": "gpt_56",
+      "gpt-6-sol": "gpt_56",
+      "gpt-6.1-sol": "gpt_56",
+      "gpt-6-luna": "gpt_56",
       "gpt-5-codex": "codex",
       "gpt-5.1-codex": "codex",
       "gpt-5.1-codex-mini": "codex",
@@ -1712,24 +1883,30 @@
         "provider": "deepseek"
       },
       {
-        "id": "deepseek-v4-flash",
+        "id": "deepseek-flash",
         "aliases": [
           "deepseek-chat",
           "deepseek-reasoner",
           "deepseek-r1",
           "deepseek-v3",
-          "deepseek-v3.2"
+          "deepseek-v3.2",
+          "flash-vision",
+          "deepseek-v4flashvisionexp"
         ],
         "supports_tools": true,
         "supports_reasoning": true,
         "provider": "deepseek"
       },
       {
+        "id": "deepseek-v4-flash",
+        "aliases": [],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepseek"
+      },
+      {
         "id": "deepseek-v4-flash-vision-exp",
-        "aliases": [
-          "flash-vision",
-          "deepseek-v4flashvisionexp"
-        ],
+        "aliases": [],
         "supports_tools": true,
         "supports_reasoning": true,
         "provider": "deepseek"
@@ -2237,10 +2414,13 @@
         "provider": "openrouter"
       },
       {
-        "id": "mimo-v2.5-pro",
+        "id": "mimo-v2.6-pro",
         "aliases": [
           "mimo",
           "pro",
+          "xiaomi-mimo-v2.6-pro",
+          "xiaomi-mimo-v2-6-pro",
+          "mimo-v2.5-pro",
           "xiaomi-mimo-v2.5-pro",
           "xiaomi-mimo-v2-5-pro"
         ],
@@ -2249,14 +2429,17 @@
         "provider": "xiaomi-mimo"
       },
       {
-        "id": "mimo-v2.5",
+        "id": "mimo-v2.6-flash",
         "aliases": [
           "omni",
           "mimo-omni",
           "v2.5-omni",
           "mimo-v2.5-omni",
+          "mimo-v2.5",
           "xiaomi-mimo-v2.5",
-          "xiaomi-mimo-v2.5-omni"
+          "xiaomi-mimo-v2.5-omni",
+          "xiaomi-mimo-v2.6-flash",
+          "xiaomi-mimo-v2-6-flash"
         ],
         "supports_tools": true,
         "supports_reasoning": true,
@@ -2729,6 +2912,46 @@
         "provider": "anthropic"
       },
       {
+        "id": "claude-opus-5-5",
+        "aliases": [
+          "opus-5-5",
+          "opus-5.5"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "anthropic"
+      },
+      {
+        "id": "claude-sonnet-5-5",
+        "aliases": [
+          "sonnet-5-5",
+          "sonnet-5.5"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "anthropic"
+      },
+      {
+        "id": "claude-haiku-5-5",
+        "aliases": [
+          "haiku-5-5",
+          "haiku-5.5"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "anthropic"
+      },
+      {
+        "id": "claude-fable-5-1",
+        "aliases": [
+          "fable-5-1",
+          "fable-5.1"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "anthropic"
+      },
+      {
         "id": "deepseek-v4-flash",
         "aliases": [
           "openmodel",
@@ -2929,6 +3152,44 @@
         "provider": "deepinfra"
       },
       {
+        "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+        "aliases": [
+          "deepseek-v4-pro-0813",
+          "di-deepseek-v4-pro-0813"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "aliases": [
+          "di-deepseek-v4.1-flash-1017"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "aliases": [
+          "deepseek-v4.1-flash",
+          "di-deepseek-v4.1-flash"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "aliases": [
+          "di-deepseek-v4-flash-0731"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
         "id": "fugu",
         "aliases": [
           "sakana-fugu",
@@ -2959,6 +3220,31 @@
         "provider": "longcat"
       },
       {
+        "id": "muse-spark-1.3",
+        "aliases": [],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "meta"
+      },
+      {
+        "id": "muse-spark-1.3-contributor",
+        "aliases": [
+          "muse-spark-contributor"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "meta"
+      },
+      {
+        "id": "muse-wonder-1.0",
+        "aliases": [
+          "muse-wonder"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "meta"
+      },
+      {
         "id": "muse-spark-1.2",
         "aliases": [
           "muse-spark",
@@ -2970,9 +3256,7 @@
       },
       {
         "id": "muse-spark-1.2-contributor",
-        "aliases": [
-          "muse-spark-contributor"
-        ],
+        "aliases": [],
         "supports_tools": true,
         "supports_reasoning": true,
         "provider": "meta"
@@ -3048,6 +3332,13 @@
         "provider": "xai"
       },
       {
+        "id": "gemini-4-argon",
+        "aliases": [],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "google"
+      },
+      {
         "id": "gemini-3.1-pro-preview",
         "aliases": [
           "gemini-3.1-pro"
@@ -3066,22 +3357,19 @@
         "provider": "google"
       },
       {
-        "id": "gemini-3.7-flash",
-        "aliases": [],
+        "id": "gemini-3.8-flash",
+        "aliases": [
+          "gemini-3.7-flash"
+        ],
         "supports_tools": true,
         "supports_reasoning": true,
         "provider": "google"
       },
       {
         "id": "gemini-3.6-flash",
-        "aliases": [],
-        "supports_tools": true,
-        "supports_reasoning": true,
-        "provider": "google"
-      },
-      {
-        "id": "gemini-3.5-flash",
-        "aliases": [],
+        "aliases": [
+          "gemini-3.5-flash"
+        ],
         "supports_tools": true,
         "supports_reasoning": true,
         "provider": "google"
@@ -3430,6 +3718,118 @@
     ],
     "public_models": [
       {
+        "id": "claude-opus-5-5",
+        "label": "Anthropic",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "claude-opus-5-5"
+        ]
+      },
+      {
+        "id": "claude-sonnet-5-5",
+        "label": "Anthropic",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "claude-sonnet-5-5"
+        ]
+      },
+      {
+        "id": "claude-haiku-5-5",
+        "label": "Anthropic",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "claude-haiku-5-5"
+        ]
+      },
+      {
+        "id": "claude-fable-5-1",
+        "label": "Anthropic",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "claude-fable-5-1"
+        ]
+      },
+      {
+        "id": "gpt-6-sol",
+        "label": "OpenAI",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "gpt-6-sol"
+        ]
+      },
+      {
+        "id": "gpt-6.1-sol",
+        "label": "OpenAI",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "gpt-6.1-sol"
+        ]
+      },
+      {
+        "id": "gpt-6-luna",
+        "label": "OpenAI",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "gpt-6-luna"
+        ]
+      },
+      {
+        "id": "gemini-4-argon",
+        "label": "Google",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "gemini-4-argon"
+        ]
+      },
+      {
+        "id": "gemini-3.8-flash",
+        "label": "Google",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "gemini-3.8-flash"
+        ]
+      },
+      {
+        "id": "muse-spark-1.3",
+        "label": "Meta",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "muse-spark-1.3"
+        ]
+      },
+      {
+        "id": "muse-spark-1.3-contributor",
+        "label": "Meta",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "muse-spark-1.3-contributor"
+        ]
+      },
+      {
+        "id": "muse-wonder-1.0",
+        "label": "Meta",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "muse-wonder-1.0"
+        ]
+      },
+      {
+        "id": "mimo-v2.6-pro",
+        "label": "Xiaomi MiMo",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "mimo-v2.6-pro"
+        ]
+      },
+      {
+        "id": "mimo-v2.6-flash",
+        "label": "Xiaomi MiMo",
+        "added_at": "2026-10-17",
+        "aliases": [
+          "mimo-v2.6-flash"
+        ]
+      },
+      {
         "id": "grok-4.7",
         "label": "xAI",
         "added_at": "2026-09-23",
@@ -3645,12 +4045,6 @@
       },
       {
         "id": "qwen3.8-max",
-        "label": "Qwen",
-        "added_at": "2026-08-02",
-        "aliases": []
-      },
-      {
-        "id": "qwen3.8-max-preview",
         "label": "Qwen",
         "added_at": "2026-08-02",
         "aliases": []
@@ -4075,7 +4469,7 @@
       "OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL": "xiaomi/mimo-v2.5-pro",
       "OPENROUTER_XIAOMI_MIMO_V2_5_MODEL": "xiaomi/mimo-v2.5",
       "XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL": "mimo-v2.5-pro-ultraspeed",
-      "XIAOMI_MIMO_V2_5_OMNI_MODEL": "mimo-v2.5",
+      "XIAOMI_MIMO_V2_6_FLASH_MODEL": "mimo-v2.6-flash",
       "XIAOMI_MIMO_ASR_MODEL": "mimo-v2.5-asr",
       "XIAOMI_MIMO_TTS_MODEL": "mimo-v2.5-tts",
       "XIAOMI_MIMO_TTS_VOICE_DESIGN_MODEL": "mimo-v2.5-tts-voicedesign",
@@ -4123,7 +4517,7 @@
       "XAI_GROK_COMPOSER_2_5_FAST_MODEL": "grok-composer-2.5-fast",
       "XAI_GROK_4_20_0309_REASONING_MODEL": "grok-4.20-0309-reasoning",
       "XAI_GROK_4_20_0309_NON_REASONING_MODEL": "grok-4.20-0309-non-reasoning",
-      "DEEPSEEK_ALIAS_REPLACEMENT": "deepseek-v4-flash"
+      "DEEPSEEK_ALIAS_REPLACEMENT": "deepseek-flash"
     },
     "groups": {
       "RECENT_OPENROUTER_LARGE_MODELS": [
@@ -4189,7 +4583,25 @@
       "https://docs.mistral.ai/studio/conversations/reasoning": "verified 2026-10-02: explicit reasoning support for mistral-medium-latest/mistral-medium-3-5 and mistral-small-latest/mistral-small-2603; no family-prefix inference; verified 2026-10-03: exact magistral-small-latest is explicitly listed as a native reasoning model (deprecated), historical wire capability only; no availability/default inference",
       "https://docs.mistral.ai/vibe/code/cli/configuration": "verified 2026-10-02: explicit reasoning support for mistral-medium-latest/mistral-medium-3-5 and mistral-small-latest/mistral-small-2603; no family-prefix inference",
       "https://docs.mistral.ai/models/mistral-medium-3-5-26-04": "verified 2026-10-02: explicit reasoning support for mistral-medium-latest/mistral-medium-3-5 and mistral-small-latest/mistral-small-2603; no family-prefix inference",
-      "https://docs.mistral.ai/models/mistral-small-4-0-26-03": "verified 2026-10-02: explicit reasoning support for mistral-medium-latest/mistral-medium-3-5 and mistral-small-latest/mistral-small-2603; no family-prefix inference"
+      "https://docs.mistral.ai/models/mistral-small-4-0-26-03": "verified 2026-10-02: explicit reasoning support for mistral-medium-latest/mistral-medium-3-5 and mistral-small-latest/mistral-small-2603; no family-prefix inference",
+      "https://platform.claude.com/docs/en/about-claude/models/overview": "verified 2026-10-17: claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5 and claude-fable-5-1 are current with 1M context and 128K output; every older direct-route id is listed as legacy",
+      "https://platform.claude.com/docs/en/about-claude/pricing": "verified 2026-10-17: Fable 5.1 $10 in / $12.50 5m write / $0.25 hit / $50 out; Opus 5.5 $4 / $5 / $0.20 / $20; Sonnet 5.5 $2 / $2.50 / $0.10 / $10; Haiku 5.5 is $0.10 / $0.50 up to 100,000 prompt tokens and $0.50 / $2.50 above, so it carries no flat reference price",
+      "https://platform.claude.com/docs/en/about-claude/model-deprecations": "verified 2026-10-17: claude-sonnet-4-5-20250929 retires 2026-11-30, replacement claude-sonnet-5-5; no Codewhale default uses it",
+      "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool": "verified 2026-10-17: web search examples run on claude-opus-5-5",
+      "https://developers.openai.com/api/docs/changelog": "verified 2026-10-17: gpt-6-sol and gpt-6-luna 2026-09-22, gpt-6.1-sol 2026-09-29; gpt-6-astra lacks the none effort and its tool calls require the Responses API, so it is not offered on the direct Chat route",
+      "https://developers.openai.com/api/docs/models/gpt-6-sol": "verified 2026-10-17: $2 in / $0.20 cached / $10 out / $2.50 cache write; gpt-6.1-sol $2 / $0.10 / $10 / $2.50 and gpt-6-luna $0.10 / $0.01 / $0.50 per the changelog",
+      "https://developers.openai.com/api/docs/deprecations": "verified 2026-10-17: gpt-5.3-codex and gpt-5.1 move to gpt-6-sol and gpt-5.4-nano to gpt-6-luna, all shutting down 2027-04-01; the catalog has no lifecycle field, so the rows stay until shutdown",
+      "https://ai.google.dev/gemini-api/docs/changelog": "verified 2026-10-17: gemini-4-argon GA 2026-10-13, gemini-3.8-flash GA 2026-09-02; gemini-3.7-flash (auto-routed to gemini-3.8-flash) and gemini-3.5-flash (auto-routed to gemini-3.6-flash) deprecated 2026-10-08 and kept only as selector aliases",
+      "https://ai.google.dev/gemini-api/docs/models": "verified 2026-10-17: gemini-4-argon and gemini-3.8-flash are stable; argon's 1M context is stated but no output ceiling is, so none is recorded",
+      "https://docs.z.ai/guides/vlm/glm-5.3-flash": "verified 2026-10-17: model code glm-5.3-flash, 1M context, 128K output, thinking.type only supports enabled",
+      "https://dev.meta.ai/docs/models.md": "verified 2026-10-17: muse-spark-1.3 is recommended for new work, muse-spark-1.2 is the previous version, muse-spark-1.3-contributor has no max effort, muse-wonder-1.0 is a preview; all 1,048,576 context",
+      "https://dev.meta.ai/docs/pricing-rate-limits": "verified 2026-10-17: Muse Spark 1.3 and 1.2 $1.25 in / $0.15 cached / $4.25 out, contributor $0.10 / $0.002 / $0.20; Muse Wonder 1.0 $4 / $0.20 / $20; no long-context premium",
+      "https://mimo.mi.com/docs/updates/deprecate": "verified 2026-10-17 via its loaded chunk: mimo-v2.5-pro (to mimo-v2.6-pro) and mimo-v2.5 (to mimo-v2.6-flash) are replaced from 2026-10-14 10:00 UTC+8 and return errors from 2026-10-21 10:00 UTC+8",
+      "https://platform.minimax.io/docs/guides/models-intro": "verified 2026-10-17: MiniMax-M2.7, M2.7-highspeed, M2.5 and M2.5-highspeed close to new users 2026-10-19 and retire 2026-11-18; they leave the fallback picker but stay accepted until then",
+      "https://www.alibabacloud.com/en/notice/alibaba_cloud_model_studio_model_upgrade_notice_81a?_p_lc=1": "verified 2026-10-17: qwen3.8-max-preview retired 2026-08-05 and its requests route to qwen3.8-max",
+      "https://api.deepinfra.com/models/list": "verified 2026-10-20: deepseek-ai/DeepSeek-V4.1-Flash-1017, deepseek-ai/DeepSeek-V4.1-Flash, deepseek-ai/DeepSeek-V4-Pro-0813 and deepseek-ai/DeepSeek-V4-Flash-0731 are listed and not deprecated, each with max_tokens 1048576 and the tools tag; both V4.1 Flash ids are tagged multimodal and reasoning, V4-Flash-0731 reasoning; V4-Pro-0813 carries can-disable-reasoning beside a non-reasoning tag, while its model page documents low, high and max reasoning effort and the Models.dev deepseek/deepseek-v4-pro-0813 row marks reasoning, so reasoning is recorded; the V4-Pro and V4-Flash previews are still listed; no separate output limit is published, so none is recorded",
+      "https://modelscope.cn/api/v1/models/deepseek-ai/DeepSeek-V4-Pro-0813": "verified 2026-10-20: the ModelScope card describes DeepSeek-V4-Pro-0813 as the official release of DeepSeek-V4-Pro on the preview model structure, whose card lists a 1M context length; no separate ModelScope API-Inference context limit is published there",
+      "https://modelscope.cn/api/v1/models/deepseek-ai/DeepSeek-V4.1-Flash": "verified 2026-10-20: the ModelScope card states contexts of up to one million tokens and a recommended 1M context_window; no separate ModelScope API-Inference context limit is published there"
     },
     "transports": [
       {
@@ -5079,24 +5491,6 @@
       },
       {
         "provider": "modelstudio-token-plan",
-        "id": "qwen3.8-max-preview",
-        "endpoint_key": "chat",
-        "default_for_provider": false,
-        "source": "preserved reviewed exact transport snapshot; see source_receipts",
-        "limits": {
-          "context_tokens": 1000000,
-          "output_tokens": 131072
-        },
-        "capabilities": {
-          "reasoning": "supported",
-          "native_tool_calls": "supported",
-          "structured_output": "supported",
-          "streaming": "supported",
-          "image_input": "supported"
-        }
-      },
-      {
-        "provider": "modelstudio-token-plan",
         "id": "qwen3.7-plus",
         "endpoint_key": "chat",
         "default_for_provider": false,
@@ -5214,6 +5608,7 @@
       "kimi-k2-6": "kimi-k2.6",
       "deepseek-v4pro": "deepseek-v4-pro",
       "deepseek-v4flash": "deepseek-v4-flash",
+      "deepseek-flash": "deepseek-v4.1-flash",
       "mimo-v2-5": "mimo-v2.5",
       "mimo-v2-5-pro": "mimo-v2.5-pro"
     },
@@ -5227,6 +5622,9 @@
         "o4-mini"
       ],
       "anthropic": [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
         "claude-fable-5",
         "claude-opus-4-8",
         "claude-mythos-5",
@@ -5241,6 +5639,8 @@
         "grok-4.5"
       ],
       "xiaomi-mimo": [
+        "mimo-v2.6-pro",
+        "mimo-v2.6-flash",
         "mimo-v2.5-pro",
         "mimo-v2.5"
       ],
@@ -5291,6 +5691,27 @@
         "output": 50.0,
         "source": "preserved exact cited reference; not endpoint/account pricing",
         "cache_write": 12.5
+      },
+      "claude-fable-5-1": {
+        "cache_read": 0.25,
+        "input": 10.0,
+        "output": 50.0,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing",
+        "cache_write": 12.5
+      },
+      "claude-opus-5-5": {
+        "cache_read": 0.2,
+        "input": 4.0,
+        "output": 20.0,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing",
+        "cache_write": 5.0
+      },
+      "claude-sonnet-5-5": {
+        "cache_read": 0.1,
+        "input": 2.0,
+        "output": 10.0,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing",
+        "cache_write": 2.5
       },
       "claude-haiku-4-5": {
         "cache_read": 0.1,
@@ -5477,6 +5898,27 @@
         "output": 1.2,
         "source": "preserved exact cited reference; not endpoint/account pricing"
       },
+      "gpt-6-sol": {
+        "cache_read": 0.2,
+        "input": 2.0,
+        "output": 10.0,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing",
+        "cache_write": 2.5
+      },
+      "gpt-6.1-sol": {
+        "cache_read": 0.1,
+        "input": 2.0,
+        "output": 10.0,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing",
+        "cache_write": 2.5
+      },
+      "gpt-6-luna": {
+        "cache_read": 0.01,
+        "input": 0.1,
+        "output": 0.5,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing",
+        "cache_write": 0.125
+      },
       "meta/muse-spark-1.1": {
         "cache_read": 0.15,
         "input": 1.25,
@@ -5512,6 +5954,24 @@
         "input": 0.1,
         "output": 0.2,
         "source": "preserved exact cited reference; not endpoint/account pricing"
+      },
+      "muse-spark-1.3": {
+        "cache_read": 0.15,
+        "input": 1.25,
+        "output": 4.25,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing"
+      },
+      "muse-spark-1.3-contributor": {
+        "cache_read": 0.002,
+        "input": 0.1,
+        "output": 0.2,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing"
+      },
+      "muse-wonder-1.0": {
+        "cache_read": 0.2,
+        "input": 4.0,
+        "output": 20.0,
+        "source": "official vendor pricing page, verified 2026-10-17; not endpoint/account pricing"
       },
       "moonshotai/kimi-k2.7-code-highspeed": {
         "cache_read": 0.38,
@@ -5780,10 +6240,10 @@
       "canonical_model_name": {
         "pro": "deepseek-v4-pro",
         "deepseek-v4pro": "deepseek-v4-pro",
-        "flash": "deepseek-v4-flash",
-        "deepseek-v4flash": "deepseek-v4-flash",
-        "flash-vision": "deepseek-v4-flash-vision-exp",
-        "deepseek-v4flashvisionexp": "deepseek-v4-flash-vision-exp"
+        "flash": "deepseek-flash",
+        "deepseek-v4flash": "deepseek-flash",
+        "flash-vision": "deepseek-flash",
+        "deepseek-v4flashvisionexp": "deepseek-flash"
       },
       "canonical_direct_deepseek_model_id": {
         "deepseek-chat": "$DEEPSEEK_ALIAS_REPLACEMENT",
@@ -5910,6 +6370,10 @@
       "canonical_xiaomi_mimo_model_id": {
         "mimo": "$DEFAULT_XIAOMI_MIMO_MODEL",
         "$DEFAULT_XIAOMI_MIMO_MODEL": "$DEFAULT_XIAOMI_MIMO_MODEL",
+        "mimo-v2.5-pro": "$DEFAULT_XIAOMI_MIMO_MODEL",
+        "mimo-v2-6-pro": "$DEFAULT_XIAOMI_MIMO_MODEL",
+        "xiaomi-mimo-v2.6-pro": "$DEFAULT_XIAOMI_MIMO_MODEL",
+        "xiaomi-mimo-v2-6-pro": "$DEFAULT_XIAOMI_MIMO_MODEL",
         "mimo-v2-5-pro": "$DEFAULT_XIAOMI_MIMO_MODEL",
         "xiaomi-mimo-v2.5-pro": "$DEFAULT_XIAOMI_MIMO_MODEL",
         "xiaomi-mimo-v2-5-pro": "$DEFAULT_XIAOMI_MIMO_MODEL",
@@ -5919,20 +6383,24 @@
         "xiaomi-mimo-v2-5-pro-ultraspeed": "$XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL",
         "ultraspeed": "$XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL",
         "pro-ultraspeed": "$XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL",
-        "omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "mimo-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "v2.5-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "v25-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "mimo-v2.5": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "mimo-v25": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "mimo-v2-5": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "mimo-v2.5-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "mimo-v25-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "mimo-v2-5-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "xiaomi-mimo-v2.5": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "xiaomi-mimo-v2-5": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "xiaomi-mimo-v2.5-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
-        "xiaomi-mimo-v2-5-omni": "$XIAOMI_MIMO_V2_5_OMNI_MODEL",
+        "omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "v2.5-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "v25-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-v2.5": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-v25": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-v2-5": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-v2.5-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-v25-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-v2-5-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "xiaomi-mimo-v2.5": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "xiaomi-mimo-v2-5": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "xiaomi-mimo-v2.5-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "xiaomi-mimo-v2-5-omni": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "$XIAOMI_MIMO_V2_6_FLASH_MODEL": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "mimo-v2-6-flash": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "xiaomi-mimo-v2.6-flash": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "xiaomi-mimo-v2-6-flash": "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
         "asr": "$XIAOMI_MIMO_ASR_MODEL",
         "mimo-asr": "$XIAOMI_MIMO_ASR_MODEL",
         "mimo-v2.5-asr": "$XIAOMI_MIMO_ASR_MODEL",
@@ -6059,8 +6527,8 @@
       ],
       "xiaomi-mimo": [
         "$DEFAULT_XIAOMI_MIMO_MODEL",
-        "$XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL",
-        "$XIAOMI_MIMO_V2_5_OMNI_MODEL"
+        "$XIAOMI_MIMO_V2_6_FLASH_MODEL",
+        "$XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL"
       ],
       "novita": [
         "$DEFAULT_NOVITA_MODEL",
@@ -6147,25 +6615,21 @@
       ],
       "anthropic": [
         "$ANTHROPIC_OPUS_MODEL",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-haiku-5-5",
         "$DEFAULT_ANTHROPIC_MODEL",
         "$ANTHROPIC_HAIKU_MODEL"
       ],
       "minimax": [
         "$DEFAULT_MINIMAX_MODEL",
-        "$MINIMAX_M2_7_MODEL",
-        "$MINIMAX_M2_7_HIGHSPEED_MODEL",
-        "$MINIMAX_M2_5_MODEL",
-        "$MINIMAX_M2_5_HIGHSPEED_MODEL",
         "$MINIMAX_M2_1_MODEL",
         "$MINIMAX_M2_1_HIGHSPEED_MODEL",
         "$MINIMAX_M2_MODEL"
       ],
       "minimax-anthropic": [
         "$DEFAULT_MINIMAX_MODEL",
-        "$MINIMAX_M2_7_MODEL",
-        "$MINIMAX_M2_7_HIGHSPEED_MODEL",
-        "$MINIMAX_M2_5_MODEL",
-        "$MINIMAX_M2_5_HIGHSPEED_MODEL",
         "$MINIMAX_M2_1_MODEL",
         "$MINIMAX_M2_1_HIGHSPEED_MODEL",
         "$MINIMAX_M2_MODEL"
@@ -6188,8 +6652,11 @@
       ],
       "meta": [
         "$DEFAULT_META_MODEL",
-        "muse-spark-1.1",
-        "muse-spark-1.2-contributor"
+        "muse-spark-1.3-contributor",
+        "muse-wonder-1.0",
+        "muse-spark-1.2",
+        "muse-spark-1.2-contributor",
+        "muse-spark-1.1"
       ],
       "xai": [
         "$DEFAULT_XAI_MODEL",
@@ -6234,10 +6701,10 @@
       ],
       "google": [
         "$DEFAULT_GOOGLE_MODEL",
+        "gemini-4-argon",
         "gemini-3-pro-preview",
-        "gemini-3.7-flash",
+        "gemini-3.8-flash",
         "gemini-3.6-flash",
-        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
         "gemini-2.5-pro",
         "gemini-2.5-flash"

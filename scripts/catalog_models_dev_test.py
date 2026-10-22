@@ -340,8 +340,9 @@ class CommittedSeedTests(unittest.TestCase):
         data = json.loads(SEED.read_text())
         source = json.loads((ROOT / "crates/config/assets/catalog_corrections.json").read_text())
         self.assertEqual(data["_reviewed"], source["reviewed"])
-        self.assertIn("fetched 2026-09-26", data["_meta"]["upstream"])
-        self.assertEqual(len(data["_reviewed"]["public_models"]), 78)
+        lock = json.loads((ROOT / "scripts/catalog/models_dev_seed.lock.json").read_text())
+        self.assertIn(f"fetched {lock['source']['fetched_at']}", data["_meta"]["upstream"])
+        self.assertEqual(len(data["_reviewed"]["public_models"]), 91)
 
     def test_reviewed_malformed_and_duplicate_public_facts_are_refused(self) -> None:
         sys.path.insert(0, str(ROOT / "scripts"))

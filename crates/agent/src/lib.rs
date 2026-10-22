@@ -690,22 +690,21 @@ mod tests {
         assert!(listed.iter().any(|model| {
             model.provider == ProviderKind::Deepseek
                 && model.id == "deepseek-v4-flash-vision-exp"
-                && model.aliases
-                    == [
-                        "flash-vision".to_string(),
-                        "deepseek-v4flashvisionexp".to_string(),
-                    ]
+                && model.aliases.is_empty()
         }));
 
-        for selector in [
-            "deepseek-v4-flash-vision-exp",
-            "flash-vision",
-            "deepseek-v4flashvisionexp",
+        for (selector, expected) in [
+            (
+                "deepseek-v4-flash-vision-exp",
+                "deepseek-v4-flash-vision-exp",
+            ),
+            ("flash-vision", "deepseek-flash"),
+            ("deepseek-v4flashvisionexp", "deepseek-flash"),
         ] {
             let resolved = registry.resolve_ok(Some(selector), Some(ProviderKind::Deepseek));
             assert_eq!(
-                resolved.resolved.id, "deepseek-v4-flash-vision-exp",
-                "{selector} must resolve to the experimental vision model"
+                resolved.resolved.id, expected,
+                "{selector} must resolve to {expected}"
             );
             assert_eq!(resolved.resolved.provider, ProviderKind::Deepseek);
             assert!(!resolved.used_fallback, "{selector} must not fall back");
@@ -824,7 +823,7 @@ mod tests {
         let resolved = registry.resolve_ok(None, Some(ProviderKind::XiaomiMimo));
 
         assert_eq!(resolved.resolved.provider, ProviderKind::XiaomiMimo);
-        assert_eq!(resolved.resolved.id, "mimo-v2.5-pro");
+        assert_eq!(resolved.resolved.id, "mimo-v2.6-pro");
         assert!(resolved.resolved.supports_reasoning);
     }
 
@@ -939,7 +938,7 @@ mod tests {
 
         let resolved = registry.resolve_ok(Some("omni"), Some(ProviderKind::XiaomiMimo));
         assert_eq!(resolved.resolved.provider, ProviderKind::XiaomiMimo);
-        assert_eq!(resolved.resolved.id, "mimo-v2.5");
+        assert_eq!(resolved.resolved.id, "mimo-v2.6-flash");
         assert!(resolved.resolved.supports_tools);
     }
 
@@ -1565,7 +1564,7 @@ mod tests {
         let resolved = registry.resolve_ok(Some("deepseek-reasoner"), Some(ProviderKind::Deepseek));
 
         assert_eq!(resolved.resolved.provider, ProviderKind::Deepseek);
-        assert_eq!(resolved.resolved.id, "deepseek-v4-flash");
+        assert_eq!(resolved.resolved.id, "deepseek-flash");
     }
 
     #[test]
