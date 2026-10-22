@@ -151,14 +151,25 @@ pub(super) fn resolve_ui_approval_disposition(
     approval_key: &str,
     approval_force_prompt: bool,
 ) -> crate::core::authority::ApprovalRequestDisposition {
-    crate::core::authority::resolve_approval_request_disposition(
+    let disposition = crate::core::authority::resolve_approval_request_disposition(
         &app_turn_authority_for_approvals(app),
         is_session_approved_for_tool(app, tool_name, grouping_key),
         is_session_denied_for_key(app, approval_key),
         approval_force_prompt,
         // This namespace is minted by the Engine, not by plugin card text.
         approval_key.starts_with("extcall:ext:"),
-    )
+    );
+    // Full Access holds a required prompt only because a programme with no
+    // person at the card must not be stranded by one. This surface always has
+    // that person, and a Computer Use consent or script exists for no other
+    // reason than to carry their answer, so ask instead of denying.
+    if disposition
+        == crate::core::authority::ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold
+        && crate::tools::approval_cache::computer_use_human_decision_tool(tool_name)
+    {
+        return crate::core::authority::ApprovalRequestDisposition::Prompt;
+    }
+    disposition
 }
 
 /// Answer, explicitly, a request that must not open a card here, so nothing

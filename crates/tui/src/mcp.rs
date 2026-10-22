@@ -1439,8 +1439,11 @@ fn resource_template_pattern(template: &str) -> Option<String> {
 ///
 /// This runs per URI per advertised template, while the template itself is
 /// fixed by the server's listing, so compiling it on every call was pure
-/// repetition. `None` still means "matches nothing" (#6213 T7).
+/// repetition. `None` still means "matches nothing" (#6213 T7). The cache is
+/// bounded because the template list is server-supplied: an unbounded key set
+/// would let one server pin memory for the life of the process.
 fn compiled_resource_template(template: &str) -> Option<Arc<regex::Regex>> {
+    const MAX_CACHED_TEMPLATES: usize = 512;
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<HashMap<String, Option<Arc<regex::Regex>>>>,
     > = std::sync::OnceLock::new();
@@ -1448,14 +1451,16 @@ fn compiled_resource_template(template: &str) -> Option<Arc<regex::Regex>> {
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache
-        .entry(template.to_string())
-        .or_insert_with(|| {
-            resource_template_pattern(template)
-                .and_then(|pattern| regex::Regex::new(&pattern).ok())
-                .map(Arc::new)
-        })
-        .clone()
+    if let Some(cached) = cache.get(template) {
+        return cached.clone();
+    }
+    let compiled = resource_template_pattern(template)
+        .and_then(|pattern| regex::Regex::new(&pattern).ok())
+        .map(Arc::new);
+    if cache.len() < MAX_CACHED_TEMPLATES {
+        cache.insert(template.to_string(), compiled.clone());
+    }
+    compiled
 }
 
 fn resource_uri_matches_template(uri: &str, template: &str) -> bool {

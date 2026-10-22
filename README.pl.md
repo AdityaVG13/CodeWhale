@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -111,12 +111,7 @@ Szczegóły opisuje [przewodnik po trybach i uprawnieniach](docs/MODES.md).
 
 ## Co potrafi
 
-### Wkrótce w 0.10.2
-
-Te zmiany są już scalone z `main`, ale nie trafiły jeszcze do żadnego
-opublikowanego wydania;
-[zbuduj `main`](docs/INSTALL.md#test-and-contribute-to-current-source), aby
-wypróbować je już teraz.
+### Nowości w 0.10.2
 
 - `/pet on` zamienia terminal w animowanego wieloryba, który pokazuje, czym
   zajmuje się agent, a pole wiadomości pozostaje przy tym aktywne. Jego 980
@@ -128,8 +123,8 @@ wypróbować je już teraz.
 - `/undo` cofa całe Twoje ostatnie zlecenie w jednym kroku, łącznie ze
   wszystkimi zmienionymi przez nie plikami, a `/diff` działa w folderach bez
   Gita.
-- Gdy plan kończy się otwartymi krokami, Codewhale pyta, czy rozpocząć Work z
-  Ask lub Auto-Review, czy dalej planować.
+- Gdy plan jest gotowy, Codewhale pyta, czy rozpocząć Work z Ask lub
+  Auto-Review, czy dalej planować.
 - `/color` nadaje każdemu czatowi własny kolor pola wiadomości, zapisywany
   razem z sesją.
 - `web_search` może korzystać z nowego Search API od DeepSeek: ustaw

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -110,12 +110,7 @@ Xem chi tiết trong [hướng dẫn về chế độ và quyền](docs/MODES.md
 
 ## Codewhale làm được gì
 
-### Sắp có trong 0.10.2
-
-Các tính năng này đã được hợp nhất vào `main` nhưng chưa có trong bản phát hành
-nào đã công bố; hãy
-[dựng `main`](docs/INSTALL.md#test-and-contribute-to-current-source) để dùng thử
-ngay.
+### Có gì mới trong 0.10.2
 
 - `/pet on` biến terminal của bạn thành một chú cá voi chuyển động cho thấy tác
   nhân đang làm gì, trong khi ô nhập tin nhắn vẫn dùng được. 980 hạt của nó ghép
@@ -125,7 +120,7 @@ ngay.
   riêng bạn (macOS và Linux).
 - `/undo` hoàn tác toàn bộ yêu cầu gần nhất của bạn trong một bước, gồm mọi tệp
   mà yêu cầu đó đã thay đổi, và `/diff` hoạt động cả trong thư mục không dùng Git.
-- Khi một kế hoạch kết thúc mà vẫn còn bước chưa làm, Codewhale hỏi bạn muốn bắt
+- Khi một kế hoạch đã sẵn sàng, Codewhale hỏi bạn muốn bắt
   đầu Work với Ask hay Auto-Review, hay tiếp tục lập kế hoạch.
 - `/color` đặt cho mỗi cuộc trò chuyện một màu ô soạn thảo riêng, được lưu cùng
   phiên.

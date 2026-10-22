@@ -105,11 +105,7 @@ See the [modes and permissions guide](docs/MODES.md) for the details.
 
 ## What it does
 
-### Coming in 0.10.2
-
-These are merged on `main` and not in a published release yet;
-[build `main`](docs/INSTALL.md#test-and-contribute-to-current-source) to try
-them now.
+### New in 0.10.2
 
 - `/pet on` turns your terminal into an animated whale that shows what the
   agent is doing, while the message box stays live. Its 980 particles spell
@@ -118,8 +114,8 @@ them now.
   into one, or press `Ctrl+N` for a shell of your own (macOS and Linux).
 - `/undo` takes back your whole last request in one step, including every file
   it changed, and `/diff` works in folders without Git.
-- When a plan ends with open steps, Codewhale asks whether to start Work with
-  Ask or Auto-Review, or keep planning.
+- When a plan is ready, Codewhale asks whether to start Work with Ask or
+  Auto-Review, or keep planning.
 - `/color` gives each chat its own composer color, saved with the session.
 - `web_search` can use DeepSeek's new Search API: set
   `[search] provider = "deepseek"` with a DeepSeek key.

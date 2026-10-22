@@ -34,7 +34,7 @@ async function fixture(t, options = {}) {
     if (url.pathname.endsWith("/sendmessage")) {
       state.sent.push(body.msg);
       if (options.send) return options.send(res, body.msg, state, json);
-      return json(res, { ret: 0 });
+      return json(res, { ret: 0, message_id: String(state.sent.length) });
     }
     if (url.pathname.includes("/msg/notify")) return json(res, { ret: 0 });
     if (url.pathname === "/v1/runtime/info") return json(res, { version: "fixture", capabilities: options.capabilities ?? { turn_operation_idempotency: true, turn_operation_lookup: true } });
@@ -109,8 +109,9 @@ test("production process keeps polling and owner approvals live, dedupes real me
   const polls = f.polls;
   f.approvals = [{ id: "approval-1", turn_id: "turn-1", tool_name: "fixture-tool" }];
   f.event("approval.required", f.approvals[0]);
-  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("approval_id=approval-1")), "approval notice missing");
-  f.batches.push([incoming(0, "private original prompt"), incoming(2, "/allow approval-1", "bob"), incoming(3, "/allow approval-1")]);
+  await until(() => f.sent.some((msg) => msg.item_list[0].text_item.text.includes("fixture-tool")), "approval notice missing");
+  const code = f.sent.find((msg) => msg.item_list[0].text_item.text.includes("fixture-tool")).item_list[0].text_item.text.match(/Reply 1 ([a-z2-9]{6}) to allow/)[1];
+  f.batches.push([incoming(0, "private original prompt"), incoming(2, "/allow approval-1", "bob"), incoming(3, `1 ${code}`)]);
   await until(() => f.decisions.length === 1 && f.polls > polls, "initiating owner could not approve or polling stopped during stream");
   assert.equal(f.posts.length, 1); assert.ok(f.polls > polls); assert.deepEqual(f.decisions, [{ decision: "allow", remember: false }]);
   f.event("item.delta", { kind: "agent_message", delta: "answer" }); f.complete("answer");
@@ -138,12 +139,15 @@ test("ambiguous admission uses stable operation lookup rather than a duplicate P
   assert.equal((await f.disk()).chats.alice.activeTurnId, "turn-1");
 });
 
-test("proven rejection retries a stable output ID; uncertain send is retained without resending", async (t) => {
+test("proven rejection holds the output until the member asks to continue; uncertain send is retained without resending", async (t) => {
   const f = await fixture(t, { send: (response, msg, state, json) => {
-    if (state.sent.length === 1) return json(response, { ret: -14 });
+    if (state.sent.length === 1) return json(response, { ret: -2 });
     return response.destroy();
   } }); f.batches.push([incoming(1, "work")]); f.start();
   await until(() => f.streams.size, "stream missing"); f.event("item.delta", { kind: "agent_message", delta: "retained answer" }); f.complete("retained answer");
+  await until(async () => (await f.disk()).chats?.alice?.turnDelivery?.outputs?.[0]?.status === "held", "rejected send was not held");
+  await delay(1200); assert.equal(f.sent.length, 1);
+  f.batches.push([incoming(2, "继续")]);
   await until(async () => (await f.disk()).chats?.alice?.turnDelivery?.outputs?.[0]?.status === "uncertain", "uncertain send was discarded");
   assert.equal(f.sent.length, 2); assert.equal(f.sent[0].client_id, f.sent[1].client_id);
   await delay(1200); assert.equal(f.sent.length, 2); assert.equal((await f.disk()).chats.alice.activeTurnId, "turn-1");

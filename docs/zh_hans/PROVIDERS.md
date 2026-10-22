@@ -651,22 +651,31 @@ OrcaRouter（`https://api.orcarouter.ai/v1`）是专用的具名路由（[OrcaRo
 PKCE S256、回环回调与恒定时间 state 校验获得持久 `sk-orca-…` key；两条路径写入
 同一个 `orcarouter` 秘密槽位，`auth_mode = "api_key"`。
 
-浏览器授权为 `https://www.orcarouter.ai/auth`；交换为
-`POST https://www.orcarouter.ai/api/v1/auth/keys`，无需 client secret 或预注册
-回调 URI。推理和目录使用独立的 `https://api.orcarouter.ai/v1`，不能由另一个
-源站猜测路径。自托管可显式用 `ORCA_AUTH_BASE_URL` 与
-`ORCA_API_BASE_URL` / `ORCAROUTER_BASE_URL` 覆盖各自源站；远程必须 HTTPS，
-HTTP 只允许回环。
+浏览器授权为 `https://www.orcarouter.ai/auth`，参数含 `ref`（Codewhale 在
+OrcaRouter 的公开标识；OrcaRouter 签发 `app_id` 后一并携带）；交换为
+`POST https://www.orcarouter.ai/api/v1/auth/keys`，无需 client secret。推理和目录
+使用独立的 `https://api.orcarouter.ai/v1`，不能由另一个源站猜测路径。推理源站可用
+`ORCA_API_BASE_URL`、`ORCA_BASE_URL` 或 `ORCAROUTER_BASE_URL` 覆盖；远程必须
+HTTPS，HTTP 只允许回环。登录源站固定为 `https://www.orcarouter.ai`：
+`ORCA_AUTH_BASE_URL` 与 `ORCAROUTER_AUTH_BASE_URL` 只能将其改为回环 HTTP 地址以供
+本地测试夹具使用，其他值一律忽略，`ORCA_BASE_URL` 不再影响登录源站。
 
 所得 key 不是刷新令牌：重启后复用，不发送 refresh grant。请在 OrcaRouter
 控制台撤销；`/auth orcarouter-revoke` 只清除本地副本。Relay 401 将该凭据版本
 标为需重新认证，不静默重试。
 
-实时 `GET https://api.orcarouter.ai/v1/models` 用所配置 key 获取目录。
-聊天选择器仅保留 `supported_endpoint_types` 含 `openai`、`anthropic`、`gemini`
-或 `openai-response` 的行；图像生成、视频与 rerank 行被过滤，不按名称猜测。
+实时 `GET https://api.orcarouter.ai/v1/models` 用所配置 key 获取目录，其标价（含
+长提示词分档价）作为该路由的价格估计。该路由只使用 Chat Completions，因此聊天选择器
+仅保留 `supported_endpoint_types` 含 `openai` 的行；只在其他协议上提供的行（如仅限
+Gemini 的图像模型）不列出；图像生成、视频与 rerank 行被过滤，不按名称猜测。
 `architecture.input_modalities` 含 `image` 才确认图像输入；无 architecture 的行
 能力为未知。
+
+桌面应用通过 Runtime API 的 `POST /v1/providers/orcarouter/connect` 连接
+OrcaRouter，无需终端：本地 Engine 运行同一流程，应用在系统浏览器中打开返回的
+授权链接，Engine 在回环回调上等待、交换授权码，并以与
+`codewhale auth orcarouter` 完全相同的方式保存 key。详见
+[RUNTIME_API.md](RUNTIME_API.md)。
 
 ### 近期 OpenRouter 大模型
 

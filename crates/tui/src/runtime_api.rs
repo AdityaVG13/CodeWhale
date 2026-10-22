@@ -226,6 +226,7 @@ pub struct RuntimeApiState {
     /// Serializes provider switches: each one saves, applies and, when the
     /// apply is refused, takes back its own save before the next one starts.
     provider_switches: Arc<tokio::sync::Mutex<()>>,
+    provider_connect: secrets::ProviderConnect,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -2078,6 +2079,7 @@ pub async fn run_http_server(
         shutdown: shutdown.clone(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+        provider_connect: Default::default(),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -3012,6 +3014,14 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .layer(DefaultBodyLimit::max(
                     secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
                 )),
+        )
+        .route(
+            "/v1/providers/{id}/connect",
+            post(secrets::start_provider_connect),
+        )
+        .route(
+            "/v1/providers/{id}/connect/{attempt_id}",
+            get(secrets::get_provider_connect).delete(secrets::cancel_provider_connect),
         )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
@@ -10640,6 +10650,8 @@ struct ProviderEntry {
         skip_serializing_if = "Option::is_none"
     )]
     credential_writable_reason: Option<&'static str>,
+    #[serde(rename = "browserConnect", skip_serializing_if = "std::ops::Not::not")]
+    browser_connect: bool,
 }
 
 /// Stable, non-secret wire projection of provider readiness.
@@ -11333,6 +11345,7 @@ fn provider_entry_for_api(
         credential_source: writeability.source,
         credential_writable: writeability.writable,
         credential_writable_reason: writeability.reason,
+        browser_connect: identity.provider == ProviderKind::Orcarouter && writeability.writable,
     }
 }
 
@@ -11354,6 +11367,7 @@ async fn list_providers(
             default_model: String::new(), has_model_catalog: false,
             credential_state: ProviderCredentialState::Legacy, credential_source: secrets::ProviderCredentialSource::None,
             credential_writable: false, credential_writable_reason: Some("This configured route is unavailable; repair its exact provider definition before using it."),
+            browser_connect: false,
         }));
         Ok(Json(ProvidersResponse {
             current_provider_id: active_identity.as_ref().and_then(|identity| identity.persisted_id()).map(str::to_string),
@@ -13422,6 +13436,7 @@ base_url = "http://127.0.0.1:9/v1"
             shutdown: RuntimeServerShutdown::default(),
             git_writes: Arc::new(tokio::sync::Mutex::new(())),
             provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+            provider_connect: Default::default(),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

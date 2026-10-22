@@ -165,6 +165,13 @@ For a tested typed example, lifecycle rules and per-plugin diagnostics, read
 [Writing an extension tool](EXTENSIONS.md). `.mts` supports Node's erasable
 types without a separate compiler; syntax needing transformation is not supported.
 
+A plugin whose tools act on the person's own machine needs more than an
+approval posture: what it may ever attempt, what the person has granted, and
+how often to interrupt are three different questions. The Computer Use bundle
+is the worked example, and
+[its permission model](https://github.com/codewhale-hq/codewhale-cu-plugin/blob/main/docs/PERMISSIONS_MODEL.md)
+proposes the separation the engine should adopt.
+
 ## Write a scoped native mod
 
 The [mod-extension example](examples/plugins/mod-extension/README.md) is a

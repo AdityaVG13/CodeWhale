@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -111,12 +111,7 @@ Consulta la [guia de modes i permisos](docs/MODES.md) per als detalls.
 
 ## Què fa
 
-### Properament a la 0.10.2
-
-Aquestes funcionalitats ja estan integrades a `main`, però encara no formen part
-de cap versió publicada;
-[compila `main`](docs/INSTALL.md#test-and-contribute-to-current-source) per
-provar-les ara.
+### Novetats de la 0.10.2
 
 - `/pet on` converteix el teu terminal en una balena animada que mostra què fa
   l’agent, mentre el quadre de missatges continua actiu. Les seves 980
@@ -126,7 +121,7 @@ provar-les ara.
   Linux).
 - `/undo` desfà tota la teva última petició d’un sol cop, inclosos tots els
   fitxers que va canviar, i `/diff` funciona en carpetes sense Git.
-- Quan un pla acaba amb passos pendents, Codewhale et pregunta si vols començar
+- Quan un pla està llest, Codewhale et pregunta si vols començar
   Work amb Ask o Auto-Review, o continuar planificant.
 - `/color` dona a cada xat el seu propi color al quadre de missatges, desat amb
   la sessió.

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -109,10 +109,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
 
 ## 할 수 있는 일
 
-### 0.10.2에서 제공 예정
-
-아래 기능은 `main`에 병합되었지만 아직 공개된 릴리스에는 포함되지 않았습니다.
-지금 써 보려면 [`main`을 빌드하세요](docs/INSTALL.md#test-and-contribute-to-current-source).
+### 0.10.2의 새로운 기능
 
 - `/pet on`은 터미널을 에이전트가 하는 일을 보여 주는 움직이는 고래로 바꾸며,
   그동안에도 메시지 입력란은 계속 쓸 수 있습니다. 980개의 입자가 현재 단계를
@@ -122,7 +119,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
   (macOS와 Linux).
 - `/undo`는 마지막 요청 전체를 그 요청이 변경한 모든 파일까지 포함해 한 번에
   되돌리고, `/diff`는 Git이 없는 폴더에서도 동작합니다.
-- 계획이 끝났는데 남은 단계가 있으면, Codewhale은 실행 모드를 확인 권한으로
+- 계획이 준비되면, Codewhale은 실행 모드를 확인 권한으로
   시작할지 자동 검토 권한으로 시작할지, 아니면 계획을 계속할지 묻습니다.
 - `/color`는 채팅마다 고유한 입력란 색을 지정하며, 이 색은 세션과 함께
   저장됩니다.

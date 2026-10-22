@@ -1523,7 +1523,12 @@ fn pid_var_proofs(command: &str) -> HashMap<String, PidVarSource> {
             // Prefix `++`/`--`, destructuring (`$a, $b = ...` proves nothing
             // about `$b`), postfix `++`/`--`, and compound assignment all
             // mutate without proving: mark touched, keep no proof.
-            let prefix_mutated = i >= 2 && matches!(&stmt[i - 2..i], "++" | "--");
+            //
+            // Compare bytes, not a `&str` slice: `i` is a boundary because it
+            // points at an ASCII `$`, but `i - 2` can land inside a multi-byte
+            // character. Slicing the string there panicked for any Cyrillic or
+            // CJK input (#7048).
+            let prefix_mutated = i >= 2 && matches!(&bytes[i - 2..i], [b'+', b'+'] | [b'-', b'-']);
             let destructured = stmt[..i].trim_end().ends_with(',');
             while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;

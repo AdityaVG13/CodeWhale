@@ -94,18 +94,12 @@ pub(crate) fn bounded_review_reasoning_effort(
 pub const MAX_COMMITTABLE_SUGGESTION_LINES: u32 = 25;
 const REVIEW_CLIENT_UNAVAILABLE: &str = "Review tool requires an active Codewhale model client";
 
-pub(crate) const MAX_REVIEW_COMMIT_MESSAGE_CHARS: usize = 16_000;
-
-pub(crate) fn commit_intent_preamble(commits: &str) -> String {
-    if commits.trim().is_empty() {
-        return String::new();
-    }
-    format!(
-        "The author's commit messages for this range follow. They state what the change is meant to do; check them against the diff rather than trusting them.\n\n{commits}\n\nEnd of commit messages.\n\n"
-    )
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What kind of claim this is. `defect` is a wrong behaviour in the changed
+/// code; `intent` is a mismatch between what the change says it does and what
+/// it does; `contract` is a dependent outside the diff that the change broke.
+/// The distinction exists because the three need different evidence and a
+/// reader triages them differently.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewIssue {
     #[serde(default)]
     pub severity: String,
@@ -117,9 +111,59 @@ pub struct ReviewIssue {
     pub path: Option<String>,
     #[serde(default)]
     pub line: Option<u32>,
+    /// `defect`, `intent` or `contract`. Absent on older receipts and model
+    /// output written before this field existed, and read as `defect`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// How the reviewer established the claim. `reproduced` requires a
+    /// command; `traced` requires `path:line`; `suspected` is never posted
+    /// inline and is moved to the summary's "worth a human look" list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ReviewEvidence>,
+    /// For a `contract` claim: what the change made newly true or false, and
+    /// which dependents were checked against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ReviewContract>,
+    /// Whether this change introduced the defect or merely exposed it.
+    ///
+    /// `introduced` or `preexisting`. Set **mechanically** from the diff by the
+    /// review core, never taken from the model: a reviewer that can label its
+    /// own accusation as someone else's problem is not a reviewer worth
+    /// trusting. A `preexisting` claim is a real bug on code this change did
+    /// not touch, reported without attributing it to the author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorship: Option<String>,
+    /// False when the claim cannot land on a line of this diff. Such a claim is
+    /// still reported — in the review body rather than inline — because losing
+    /// a proven finding to a line-number disagreement is worse than reporting
+    /// it in the wrong place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_anchorable: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewEvidence {
+    /// `reproduced`, `traced` or `suspected`.
+    #[serde(default)]
+    pub tier: String,
+    /// The command and its output for `reproduced`, or the input and the
+    /// `path:line` chain for `traced`. Free text, rendered verbatim.
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewContract {
+    /// What became newly true or newly false at the changed line.
+    #[serde(default)]
+    pub became: String,
+    /// Dependents of that contract the reviewer checked, as `path:line` or a
+    /// path with a symbol. An empty list is honest: it means none were found.
+    #[serde(default)]
+    pub dependents_checked: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewSuggestion {
     #[serde(default)]
     pub path: Option<String>,
@@ -143,7 +187,7 @@ pub struct ReviewSuggestion {
     pub replacement: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewOutput {
     #[serde(default)]
     pub summary: String,
@@ -153,6 +197,31 @@ pub struct ReviewOutput {
     pub suggestions: Vec<ReviewSuggestion>,
     #[serde(default)]
     pub overall_assessment: String,
+    /// `low`, `medium` or `high`, with the reason, so the person merging gets
+    /// the answer they actually want before reading a single finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_risk: Option<ReviewMergeRisk>,
+    /// What the reviewer established rather than suspected: dependents read,
+    /// commands run and their results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified: Vec<String>,
+    /// What was not reviewed, and why. An honest gap, not a blank cheque.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_reviewed: Vec<String>,
+    /// What the reviewer examined and found sound, with the reason. A negative
+    /// result, not a claim: it never counts toward merge risk and never becomes
+    /// an inline comment. This is what lets a reader stop checking something.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ruled_out: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewMergeRisk {
+    /// `low`, `medium` or `high`.
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub reason: String,
 }
 
 impl ReviewOutput {
@@ -201,9 +270,7 @@ impl ReviewOutput {
         };
         Self {
             summary,
-            issues: Vec::new(),
-            suggestions: Vec::new(),
-            overall_assessment: String::new(),
+            ..Self::default()
         }
     }
 
@@ -215,7 +282,59 @@ impl ReviewOutput {
             issue.title = issue.title.trim().to_string();
             issue.description = issue.description.trim().to_string();
             issue.path = normalize_optional(issue.path.take());
+            issue.kind = issue
+                .kind
+                .take()
+                .map(|kind| normalize_claim_kind(&kind))
+                .filter(|kind| !kind.is_empty());
+            if let Some(evidence) = issue.evidence.as_mut() {
+                evidence.tier = normalize_evidence_tier(&evidence.tier);
+                evidence.detail = evidence.detail.trim().to_string();
+            }
+            issue.authorship = issue.authorship.take().map(|value| {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "preexisting" | "pre-existing" | "pre_existing" | "existing" => "preexisting",
+                    _ => "introduced",
+                }
+                .to_string()
+            });
+            if let Some(contract) = issue.contract.as_mut() {
+                contract.became = contract.became.trim().to_string();
+                contract.dependents_checked = contract
+                    .dependents_checked
+                    .iter()
+                    .map(|entry| entry.trim().to_string())
+                    .filter(|entry| !entry.is_empty())
+                    .collect();
+            }
         }
+        if let Some(risk) = self.merge_risk.as_mut() {
+            risk.level = match risk.level.trim().to_ascii_lowercase().as_str() {
+                "high" | "blocking" | "blocker" => "high",
+                "medium" | "moderate" | "concern" => "medium",
+                _ => "low",
+            }
+            .to_string();
+            risk.reason = risk.reason.trim().to_string();
+        }
+        self.verified = self
+            .verified
+            .iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        self.not_reviewed = self
+            .not_reviewed
+            .iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        self.ruled_out = self
+            .ruled_out
+            .iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect();
         for suggestion in &mut self.suggestions {
             suggestion.suggestion = suggestion.suggestion.trim().to_string();
             suggestion.path = normalize_optional(suggestion.path.take());
@@ -752,6 +871,9 @@ impl PrReviewAccumulator {
             summary,
             issues,
             suggestions,
+            merge_risk: None,
+            verified: Vec::new(),
+            not_reviewed: Vec::new(),
             overall_assessment: if assessments.is_empty() {
                 if self.manifest.skipped_files.is_empty() {
                     format!("All {total} review passes completed with structured output.")
@@ -763,6 +885,7 @@ impl PrReviewAccumulator {
             } else {
                 assessments.join("\n")
             },
+            ..Default::default()
         };
         output.note_binary_coverage(complete_diff);
         let completed_passes = self
@@ -1444,6 +1567,8 @@ impl ToolSpec for ReviewTool {
             }
             _ => super::review_core::repository_tool_workspace(&context.workspace, None),
         };
+        let triage = super::review_triage::triage_review(&review_diff);
+        let budget = super::review_triage::budget_for(&triage);
         let mut usage = Usage::default();
         let mut accumulator = plan.as_ref().map(PrReviewAccumulator::new);
         let mut single_output = None;
@@ -1453,10 +1578,17 @@ impl ToolSpec for ReviewTool {
         let mut tool_calls = 0;
         let mut changed_lines = 0;
         let mut outcome = super::review_core::ReviewCoreOutcome::Completed;
+        let mut stop = None;
+        let mut spend_usd = None;
         for (index, prompt) in prompts.into_iter().enumerate() {
             let mut request = super::review_core::ReviewCoreRequest::new(&review_diff, prompt);
             request.workspace = tool_workspace.clone();
-            request.max_output_tokens = Some(client.effective_max_output_tokens(&route.model));
+            request.budget = budget.tool_budget();
+            request.max_output_tokens = Some(
+                client
+                    .effective_max_output_tokens(&route.model)
+                    .min(budget.max_output_tokens),
+            );
             let result =
                 match super::review_core::run_review_core(&client, &self.model, request).await {
                     Ok(result) => result,
@@ -1488,6 +1620,8 @@ impl ToolSpec for ReviewTool {
             tool_calls += result.tool_calls;
             changed_lines += result.coverage.changed_lines;
             outcome = result.outcome;
+            stop = result.stop.clone().or(stop);
+            spend_usd = result.spend_usd.or(spend_usd);
             if codewhale_models::is_incomplete_stop_reason(result.stop_reason.as_deref()) {
                 return Ok(review_error_with_usage(
                     &route,
@@ -1531,6 +1665,16 @@ impl ToolSpec for ReviewTool {
         } else {
             single_output.expect("one non-PR review response")
         };
+        let mut output = output;
+        if let Some(note) = stop
+            .as_ref()
+            .map(|stop| super::review_triage::partial_review_note(stop, &triage, &budget))
+        {
+            if !output.summary.is_empty() {
+                output.summary.push_str("\n\n");
+            }
+            output.summary.push_str(&note);
+        }
         let mut metadata = review_usage_metadata(&route, &usage);
         metadata["review_anchors"] = json!(anchors);
         metadata["review_tools_used"] = json!(tools_used);
@@ -1538,6 +1682,11 @@ impl ToolSpec for ReviewTool {
         metadata["review_steps"] = json!(steps);
         metadata["review_tool_calls"] = json!(tool_calls);
         metadata["review_changed_lines"] = json!(changed_lines);
+        metadata["review_triage"] = json!(triage);
+        metadata["review_budget"] = json!(budget);
+        metadata["review_stop"] =
+            json!(stop.as_ref().map(super::review_triage::ReviewStop::as_str));
+        metadata["review_spend_usd"] = json!(spend_usd);
         metadata["review_outcome"] = json!(match outcome {
             super::review_core::ReviewCoreOutcome::Completed => "completed",
             super::review_core::ReviewCoreOutcome::NoFinalAnswer => "no_final_answer",
@@ -1924,6 +2073,29 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn normalize_claim_kind(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "intent" | "intent_mismatch" | "unannounced" => "intent",
+        "contract" | "dependent" | "impact" => "contract",
+        "defect" | "bug" | "" => "defect",
+        other if other.starts_with("intent") => "intent",
+        other if other.starts_with("contract") || other.starts_with("depend") => "contract",
+        _ => "defect",
+    }
+    .to_string()
+}
+
+fn normalize_evidence_tier(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.starts_with("repro") || lower.starts_with("verif") {
+        "reproduced".to_string()
+    } else if lower.starts_with("trace") || lower.starts_with("proven") {
+        "traced".to_string()
+    } else {
+        "suspected".to_string()
+    }
 }
 
 fn normalize_severity(value: &str) -> String {
@@ -2949,6 +3121,7 @@ mod tests {
                 description: "Add coverage".to_string(),
                 path: Some("src/lib.rs".to_string()),
                 line: Some(12),
+                ..Default::default()
             }],
             suggestions: vec![ReviewSuggestion {
                 path: Some("src/lib.rs".to_string()),
@@ -2959,6 +3132,7 @@ mod tests {
                 replacement: None,
             }],
             overall_assessment: "Needs a test".to_string(),
+            ..Default::default()
         };
 
         let receipt = build_review_receipt(
@@ -3051,6 +3225,7 @@ mod tests {
                 },
             ],
             overall_assessment: "Fix the unwrap".to_string(),
+            ..Default::default()
         };
 
         let receipt = build_review_receipt(
@@ -3199,9 +3374,11 @@ mod tests {
                 description: "Needs work".to_string(),
                 path: Some("a".to_string()),
                 line: Some(1),
+                ..Default::default()
             }],
             suggestions: Vec::new(),
             overall_assessment: String::new(),
+            ..Default::default()
         };
         let receipt = build_review_receipt(
             "working-tree",
@@ -3216,7 +3393,10 @@ mod tests {
         let validation = validate_review_receipt_for_diff(diff, &receipt, None);
 
         assert!(!validation.passed);
-        assert_eq!(validation.unresolved_risk.as_ref().unwrap().level, "blocker");
+        assert_eq!(
+            validation.unresolved_risk.as_ref().unwrap().level,
+            "blocker"
+        );
         assert!(validation.reason.contains("unresolved review issue"));
     }
 

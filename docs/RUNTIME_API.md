@@ -2487,6 +2487,57 @@ auth mode, consent state and the *kind* of any configured `api_key` value,
 and never resolves a secret, an environment value, or an auth command. It is
 a class and never a value, a path, or an environment variable name.
 
+### `POST /v1/providers/orcarouter/connect` — browser sign-in without a terminal
+
+```json
+// response
+{ "attemptId": "0f3c…", "authorizeUrl": "https://www.orcarouter.ai/auth?…",
+  "expiresIn": 900 }
+```
+
+Runs the same OrcaRouter OAuth 2.0 + PKCE sign-in as `codewhale auth orcarouter`
+for a client that has no terminal. The Engine binds its loopback callback
+(`http://127.0.0.1:<port>/callback`), returns the consent URL, and waits on a
+worker for up to `expiresIn` seconds. The client opens `authorizeUrl` in the
+system browser — never an embedded view — and polls the attempt. When the
+browser comes back, the Engine exchanges the code, refuses a key whose granted
+scope is not `api`, and stores the key through the same seam as the CLI, then
+mirrors the credential markers into the live config the way
+`PUT /v1/providers/{id}/key` does. It does not switch the active provider; use
+`POST /v1/providers/{id}/switch` for that.
+
+The callback listens on the Engine's own computer, so a client offers this
+route only for an Engine on the same computer as the browser. A new `POST`
+cancels the previous attempt, and only the current attempt can be read.
+Refusals: `400` for an id other than `orcarouter`, `409` when the route's
+credential is not writable (the same reason `credentialWritableReason`
+carries), `500` when the callback cannot be bound. `GET /v1/providers` marks a
+route that supports this with `"browserConnect": true`; the field is absent
+otherwise and on Engines without the route.
+
+### `GET /v1/providers/orcarouter/connect/{attemptId}` and `DELETE …` — status and cancel
+
+```json
+{ "attemptId": "0f3c…", "status": "failed", "reason": "key_not_saved" }
+```
+
+`status` is `waiting`, `connected`, `declined` (the user refused in the
+browser), `expired` (no callback in time), `cancelled` or `failed`. `failed`
+carries a `reason`: `authorization_error` (the browser came back with another
+error), `callback_failed`, `not_writable` (the route's credential stopped being
+writable before the exchange; no key was created), `exchange_failed`,
+`scope_refused` or `key_not_saved`. After `scope_refused` or `key_not_saved`,
+OrcaRouter created a key that Codewhale did not keep; the user should revoke
+it under Authorized Apps in OrcaRouter. `exchange_failed` can follow a key
+OrcaRouter created before the response was lost.
+
+`DELETE` cancels an attempt that is still waiting for the browser. Once the
+exchange has started a key may already exist, so the attempt runs on and
+reports `connected`, or `failed` with `key_not_saved`; `DELETE` then answers
+with the current status. An unknown or superseded `attemptId` is `404`. Only
+the `POST` response carries the consent URL; no status, error or log line
+carries it, the key, the code or the verifier.
+
 ### `POST /v1/providers/{id}/switch`
 
 ```json

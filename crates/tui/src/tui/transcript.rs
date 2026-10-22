@@ -1231,11 +1231,9 @@ const fn spacer_rows_for_boundary(
     match (boundary, spacing) {
         (TranscriptBoundary::Joined | TranscriptBoundary::GroupedTool, _) => 0,
         (TranscriptBoundary::Activity, TranscriptSpacing::Compact) => 0,
-        (TranscriptBoundary::Activity, _) => BLOCK_SEPARATOR_ROWS,
-        (TranscriptBoundary::Turn, TranscriptSpacing::Compact | TranscriptSpacing::Comfortable) => {
-            BLOCK_SEPARATOR_ROWS
-        }
-        (TranscriptBoundary::Turn, TranscriptSpacing::Spacious) => BLOCK_SEPARATOR_ROWS + 1,
+        (TranscriptBoundary::Activity, TranscriptSpacing::Spacious) => BLOCK_SEPARATOR_ROWS + 1,
+        (TranscriptBoundary::Turn, TranscriptSpacing::Compact) => BLOCK_SEPARATOR_ROWS,
+        (TranscriptBoundary::Turn, TranscriptSpacing::Spacious) => BLOCK_SEPARATOR_ROWS + 2,
     }
 }
 

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -114,11 +114,7 @@ Details stehen in der [Anleitung zu Modi und Berechtigungen](docs/MODES.md).
 
 ## Was es kann
 
-### Kommt mit 0.10.2
-
-Diese Funktionen sind in `main` gemergt, aber noch in keinem veröffentlichten
-Release; [baue `main`](docs/INSTALL.md#test-and-contribute-to-current-source),
-um sie jetzt auszuprobieren.
+### Neu in 0.10.2
 
 - `/pet on` verwandelt dein Terminal in einen animierten Wal, der zeigt, was der
   Agent gerade tut, während das Nachrichtenfeld weiter benutzbar bleibt. Seine
@@ -130,8 +126,8 @@ um sie jetzt auszuprobieren.
 - `/undo` macht deine gesamte letzte Anfrage in einem Schritt rückgängig,
   einschließlich jeder Datei, die sie geändert hat, und `/diff` funktioniert in
   Ordnern ohne Git.
-- Endet ein Plan mit offenen Schritten, fragt Codewhale, ob es Work mit Ask
-  oder Auto-Review starten oder weiterplanen soll.
+- Wenn ein Plan bereit ist, fragt Codewhale, ob es Work mit Ask oder
+  Auto-Review starten oder weiterplanen soll.
 - `/color` gibt jedem Chat eine eigene Farbe für das Nachrichtenfeld, die mit
   der Sitzung gespeichert wird.
 - `web_search` kann die neue Search API von DeepSeek verwenden: setze

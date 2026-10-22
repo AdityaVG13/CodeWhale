@@ -4011,7 +4011,7 @@ mod tests {
             let mut app = create_test_app();
             app.low_motion = true;
             app.fancy_animations = false;
-            app.transcript_spacing = TranscriptSpacing::Comfortable;
+            app.transcript_spacing = TranscriptSpacing::Spacious;
 
             for turn in 0..4 {
                 app.add_message(HistoryCell::User {

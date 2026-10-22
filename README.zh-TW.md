@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -96,10 +96,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
 
 ## 功能
 
-### 即將在 0.10.2 推出
-
-這些功能已合併到 `main`，但尚未包含在任何已發行的版本中；
-[建置 `main`](docs/INSTALL.md#test-and-contribute-to-current-source) 即可立即試用。
+### 0.10.2 新增內容
 
 - `/pet on` 會把你的終端機變成一隻動畫鯨魚，顯示代理正在做什麼，同時訊息框仍可照常使用。
   牠的 980 個粒子會以英文、中文或日文拼出目前的步驟。
@@ -107,7 +104,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
   也可以按 `Ctrl+N` 開啟你自己的 shell（macOS 與 Linux）。
 - `/undo` 一步就能還原你上一個完整的請求，包括它變更的每個檔案；`/diff` 也能在沒有 Git
   的資料夾中使用。
-- 計畫結束時若仍有未完成的步驟，Codewhale 會詢問你要以「詢問」還是「自動審核」開始 Work，
+- 當計畫準備就緒時，Codewhale 會詢問你要以「詢問」還是「自動審核」開始 Work，
   或是繼續規劃。
 - `/color` 會為每個對話設定各自的輸入框顏色，並隨工作階段一起儲存。
 - `web_search` 可以使用 DeepSeek 新推出的 Search API：在擁有 DeepSeek 金鑰的情況下設定

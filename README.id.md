@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -111,11 +111,7 @@ Lihat [panduan mode dan izin](docs/MODES.md) untuk detailnya.
 
 ## Apa yang bisa dilakukan
 
-### Hadir di 0.10.2
-
-Fitur-fitur ini sudah digabungkan ke `main` tetapi belum ada di rilis yang
-diterbitkan; [build `main`](docs/INSTALL.md#test-and-contribute-to-current-source)
-untuk mencobanya sekarang.
+### Baru di 0.10.2
 
 - `/pet on` mengubah terminal Anda menjadi paus animasi yang menunjukkan apa
   yang sedang dilakukan agen, sementara kotak pesan tetap aktif. 980 partikelnya
@@ -126,7 +122,7 @@ untuk mencobanya sekarang.
 - `/undo` membatalkan seluruh permintaan terakhir Anda dalam satu langkah,
   termasuk setiap berkas yang diubahnya, dan `/diff` berfungsi di folder tanpa
   Git.
-- Saat sebuah rencana berakhir dengan langkah yang belum selesai, Codewhale
+- Saat sebuah rencana sudah siap, Codewhale
   bertanya apakah akan memulai Work dengan Tanya atau Tinjauan otomatis, atau
   melanjutkan perencanaan.
 - `/color` memberi setiap obrolan warna kotak penulisan sendiri, yang disimpan

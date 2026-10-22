@@ -346,6 +346,11 @@ const DENSITY: &[SettingOption] = &[
     SettingOption::new("spacious", "", ""),
 ];
 
+const TRANSCRIPT_SPACING: &[SettingOption] = &[
+    SettingOption::new("compact", "", ""),
+    SettingOption::new("spacious", "", ""),
+];
+
 const TOOL_COLLAPSE: &[SettingOption] = &[
     SettingOption::new("compact", "", ""),
     SettingOption::new("expanded", "", ""),
@@ -687,8 +692,8 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     ),
     def(
         "transcript_spacing",
-        SettingKind::Enum(DENSITY),
-        "comfortable",
+        SettingKind::Enum(TRANSCRIPT_SPACING),
+        "spacious",
         ui(
             TAB_APPEARANCE,
             "display",

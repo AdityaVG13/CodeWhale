@@ -2,7 +2,7 @@
   "format": "codewhale.features.v1",
   "source": {
     "path": "docs/features.toml",
-    "sha256": "47ec08953b274e51d18ec9ed6055d265b0ebcc2b56edfe9cb52ba0af7f54005c"
+    "sha256": "fa0e52f5196f6caa02a7eb445ebd4c8e04989a9f46de4589833c69a5a00fe962"
   },
   "features": [
     {
@@ -972,7 +972,7 @@
       "status": "experimental",
       "surfaces": {
         "tui": "preview",
-        "api": "none",
+        "api": "preview",
         "web": "none"
       },
       "since": "0.10.1",

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -112,11 +112,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
 
 ## Что он умеет
 
-### Скоро в 0.10.2
-
-Эти изменения уже влиты в `main`, но ещё не вошли ни в один опубликованный
-релиз; чтобы попробовать их сейчас,
-[соберите `main`](docs/INSTALL.md#test-and-contribute-to-current-source).
+### Новое в 0.10.2
 
 - `/pet on` превращает терминал в анимированного кита, который показывает, чем
   занят агент, а поле сообщения при этом остаётся доступным. Его 980 частиц
@@ -126,8 +122,8 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
   вашу собственную оболочку (macOS и Linux).
 - `/undo` отменяет весь ваш последний запрос за один шаг, включая все
   изменённые им файлы, а `/diff` работает в папках без Git.
-- Когда план заканчивается невыполненными шагами, Codewhale спрашивает, начать
-  ли Work с Ask или Auto-Review или продолжить планирование.
+- Когда план готов, Codewhale спрашивает, начать ли Work с Ask или Auto-Review
+  или продолжить планирование.
 - `/color` задаёт каждому чату свой цвет поля ввода, который сохраняется вместе
   с сессией.
 - `web_search` может использовать новый Search API от DeepSeek: задайте

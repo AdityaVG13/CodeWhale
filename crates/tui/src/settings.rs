@@ -585,7 +585,7 @@ impl Default for Settings {
             composer_border: true,
             composer_multiline_mode: false,
             composer_vim_mode: "normal".to_string(),
-            transcript_spacing: "comfortable".to_string(),
+            transcript_spacing: "spacious".to_string(),
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
             sidebar_focus: "auto".to_string(),
@@ -2885,7 +2885,7 @@ fn normalize_composer_density(value: &str) -> &str {
 fn normalize_transcript_spacing(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "compact" | "tight" => "compact",
-        "comfortable" | "default" | "normal" => "comfortable",
+        "comfortable" | "default" | "normal" => "spacious",
         "spacious" | "loose" => "spacious",
         _ => value,
     }
@@ -3602,7 +3602,7 @@ mod tests {
             load_error: None,
             fancy_animations: true,
             show_tool_details: true,
-            transcript_spacing: "comfortable".to_string(),
+            transcript_spacing: "spacious".to_string(),
             ..Settings::default()
         }
     }
@@ -3634,13 +3634,13 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_use_comfortable_transcript_spacing() {
+    fn default_settings_use_spacious_transcript_spacing() {
         let settings = Settings::default();
         assert!(settings.calm_mode);
         assert!(!settings.show_tool_details);
         assert!(!settings.low_motion);
         assert!(settings.fancy_animations);
-        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert_eq!(settings.transcript_spacing, "spacious");
         assert_eq!(settings.tool_collapse_mode, "compact");
         // Thinking is opt-in so the transcript stays focused on the chat.
         assert!(!settings.show_thinking);
@@ -3859,7 +3859,7 @@ mod tests {
             "underwater presentation is the default"
         );
         assert!(!settings.low_motion);
-        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert_eq!(settings.transcript_spacing, "spacious");
     }
 
     #[test]

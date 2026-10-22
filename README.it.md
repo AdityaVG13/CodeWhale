@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -111,11 +111,7 @@ I dettagli sono nella [guida a modalità e permessi](docs/MODES.md).
 
 ## Cosa fa
 
-### In arrivo con la 0.10.2
-
-Queste funzioni sono già integrate in `main` ma non ancora in una release
-pubblicata; [compila `main`](docs/INSTALL.md#test-and-contribute-to-current-source)
-per provarle subito.
+### Novità della 0.10.2
 
 - `/pet on` trasforma il terminale in una balena animata che mostra cosa sta
   facendo l’agente, mentre la casella dei messaggi resta utilizzabile. Le sue
@@ -125,8 +121,8 @@ per provarle subito.
   shell tutta tua (macOS e Linux).
 - `/undo` annulla l’intera ultima richiesta in un solo passaggio, compreso ogni
   file che ha modificato, e `/diff` funziona nelle cartelle senza Git.
-- Quando un piano termina con passaggi ancora aperti, Codewhale chiede se avviare
-  Work con Ask o Auto-Review, oppure continuare a pianificare.
+- Quando un piano è pronto, Codewhale chiede se avviare Work con Ask o
+  Auto-Review, oppure continuare a pianificare.
 - `/color` dà a ogni chat un colore proprio per la casella dei messaggi, salvato
   con la sessione.
 - `web_search` può usare la nuova Search API di DeepSeek: imposta

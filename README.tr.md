@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -111,11 +111,7 @@ Ayrıntılar için [modlar ve izinler kılavuzuna](docs/MODES.md) bakın.
 
 ## Ne yapar
 
-### 0.10.2'de geliyor
-
-Bunlar `main` dalına birleştirildi ama henüz yayımlanmış bir sürümde yok; şimdi
-denemek için
-[`main` dalını derleyin](docs/INSTALL.md#test-and-contribute-to-current-source).
+### 0.10.2'deki yenilikler
 
 - `/pet on`, terminalinizi ajanın ne yaptığını gösteren hareketli bir balinaya
   dönüştürür; bu sırada mesaj kutusu kullanılabilir kalır. 980 parçacığı o anki
@@ -124,9 +120,8 @@ denemek için
   yazın ya da kendinize ait bir kabuk için `Ctrl+N` tuşuna basın (macOS ve Linux).
 - `/undo`, son isteğinizin tamamını, değiştirdiği her dosya dahil tek adımda geri
   alır; `/diff` de Git kullanılmayan klasörlerde çalışır.
-- Bir plan açık adımlarla bittiğinde Codewhale, Work'e Ask ile mi yoksa
-  Auto-Review ile mi başlanacağını ya da planlamaya devam edilip edilmeyeceğini
-  sorar.
+- Bir plan hazır olduğunda Codewhale, Work'e Ask ile mi yoksa Auto-Review ile mi
+  başlanacağını ya da planlamaya devam edilip edilmeyeceğini sorar.
 - `/color`, her sohbete oturumla birlikte kaydedilen kendi yazma kutusu rengini
   verir.
 - `web_search`, DeepSeek'in yeni Search API'sini kullanabilir: bir DeepSeek

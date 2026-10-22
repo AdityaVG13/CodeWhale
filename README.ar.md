@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -103,11 +103,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
 
 ## ما الذي يفعله
 
-### قادم في 0.10.2
-
-دُمجت هذه الميزات في `main` ولم تصدر في إصدار منشور بعد؛
-[ابنِ `main`](docs/INSTALL.md#test-and-contribute-to-current-source) لتجربتها
-الآن.
+### الجديد في 0.10.2
 
 - يحوّل `/pet on` طرفيتك إلى حوت متحرك يُظهر ما يفعله الوكيل، بينما يبقى مربع
   الرسائل قابلًا للاستخدام. وتكتب جسيماته البالغ عددها 980 الخطوة الحالية
@@ -116,8 +112,8 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
   إحداها، أو اضغط `Ctrl+N` لتفتح صدفة خاصة بك (macOS وLinux).
 - يتراجع `/undo` عن آخر طلب لك كاملًا في خطوة واحدة، بما في ذلك كل ملف غيّره،
   ويعمل `/diff` في المجلدات التي لا تستخدم Git.
-- عندما تنتهي خطة بخطوات مفتوحة، يسألك Codewhale هل تبدأ Work بإذن Ask أو
-  Auto-Review، أم تواصل التخطيط.
+- عندما تكون الخطة جاهزة، يسألك Codewhale هل تبدأ Work بإذن Ask أو Auto-Review،
+  أم تواصل التخطيط.
 - يمنح `/color` كل محادثة لونًا خاصًا بها لمربع الكتابة، ويُحفظ مع الجلسة.
 - يمكن أن يستخدم `web_search` واجهة Search API الجديدة من DeepSeek: اضبط
   `[search] provider = "deepseek"` مع مفتاح DeepSeek.

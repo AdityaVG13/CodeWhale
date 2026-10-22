@@ -409,9 +409,9 @@ pub fn oauth_provider_params(provider: OAuthProvider) -> &'static OAuthProviderP
 pub const ORCAROUTER_AUTH_BASE: &str = "https://www.orcarouter.ai";
 /// OrcaRouter's public inference/catalog origin.
 pub const ORCAROUTER_API_BASE: &str = "https://api.orcarouter.ai/v1";
-/// OrcaRouter has no client registration step: the public client id is a
-/// constant label, not a secret. PKCE — not a client secret — binds the auth
-/// code to this process.
+/// OrcaRouter's authorize contract carries no client id: this public label is
+/// a constant, not a secret. PKCE — not a client secret — binds the auth code
+/// to this process.
 pub const ORCAROUTER_CLIENT_ID: &str = "codewhale";
 /// Shown on the OrcaRouter consent screen.
 pub const ORCAROUTER_APP_NAME: &str = "Codewhale";
@@ -423,6 +423,8 @@ pub const ORCAROUTER_AUTHORIZE_PATH: &str = "auth";
 pub const ORCAROUTER_EXCHANGE_PATH: &str = "/api/v1/auth/keys";
 /// The scope this client asks for, and the only scope it accepts back.
 pub const ORCAROUTER_SCOPE: &str = "api";
+pub const ORCAROUTER_REF: &str = "ref_df843907ad10d887b867";
+pub const ORCAROUTER_APP_ID: Option<&str> = None;
 
 pub const ORCAROUTER_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
     display_name: "OrcaRouter",
@@ -430,13 +432,8 @@ pub const ORCAROUTER_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderP
     default_client_id: ORCAROUTER_CLIENT_ID,
     default_scopes: ORCAROUTER_SCOPE,
     env: OAuthEnvOverrides {
-        // Explicit overrides win over the shared fallback, which wins over the
-        // public default. See [`resolve_orcarouter_auth_base`].
-        issuer_vars: &[
-            "ORCA_AUTH_BASE_URL",
-            "ORCA_BASE_URL",
-            "ORCAROUTER_AUTH_BASE_URL",
-        ],
+        // Loopback HTTP fixtures only. See [`resolve_orcarouter_auth_base`].
+        issuer_vars: &["ORCA_AUTH_BASE_URL", "ORCAROUTER_AUTH_BASE_URL"],
         client_id_vars: &["ORCAROUTER_OAUTH_CLIENT_ID"],
         scope_vars: &["ORCAROUTER_OAUTH_SCOPE"],
         no_browser_var: "CODEWHALE_ORCAROUTER_OAUTH_NO_BROWSER",
@@ -447,7 +444,7 @@ pub const ORCAROUTER_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderP
     // OrcaRouter's authorize contract is built by
     // [`build_orcarouter_authorize_url`] instead.
     authorize_path: Some(""),
-    // Unused: the exchange is JSON-formatted by
+    // Unused: the exchange is form-encoded by
     // [`exchange_orcarouter_code`]. Kept empty so a future generic caller
     // cannot silently hit the wrong path.
     token_path: "",
@@ -467,18 +464,28 @@ pub const ORCAROUTER_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderP
 
 /// Resolve the OrcaRouter **authentication** origin.
 ///
-/// Precedence: an explicit auth override, then the shared self-hosted
-/// fallback, then the public default. The inference origin is never derived
-/// from this value.
+/// An override moves the origin only to plain HTTP on a loopback host, for
+/// local fixtures; any other value, HTTPS included, is ignored and the public
+/// default is used. The inference origin is never derived from this value.
 #[must_use]
 pub fn resolve_orcarouter_auth_base() -> String {
-    let first_set = |vars: &[&str]| {
-        vars.iter()
-            .filter_map(|var| std::env::var(var).ok())
-            .find(|value| !value.trim().is_empty())
-    };
-    let params = &ORCAROUTER_OAUTH_PARAMS;
-    first_set(params.env.issuer_vars).unwrap_or_else(|| ORCAROUTER_AUTH_BASE.to_string())
+    ORCAROUTER_OAUTH_PARAMS
+        .env
+        .issuer_vars
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| {
+            reqwest::Url::parse(value).is_ok_and(|url| {
+                url.scheme() == "http"
+                    && codewhale_config::device_code::validate_browser_verification_uri(
+                        url.as_str(),
+                        "OrcaRouter auth base",
+                    )
+                    .is_ok()
+            })
+        })
+        .unwrap_or_else(|| ORCAROUTER_AUTH_BASE.to_string())
 }
 
 /// Resolve the OrcaRouter **inference/catalog** origin.
@@ -621,7 +628,7 @@ impl OrcaLoginInputs {
 /// The OrcaRouter authorize URL.
 ///
 /// Deliberately NOT [`build_authorize_url`]: OrcaRouter's contract is
-/// `GET {auth}/auth?callback_url=…&code_challenge=…&code_challenge_method=S256&state=…&app_name=…&scope=api`.
+/// `GET {auth}/auth?callback_url=…&code_challenge=…&code_challenge_method=S256&state=…&app_name=…&scope=api[&app_id=…]&ref=…`.
 /// There is no `client_id`, no `response_type`, and the redirect parameter is
 /// named `callback_url` — three facts the generic builder gets wrong.
 pub fn build_orcarouter_authorize_url(
@@ -643,6 +650,10 @@ pub fn build_orcarouter_authorize_url(
         .append_pair("state", state)
         .append_pair("app_name", &inputs.app_name)
         .append_pair("scope", ORCAROUTER_SCOPE);
+    if let Some(app_id) = ORCAROUTER_APP_ID {
+        url.query_pairs_mut().append_pair("app_id", app_id);
+    }
+    url.query_pairs_mut().append_pair("ref", ORCAROUTER_REF);
     Ok(url.to_string())
 }
 
@@ -738,8 +749,8 @@ pub(crate) fn exchange_orcarouter_code(
 /// Bind the OrcaRouter loopback callback: always `127.0.0.1`, ephemeral port.
 ///
 /// OrcaRouter validates `http://127.0.0.1:<port>` (and `localhost`/`[::1]`)
-/// per request and has no pre-registered redirect URI, so a fresh port per
-/// attempt is correct rather than a conflict.
+/// per request, and a registered loopback callback matches any port, so a
+/// fresh port per attempt is correct rather than a conflict.
 pub fn bind_orcarouter_callback() -> Result<Vec<TcpListener>> {
     let params = &ORCAROUTER_OAUTH_PARAMS;
     let mut listeners = Vec::new();
@@ -2076,7 +2087,7 @@ pub(crate) fn start_auth_request_on(
 }
 
 // Allow time for browser authentication and 2FA, as in the MCP OAuth flow.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
+pub(crate) const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
 const CALLBACK_HTML_OK: &str = "<!doctype html><html><body><p>Signed in to Codewhale. You can close this tab.</p></body></html>";
 const CALLBACK_HTML_ERR: &str = "<!doctype html><html><body><p>Sign-in did not complete. You can close this tab and retry in Codewhale.</p></body></html>";
 
@@ -2094,13 +2105,66 @@ fn wait_for_callback_validated(
     expected_state: &str,
     expected_issuer: Option<&str>,
 ) -> Result<(String, Option<String>)> {
-    let deadline = Instant::now() + CALLBACK_TIMEOUT;
+    let Some(outcome) = wait_for_callback_outcome(
+        listeners,
+        params,
+        expected_state,
+        expected_issuer,
+        Instant::now() + CALLBACK_TIMEOUT,
+        &|| false,
+    )?
+    else {
+        bail!(
+            "{} sign-in timed out waiting for the browser callback",
+            params.display_name
+        );
+    };
+    accept_callback_with_client(expected_state, outcome)
+}
+
+pub(crate) enum OrcaCallback {
+    Code(String),
+    Declined,
+    Refused,
+    Stopped,
+}
+
+pub(crate) fn wait_for_orcarouter_callback(
+    listeners: &[TcpListener],
+    expected_state: &str,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<OrcaCallback> {
+    Ok(
+        match wait_for_callback_outcome(
+            listeners,
+            &ORCAROUTER_OAUTH_PARAMS,
+            expected_state,
+            None,
+            deadline,
+            cancelled,
+        )? {
+            None => OrcaCallback::Stopped,
+            Some(CallbackOutcome::Success { code, .. }) => OrcaCallback::Code(code),
+            Some(CallbackOutcome::Error { error, .. }) if error == "access_denied" => {
+                OrcaCallback::Declined
+            }
+            Some(CallbackOutcome::Error { .. }) => OrcaCallback::Refused,
+        },
+    )
+}
+
+fn wait_for_callback_outcome(
+    listeners: &[TcpListener],
+    params: &OAuthProviderParams,
+    expected_state: &str,
+    expected_issuer: Option<&str>,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<CallbackOutcome>> {
     loop {
-        if Instant::now() >= deadline {
-            bail!(
-                "{} sign-in timed out waiting for the browser callback",
-                params.display_name
-            );
+        if Instant::now() >= deadline || cancelled() {
+            return Ok(None);
         }
         // Whichever stack `localhost` resolved to for the browser is the one
         // that gets the connection; poll them all.
@@ -2114,7 +2178,7 @@ fn wait_for_callback_validated(
                         expected_issuer,
                         deadline,
                     ) {
-                        return accept_callback_with_client(expected_state, outcome);
+                        return Ok(Some(outcome));
                     }
                 }
                 Err(error)
@@ -8828,6 +8892,8 @@ consent_version = 1
         assert_eq!(form["state"], "state-1");
         assert_eq!(form["app_name"], ORCAROUTER_APP_NAME);
         assert_eq!(form["scope"], ORCAROUTER_SCOPE);
+        assert_eq!(form["ref"], ORCAROUTER_REF);
+        assert_eq!(form.get("app_id").map(|value| &**value), ORCAROUTER_APP_ID);
         assert!(!form.contains_key("client_id"), "no client id in the URL");
         assert!(
             !form.contains_key("client_secret"),

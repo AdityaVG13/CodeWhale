@@ -175,6 +175,32 @@
   padding-block-start: var(--space-6);
 }
 
+/* ---------- partner offer ---------- */
+.home-promo {
+  width: var(--container);
+  max-width: 1000px;
+  margin-inline: auto;
+  padding-block-start: var(--space-6);
+}
+.home-promo-card {
+  display: grid;
+  gap: var(--space-4) var(--space-6);
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  color: inherit;
+  text-decoration: none;
+  border-radius: var(--radius-surface);
+}
+.home-promo-card .figure-frame { display: block; }
+.home-promo-card .figure-frame img { display: block; width: 100%; height: auto; }
+.home-promo-text { display: grid; gap: var(--space-2); justify-items: start; }
+.home-promo-title { font-size: var(--text-body); font-weight: 600; color: var(--text); }
+.home-promo-body { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
+.home-promo-card:hover .section-link { text-decoration: underline; text-underline-offset: 0.2em; }
+@media (min-width: 900px) {
+  .home-promo-card { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+}
+
 /* ---------- paper: the reading sections ---------- */
 .home-body {
   width: var(--container);

@@ -51,9 +51,11 @@ quiet hours + digest, automation output routable
 to any paired channel, one pairing code bound inside the authenticated
 app, unbind revokes instantly.
 
-WeChat note: personal-WeChat automation is **not supported** —
-reverse-engineered protocols get users banned. Official 公众号/服务号 APIs
-are the only acceptable path and are still under assessment.
+WeChat note: personal WeChat is supported only through Tencent's official
+ClawBot (iLink) channel, never through unofficial account automation. The
+open-source `integrations/weixin-bridge` uses it with a local
+`codewhale serve --http`, and it stops when Tencent's risk control objects.
+Official Account (公众号/服务号) APIs are not used.
 
 ## Pointer
 

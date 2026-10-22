@@ -1377,6 +1377,7 @@ async fn build_test_server(
         shutdown: overrides.shutdown.clone().unwrap_or_default(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+        provider_connect: Default::default(),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let (owner_frontend, compatibility) = if let Some(socket) = overrides.owner_socket {
@@ -14055,7 +14056,10 @@ model = "local-model"
         // environment variable name. `credentialWritableReason` is
         // `skip_serializing_if = Option::is_none`, so it is absent for every
         // writable route and is asserted separately below when present.
+        // `browserConnect` is the same kind of fact as `credentialWritable`: a
+        // boolean that says the route has a sign-in flow the client can drive.
         let allowed_fields: std::collections::BTreeSet<_> = [
+            "browserConnect",
             "credentialSource",
             "credentialState",
             "credentialWritable",

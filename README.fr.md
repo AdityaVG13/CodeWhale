@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -115,12 +115,7 @@ Le [guide des modes et des permissions](docs/MODES.md) donne les détails.
 
 ## Ce qu’il fait
 
-### À venir dans la 0.10.2
-
-Ces changements sont fusionnés dans `main` mais ne figurent encore dans aucune
-version publiée ;
-[compilez `main`](docs/INSTALL.md#test-and-contribute-to-current-source) pour
-les essayer dès maintenant.
+### Nouveautés de la 0.10.2
 
 - `/pet on` transforme votre terminal en une baleine animée qui montre ce que
   fait l’agent, tandis que la zone de message reste utilisable. Ses
@@ -132,8 +127,8 @@ les essayer dès maintenant.
 - `/undo` annule toute votre dernière demande en une seule étape, y compris
   chaque fichier qu’elle a modifié, et `/diff` fonctionne dans les dossiers sans
   Git.
-- Quand un plan se termine avec des étapes en suspens, Codewhale demande s’il
-  faut lancer Work avec Ask ou Auto-Review, ou continuer à planifier.
+- Quand un plan est prêt, Codewhale demande s’il faut lancer Work avec Ask ou
+  Auto-Review, ou continuer à planifier.
 - `/color` donne à chaque conversation sa propre couleur de zone de saisie,
   enregistrée avec la session.
 - `web_search` peut utiliser la nouvelle Search API de DeepSeek : définissez

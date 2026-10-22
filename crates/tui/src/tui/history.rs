@@ -269,7 +269,7 @@ impl Default for TranscriptRenderOptions {
             calm_mode: false,
             low_motion: false,
             motion_mode: MotionMode::Full,
-            spacing: TranscriptSpacing::Comfortable,
+            spacing: TranscriptSpacing::Spacious,
             palette_mode: palette::PaletteMode::detect(),
             prose_measure: None,
         }

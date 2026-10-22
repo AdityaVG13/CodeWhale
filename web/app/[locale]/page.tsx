@@ -1,4 +1,5 @@
 import { Fragment } from "react";
+import Image from "next/image";
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { HeroInstall } from "@/components/hero-install";
@@ -10,6 +11,7 @@ import { TerminalCapture } from "@/components/terminal-capture";
 import { WhaleLive } from "@/components/whale-live";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
+import { PARTNER_PROMO } from "@/lib/content/partner-promo";
 import { RELEASE_HIGHLIGHTS } from "@/lib/content/release-highlights";
 import { fill, getChrome, getHome, pickText, splitToken } from "@/lib/i18n/dictionaries";
 import {
@@ -51,6 +53,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
   const sourceIsPublished = publishedRelease?.version === sourceVersion;
   const highlightsPublished = publishedRelease?.version === RELEASE_HIGHLIGHTS.version;
   const showHighlights = highlightsPublished || sourceVersion === RELEASE_HIGHLIGHTS.version;
+  const showPromo = Date.now() < Date.parse(PARTNER_PROMO.endsAt);
 
   // The install URL resolves published artifacts, so its structured version
   // must come from the published-release receipt rather than source-candidate
@@ -113,6 +116,30 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
         <span>{facts.license ?? "MIT"}</span>
       </div>
+
+      {showPromo && (
+        <section className="home-promo" aria-labelledby="home-promo-title">
+          <a href={PARTNER_PROMO.href} rel="sponsored" className="home-promo-card">
+            <span className="figure-frame">
+              <Image
+                src={PARTNER_PROMO.image.src}
+                alt=""
+                width={PARTNER_PROMO.image.width}
+                height={PARTNER_PROMO.image.height}
+                unoptimized
+              />
+            </span>
+            <span className="home-promo-text">
+              <span className="home-promo-title" id="home-promo-title">{PARTNER_PROMO.title}</span>
+              <span className="home-promo-body">{pickText(PARTNER_PROMO.body, locale)}</span>
+              <span className="section-link">
+                {pickText(PARTNER_PROMO.cta, locale)}
+                <Icon name="external" />
+              </span>
+            </span>
+          </a>
+        </section>
+      )}
 
       <figure className="home-terminal figure">
         <div className="figure-frame" dir="ltr">

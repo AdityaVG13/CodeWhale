@@ -199,7 +199,6 @@ pub(crate) fn show_single_setting(app: &App, key: &str) -> ConfigReply {
     fn spacing_display(s: crate::tui::app::TranscriptSpacing) -> &'static str {
         match s {
             crate::tui::app::TranscriptSpacing::Compact => "compact",
-            crate::tui::app::TranscriptSpacing::Comfortable => "comfortable",
             crate::tui::app::TranscriptSpacing::Spacious => "spacious",
         }
     }

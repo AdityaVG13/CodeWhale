@@ -2152,6 +2152,50 @@ Runtime 的提供商或模型默认值。
 并且永不解析密钥、环境变量值或认证命令。它是一个
 类别，永不是一个值、一个路径或一个环境变量名。
 
+### `POST /v1/providers/orcarouter/connect` —— 无终端的浏览器登录
+
+```json
+// 响应
+{ "attemptId": "0f3c…", "authorizeUrl": "https://www.orcarouter.ai/auth?…",
+  "expiresIn": 900 }
+```
+
+为没有终端的客户端运行与 `codewhale auth orcarouter` 相同的 OrcaRouter
+OAuth 2.0 + PKCE 登录。Engine 绑定自己的回环回调
+（`http://127.0.0.1:<port>/callback`），返回授权页 URL，并在后台最多等待
+`expiresIn` 秒。客户端在系统浏览器（绝不是内嵌视图）中打开 `authorizeUrl`
+并轮询该次尝试。浏览器回调后，Engine 交换授权码，拒绝授予 scope 不是 `api`
+的 key，经与 CLI 相同的入口保存 key，再像 `PUT /v1/providers/{id}/key` 一样把
+凭据标记同步到运行中的配置。它不会切换当前提供商；请用
+`POST /v1/providers/{id}/switch`。
+
+回调监听在 Engine 所在的计算机上，因此客户端只应在 Engine 与浏览器位于同一台
+计算机时提供此路由。新的 `POST` 会取消上一次尝试，且只能读取当前尝试。拒绝情况：
+id 不是 `orcarouter` 为 `400`；该路由凭据不可写为 `409`（理由与
+`credentialWritableReason` 相同）；无法绑定回调为 `500`。`GET /v1/providers`
+会在支持此路由的条目上标注 `"browserConnect": true`；否则以及在没有此路由的
+Engine 上不出现该字段。
+
+### `GET /v1/providers/orcarouter/connect/{attemptId}` 与 `DELETE …` —— 状态与取消
+
+```json
+{ "attemptId": "0f3c…", "status": "failed", "reason": "key_not_saved" }
+```
+
+`status` 为 `waiting`、`connected`、`declined`（用户在浏览器中拒绝）、
+`expired`（未按时回调）、`cancelled` 或 `failed`。`failed` 附带 `reason`：
+`authorization_error`（浏览器带回其他错误）、`callback_failed`、
+`not_writable`（交换前该路由凭据已不可写；未创建 key）、`exchange_failed`、
+`scope_refused` 或 `key_not_saved`。出现 `scope_refused` 或 `key_not_saved`
+时，OrcaRouter 已创建了一个 Codewhale 未保存的 key，用户应在 OrcaRouter 的
+Authorized Apps 中撤销它。`exchange_failed` 也可能发生在 OrcaRouter 已创建
+key 但响应丢失之后。
+
+`DELETE` 取消仍在等待浏览器的尝试。交换一旦开始，key 可能已经存在，因此该尝试
+会继续，并报告 `connected`，或带 `key_not_saved` 的 `failed`；此时 `DELETE`
+返回当前状态。未知或已被取代的 `attemptId` 为 `404`。只有 `POST` 响应携带授权页
+URL；任何状态、错误或日志都不携带它、key、授权码或 verifier。
+
 ### `POST /v1/providers/{id}/switch`
 
 ```json

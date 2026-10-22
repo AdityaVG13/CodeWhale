@@ -27,7 +27,7 @@ PAGE = REPO / "crates" / "tui" / "src" / "runtime_web" / "orca-evidence.html"
 
 CATALOG_SOURCE = "https://api.orcarouter.ai/v1/models?capability=chat"
 EXCHANGE_PATH = "/api/v1/auth/keys"
-CHAT_ENDPOINT_TYPES = {"openai", "anthropic", "gemini", "openai-response"}
+CHAT_ENDPOINT_TYPES = {"openai"}
 # The exact masked placeholder the settings page renders; not a credential.
 MASKED_KEY = "sk-orca-\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
 
@@ -150,25 +150,27 @@ def main() -> int:
     if models is not None:
         check(len(models) > 0, "the live chat roster is non-empty")
         image = 0
+        served = []
         for model in models:
             if not isinstance(model, dict):
                 continue
             declared = model.get("supported_endpoint_types")
-            # A row that names its dialects must name a chat one. A row that
-            # names none is left to the client's fail-closed filter
-            # (`orcarouter_row_is_chat`), which drops it from the picker rather
-            # than serving it as text. The gateway does not guarantee every
-            # `?capability=chat` row carries the field.
-            if declared:
-                check(bool(set(declared) & CHAT_ENDPOINT_TYPES),
-                      f"chat row {model.get('id')} declares a chat endpoint type")
+            # Rows that do not advertise Chat Completions are skipped, not
+            # failed: the client's fail-closed filter (`orcarouter_row_is_chat`)
+            # keeps them out of the picker, and the gateway's `?capability=chat`
+            # listing includes rows offered only on other dialects.
+            if not declared or not set(declared) & CHAT_ENDPOINT_TYPES:
+                continue
+            served.append(model)
             modalities = (model.get("architecture") or {}).get(
                 "input_modalities") or []
             if "image" in modalities:
                 image += 1
-        print(f"[contract] live catalog: {len(models)} chat rows, {image} image-input")
+        check(len(served) > 0, "the live roster has Chat Completions rows")
+        print(f"[contract] live catalog: {len(models)} listed, {len(served)} Chat Completions, "
+              f"{len(models) - len(served)} skipped, {image} image-input")
         if os.environ.get("ORCAROUTER_API_KEY", "").strip():
-            for model in models:
+            for model in served:
                 status = live_chat_status(model)
                 if status is None:
                     break

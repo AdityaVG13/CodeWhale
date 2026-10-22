@@ -918,26 +918,47 @@ enum EngineHostSetup {
     Rlm(rlm_host::RlmHostSetup),
 }
 
-/// Rewrite the text of every tool result in `message`, including text
-/// content blocks, with `redact`.
-pub(crate) fn redact_tool_result_blocks(message: &mut Message, redact: impl Fn(&str) -> String) {
+/// Rewrite the text of every tool result and tool-call input in `message`,
+/// including text content blocks, with `redact`.
+pub(crate) fn redact_tool_blocks(message: &mut Message, redact: impl Fn(&str) -> String) {
     for block in &mut message.content {
-        let ContentBlock::ToolResult {
-            content,
-            content_blocks,
-            ..
-        } = block
-        else {
-            continue;
-        };
-        *content = redact(content);
-        for value in content_blocks.iter_mut().flatten() {
-            if value.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                && let Some(serde_json::Value::String(text)) = value.get_mut("text")
-            {
-                *text = redact(text);
+        match block {
+            ContentBlock::ToolResult {
+                content,
+                content_blocks,
+                ..
+            } => {
+                *content = redact(content);
+                for value in content_blocks.iter_mut().flatten() {
+                    if value.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && let Some(serde_json::Value::String(text)) = value.get_mut("text")
+                    {
+                        *text = redact(text);
+                    }
+                }
+            }
+            ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => {
+                redact_json_strings(input, &redact);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn redact_json_strings(value: &mut serde_json::Value, redact: &impl Fn(&str) -> String) {
+    match value {
+        serde_json::Value::String(text) => *text = redact(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_strings(value, redact);
             }
         }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_json_strings(value, redact);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -4715,13 +4736,15 @@ impl Engine {
         self.emit_session_updated().await;
     }
 
-    /// Scrub credentials from tool output once, as it enters the transcript
-    /// (B1). The transcript is what session JSON, the journal and every
-    /// later request are built from, so a token a tool printed is never
-    /// written to disk live. Honors the confirmed `[redaction] model_bound`
-    /// opt-out the same way the request boundary does.
+    /// Scrub credentials from tool output and tool-call input once, as it
+    /// enters the transcript (B1). The transcript is what session JSON, the
+    /// journal and every later request are built from, so a token a tool
+    /// printed — or one a tool was *given* in its arguments — is never written
+    /// to disk live. Unlike the request boundary this does not honor the
+    /// `[redaction] model_bound` opt-out: that opt-out exists so the model can
+    /// quote file bytes back for exact edits, never to relax storage.
     fn redact_tool_results_for_transcript(&self, message: &mut Message) {
-        redact_tool_result_blocks(message, |text| self.redact_tool_output_for_transcript(text));
+        redact_tool_blocks(message, |text| self.redact_tool_output_for_transcript(text));
     }
 
     fn redact_tool_output_for_transcript(&self, text: &str) -> String {

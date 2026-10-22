@@ -174,14 +174,19 @@ impl CommandSpec {
         self
     }
 
-    /// Add environment variables for this command.
+    /// Add environment variables without discarding shell defaults.
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
-        self.env = env;
+        for (key, value) in env {
+            self = self.with_env_var(&key, &value);
+        }
         self
     }
 
     /// Add a single environment variable.
     pub fn with_env_var(mut self, key: &str, value: &str) -> Self {
+        #[cfg(windows)]
+        self.env
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(key));
         self.env.insert(key.to_string(), value.to_string());
         self
     }
@@ -1074,6 +1079,26 @@ mod tests {
         ));
         assert_eq!(spec.env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(spec.justification, Some("Testing".to_string()));
+
+        let spec = spec
+            .with_env(HashMap::new())
+            .with_env(HashMap::from([("SECOND".to_string(), "added".to_string())]));
+        assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(spec.env.get("SECOND").map(String::as_str), Some("added"));
+        let spec = spec.with_env(HashMap::from([("FOO".to_string(), "override".to_string())]));
+        assert_eq!(spec.env.get("FOO").map(String::as_str), Some("override"));
+        #[cfg(windows)]
+        {
+            let spec = spec.with_env(HashMap::from([(
+                "foo".to_string(),
+                "lowercase".to_string(),
+            )]));
+            assert!(!spec.env.contains_key("FOO"));
+            assert_eq!(spec.env.get("foo").map(String::as_str), Some("lowercase"));
+            let spec = spec.with_env_var("FOO", "uppercase");
+            assert!(!spec.env.contains_key("foo"));
+            assert_eq!(spec.env.get("FOO").map(String::as_str), Some("uppercase"));
+        }
     }
 
     #[test]

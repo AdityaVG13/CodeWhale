@@ -724,7 +724,7 @@ id = "orcarouter-sign-in"
 name = "Sign in with OrcaRouter"
 summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
 status = "experimental"
-surfaces = { tui = "preview", api = "none", web = "none" }
+surfaces = { tui = "preview", api = "preview", web = "none" }
 since = "0.10.1"
 docs = "docs/PROVIDERS.md"
 owner = "crates/tui/src/oauth.rs"

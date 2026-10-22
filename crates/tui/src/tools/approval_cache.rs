@@ -408,6 +408,22 @@ pub(crate) fn computer_use_user_gate(
     })
 }
 
+/// Whether this call exists only to carry a person's own answer: Computer Use
+/// consent, a consent revoke, or an app script. A posture may supply an
+/// allowance, but it can never supply an answer.
+#[must_use]
+pub(crate) fn computer_use_human_decision_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp_")
+        && [
+            "_consent",
+            "_consent_allow",
+            "_consent_revoke",
+            "_app_script",
+        ]
+        .iter()
+        .any(|suffix| tool_name.ends_with(suffix))
+}
+
 /// The inner tool of the first `run_actions` step that would need a human
 /// decision (K1 / K2). Computer Use `run_actions` accepts any plugin tool name
 /// as a step — including the unlisted `consent_allow` / `consent_revoke` and

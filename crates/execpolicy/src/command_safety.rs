@@ -382,12 +382,23 @@ pub fn prefix_allow_matches(pattern: &str, command: &str) -> bool {
 
     // Fallback: normalised exact match for patterns not in the arity table
     // (e.g. exact-match rules like `"ls -la"` that lack a dictionary entry).
+    // A prefix grant never covers a compound or expansion-bearing command: the
+    // allow is for one inert invocation, so a shell operator fails closed here
+    // rather than depending on the caller having classified it first.
     let command_norm: String = command
         .trim()
         .to_ascii_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    if command_norm.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\n' | '\r'
+        )
+    }) {
+        return false;
+    }
     command_norm == pattern_norm || command_norm.starts_with(&format!("{pattern_norm} "))
 }
 

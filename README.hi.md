@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -106,11 +106,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
 
 ## यह क्या करता है
 
-### 0.10.2 में आ रहा है
-
-ये बदलाव `main` में मर्ज हो चुके हैं, पर अभी किसी प्रकाशित रिलीज़ में नहीं हैं; इन्हें
-अभी आज़माने के लिए
-[`main` बिल्ड करें](docs/INSTALL.md#test-and-contribute-to-current-source)।
+### 0.10.2 में नया
 
 - `/pet on` आपके टर्मिनल को एक एनिमेटेड व्हेल में बदल देता है, जो दिखाती है कि एजेंट
   क्या कर रहा है, और इस दौरान संदेश बॉक्स चालू रहता है। इसके 980 कण मौजूदा कदम को
@@ -119,8 +115,8 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
   किसी में टाइप करें, या अपना खुद का शेल खोलने के लिए `Ctrl+N` दबाएँ (macOS और Linux)।
 - `/undo` आपका पूरा पिछला अनुरोध एक ही कदम में वापस करता है, उससे बदली गई हर फ़ाइल
   समेत, और `/diff` बिना Git वाले फ़ोल्डरों में भी काम करता है।
-- जब कोई प्लान खुले कदमों के साथ खत्म होता है, तो Codewhale पूछता है कि Work को Ask
-  या Auto-Review के साथ शुरू करें, या प्लानिंग जारी रखें।
+- जब कोई प्लान तैयार होता है, तो Codewhale पूछता है कि Work को Ask या Auto-Review
+  के साथ शुरू करें, या प्लानिंग जारी रखें।
 - `/color` हर चैट के कंपोज़र को उसका अपना रंग देता है, जो सेशन के साथ सहेजा जाता है।
 - `web_search` DeepSeek के नए Search API का इस्तेमाल कर सकता है: DeepSeek कुंजी के
   साथ `[search] provider = "deepseek"` सेट करें।

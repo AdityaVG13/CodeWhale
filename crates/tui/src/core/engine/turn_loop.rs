@@ -2469,19 +2469,25 @@ impl Engine {
 
             // Consent is an exact human decision, never a standing grant or
             // autonomous approval. Keep existing hard blocks authoritative.
+            // Ask and Full Access both have a person at the card; Auto-Review
+            // and Never do not, and keep failing closed.
             if blocked_error.is_none()
                 && crate::tools::approval_cache::computer_use_user_gate(&tool_name, &tool_input)
                     .is_some()
             {
-                if batch_approval_mode == ApprovalMode::Suggest {
+                if matches!(
+                    batch_approval_mode,
+                    ApprovalMode::Suggest | ApprovalMode::Bypass
+                ) {
                     approval_required = true;
                     approval_force_prompt = true;
                 } else {
                     approval_required = false;
                     approval_force_prompt = false;
-                    blocked_error = Some(ToolError::permission_denied(
-                        "Computer Use consent, scripting and registration require the user's exact approval in Ask posture.".to_string()
-                    ));
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "Computer Use consent, scripting and registration need the user's own answer, and the current {} posture has no one to ask. Switch to Ask or Full Access to review it.",
+                        batch_approval_mode.permission_chip_label()
+                    )));
                 }
             }
 

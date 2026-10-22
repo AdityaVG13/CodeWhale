@@ -19470,7 +19470,7 @@ impl RuntimeThreadManager {
         {
             let mut messages = engine.get_session_snapshot().await?.messages;
             for message in &mut messages {
-                crate::core::engine::redact_tool_result_blocks(message, |text| {
+                crate::core::engine::redact_tool_blocks(message, |text| {
                     crate::client::redact_model_bound_text(text, &receipt_secrets)
                 });
             }

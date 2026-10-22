@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:30c9b9765b04 -->
+<!-- source: README.md sha256:182e239fcdf7 -->
 <div align="center">
 
 <picture>
@@ -100,10 +100,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
 
 ## 主な機能
 
-### 0.10.2 で登場予定
-
-これらは `main` にマージ済みですが、まだ公開リリースには含まれていません。
-今すぐ試すには [`main` をビルド](docs/INSTALL.md#test-and-contribute-to-current-source)してください。
+### 0.10.2 の新機能
 
 - `/pet on` は、ターミナルをアニメーションのクジラに変え、エージェントが何をしているかを見せます。その間もメッセージ入力欄はそのまま使えます。
   980 個の粒子が、現在のステップを英語、中国語、日本語のいずれかで描き出します。
@@ -111,7 +108,7 @@ codewhale exec --auto --sandbox workspace-write "fix the failing tests and expla
   そこに入力することも、`Ctrl+N` で自分用のシェルを開くこともできます（macOS と Linux）。
 - `/undo` は、直前のリクエスト全体を、変更したすべてのファイルを含めて 1 回で元に戻します。
   また、`/diff` は Git のないフォルダーでも使えます。
-- 計画が未完了のステップを残して終わると、Codewhale は「確認」と「自動レビュー」のどちらで Work を始めるか、それとも計画を続けるかを尋ねます。
+- 計画の準備ができたら、Codewhale は「確認」と「自動レビュー」のどちらで Work を始めるか、それとも計画を続けるかを尋ねます。
 - `/color` は、チャットごとに入力欄の色を設定し、セッションとともに保存します。
 - `web_search` で DeepSeek の新しい Search API を使えます。
   DeepSeek のキーを用意して `[search] provider = "deepseek"` を設定してください。

@@ -208,6 +208,7 @@
             description: "detail".to_string(),
             path: path.map(str::to_string),
             line,
+            ..Default::default()
         }
     }
 
@@ -234,7 +235,7 @@
             summary: "summary".to_string(),
             issues,
             suggestions,
-            overall_assessment: String::new(),
+            ..Default::default()
         }
     }
 

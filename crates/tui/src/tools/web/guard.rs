@@ -62,12 +62,35 @@ pub(crate) fn is_restricted_ip(ip: &IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_restricted_ip(&IpAddr::V4(v4));
             }
+            // A NAT64 gateway reaches the embedded IPv4 target, so the prefix
+            // must not hide a restricted address.
+            if let Some(v4) = nat64_ipv4(*v6)
+                && is_restricted_ip(&IpAddr::V4(v4))
+            {
+                return true;
+            }
             v6.is_loopback()
                 || v6.is_multicast()
                 || matches!(v6.segments(), [0xfc00..=0xfdff, ..]) // ULA fc00::/7
                 || matches!(v6.segments(), [0xfe80..=0xfebf, ..]) // Link-local fe80::/10
+                || matches!(v6.segments(), [0xfec0..=0xfeff, ..]) // Site-local fec0::/10
+                || matches!(v6.segments(), [0x2002, ..]) // 6to4 2002::/16
+                || matches!(v6.segments(), [0x2001, 0x0000, ..]) // Teredo 2001::/32
+                || matches!(v6.segments(), [0, 0, 0, 0, 0, 0, ..]) // IPv4-compatible ::a.b.c.d
         }
     }
+}
+
+/// The IPv4 target of a well-known-prefix NAT64 address (`64:ff9b::/96`).
+fn nat64_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let segments = v6.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6].iter().all(|s| *s == 0) {
+        let octets = v6.octets();
+        return Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
 }
 
 /// Validate that `url` is a safe fetch target under SSRF and network policy.

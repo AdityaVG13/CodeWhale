@@ -60,6 +60,7 @@ pub mod review_core;
 pub(crate) mod review_host;
 pub mod review_hunks;
 pub(crate) mod review_pr;
+pub mod review_triage;
 pub mod rlm;
 pub mod run_tool;
 pub mod runtime_mcp;
