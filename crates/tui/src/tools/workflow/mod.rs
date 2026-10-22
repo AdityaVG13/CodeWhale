@@ -12110,6 +12110,7 @@ FINAL RECEIPT
                     workflow_task_label: None,
                     workflow_child_index: None,
                     fleet_receipt: None,
+                    queue_ticket: None,
                 })),
             )
         }
@@ -12132,6 +12133,7 @@ FINAL RECEIPT
                 workflow_goal: Some("ship it".to_string()),
                 source_path: Some(PathBuf::from("/ws/flow.json")),
                 token_budget: Some(1_000),
+                max_concurrent: None,
             },
         ));
         // Two dispatches, one shared workspace: the hoist dedupes.

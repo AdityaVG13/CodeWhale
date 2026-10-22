@@ -1073,26 +1073,6 @@ impl ReadFileTool {
                 "Navigation reference for {path_str} is stale. Read the path without the old range/expected_revision to obtain a new reference; do not reuse its offsets."
             )));
         }
-        // Admission and current-byte revision checks precede every cache hit.
-        // Shared physical knowledge does not grant access or delivery state.
-        let cached_navigation = if let Some((namespace, path)) = &cache_identity {
-            context
-                .runtime
-                .code_observations
-                .lock()
-                .await
-                .get_json_named(namespace, path)
-                .cloned()
-                .and_then(|value| {
-                    serde_json::from_value::<crate::tools::echolocation::SourceNavigation>(value)
-                        .ok()
-                })
-                .filter(|navigation| {
-                    navigation.matches(path, source_revision.as_deref().unwrap_or_default())
-                })
-        } else {
-            None
-        };
         // Count and select with byte boundaries, without a pointer per newline.
         let line_count = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
         let requested_offset = offset.unwrap_or(1);

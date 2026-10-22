@@ -8302,10 +8302,6 @@ fn enabled_agent_surface_options() -> AgentToolSurfaceOptions {
     options
 }
 
-/// Return the exact model-visible catalog built for a default General child.
-///
-/// Request-boundary tests use this fixture so Moonshot compatibility coverage
-/// cannot drift into a hand-maintained approximation of the child surface.
 #[test]
 fn deferred_agent_and_workflow_are_discoverable_by_name() {
     // Diet regression: deferral must never strand the tools. The real
@@ -8349,7 +8345,9 @@ fn deferred_agent_and_workflow_are_discoverable_by_name() {
         ("agent", "regex", "agent"),
         ("workflow", "regex", "workflow"),
         ("spawn subagent worker", "bm25", "agent"),
-        ("spawn subagent worker", "bm25", "workflow"),
+        // The bounded toolbox need not admit both delegation schemas for
+        // one broad query. Each capability must load for its own intent.
+        ("workflow ordered phases", "bm25", "workflow"),
     ] {
         let mut active = HashSet::new();
         let mut cache = ToolActivationCache::default();
@@ -8376,6 +8374,10 @@ fn deferred_agent_and_workflow_are_discoverable_by_name() {
     }
 }
 
+/// Return the exact model-visible catalog built for a default General child.
+///
+/// Request-boundary tests use this fixture so Moonshot compatibility coverage
+/// cannot drift into a hand-maintained approximation of the child surface.
 pub(crate) fn kimi_general_child_request_tools_fixture() -> Vec<Tool> {
     let tmp = tempdir().expect("tempdir");
     let mut runtime =
@@ -8527,16 +8529,25 @@ fn small_surface_starts_with_core_tools_and_discoverable_goal_control() {
         .map(str::to_string)
         .collect()
     );
-    // The delegation and goal controls still exist — deferred, not deleted.
-    for deferred_name in ["agent", "workflow", "get_goal", "update_goal"] {
+    // Delegation and goal inspection remain discoverable. Root goal
+    // mutation belongs to the parent, not to this child.
+    for deferred_name in ["agent", "workflow", "get_goal"] {
         assert_eq!(
             surface
-                .catalog
+                .catalog()
                 .iter()
                 .find(|tool| tool.name == deferred_name)
                 .and_then(|tool| tool.defer_loading),
             Some(true),
             "{deferred_name} must stay discoverable"
+        );
+    }
+    for root_mutator in ["create_goal", "update_goal"] {
+        assert!(
+            !surface
+                .catalog()
+                .iter()
+                .any(|tool| tool.name == root_mutator)
         );
     }
     let strict = surface.request_tools(surface.catalog().to_vec(), true);
@@ -8821,8 +8832,8 @@ fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
         synthetic_eager_tool(TOOL_SEARCH_NAME),
     ];
     let warm = ["agent".to_string()];
-    let mut first = SubAgentToolSurface::new(catalog.clone(), &warm);
-    let mut second = SubAgentToolSurface::new(catalog.clone(), &warm);
+    let mut first = ChildSurfaceProbe::new(catalog.clone(), &warm);
+    let mut second = ChildSurfaceProbe::new(catalog.clone(), &warm);
     let first_wire = model_request_tools(&mut first);
     let second_wire = model_request_tools(&mut second);
     let first_json = crate::prompt_zones::wire_tool_catalog_json(&first_wire).expect("serializes");
@@ -8830,7 +8841,7 @@ fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
         crate::prompt_zones::wire_tool_catalog_json(&second_wire).expect("serializes");
     assert_eq!(first_json, second_json, "same catalog plus same names");
     assert!(first_wire.iter().any(|tool| tool.name == "agent"));
-    let mut cold = SubAgentToolSurface::new(catalog, &[]);
+    let mut cold = ChildSurfaceProbe::new(catalog, &[]);
     let cold_wire = model_request_tools(&mut cold);
     let cold_json = crate::prompt_zones::wire_tool_catalog_json(&cold_wire).expect("serializes");
     assert_ne!(cold_json, first_json, "warming must change the wire block");
@@ -8880,8 +8891,9 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
         .push(synthetic_deferred_tool("oversized", 17 * 1024));
     assert!(first.hydrate("oversized", &json!({})).is_err());
 
+    // Two schemas fit the 16 KiB budget; the third must be held.
     let mut byte_catalog = (0..3)
-        .map(|index| synthetic_deferred_tool(&format!("bytes_{index}"), 9 * 1024))
+        .map(|index| synthetic_deferred_tool(&format!("bytes_{index}"), 6 * 1024))
         .collect::<Vec<_>>();
     ensure_advanced_tooling(
         &mut byte_catalog,
@@ -8902,14 +8914,8 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
 #[tokio::test]
 async fn small_surface_successful_cached_use_touches_lru() {
     let registry = small_surface_registry(FleetRole::Builder);
-    let mut catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
-    // Exercise the LRU with a deliberately deferred read-only fixture tool;
-    // production goal controls are eager and must not consume cache slots.
-    catalog
-        .iter_mut()
-        .find(|tool| tool.name == "get_goal")
-        .expect("goal read fixture")
-        .defer_loading = Some(true);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
+    // Exercise the LRU with deferred goal inspection, not root mutation.
     let mut others = catalog
         .iter()
         .filter(|tool| tool.defer_loading == Some(true) && tool.name != "get_goal")
@@ -8930,6 +8936,11 @@ async fn small_surface_successful_cached_use_touches_lru() {
 
 #[test]
 fn small_surface_depth_cap_removes_only_agent() {
+    let baseline = small_surface_registry(FleetRole::Builder);
+    let mut expected = model_tool_names(baseline.deferred_catalog_for_model(&FleetRole::Builder));
+    assert!(expected.remove("agent"));
+    assert!(expected.contains("get_goal") && expected.contains("workflow"));
+
     let mut runtime =
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
     runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
@@ -8941,30 +8952,11 @@ fn small_surface_depth_cap_removes_only_agent() {
         crate::tools::todo::new_shared_todo_list(),
         crate::tools::plan::new_shared_plan_state(),
     );
-    let mut surface = ChildSurfaceProbe::new(
-        registry.deferred_catalog_for_model(&FleetRole::Builder),
-        &[],
-    );
-    // Token diet: the depth cap still removes only agent; get_goal and
-    // workflow are absent from the head by deferral, not by depth.
+    // Compare the entire catalog, not just its eager head: deferral must
+    // not hide an unrelated tool disappearing at the depth boundary.
     assert_eq!(
-        model_tool_names(model_request_tools(&mut surface)),
-        [
-            "bash",
-            "edit",
-            "file_search",
-            "get_goal",
-            "load_skill",
-            "read",
-            "task_shell_wait",
-            "todo_write",
-            "tool_search",
-            "workflow",
-            "write"
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+        model_tool_names(registry.deferred_catalog_for_model(&FleetRole::Builder)),
+        expected
     );
 }
 

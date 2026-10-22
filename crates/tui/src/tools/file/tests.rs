@@ -123,7 +123,7 @@ async fn contract_read_miss_echoes_parent_mates_on_not_found() {
         .await
         .expect_err("typo'd path must fail");
     match error {
-        ToolError::ExecutionFailed { message } => {
+        ToolError::ExecutionFailed { message, .. } => {
             assert!(message.contains("Failed to read"), "{message}");
             assert!(message.contains("[Miss echo: "), "{message}");
             assert!(message.contains("alpha.rs"), "{message}");

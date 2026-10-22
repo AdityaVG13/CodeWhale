@@ -1610,7 +1610,7 @@ fn execute_tool_search_inner(
         json!({
             "type": "unavailable_tool_reference",
             "tool_name": name,
-            "reason": "The tool schema exceeds the bounded conversation toolbox (8 cached tools, 24KiB of added serialized schemas). Narrow the search or use a smaller matching tool."
+            "reason": "The tool schema exceeds the bounded conversation toolbox (8 cached tools, 16KiB of added serialized schemas). Narrow the search or use a smaller matching tool."
         })
     }));
     unavailable_references.extend(cache_held.iter().map(|name| {
