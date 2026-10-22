@@ -1078,7 +1078,7 @@ pub struct Engine {
     /// same-route child can extend the parent's cached prefix. Safe as
     /// a session-lifetime cell: turns run strictly one at a time, so it
     /// always holds the latest request of the running turn.
-    live_header: crate::prompt_zones::SharedLiveHeader,
+    live_header: crate::prompt_zones::SharedLiveHeader<crate::route_receipt::TurnRouteReceipt>,
     active_route_limits: Option<codewhale_config::route::RouteLimits>,
     active_route_capabilities: codewhale_config::route::RouteCapabilities,
     /// The endpoint the current client was built from: base URL, endpoint
@@ -4581,7 +4581,13 @@ impl Engine {
 
     async fn emit_session_updated(&self) {
         if let Some(job) = self.child_job()
-            && let Err(error) = job.project(&self.session.messages, job.steps()).await
+            && let Err(error) = job
+                .project(
+                    &self.session.messages,
+                    job.steps(),
+                    self.session.system_prompt.as_ref(),
+                )
+                .await
         {
             self.cancel_token.cancel();
             tracing::error!(%error, "child Session projection failed; turn stopped");
@@ -5793,8 +5799,8 @@ impl Engine {
                 tool_context.clone(),
                 self.tx_subagent_completion.clone(),
                 SubAgentForkContext {
+                    live_header: crate::prompt_zones::new_live_header_cell(),
                     messages: self.messages_with_turn_metadata(),
-                    live_header: Arc::clone(&self.live_header),
                     structured_state_block: None,
                     work_source: Some(self.todo_source()),
                 },
@@ -6146,6 +6152,18 @@ impl Engine {
         );
         if let Some(child) = self.child_host.as_ref() {
             Self::narrow_child_surface(&child.authority, &mut surface);
+            let prefix = &child.fork_cache_prefix;
+            surface.catalog.sort_by_key(|tool| {
+                prefix
+                    .iter()
+                    .position(|name| name == &tool.name)
+                    .unwrap_or(prefix.len())
+            });
+            surface.active = tool_catalog::active_tools_for_request(
+                &surface.catalog,
+                &surface.active_names,
+                surface.strict_tool_mode,
+            );
         }
         TurnToolBuild {
             surface,

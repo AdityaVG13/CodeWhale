@@ -18,7 +18,14 @@ impl Engine {
         } = prepared;
         let child_job = self.child_job();
         if let Some(job) = child_job.as_ref() {
-            if let Err(error) = job.project(&self.session.messages, job.steps()).await {
+            if let Err(error) = job
+                .project(
+                    &self.session.messages,
+                    job.steps(),
+                    stream_request.system.as_ref(),
+                )
+                .await
+            {
                 return PhaseResult::Return((
                     TurnOutcomeStatus::Failed,
                     Some(format!(
@@ -435,17 +442,40 @@ impl Engine {
             job.response_settled(!response_stream_failed);
         }
         turn.add_parent_usage(&usage);
-        turn.note_parent_prompt_len(self.session.messages.len());
-        self.session.latest_parent_input_tokens = turn.latest_parent_input_tokens;
-        // Fork-prefix inheritance: mark the snapshotted header hot or
-        // cold from this response's usage. Sequential loop order
-        // guarantees this usage answers the request captured above.
-        if crate::prompt_zones::fork_inherit_enabled() {
-            let mut guard = self.live_header.lock();
-            if let Some(cell) = guard.as_mut() {
-                cell.last_hit_tokens = usage.prompt_cache_hit_tokens;
+        if let Some(child) = self.child_host.as_mut()
+            && child.fork_cache_checked
+            && !child.fork_trial_first_response_logged
+            && !child_reporting
+        {
+            child.fork_trial_first_response_logged = true;
+            #[allow(clippy::print_stderr)]
+            if crate::prompt_zones::fork_trial_diag_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "codewhale_fork_trial": "first_response",
+                        "agent_id": child.authority.owner_agent_id,
+                        "inherited": child.fork_cache_inherited.is_some(),
+                        "usage_reported": usage_reported,
+                        "stream_failed": response_stream_failed,
+                        "input": usage.input_tokens,
+                        "hit": usage.prompt_cache_hit_tokens,
+                        "miss": usage.prompt_cache_miss_tokens,
+                        "system_bytes": serde_json::to_vec(&stream_request.system).ok().map(|bytes| bytes.len()),
+                        "tools_bytes": serde_json::to_vec(&stream_request.tools).ok().map(|bytes| bytes.len()),
+                        "history_bytes": serde_json::to_vec(&stream_request.messages).ok().map(|bytes| bytes.len()),
+                    })
+                );
             }
         }
+        if self.child_host.is_none()
+            && let Ok(mut cell) = self.live_header.lock()
+            && let Some(snapshot) = cell.as_mut()
+        {
+            snapshot.last_hit_tokens = usage.prompt_cache_hit_tokens;
+        }
+        turn.note_parent_prompt_len(self.session.messages.len());
+        self.session.latest_parent_input_tokens = turn.latest_parent_input_tokens;
         if usage_reported {
             let _ = self
                 .send_event(Event::TurnUsage {

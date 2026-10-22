@@ -182,8 +182,6 @@ impl std::fmt::Display for PrefixDrift {
     }
 }
 
-// ── LiveHeader (fork-prefix inheritance) ─────────────────────────────────
-
 /// Exact header of the parent turn's latest model request, shared with
 /// fork children so a same-route child can extend the parent's live
 /// cached prefix instead of starting cold.
@@ -195,40 +193,40 @@ impl std::fmt::Display for PrefixDrift {
 /// tools here must byte-match a cached request or inheritance silently
 /// costs more than a cold start — every gate below fails closed.
 #[derive(Debug, Clone)]
-pub struct LiveHeaderSnapshot {
+pub struct LiveHeaderSnapshot<R = ()> {
     /// Exact system prompt, shape-preserving (`Text` stays `Text`).
     pub system: Option<SystemPrompt>,
     /// Wire-order canonical tools JSON (see [`wire_tool_catalog_json`]).
     pub tools_json: String,
-    /// Wire-order tool names, for warming the child's activation cache
-    /// in admission order so its rebuilt wire block can byte-match.
+    /// Canonical ordered tool names used to match the child's already-active
+    /// policy-filtered tools without activating additional schemas.
     pub active_names: Vec<String>,
     /// Route the request was built for (caches are per route).
     pub model: String,
     pub provider: codewhale_config::ProviderKind,
     pub provider_identity: String,
+    pub endpoint_fingerprint: Option<String>,
+    pub route_receipt: Option<R>,
     /// Request messages the hot proof covers. Each new request must
     /// start with these byte-for-byte (element-wise) to keep the
     /// proof; compaction or any rewrite resets to cold.
     pub history: Vec<Message>,
-    /// Cache-hit tokens proving the snapshotted head hot. Set from the
-    /// response's usage, then carried forward across append-only
-    /// requests (see [`carry_hot_forward`]) so a fork mid-turn reads
-    /// the still-valid proof instead of the current request's
-    /// not-yet-known usage. Inheritance requires `Some(>0)` — a
-    /// provably hot prefix, not a hopefully warm one.
+    /// Provider-reported cached-input tokens for this logical request, carried
+    /// across equal headers and append-only history with the same opaque route.
+    /// Positive usage permits matching prefix reuse; it does not establish
+    /// which components or the entire history were cache hits.
     pub last_hit_tokens: Option<u32>,
 }
 
 /// Cloneable handle to the turn's live-header cell. Created once per
 /// Engine (turns run strictly one at a time); fork contexts clone the
 /// `Arc` and read it at spawn.
-pub type SharedLiveHeader = Arc<parking_lot::Mutex<Option<LiveHeaderSnapshot>>>;
+pub type SharedLiveHeader<R = ()> = Arc<std::sync::Mutex<Option<LiveHeaderSnapshot<R>>>>;
 
 /// Empty live-header cell: nothing cached yet, every gate reads cold.
 #[must_use]
-pub fn new_live_header_cell() -> SharedLiveHeader {
-    Arc::new(parking_lot::Mutex::new(None))
+pub fn new_live_header_cell<R>() -> SharedLiveHeader<R> {
+    Arc::new(std::sync::Mutex::new(None))
 }
 
 /// Wire-canonical tools serialization: per-tool chat-API JSON in wire
@@ -251,18 +249,14 @@ pub fn wire_tool_catalog_json(tools: &[Tool]) -> Option<String> {
     Some(out)
 }
 
-/// Trial gate: `CODEWHALE_FORK_INHERIT=on` enables prefix inheritance.
-/// Default-off on this architecture: the snapshot writes and the pure
-/// resolution helpers are wired, but the child admission path has no
-/// consumer yet, so an on-by-default write would clone history and
-/// serialize the wire catalog on every parent request for nothing.
-/// Process-pinned.
+/// Trial gate: `CODEWHALE_FORK_INHERIT=off` disables prefix inheritance
+/// (same-binary A/B against the default-on arm). Process-pinned.
 #[must_use]
 pub fn fork_inherit_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| {
         std::env::var("CODEWHALE_FORK_INHERIT")
-            .map(|raw| raw.trim() == "on")
+            .map(|raw| raw.trim() != "off")
             .unwrap_or(true)
     })
 }
@@ -291,13 +285,17 @@ pub fn fork_trial_diag_enabled() -> bool {
 /// same wire tools, messages grown append-only. Drift, compaction, or
 /// any rewrite resets to `None`. Fails closed throughout.
 #[must_use]
-pub fn carry_hot_forward(
-    old: Option<&LiveHeaderSnapshot>,
+pub fn carry_hot_forward<R: PartialEq>(
+    old: Option<&LiveHeaderSnapshot<R>>,
     new_system: &Option<SystemPrompt>,
     new_tools_json: &str,
     new_history: &[Message],
+    new_route_receipt: Option<&R>,
 ) -> Option<u32> {
     let old = old?;
+    if new_route_receipt.is_none() || old.route_receipt.as_ref() != new_route_receipt {
+        return None;
+    }
     let hits = old.last_hit_tokens.filter(|hits| *hits > 0)?;
     if &old.system != new_system {
         return None;
@@ -317,12 +315,9 @@ pub fn carry_hot_forward(
 pub struct ForkInheritDecision {
     pub inherit: bool,
     pub reason: &'static str,
-    /// Longest byte-equal head of the parent's wire tools, resolved from
-    /// the child's own catalog, already strict-transformed by the caller if
-    /// that route is strict. The child's first
-    /// request sends exactly these; the rest of its grant stays deferred
-    /// and activates on demand, so truncation costs cache bytes, never
-    /// capability. Empty unless `inherit` is true.
+    /// Longest matching canonical tool head from the child's policy-filtered
+    /// active catalog. It determines ordering, never grants or removes tools.
+    /// Empty unless `inherit` is true.
     pub prefix_tools: Vec<Tool>,
 }
 
@@ -332,11 +327,10 @@ pub struct ForkInheritDecision {
 /// wire block grows by deferred discovery while the child's grant is
 /// fixed and usually narrower. Instead the gate resolves the longest
 /// head of the parent's wire block the child reproduces byte-for-byte
-/// (same route, hot proof, append-only history all still required):
-/// a full head (`inherited_full`) prices the shared history as hits;
-/// a partial head (`inherited_prefix`) still prices the system plus
-/// the matched tools as hits. No common head (`tools_mismatch`) and
-/// every other failure stay cold.
+/// (same actual route receipt and positive parent cache usage required):
+/// `inherited_full` matches all parent tool definitions; `inherited_prefix`
+/// matches a shorter head. Neither outcome proves full history cache coverage
+/// or provider savings. No common head and every guard failure stay cold.
 ///
 /// The grant boundary enforces itself through catalog lookup: names
 /// outside the child's grant end the run, so narrowed roles inherit a
@@ -345,12 +339,15 @@ pub struct ForkInheritDecision {
 /// unit-testable.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn resolve_fork_inherit(
+pub fn resolve_fork_inherit<R: PartialEq>(
     gate_on: bool,
-    snapshot: Option<&LiveHeaderSnapshot>,
+    snapshot: Option<&LiveHeaderSnapshot<R>>,
     child_model: &str,
     child_provider: codewhale_config::ProviderKind,
     child_provider_identity: &str,
+    child_wire_format: codewhale_config::provider::WireFormat,
+    child_endpoint_fingerprint: Option<&str>,
+    child_route_receipt: Option<&R>,
     child_catalog: &[Tool],
     history_len: usize,
 ) -> ForkInheritDecision {
@@ -361,6 +358,9 @@ pub fn resolve_fork_inherit(
     };
     if !gate_on {
         return cold("gate_off");
+    }
+    if child_wire_format != codewhale_config::provider::WireFormat::ChatCompletions {
+        return cold("wire_format_unsupported");
     }
     let Some(snapshot) = snapshot else {
         return cold("no_snapshot");
@@ -376,6 +376,14 @@ pub fn resolve_fork_inherit(
     }
     if snapshot.provider_identity != child_provider_identity {
         return cold("route_mismatch");
+    }
+    if snapshot.endpoint_fingerprint.as_deref() != child_endpoint_fingerprint
+        || child_endpoint_fingerprint.is_none()
+    {
+        return cold("endpoint_mismatch");
+    }
+    if child_route_receipt.is_none() || snapshot.route_receipt.as_ref() != child_route_receipt {
+        return cold("route_receipt_mismatch");
     }
     if snapshot.last_hit_tokens.unwrap_or(0) == 0 {
         return cold("prefix_cold");
@@ -395,11 +403,12 @@ pub fn resolve_fork_inherit(
         let Some(tool) = child_catalog.iter().find(|tool| &tool.name == name) else {
             break;
         };
-        let wire = codewhale_core::prefix_cache::tool_to_api_json(tool);
+        let tool = tool.clone();
+        let wire = codewhale_core::prefix_cache::tool_to_api_json(&tool);
         if wire.as_deref() != Some(*parent_json) {
             break;
         }
-        prefix.push(tool.clone());
+        prefix.push(tool);
     }
     if prefix.is_empty() {
         return cold("tools_mismatch");
@@ -968,7 +977,7 @@ mod tests {
         }
     }
 
-    fn inherit_snapshot() -> LiveHeaderSnapshot {
+    fn inherit_snapshot() -> LiveHeaderSnapshot<&'static str> {
         let tools = vec![make_tool("read"), make_tool("agent")];
         LiveHeaderSnapshot {
             system: Some(SystemPrompt::Text("parent system".to_string())),
@@ -977,6 +986,8 @@ mod tests {
             model: "deepseek-chat".to_string(),
             provider: codewhale_config::ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
+            endpoint_fingerprint: Some("fixture-endpoint".to_string()),
+            route_receipt: Some("fixture-route"),
             history: vec![make_message("user", "hi")],
             last_hit_tokens: Some(1200),
         }
@@ -1009,21 +1020,51 @@ mod tests {
     fn fork_inherit_requires_every_gate() {
         let snapshot = inherit_snapshot();
         let full_catalog = vec![make_tool("read"), make_tool("agent")];
-        let decide = |snapshot: Option<&LiveHeaderSnapshot>, model: &str, catalog: &[Tool]| {
-            resolve_fork_inherit(
-                true,
-                snapshot,
-                model,
-                codewhale_config::ProviderKind::Deepseek,
-                "deepseek",
-                catalog,
-                4,
-            )
-        };
+        let decide =
+            |snapshot: Option<&LiveHeaderSnapshot<&'static str>>, model: &str, catalog: &[Tool]| {
+                resolve_fork_inherit(
+                    true,
+                    snapshot,
+                    model,
+                    codewhale_config::ProviderKind::Deepseek,
+                    "deepseek",
+                    codewhale_config::provider::WireFormat::ChatCompletions,
+                    Some("fixture-endpoint"),
+                    Some(&"fixture-route"),
+                    catalog,
+                    4,
+                )
+            };
         let ok = decide(Some(&snapshot), "deepseek-chat", &full_catalog);
         assert!(ok.inherit, "{ok:?}");
         assert_eq!(ok.reason, "inherited_full");
         assert_eq!(ok.prefix_tools.len(), 2);
+        let mut missing_receipt = snapshot.clone();
+        missing_receipt.route_receipt = None;
+        assert_eq!(
+            decide(Some(&missing_receipt), "deepseek-chat", &full_catalog).reason,
+            "route_receipt_mismatch"
+        );
+        let mut changed_receipt = snapshot.clone();
+        changed_receipt.route_receipt = Some("different-fixture-route");
+        assert_eq!(
+            decide(Some(&changed_receipt), "deepseek-chat", &full_catalog).reason,
+            "route_receipt_mismatch"
+        );
+        let unsupported = resolve_fork_inherit(
+            true,
+            Some(&snapshot),
+            "deepseek-chat",
+            codewhale_config::ProviderKind::Deepseek,
+            "deepseek",
+            codewhale_config::provider::WireFormat::AnthropicMessages,
+            Some("fixture-endpoint"),
+            Some(&"fixture-route"),
+            &full_catalog,
+            4,
+        );
+        assert!(!unsupported.inherit);
+        assert_eq!(unsupported.reason, "wire_format_unsupported");
 
         // Narrowed grant: head matches, tail grant-gap ends the run.
         let narrowed = vec![make_tool("read")];
@@ -1075,6 +1116,9 @@ mod tests {
             "deepseek-chat",
             codewhale_config::ProviderKind::Openai,
             "deepseek",
+            codewhale_config::provider::WireFormat::ChatCompletions,
+            Some("fixture-endpoint"),
+            Some(&"fixture-route"),
             &full_catalog,
             4,
         );
@@ -1086,6 +1130,9 @@ mod tests {
             "deepseek-chat",
             codewhale_config::ProviderKind::Deepseek,
             "custom-mirror",
+            codewhale_config::provider::WireFormat::ChatCompletions,
+            Some("fixture-endpoint"),
+            Some(&"fixture-route"),
             &full_catalog,
             4,
         );
@@ -1105,8 +1152,10 @@ mod tests {
             "deepseek-chat",
             codewhale_config::ProviderKind::Deepseek,
             "deepseek",
+            codewhale_config::provider::WireFormat::ChatCompletions,
+            Some("fixture-endpoint"),
+            Some(&"fixture-route"),
             &full_catalog,
-            false,
             0,
         );
         assert_eq!(empty_history.reason, "empty_history");
@@ -1122,6 +1171,9 @@ mod tests {
             "deepseek-chat",
             codewhale_config::ProviderKind::Deepseek,
             "deepseek",
+            codewhale_config::provider::WireFormat::ChatCompletions,
+            Some("fixture-endpoint"),
+            Some(&"fixture-route"),
             &full_catalog,
             4,
         );
@@ -1142,6 +1194,7 @@ mod tests {
                 &snapshot.system,
                 &snapshot.tools_json,
                 &grown,
+                Some(&"fixture-route")
             ),
             Some(1200),
             "append-only growth keeps the proof"
@@ -1153,6 +1206,7 @@ mod tests {
                 &snapshot.system,
                 &snapshot.tools_json,
                 &snapshot.history,
+                Some(&"fixture-route")
             ),
             Some(1200)
         );
@@ -1163,18 +1217,31 @@ mod tests {
                 &snapshot.system,
                 &snapshot.tools_json,
                 &edited,
+                Some(&"fixture-route")
             ),
             None,
             "in-place rewrite resets"
         );
         assert_eq!(
-            carry_hot_forward(Some(&snapshot), &snapshot.system, &snapshot.tools_json, &[]),
+            carry_hot_forward(
+                Some(&snapshot),
+                &snapshot.system,
+                &snapshot.tools_json,
+                &[],
+                Some(&"fixture-route")
+            ),
             None,
             "compaction shrink resets"
         );
         let other_system = Some(SystemPrompt::Text("other".to_string()));
         assert_eq!(
-            carry_hot_forward(Some(&snapshot), &other_system, &snapshot.tools_json, &grown),
+            carry_hot_forward(
+                Some(&snapshot),
+                &other_system,
+                &snapshot.tools_json,
+                &grown,
+                Some(&"fixture-route")
+            ),
             None,
             "system drift resets"
         );
@@ -1183,19 +1250,52 @@ mod tests {
                 Some(&snapshot),
                 &snapshot.system,
                 "{\"name\":\"other\"}",
-                &grown
+                &grown,
+                Some(&"fixture-route")
             ),
             None,
             "tool drift resets"
         );
         assert_eq!(
-            carry_hot_forward(None, &snapshot.system, &snapshot.tools_json, &grown),
+            carry_hot_forward(
+                None,
+                &snapshot.system,
+                &snapshot.tools_json,
+                &grown,
+                Some(&"fixture-route")
+            ),
+            None
+        );
+        assert_eq!(
+            carry_hot_forward(
+                Some(&snapshot),
+                &snapshot.system,
+                &snapshot.tools_json,
+                &grown,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            carry_hot_forward(
+                Some(&snapshot),
+                &snapshot.system,
+                &snapshot.tools_json,
+                &grown,
+                Some(&"different-fixture-route")
+            ),
             None
         );
         let mut cold = snapshot.clone();
         cold.last_hit_tokens = Some(0);
         assert_eq!(
-            carry_hot_forward(Some(&cold), &cold.system, &cold.tools_json, &grown),
+            carry_hot_forward(
+                Some(&cold),
+                &cold.system,
+                &cold.tools_json,
+                &grown,
+                Some(&"fixture-route")
+            ),
             None,
             "zero hits never carry"
         );

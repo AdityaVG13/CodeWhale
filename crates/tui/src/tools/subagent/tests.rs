@@ -13502,10 +13502,54 @@ async fn parent_todo_state_still_reaches_children_as_immutable_fork_context() {
         work_source: None,
     });
 
+    let parent_header = Arc::clone(&parent.fork_context.as_ref().unwrap().live_header);
+    *parent_header.lock().unwrap() = Some(crate::prompt_zones::LiveHeaderSnapshot {
+        system: Some(codewhale_models::SystemPrompt::Text(
+            "captured parent header".to_string(),
+        )),
+        tools_json: String::new(),
+        active_names: Vec::new(),
+        model: parent.model.clone(),
+        provider: crate::config::ProviderKind::Deepseek,
+        provider_identity: "fixture-parent".to_string(),
+        endpoint_fingerprint: Some("fixture-endpoint".to_string()),
+        route_receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
+            crate::config::ProviderKind::Deepseek,
+            "fixture-parent",
+            &parent.model,
+            "https://api.example.test/v1",
+            "fake-cache-key",
+        )),
+        history: Vec::new(),
+        last_hit_tokens: Some(1),
+    });
     let direct = parent.child_runtime();
     let nested = direct.child_runtime();
+    parent_header.lock().unwrap().as_mut().unwrap().system = Some(
+        codewhale_models::SystemPrompt::Text("later parent header".to_string()),
+    );
 
     for (label, child) in [("direct child", &direct), ("nested child", &nested)] {
+        let child_header = &child.fork_context.as_ref().unwrap().live_header;
+        assert!(!Arc::ptr_eq(&parent_header, child_header));
+        let header = child_header.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            header.route_receipt.as_ref(),
+            Some(&crate::route_receipt::TurnRouteReceipt::new(
+                crate::config::ProviderKind::Deepseek,
+                "fixture-parent",
+                &parent.model,
+                "https://api.example.test/v1",
+                "fake-cache-key",
+            ))
+        );
+        assert_eq!(
+            header.system,
+            Some(codewhale_models::SystemPrompt::Text(
+                "captured parent header".to_string()
+            )),
+            "{label} must retain the header captured at spawn"
+        );
         let block = child
             .fork_context
             .as_ref()
@@ -27630,4 +27674,78 @@ async fn settled_projection_waiter_releases_origin_lease_and_mailbox_before_meta
     let usage = record.usage.as_ref().unwrap();
     assert_eq!(usage.total_tokens, Some(20));
     assert_eq!(usage.cost_microusd, Some(7));
+}
+
+#[test]
+fn eager_agent_and_workflow_stay_offered_without_search_rejection() {
+    use crate::core::engine::tool_catalog::{
+        TOOL_SEARCH_NAME, apply_native_tool_deferral, execute_tool_search_with_cache,
+    };
+    use crate::core::session::ToolActivationCache;
+    use std::collections::HashSet;
+
+    let registry = small_surface_registry(FleetRole::Builder);
+    let mut catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
+    // Keep the eager-tool contract when a caller explicitly pins delegation;
+    // the default compact catalog still defers both schemas.
+    let always_load = ["agent", "workflow"]
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    apply_native_tool_deferral(&mut catalog, &always_load);
+    let mut surface = ChildSurfaceProbe::new(catalog.clone(), &[]);
+    let eager_names = model_tool_names(model_request_tools(&mut surface));
+    for name in ["agent", "workflow"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.defer_loading),
+            Some(false),
+            "{name} is registered and eager"
+        );
+        assert!(eager_names.contains(name), "{name} must already be offered");
+    }
+
+    for (query, match_kind, wanted) in [
+        ("agent", "regex", "agent"),
+        ("workflow", "regex", "workflow"),
+        ("spawn subagent worker", "bm25", "agent"),
+        ("spawn subagent worker", "bm25", "workflow"),
+    ] {
+        let mut active = eager_names.iter().cloned().collect::<HashSet<_>>();
+        let mut cache = ToolActivationCache::default();
+        let metadata = execute_tool_search_with_cache(
+            TOOL_SEARCH_NAME,
+            &json!({"query": query, "match": match_kind}),
+            &catalog,
+            &mut active,
+            &mut cache,
+        )
+        .expect("tool_search runs")
+        .metadata
+        .expect("metadata");
+        let found = metadata["tool_references"].as_array().expect("refs");
+        let unavailable = metadata["unavailable_tool_references"]
+            .as_array()
+            .expect("unavailable refs");
+        assert!(
+            active.contains(wanted),
+            "{match_kind} {query:?} must keep {wanted} offered"
+        );
+        for name in ["agent", "workflow"] {
+            assert!(active.contains(name), "{name} must stay active");
+            assert!(
+                !found.iter().any(|value| value.as_str() == Some(name)),
+                "{match_kind} {query:?} must not re-offer eager {name}: {found:?}"
+            );
+            assert!(
+                !unavailable
+                    .iter()
+                    .any(|value| value["tool_name"].as_str() == Some(name)),
+                "{match_kind} {query:?} must not reject eager {name}: {unavailable:?}"
+            );
+            assert!(!cache.names().any(|cached| cached == name));
+        }
+    }
 }

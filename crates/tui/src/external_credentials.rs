@@ -632,7 +632,10 @@ fn reject_windows_reparse_components(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_secure_regular_file(_path: &Path, _require_owner_only: bool) -> io::Result<File> {
+pub(crate) fn open_secure_regular_file(
+    _path: &Path,
+    _require_owner_only: bool,
+) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure external credential reads are unsupported on this platform",

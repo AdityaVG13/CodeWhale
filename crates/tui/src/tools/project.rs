@@ -53,7 +53,15 @@ impl ToolSpec for ProjectMapTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let max_depth = optional_u64(&input, "max_depth", 3)? as usize;
-        let map = generate_project_map(&context.workspace, max_depth, context.follow_symlinks)?;
+        let workspace = context.workspace.clone();
+        let follow_symlinks = context.follow_symlinks;
+        let map = tokio::task::spawn_blocking(move || {
+            generate_project_map(&workspace, max_depth, follow_symlinks)
+        })
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!("project_map worker failed: {error}"))
+        })??;
         ToolResult::json(&map).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }

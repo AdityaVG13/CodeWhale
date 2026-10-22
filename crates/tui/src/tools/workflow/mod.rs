@@ -2480,14 +2480,12 @@ impl RunPayloadBounds {
 ///   `WORKFLOW_RESULT_LEAF_OUTPUT_MAX_CHARS`.
 /// - event objects: exact top-level duplicates (`owner_session_id`,
 ///   `workflow_goal`, `workflow_id`, `source_path`, `token_budget`) are
-///   removed; distinct `workspace` values hoist to top-level
-///   `event_workspaces` once instead of repeating per event; routing,
-///   isolation, and payload keys stay.
+///   removed; per-event `workspace`, routing, isolation, and payload keys stay.
 ///
 /// Full detail remains available in `.codewhale/workflow-runs.jsonl`; every
 /// lossy clip adds an explicit note/pointer so the model can fetch more on
 /// demand. The key projection is lossless by construction (duplicates live
-/// on at top level; workspaces hoist), so it carries no pointer.
+/// on at top level), so it carries no pointer.
 fn bounded_run_record_value(
     record: &WorkflowRunRecord,
     journal_path: &Path,
@@ -2508,7 +2506,6 @@ fn bounded_run_record_value(
     );
     obj.insert("progress_count".to_string(), json!(record.progress_count));
 
-    let mut workspaces = std::collections::BTreeSet::new();
     if let Some(events) = obj.get_mut("events").and_then(Value::as_array_mut) {
         if events.len() > WORKFLOW_RESULT_EVENTS_TAIL {
             let omitted = events.len() - WORKFLOW_RESULT_EVENTS_TAIL;
@@ -2518,9 +2515,8 @@ fn bounded_run_record_value(
         // Token diet: project each event to model-essential keys. Dropped
         // keys are exact top-level duplicates (`RunStarted` clones the
         // record's goal/id/source/budget verbatim; `owner_session_id`
-        // repeats on every event). `workspace` is hoisted instead of
-        // dropped: the distinct set rides top-level once, since a
-        // worktree path names an isolation dir the model may need.
+        // repeats on every event). `workspace` stays per event so each
+        // task retains the directory the model must inspect.
         // `git_branch` stays per event — short run context that can vary
         // per child. Routing keys (profile, resolved_*, route_source),
         // worktree (isolation signal), and message/title/status/error/
@@ -2531,12 +2527,6 @@ fn bounded_run_record_value(
             let Some(fields) = event.as_object_mut() else {
                 continue;
             };
-            if let Some(workspace) = fields.remove("workspace")
-                && let Some(path) = workspace.as_str()
-                && !path.is_empty()
-            {
-                workspaces.insert(path.to_string());
-            }
             for key in [
                 "owner_session_id",
                 "workflow_goal",
@@ -2548,12 +2538,6 @@ fn bounded_run_record_value(
             }
         }
         bounds.events_returned = events.len();
-    }
-    if !workspaces.is_empty() {
-        obj.insert(
-            "event_workspaces".to_string(),
-            Value::Array(workspaces.into_iter().map(Value::String).collect()),
-        );
     }
     if bounds.events_omitted > 0 {
         obj.insert(
@@ -12109,8 +12093,8 @@ FINAL RECEIPT
                     workflow_phase_id: None,
                     workflow_task_label: None,
                     workflow_child_index: None,
-                    fleet_receipt: None,
                     queue_ticket: None,
+                    fleet_receipt: None,
                 })),
             )
         }
@@ -12136,9 +12120,9 @@ FINAL RECEIPT
                 max_concurrent: None,
             },
         ));
-        // Two dispatches, one shared workspace: the hoist dedupes.
+        // Two dispatches keep their distinct workspace associations.
         record.push_event(task_started("t1", "/tmp/wt-1"));
-        record.push_event(task_started("t2", "/tmp/wt-1"));
+        record.push_event(task_started("t2", "/tmp/wt-2"));
 
         let journal = tmp.path().join("workflow-runs.jsonl");
         let (payload, bounds) = bounded_run_record_value(&record, &journal);
@@ -12153,15 +12137,18 @@ FINAL RECEIPT
                 "workflow_id",
                 "source_path",
                 "token_budget",
-                "workspace",
             ] {
                 assert!(event.get(key).is_none(), "dropped {key}: {event}");
             }
         }
-        // … but live on at top level (duplicates) or hoisted (workspaces).
+        // … but live on at top level while workspaces stay with their tasks.
         assert_eq!(payload["workflow_goal"], "ship it");
         assert_eq!(payload["token_budget"], 1_000);
-        assert_eq!(payload["event_workspaces"], json!(["/tmp/wt-1"]));
+        assert!(payload.get("event_workspaces").is_none());
+        assert_eq!(events[1]["task_id"], "t1");
+        assert_eq!(events[1]["workspace"], "/tmp/wt-1");
+        assert_eq!(events[2]["task_id"], "t2");
+        assert_eq!(events[2]["workspace"], "/tmp/wt-2");
 
         // Routing, isolation, and payload keys stay on the dispatch event.
         let dispatch = &events[1];

@@ -837,11 +837,26 @@ async fn contract_mutation_result(
     // edit hit (touched symbols) and what hears it (impacted callers).
     // Deterministic, hard-budgeted, None when there is nothing to say.
     let mut summary = summary;
-    if let Some(echo) =
-        crate::tools::echolocation::sound_edit_echo(&context.workspace, file_path, before, after)
+    let workspace = context.workspace.clone();
+    let echo_path = file_path.to_path_buf();
+    let echo_before = before.to_string();
+    let echo_after = after.to_string();
+    match tokio::task::spawn_blocking(move || {
+        crate::tools::echolocation::sound_edit_echo(
+            &workspace,
+            &echo_path,
+            &echo_before,
+            &echo_after,
+        )
+    })
+    .await
     {
-        summary.push_str("\n\n");
-        summary.push_str(&echo);
+        Ok(Some(echo)) => {
+            summary.push_str("\n\n");
+            summary.push_str(&echo);
+        }
+        Ok(None) => {}
+        Err(error) => summary.push_str(&format!("\n\nEdit echo unavailable: {error}")),
     }
     ToolResult::success(summary).with_metadata(json!({
         "event": "file.mutation",
@@ -998,19 +1013,22 @@ impl ReadFileTool {
             Err(error) => return Err(error),
         };
         check_file_operation_cancelled(context)?;
-        let bytes = load_contract_source(&file_path, false, context)
-            .await?
-            .ok_or_else(|| {
-                // Miss echo: only for genuine not-found — never for denylist
-                // or permission failures, where listing the parent would
-                // answer a refused probe. `sound_miss_echo` carries those
-                // gates internally, so appending it here stays fail-closed.
-                let mut message = format!("Failed to read {}: file not found", file_path.display());
-                if let Some(echo) = crate::tools::echolocation::sound_miss_echo(&file_path) {
-                    message.push_str(&echo);
-                }
-                ToolError::execution_failed(message)
-            })?;
+        let bytes = match load_contract_source(&file_path, false, context).await? {
+            Some(bytes) => bytes,
+            None => {
+                let echo_path = file_path.clone();
+                let echo = tokio::task::spawn_blocking(move || {
+                    super::echolocation::sound_miss_echo(&echo_path)
+                })
+                .await
+                .map_err(|error| ToolError::execution_failed(format!("Miss echo task: {error}")))?;
+                return Err(ToolError::execution_failed(format!(
+                    "Failed to read {}: file not found{}",
+                    file_path.display(),
+                    echo.unwrap_or_default()
+                )));
+            }
+        };
         // #6283: every read response carries the file's byte size, line
         // count, and truncation flag so the caller can page deliberately
         // instead of discovering a huge file one window at a time.

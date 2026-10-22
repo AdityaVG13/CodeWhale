@@ -113,10 +113,7 @@ impl ToolSpec for FileSearchTool {
 
         let extensions = parse_extensions(&input);
         let exclude_patterns = parse_exclude_patterns(&input);
-        let pod_root = base_path.clone();
-        let pod_excludes = exclude_patterns.clone();
-        let pod_extensions = extensions.clone();
-        let matches = search_files_async(
+        let result = search_files_async(
             query.to_string(),
             base_path,
             extensions,
@@ -127,34 +124,7 @@ impl ToolSpec for FileSearchTool {
             context.follow_symlinks,
         )
         .await?;
-        // Echolocation sounding: chart the matched dirs (sorted, capped)
-        // so each candidate arrives with its neighborhood. Dirs resolve
-        // against the search root, which is the workspace by default.
-        let paths: Vec<String> = matches.iter().map(|item| item.path.clone()).collect();
-        let vis = super::echolocation::PodVisibility {
-            include: &[],
-            exclude: &pod_excludes,
-            extensions: &pod_extensions,
-            glob_root: &pod_root,
-            gitignore: true,
-        };
-        let (pods, pods_omitted) = super::echolocation::sound_match_pods(&pod_root, &paths, &vis);
-        let pods_json: Vec<Value> = pods
-            .iter()
-            .map(|pod| {
-                json!({
-                    "dir": pod.dir,
-                    "mates": pod.mates,
-                    "mate_total": pod.mate_total,
-                })
-            })
-            .collect();
-        ToolResult::json(&json!({
-            "matches": matches,
-            "pods": pods_json,
-            "pods_omitted": pods_omitted,
-        }))
-        .map_err(|e| ToolError::execution_failed(e.to_string()))
+        ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
 
@@ -168,28 +138,49 @@ async fn search_files_async(
     cancel_token: Option<CancellationToken>,
     timeout: Duration,
     follow_symlinks: bool,
-) -> Result<Vec<FileSearchMatch>, ToolError> {
+) -> Result<Value, ToolError> {
     run_blocking_file_search(timeout, cancel_token, move |worker_cancel_token| {
-        search_files(
+        let matches = search_files(
             &query,
             &base_path,
-            extensions,
-            exclude_patterns,
+            extensions.clone(),
+            exclude_patterns.clone(),
             limit,
             Some(&worker_cancel_token),
             follow_symlinks,
-        )
+        )?;
+        check_cancelled(Some(&worker_cancel_token))?;
+        let paths: Vec<String> = matches.iter().map(|item| item.path.clone()).collect();
+        let vis = super::echolocation::PodVisibility {
+            include: &[],
+            exclude: &exclude_patterns,
+            extensions: &extensions,
+            glob_root: &base_path,
+            gitignore: true,
+        };
+        let (pods, pods_omitted) = super::echolocation::sound_match_pods(&base_path, &paths, &vis);
+        let pods_json: Vec<Value> = pods
+            .iter()
+            .map(|pod| {
+                json!({
+                    "dir": pod.dir, "mates": pod.mates, "mate_total": pod.mate_total,
+                })
+            })
+            .collect();
+        check_cancelled(Some(&worker_cancel_token))?;
+        Ok(json!({ "matches": matches, "pods": pods_json, "pods_omitted": pods_omitted }))
     })
     .await
 }
 
-async fn run_blocking_file_search<F>(
+async fn run_blocking_file_search<F, T>(
     timeout: Duration,
     cancel_token: Option<CancellationToken>,
     search: F,
-) -> Result<Vec<FileSearchMatch>, ToolError>
+) -> Result<T, ToolError>
 where
-    F: FnOnce(CancellationToken) -> Result<Vec<FileSearchMatch>, ToolError> + Send + 'static,
+    F: FnOnce(CancellationToken) -> Result<T, ToolError> + Send + 'static,
+    T: Send + 'static,
 {
     if cancel_token
         .as_ref()
@@ -791,13 +782,17 @@ mod tests {
     #[tokio::test]
     async fn test_file_search_blocking_wrapper_reports_timeout() {
         let (finished, worker_finished) = tokio::sync::oneshot::channel();
-        let err = run_blocking_file_search(Duration::from_millis(1), None, move |cancel_token| {
-            while !cancel_token.is_cancelled() {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let _ = finished.send(cancel_token.is_cancelled());
-            Err(file_search_cancelled())
-        })
+        let err = run_blocking_file_search::<_, Vec<FileSearchMatch>>(
+            Duration::from_millis(1),
+            None,
+            move |cancel_token| {
+                while !cancel_token.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let _ = finished.send(cancel_token.is_cancelled());
+                Err(file_search_cancelled())
+            },
+        )
         .await
         .expect_err("slow file_search worker should time out");
 

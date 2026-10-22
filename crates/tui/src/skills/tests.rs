@@ -416,9 +416,21 @@ fn render_available_skills_context_resolves_by_name_without_invented_paths() {
         rendered.contains("- friendly-name: drift case"),
         "registry-name row present, got:\n{rendered}"
     );
+    let (index, warnings) = rendered
+        .split_once("\n### Skill load warnings\n")
+        .expect("the real name/directory mismatch must remain visible");
     assert!(
-        !rendered.contains("weird-dir-name/SKILL.md"),
-        "no dir-derived path:\n{rendered}"
+        !index.contains("weird-dir-name/SKILL.md"),
+        "no dir-derived path in the index:\n{index}"
+    );
+    assert!(
+        warnings.contains("weird-dir-name/SKILL.md: frontmatter name `friendly-name` differs from directory `weird-dir-name`"),
+        "the warning must identify the real source:\n{warnings}"
+    );
+    let registry = super::SkillRegistry::discover(&tmpdir.path().join("skills"));
+    assert_eq!(
+        registry.get("friendly-name").expect("name lookup").path,
+        tmpdir.path().join("skills/weird-dir-name/SKILL.md")
     );
     assert!(
         !rendered.contains("friendly-name/SKILL.md"),

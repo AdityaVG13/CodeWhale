@@ -416,6 +416,9 @@ async fn budget_handback_turn_failure_and_timeout_do_not_add_worker_retries() {
         ("timeout", "report deadline expired"),
     ] {
         let mut fixture = fixture(mode, 15, 1).await;
+        tokio::time::timeout(Duration::from_secs(30), fixture.report_started.notified())
+            .await
+            .expect("report request must reach the fixture");
         let result = fixture.finish().await;
         assert_eq!(
             fixture.requests.lock().unwrap().len(),
