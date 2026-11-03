@@ -154,7 +154,8 @@ CW_SMOKE_MODEL="deepseek-v4-pro"
 | `route_source` | 记录*为什么*选中了那条路由 |
 | `reasoning_tokens` | 当回执报告推理时出现；缺失可能反映模型/提供商行为、配置，或 harness 的遗漏，需要旁证 |
 | `tool_catalog_sha256` | 当提供了工具表面（tool surface）时出现 |
-| `approval_posture`、`sandbox_posture` | 与你传入的标志一致 |
+| `approval_posture` | 上面的 `--auto` 命令应为 `auto_tools` |
+| `sandbox_posture` | 沙箱策略及其执行情况：`--auto` 默认是 Full Access；受限策略会标明 `local OS sandbox applied` 或 `policy only; no execution sandbox available`；外部执行后端会标明文件系统/网络隔离未经 Codewhale 验证 |
 | `duration_ms`、`input_tokens`、`output_tokens` | 一次完成的运行中会出现 |
 
 报告回执字段。**不要**粘贴凭据、密钥文件，或提供商的原始错误正文
@@ -172,5 +173,5 @@ unset CW_SMOKE_CODEWHALE_HOME CW_SMOKE_CRED_VAR \
 
 一次绿色的实时冒烟运行是证据，说明所配置的实时尝试今天完成了。它本身并不能证明端点身份、
 账号的持久权益，也不能证明不存在 harness 缺陷；那些主张需要另行旁证。它也没有说明技能选择、
-别名解析、语言区域（locale）路由或提示词预算——这些都由 `crates/tui/src/skills/catalog_matrix.rs`
+别名解析、语言区域（locale）路由或提示词预算——这些都由 `crates/skills/src/catalog_matrix.rs`
 以确定性、无提供商的方式覆盖。

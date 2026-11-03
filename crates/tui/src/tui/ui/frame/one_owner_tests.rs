@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 use ratatui::{Terminal, backend::TestBackend};
 
-use crate::config::Config;
 use crate::tui::app::App;
 use crate::tui::history::HistoryCell;
+use codewhale_runtime::config::Config;
 
 fn frame_app() -> App {
     let mut app = crate::tui::test_support::test_app_with_options(crate::tui::app::TuiOptions {
@@ -33,7 +33,7 @@ fn frame_app() -> App {
     app.onboarding = crate::tui::app::OnboardingState::None;
     app.launch.visible = false;
     app.ui_locale = codewhale_localization::Locale::En;
-    app.metrics_line = crate::config::ChromeRowPreset::Full;
+    app.metrics_line = codewhale_runtime::config::ChromeRowPreset::Full;
     // The posture bar's permission chip carries the filesystem-scope notice
     // (`files: workspace (unenforced)`) whenever no sandbox backend can
     // actually enforce the policy — true on default Linux and all Windows,
@@ -51,9 +51,9 @@ fn frame_app() -> App {
 
 fn subagent(
     id: &str,
-    status: crate::tools::subagent::SubAgentStatus,
-) -> crate::tools::subagent::SubAgentResult {
-    crate::tools::subagent::SubAgentResult {
+    status: codewhale_engine::tools::subagent::SubAgentStatus,
+) -> codewhale_engine::tools::subagent::SubAgentResult {
+    codewhale_engine::tools::subagent::SubAgentResult {
         usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
@@ -61,8 +61,8 @@ fn subagent(
         fork_context: false,
         workspace: None,
         git_branch: None,
-        agent_type: crate::tools::subagent::FleetRole::Worker,
-        assignment: crate::tools::subagent::SubAgentAssignment {
+        agent_type: codewhale_agent_contract::role::FleetRole::Worker,
+        assignment: codewhale_engine::tools::subagent::SubAgentAssignment {
             native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
@@ -98,8 +98,14 @@ fn working_app() -> App {
     app.is_loading = true;
     app.turn_started_at = Some(Instant::now() - Duration::from_secs(75));
     app.subagent_cache = vec![
-        subagent("agent_a", crate::tools::subagent::SubAgentStatus::Running),
-        subagent("agent_b", crate::tools::subagent::SubAgentStatus::Running),
+        subagent(
+            "agent_a",
+            codewhale_engine::tools::subagent::SubAgentStatus::Running,
+        ),
+        subagent(
+            "agent_b",
+            codewhale_engine::tools::subagent::SubAgentStatus::Running,
+        ),
     ];
     app.session_metrics
         .record_model_call(1_200, 29_600, Some(400), Some(30_000));
@@ -376,7 +382,7 @@ fn double_tap_window_shows_the_send_now_hint() {
 /// displaced by the choice.
 #[test]
 fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
-    use crate::config::ChromeRowPreset;
+    use codewhale_runtime::config::ChromeRowPreset;
     // 160 columns joins the blocker sizes above: the working clock's two
     // halves only both fit beside the pinned unenforced-scope permission
     // chip from that width up, and this test asserts the full row's clocks.
@@ -475,8 +481,8 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
 /// restoration. Fresh buffers alone cannot expose stale chrome or hitboxes.
 #[test]
 fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
-    use crate::config::{ChromeRowPreset, StatusItem};
     use crate::tui::tideline::{InteractionAction, InteractionTargetId};
+    use codewhale_runtime::config::{ChromeRowPreset, StatusItem};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Position;
 
@@ -697,8 +703,9 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
 /// missing coverage is evidence, independent of whether today's route is known.
 #[test]
 fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
-    use crate::config::{ChromeRowPreset, ProviderKind, StatusItem};
-    use crate::route_billing::{BillingPresentation, UsageChip};
+    use codewhale_config::ProviderKind;
+    use codewhale_engine::route_billing::{BillingPresentation, UsageChip};
+    use codewhale_runtime::config::{ChromeRowPreset, StatusItem};
 
     for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32)] {
         let mut app = frame_app();
@@ -709,7 +716,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
         app.set_provider_identity(ProviderKind::Custom, "my-gateway");
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
-        app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::High;
+        app.reasoning_effort = codewhale_engine::reasoning_preference::ReasoningEffort::High;
         app.billing_presentation = BillingPresentation::Unknown;
         app.session.cost_coverage_unknown_legacy = true;
         app.status_items = vec![StatusItem::ContextPercent, StatusItem::Cost];
@@ -756,7 +763,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
         app.session.cost_coverage_unknown_legacy = false;
         app.session.cost_unpriced_turns = 1;
         app.session.cost_unpriced_reasons.insert(
-            crate::pricing::UnpricedReason::NoPricingRow
+            codewhale_engine::pricing::UnpricedReason::NoPricingRow
                 .label()
                 .to_string(),
         );
@@ -834,10 +841,10 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
 /// both text and ink without moving the transcript, composer or inspector.
 #[test]
 fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
-    use crate::config::{ChromeRowPreset, StatusItem};
     use crate::tui::tideline::InteractionTargetId;
     use codewhale_models::{ContentBlock, Message, Role};
     use codewhale_palette::ChromeInk;
+    use codewhale_runtime::config::{ChromeRowPreset, StatusItem};
 
     for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32)] {
         let mut app = frame_app();

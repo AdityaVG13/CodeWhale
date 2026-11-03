@@ -22,17 +22,19 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
+#[cfg(windows)]
+use codewhale_app_server::daemon_socket::default_socket_path;
+use codewhale_app_server_protocol::runtime::{
+    DynamicToolCallResult, RUNTIME_API_VERSION, RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+    RuntimeCapabilities, RuntimeEventEnvelope, RuntimeExperimentalCapabilities,
+};
+#[cfg(unix)]
+use codewhale_paths::daemon_socket::default_socket_path;
 use codewhale_protocol::agent_mail::{
     AgentMailDeliveryMode, AgentMailEnvelope, AgentMailMessageId, AgentMailSendRequest,
     AgentMailSendResponse,
 };
-use codewhale_protocol::runtime::{
-    DynamicToolCallResult, RUNTIME_API_VERSION, RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
-    RuntimeCapabilities, RuntimeEventEnvelope, RuntimeExperimentalCapabilities,
-};
-use codewhale_secrets::account::{
-    ACCOUNT_API_BASE_ENV, DEFAULT_ACCOUNT_API_BASE, RuntimeAccountInfo,
-};
+use codewhale_secrets::account::RuntimeAccountInfo;
 #[cfg(not(test))]
 use codewhale_secrets::account::{AccountSessionStore, secure_account_session_secrets};
 use serde::{Deserialize, Serialize};
@@ -47,48 +49,53 @@ mod constitution;
 mod notification_delivery;
 
 #[cfg(test)]
-use crate::dependencies::ExternalTool;
+use codewhale_dependencies::ExternalTool;
 
-use crate::automation_manager::{
-    AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedulerConfig,
-    CreateAutomationRequest, SharedAutomationManager, UpdateAutomationRequest, spawn_scheduler,
-};
+use codewhale_config::ProviderKind;
 #[cfg(test)]
-use crate::config::DEFAULT_TEXT_MODEL;
-use crate::config::{Config, ProviderKind, normalize_model_name_for_provider, validate_route};
-use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
-use crate::fleet::ledger::{
+use codewhale_config::descriptors::defaults::DEFAULT_TEXT_MODEL;
+use codewhale_engine::automation_manager::{
+    AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedulerConfig,
+    CreateAutomationRequest, CreateDelayedTriggerRequest, DelayedTriggerRecord,
+    DelayedTriggerStatus, SharedAutomationManager, UpdateAutomationRequest, spawn_scheduler,
+};
+use codewhale_engine::fleet::executor::{FleetExecutor, configured_codewhale_binary};
+use codewhale_engine::fleet::ledger::{
     FleetEventReplayError, FleetLedgerState, FleetTaskLedgerStatus, fleet_ledger_path,
     subscribe_fleet_ledger_appends,
 };
-use crate::fleet::manager::{
+use codewhale_engine::fleet::manager::{
     FleetManager, FleetStatusSnapshot, FleetWorkerInspection, FleetWorkerRuntimeProjection,
     ManagedFleetRunDescriptor,
 };
-use crate::fleet::profile::canonical_public_role_name;
-use crate::fleet::task_spec::FleetTaskSpecDocument;
-use crate::fleet::worker_runtime::fleet_write_roots;
-use crate::mcp::McpPool;
-use crate::runtime_threads::{
-    CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision,
-    MAX_RUNTIME_EVENT_REPLAY_TAIL, RuntimeThreadManager, RuntimeThreadManagerConfig,
-    SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest, ThreadDetail, ThreadListFilter,
-    ThreadRecord, TurnRecord, UpdateThreadRequest, UsageGroupBy, UsageTotals,
+use codewhale_engine::fleet::profile::canonical_public_role_name;
+use codewhale_engine::fleet::task_spec::FleetTaskSpecDocument;
+use codewhale_engine::fleet::worker_runtime::fleet_write_roots;
+use codewhale_engine::mcp::McpPool;
+use codewhale_engine::runtime_threads::{
+    MAX_RUNTIME_EVENT_REPLAY_TAIL, ThreadRecord, TurnRecord, manager::CompactThreadRequest,
+    manager::CreateThreadRequest, manager::ExternalApprovalDecision, manager::RuntimeThreadManager,
+    manager::RuntimeThreadManagerConfig, manager::SharedRuntimeThreadManager,
+    manager::StartTurnRequest, manager::SteerTurnRequest, manager::ThreadDetail,
+    manager::ThreadListFilter, manager::UpdateThreadRequest, manager::UsageGroupBy,
+    manager::UsageTotals,
 };
+use codewhale_runtime::config::{Config, normalize_model_name_for_provider, validate_route};
 // `TurnItemKind` is read only by the summary tests now that the route builds
 // its rows from `ThreadListFacts` instead of walking item records here.
 #[cfg(test)]
-pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemKind, TurnItemLifecycleStatus};
-use crate::session_manager::default_sessions_dir;
+pub(super) use codewhale_engine::runtime_threads::{
+    RuntimeTurnStatus, TurnItemKind, TurnItemLifecycleStatus,
+};
+use codewhale_engine::session_manager::default_sessions_dir;
 #[cfg(test)]
-pub(super) use crate::session_manager::{SavedSession, SessionMetadata};
-use crate::skill_state::SkillStateStore;
-use crate::task_manager::{
+pub(super) use codewhale_engine::session_manager::{SavedSession, SessionMetadata};
+use codewhale_engine::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskRecord, TaskSummary,
 };
-use crate::tools::subagent::{
+use codewhale_engine::tools::subagent::{
     AgentWorkerRecord, AgentWorkerStatus, SharedSubAgentManager, SubAgentStatus,
-    new_shared_subagent_manager_with_timeout,
+    new_exclusive_runtime_subagent_manager,
 };
 #[cfg(test)]
 pub(super) use codewhale_models::{ContentBlock, Message};
@@ -97,6 +104,7 @@ use codewhale_protocol::fleet::{
     FleetRuntimeTarget, FleetSecurityPolicy, FleetTaskSpec, FleetWorkerEventPayload,
     FleetWorkerSpec, FleetWorkerStatus, FleetWorkflowDescriptor, FleetWorkflowKind,
 };
+use codewhale_runtime::skill_state::SkillStateStore;
 
 mod auth;
 mod avatars;
@@ -105,16 +113,20 @@ mod context;
 mod diagnostics;
 mod git;
 mod jobs;
+pub(crate) mod listener;
 mod lsp;
 mod mcp_import;
+mod members;
 mod memory_lens;
 mod mobile;
 mod plans;
 mod plugins;
+pub(crate) mod review;
 mod secrets;
 pub(crate) mod sessions;
 mod targets;
 mod terminal;
+mod thread_delete;
 pub(crate) mod thread_history;
 mod turn_artifacts;
 mod voice;
@@ -184,7 +196,7 @@ fn runtime_token_alias_warning(
 pub struct RuntimeApiState {
     config: Arc<parking_lot::RwLock<Config>>,
     workspace: PathBuf,
-    plugin_discovery: Arc<crate::plugins::PluginDiscoveryContext>,
+    plugin_discovery: Arc<codewhale_plugins::PluginDiscoveryContext>,
     task_manager: SharedTaskManager,
     runtime_threads: SharedRuntimeThreadManager,
     cors_origins: Vec<String>,
@@ -226,6 +238,7 @@ pub struct RuntimeApiState {
     /// Serializes provider switches: each one saves, applies and, when the
     /// apply is refused, takes back its own save before the next one starts.
     provider_switches: Arc<tokio::sync::Mutex<()>>,
+    provider_connect: secrets::ProviderConnect,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -240,58 +253,31 @@ struct RuntimeWorkspaceScope {
     canonical: PathBuf,
     directory: Arc<std::fs::File>,
     mcp: Mutex<Option<(u64, Arc<Mutex<McpPool>>)>>,
-    lsp: std::sync::OnceLock<Arc<crate::lsp::LspManager>>,
+    mcp_policy: parking_lot::Mutex<Value>,
+    lsp: std::sync::OnceLock<Arc<codewhale_lsp::LspManager>>,
     owner: SharedRuntimeThreadManager,
     cleanup_runtime: tokio::runtime::Handle,
     /// The workspace drive lease held for this scope's lifetime: at most one
     /// driving engine per workspace, across stores and clients
     /// (`workspace_lease`). Watch-only observers never reach scope admission.
     /// Underscored because it is held for its `Drop` side effect, never read.
-    _drive_lease: Option<crate::workspace_lease::SharedWorkspaceDriveLease>,
-}
-
-pub(crate) fn open_workspace_directory(workspace: &FsPath) -> Result<(PathBuf, std::fs::File)> {
-    let canonical = workspace
-        .canonicalize()
-        .context("workspace is unavailable")?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.custom_flags(0x0200_0000 | 0x0020_0000); // BACKUP_SEMANTICS, OPEN_REPARSE_POINT
-    }
-    let directory = options.open(&canonical)?;
-    let metadata = directory.metadata()?;
-    anyhow::ensure!(
-        metadata.is_dir() && !crate::plugins::metadata_is_link_or_reparse(&metadata),
-        "workspace is not an ordinary directory"
-    );
-    anyhow::ensure!(
-        workspace.canonicalize()? == canonical,
-        "selected workspace changed"
-    );
-    Ok((canonical, directory))
+    _drive_lease: Option<codewhale_runtime::workspace_lease::SharedWorkspaceDriveLease>,
 }
 
 impl RuntimeWorkspaceScope {
     fn validate_sync(&self) -> Result<()> {
-        let (canonical, directory) = open_workspace_directory(&self.lexical)?;
+        let (canonical, directory) =
+            codewhale_util::workspace_dir::open_workspace_directory(&self.lexical)?;
         anyhow::ensure!(
             canonical == self.canonical
-                && crate::fleet::files::same_file(&self.directory, &directory)?,
+                && codewhale_util::files::same_file(&self.directory, &directory)?,
             "selected workspace identity changed"
         );
         Ok(())
     }
     async fn validate(self: &Arc<Self>) -> Result<()> {
         let scope = self.clone();
-        codewhale_app_server::daemon_socket::owner_work(move || scope.validate_sync()).await
+        codewhale_runtime::runtime_control::owner_work(move || scope.validate_sync()).await
     }
 }
 
@@ -321,7 +307,8 @@ impl Drop for RuntimeWorkspaceScope {
 struct RuntimeWorkspaceScopes {
     scopes: parking_lot::Mutex<BTreeMap<PathBuf, Arc<RuntimeWorkspaceScope>>>,
     mcp_generation: std::sync::atomic::AtomicU64,
-    dynamic_servers: Arc<parking_lot::RwLock<HashMap<String, crate::mcp::McpServerConfig>>>,
+    dynamic_servers:
+        Arc<parking_lot::RwLock<HashMap<String, codewhale_mcp::config::McpServerConfig>>>,
     owner: SharedRuntimeThreadManager,
     workers: SharedSubAgentManager,
     cleanup_runtime: tokio::runtime::Handle,
@@ -337,9 +324,10 @@ struct WorkspaceDriveLeaseRefusal {
 
 impl WorkspaceDriveLeaseRefusal {
     fn named_holder(workspace: &FsPath) -> Option<Self> {
-        let holder = crate::workspace_lease::WorkspaceDriveLease::read_holder(workspace)
-            .ok()
-            .flatten()?;
+        let holder =
+            codewhale_runtime::workspace_lease::WorkspaceDriveLease::read_holder(workspace)
+                .ok()
+                .flatten()?;
         let held_for = holder.held_for();
         Some(Self {
             message: format!(
@@ -387,14 +375,15 @@ impl RuntimeWorkspaceScopes {
 
     async fn admit(self: &Arc<Self>, lexical: PathBuf) -> Result<Arc<RuntimeWorkspaceScope>> {
         let owner = self.clone();
-        codewhale_app_server::daemon_socket::owner_work(move || {
-            let (canonical, directory) = open_workspace_directory(&lexical)?;
+        codewhale_runtime::runtime_control::owner_work(move || {
+            let (canonical, directory) =
+                codewhale_util::workspace_dir::open_workspace_directory(&lexical)?;
             let directory = Arc::new(directory);
             let mut scopes = owner.scopes.lock();
             if let Some(scope) = scopes.get(&lexical) {
                 anyhow::ensure!(
                     canonical == scope.canonical
-                        && crate::fleet::files::same_file(&scope.directory, &directory)?,
+                        && codewhale_util::files::same_file(&scope.directory, &directory)?,
                     "selected workspace identity changed"
                 );
                 return Ok(scope.clone());
@@ -419,21 +408,42 @@ impl RuntimeWorkspaceScopes {
                 })
                 .map(|label| label.replace(['\n', '='], " "));
             let store_root = owner.owner.session_store_binding().data_dir;
-            let drive_lease = crate::workspace_lease::SharedWorkspaceDriveLease::acquire(
-                &lexical,
-                client.as_deref(),
-                Some(&store_root),
-            )
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "workspace drive lease check failed for {}: {error:#}",
-                    lexical.display()
+            // Three outcomes, two of them refusals. A second driver is refused
+            // with its holder's facts. A filesystem that cannot *carry* the lease
+            // is not a second driver, and failing the whole engine over it turns
+            // a mount limitation into "Engine exited before becoming ready". Run
+            // there, and say what was lost every time the scope is admitted
+            // rather than assuming exclusivity still holds. Admission relaxes
+            // only the ownership proof: the lock is a separate capability and is
+            // still taken, so this branch is only reached when the filesystem
+            // refuses advisory locks themselves.
+            let drive_lease =
+                codewhale_runtime::workspace_lease::SharedWorkspaceDriveLease::acquire(
+                    &lexical,
+                    client.as_deref(),
+                    Some(&store_root),
                 )
-            })?;
-            let Some(drive_lease) = drive_lease else {
-                let refusal = WorkspaceDriveLeaseRefusal::named_holder(&lexical)
-                    .unwrap_or_else(WorkspaceDriveLeaseRefusal::unreadable);
-                return Err(anyhow::Error::new(refusal));
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "workspace drive lease check failed for {}: {error:#}",
+                        lexical.display()
+                    )
+                })?;
+            let drive_lease = match drive_lease {
+                codewhale_runtime::workspace_lease::LeaseAdmission::Held(lease) => Some(lease),
+                codewhale_runtime::workspace_lease::LeaseAdmission::Contended => {
+                    let refusal = WorkspaceDriveLeaseRefusal::named_holder(&lexical)
+                        .unwrap_or_else(WorkspaceDriveLeaseRefusal::unreadable);
+                    return Err(anyhow::Error::new(refusal));
+                }
+                codewhale_runtime::workspace_lease::LeaseAdmission::Unsupported(unavailable) => {
+                    tracing::warn!(
+                        workspace = %lexical.display(),
+                        "{unavailable} — running without workspace drive exclusivity; \
+                         another client may write this tree at the same time"
+                    );
+                    None
+                }
             };
             owner
                 .workers
@@ -445,10 +455,11 @@ impl RuntimeWorkspaceScopes {
                 canonical,
                 directory,
                 mcp: Mutex::new(None),
+                mcp_policy: parking_lot::Mutex::new(Value::Null),
                 lsp: std::sync::OnceLock::new(),
                 owner: owner.owner.clone(),
                 cleanup_runtime: owner.cleanup_runtime.clone(),
-                _drive_lease: Some(drive_lease),
+                _drive_lease: drive_lease,
             });
             scopes.insert(lexical, scope.clone());
             Ok(scope)
@@ -489,6 +500,219 @@ impl RuntimeServerShutdown {
         tokio::time::timeout(deadline, self.stopped.cancelled())
             .await
             .is_ok()
+    }
+}
+
+/// Run the long-lived components of `serve --http` until one of them ends.
+///
+/// Any ending stops the others: a Runtime API server that stops must stop the
+/// control endpoint, and an endpoint that stops must stop the server. The
+/// endpoint is optional — a filesystem that cannot hold its private directory
+/// leaves it out — and its absence has to behave like an *already finished*
+/// stop. Awaiting a future that never completes would hang a clean shutdown
+/// instead of ending it, which is why the absence is carried as a flag and the
+/// select arm for a missing endpoint can never fire.
+///
+/// `stop` is the endpoint's own way of asking it to stop, so this stays
+/// independent of how the socket is represented.
+async fn supervise_frontends<S, T, F>(
+    serve: S,
+    stdio: T,
+    endpoint: Option<(
+        tokio::task::JoinHandle<Result<(), codewhale_app_server::daemon_socket::DaemonSocketError>>,
+        F,
+    )>,
+    shutdown: &RuntimeServerShutdown,
+) -> (Result<()>, Result<()>)
+where
+    S: std::future::Future<Output = std::io::Result<()>>,
+    T: std::future::Future<Output = Result<()>>,
+    F: FnOnce(),
+{
+    let (has_endpoint, mut stop, task) = match endpoint {
+        Some((task, stop)) => (true, Some(stop), Some(task)),
+        None => (false, None, None),
+    };
+    let mut endpoint_stopped = Box::pin(async move {
+        match task {
+            Some(task) => task
+                .await
+                .context("owner control frontend task failed")
+                .and_then(|result| result.map_err(Into::into)),
+            // Never ready: an arm for a component that does not exist must not
+            // fire. The joins below check `has_endpoint` instead.
+            None => std::future::pending::<Result<()>>().await,
+        }
+    });
+    tokio::pin!(serve);
+    tokio::pin!(stdio);
+    tokio::select! {
+        result = &mut serve => {
+            if let Some(stop) = stop.take() { stop(); }
+            let owner = if has_endpoint { endpoint_stopped.await } else { Ok(()) };
+            (result.map_err(|e| anyhow!("Runtime API server error: {e}")), owner)
+        }
+        result = &mut stdio => {
+            shutdown.requested.cancel();
+            let served = serve.await.map_err(|error| anyhow!("Runtime API server error: {error}"));
+            if let Some(stop) = stop.take() { stop(); }
+            let owner = if has_endpoint { endpoint_stopped.await } else { Ok(()) };
+            (result.and(served), owner)
+        }
+        owner = &mut endpoint_stopped => {
+            shutdown.requested.cancel();
+            let result = serve.await.map_err(|e| anyhow!("Runtime API server error: {e}"));
+            (result, owner.and_then(|()| Err(anyhow!("owner control frontend stopped before its Runtime host"))))
+        }
+    }
+}
+
+#[cfg(test)]
+mod supervise_frontends_tests {
+    use super::{RuntimeServerShutdown, supervise_frontends};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn shutdown_handle() -> RuntimeServerShutdown {
+        RuntimeServerShutdown {
+            requested: tokio_util::sync::CancellationToken::new(),
+            stopped: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// A stand-in for `serve_runtime_api` that drains when asked, the way the
+    /// real one does. A fake that ignored the token would hang for reasons that
+    /// have nothing to do with the supervision being tested.
+    fn draining_server(
+        shutdown: &RuntimeServerShutdown,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> {
+        let requested = shutdown.requested.clone();
+        async move {
+            requested.cancelled().await;
+            Ok(())
+        }
+    }
+
+    /// The degraded start: HTTP only. Stopping the server must end the whole
+    /// supervision instead of waiting for an endpoint task that does not exist.
+    #[tokio::test]
+    async fn a_server_without_an_endpoint_stops_instead_of_waiting_forever() {
+        let shutdown = shutdown_handle();
+        let stdio = std::future::pending::<anyhow::Result<()>>();
+        let (served, owner) = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise_frontends(
+                async { Ok(()) },
+                stdio,
+                None::<(
+                    tokio::task::JoinHandle<
+                        Result<(), codewhale_app_server::daemon_socket::DaemonSocketError>,
+                    >,
+                    fn(),
+                )>,
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("a missing endpoint must not hold shutdown open");
+        served.expect("the server result is passed through");
+        owner.expect("a stop with no endpoint to wait for is a completed stop");
+    }
+
+    /// An endpoint that stops on its own is an error: nothing is serving the
+    /// Runtime host any more, so pretending the shutdown was clean would hide it.
+    #[tokio::test]
+    async fn an_endpoint_that_stops_first_is_reported() {
+        let shutdown = shutdown_handle();
+        let endpoint = Some((tokio::spawn(async { Ok(()) }), || {}));
+        let stdio = std::future::pending::<anyhow::Result<()>>();
+        let (_served, owner) = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise_frontends(draining_server(&shutdown), stdio, endpoint, &shutdown),
+        )
+        .await
+        .expect("an endpoint that ends must end the supervision");
+        let error = owner.expect_err("a stopped endpoint is not a clean shutdown");
+        assert!(
+            error
+                .to_string()
+                .contains("stopped before its Runtime host"),
+            "{error}"
+        );
+    }
+
+    /// The normal start: stopping the server asks the endpoint to stop and then
+    /// waits for it, so a second client is not left with a dead socket.
+    #[tokio::test]
+    async fn stopping_the_server_stops_and_joins_the_endpoint() {
+        let shutdown = shutdown_handle();
+        let asked = Arc::new(AtomicBool::new(false));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let endpoint = Some((
+            tokio::spawn(async move {
+                let _ = stop_rx.await;
+                Ok(())
+            }),
+            {
+                let asked = asked.clone();
+                move || {
+                    asked.store(true, Ordering::SeqCst);
+                    let _ = stop_tx.send(());
+                }
+            },
+        ));
+        let stdio = std::future::pending::<anyhow::Result<()>>();
+        let (served, owner) = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise_frontends(async { Ok(()) }, stdio, endpoint, &shutdown),
+        )
+        .await
+        .expect("the endpoint must be asked to stop and then joined");
+        served.expect("the server result is passed through");
+        owner.expect("the endpoint stopped when asked");
+        assert!(
+            asked.load(Ordering::SeqCst),
+            "the endpoint was never asked to stop"
+        );
+    }
+
+    /// A stdio frontend ending stops both the server and the endpoint.
+    #[tokio::test]
+    async fn a_finished_stdio_frontend_stops_the_other_components() {
+        let shutdown = shutdown_handle();
+        let asked = Arc::new(AtomicBool::new(false));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let endpoint = Some((
+            tokio::spawn(async move {
+                let _ = stop_rx.await;
+                Ok(())
+            }),
+            {
+                let asked = asked.clone();
+                move || {
+                    asked.store(true, Ordering::SeqCst);
+                    let _ = stop_tx.send(());
+                }
+            },
+        ));
+        let (served, owner) = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise_frontends(
+                draining_server(&shutdown),
+                async { Ok(()) },
+                endpoint,
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("stdio ending must end the supervision");
+        served.expect("the drained server has no error");
+        owner.expect("the endpoint stopped when asked");
+        assert!(
+            asked.load(Ordering::SeqCst),
+            "the endpoint was never asked to stop"
+        );
     }
 }
 
@@ -574,7 +798,7 @@ impl CapturedRuntimeFrontend {
             .loaded_config_path
             .clone()
             .or_else(|| state.config_path.clone());
-        let config_source = codewhale_app_server::daemon_socket::owner_work(move || {
+        let config_source = codewhale_runtime::runtime_control::owner_work(move || {
             canonical_runtime_config_source(source)
         })
         .await?;
@@ -600,7 +824,7 @@ impl CapturedRuntimeFrontend {
             "selected config profile differs from the captured owner scope"
         );
         if let Some(source) = scope.config_source.clone() {
-            let source = codewhale_app_server::daemon_socket::owner_work(move || {
+            let source = codewhale_runtime::runtime_control::owner_work(move || {
                 canonical_runtime_config_source(Some(source))
             })
             .await?;
@@ -659,7 +883,7 @@ impl codewhale_app_server::RuntimeOwnerFrontend for CapturedRuntimeFrontend {
                         mobile: selection.mobile,
                         web: selection.web,
                         control_frontend: Some(
-                            codewhale_app_server::RuntimeControlFrontend::LegacyHttp,
+                            codewhale_runtime::runtime_control::RuntimeControlFrontend::LegacyHttp,
                         ),
                         ..Default::default()
                     })?;
@@ -737,7 +961,9 @@ impl codewhale_app_server::RuntimeOwnerFrontend for CapturedRuntimeFrontend {
                 insecure_no_auth: selection.insecure_no_auth,
                 mobile: selection.mobile,
                 web: selection.web,
-                control_frontend: Some(codewhale_app_server::RuntimeControlFrontend::LegacyHttp),
+                control_frontend: Some(
+                    codewhale_runtime::runtime_control::RuntimeControlFrontend::LegacyHttp,
+                ),
                 ..Default::default()
             };
             validate_runtime_listener_security(&options)?;
@@ -819,13 +1045,17 @@ impl codewhale_app_server::RuntimeOwnerFrontend for CapturedRuntimeFrontend {
             // the global signal registration or stop shared schedulers/managers.
             let shutdown = RuntimeServerShutdown::default();
             state.shutdown = shutdown.clone();
-            let app =
-                build_router(state).merge(codewhale_app_server::runtime_compatibility_router(
-                    compatibility,
-                    &options.cors_origins,
-                    resolved.token.clone(),
-                    Some(workspace),
-                ));
+            let app = with_loopback_host_guard(
+                build_router(state).merge(
+                    codewhale_app_server::http::runtime_compatibility_router(
+                        compatibility,
+                        &options.cors_origins,
+                        resolved.token.clone(),
+                        Some(workspace),
+                    ),
+                ),
+                resolved.token.is_none(),
+            );
             let ready = RuntimeFrontendReady {
                 endpoint,
                 auth_required: resolved.token.is_some(),
@@ -857,15 +1087,13 @@ async fn write_frontend_ready(
     output: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     ready: RuntimeFrontendReady,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-    let frame = serde_json::to_vec(
+    let frame = codewhale_app_server::stdio::serialize_control_frame(
         &json!({"jsonrpc":"2.0","method":"daemon/frontend_ready","params":ready}),
     )?;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        output.write_all(&frame).await?;
-        output.write_all(b"\n").await?;
-        output.flush().await
-    })
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        codewhale_app_server::stdio::write_control_line(output, &frame),
+    )
     .await
     .context("selected listener readiness write timed out; outcome uncertain")??;
     Ok(())
@@ -873,7 +1101,7 @@ async fn write_frontend_ready(
 async fn wait_frontend_input_close(
     input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
 ) -> Result<()> {
-    let mut input = codewhale_app_server::BoundedLines::new(input);
+    let mut input = codewhale_app_server::stdio::BoundedLines::new(input);
     if let Some(line) = input.next_line().await? {
         let value: Value = serde_json::from_str(&line)?;
         anyhow::ensure!(
@@ -976,9 +1204,10 @@ pub struct RuntimeApiOptions {
     pub config_path: Option<PathBuf>,
     /// Effective profile used to load the server's initial Config.
     pub config_profile: Option<String>,
-    pub control_frontend: Option<codewhale_app_server::RuntimeControlFrontend>,
-    pub runtime_event_tap:
-        Option<fn(tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>)>,
+    pub control_frontend: Option<codewhale_runtime::runtime_control::RuntimeControlFrontend>,
+    pub runtime_event_tap: Option<
+        fn(tokio::sync::broadcast::Receiver<codewhale_engine::runtime_threads::RuntimeEventRecord>),
+    >,
 }
 
 impl Default for RuntimeApiOptions {
@@ -1007,7 +1236,7 @@ struct StreamTurnRequest {
     max_output_tokens: Option<std::num::NonZeroU32>,
     prompt: String,
     #[serde(default)]
-    images: Vec<codewhale_protocol::runtime::RuntimeImageInput>,
+    images: Vec<codewhale_app_server_protocol::runtime::RuntimeImageInput>,
     model: Option<String>,
     mode: Option<String>,
     permission_posture: Option<String>,
@@ -1027,7 +1256,7 @@ struct HealthResponse {
 #[derive(Debug, Serialize)]
 struct TasksResponse {
     tasks: Vec<TaskSummary>,
-    counts: crate::task_manager::TaskCounts,
+    counts: codewhale_engine::task_manager::TaskCounts,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1090,6 +1319,15 @@ struct ThreadSummary {
     /// thread snapshot. Clients use this typed fact for attention grouping;
     /// lifecycle prose and turn-status strings are not an authority signal.
     pending_attention_count: usize,
+    last_read_item_id: Option<String>,
+    unread: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_thread_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkThreadReadRequest {
+    item_id: String,
 }
 
 /// `GET /v1/skills` row. Routing metadata (`invocation`, `aliases`,
@@ -1284,14 +1522,7 @@ struct DecideApprovalResponse {
 
 #[derive(Debug, Deserialize)]
 struct SubmitUserInputBody {
-    answers: Vec<UserInputAnswerBody>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UserInputAnswerBody {
-    id: String,
-    label: String,
-    value: String,
+    answers: Vec<codewhale_engine::tools::user_input::UserInputAnswer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1326,11 +1557,16 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         client_token_intents: true,
         account_session: true,
         account_model_owner: true,
+        session_provider_keys: false,
         threads: true,
+        thread_create_idempotency: true,
+        thread_idle_precondition: true,
         thread_shell_consent: true,
         turns: true,
         turn_operation_idempotency: true,
         turn_operation_lookup: true,
+        structured_review_turns: true,
+        structured_review_version: 2,
         automation_mutation_preconditions: true,
         turn_image_inputs: true,
         turn_output_token_limit: true,
@@ -1342,6 +1578,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         environments: false,
         worker_runtime: true,
         fleet_run_create: true,
+        thread_fleet_members: true,
         fleet_run_start: true,
         fleet_event_replay: true,
         fleet_event_stream: true,
@@ -1367,15 +1604,11 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
     }
 }
 
-fn runtime_api_sub_agent_manager(workspace: &FsPath, workers: usize) -> SharedSubAgentManager {
-    let max_agents = workers.max(1);
-    new_shared_subagent_manager_with_timeout(
-        workspace.to_path_buf(),
-        max_agents,
-        max_agents,
-        Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
-        max_agents,
-    )
+fn runtime_api_sub_agent_manager(
+    workspace: &FsPath,
+    workers: usize,
+) -> Result<SharedSubAgentManager> {
+    new_exclusive_runtime_subagent_manager(workspace.to_path_buf(), workers)
 }
 
 #[derive(Debug, Serialize)]
@@ -1536,7 +1769,7 @@ struct McpServerDetail {
 impl McpServerDetail {
     fn from_config(
         name: &str,
-        cfg: &crate::mcp::McpServerConfig,
+        cfg: &codewhale_mcp::config::McpServerConfig,
         connected: bool,
         revision: String,
     ) -> Self {
@@ -1663,10 +1896,8 @@ fn replay_flag_is_absent(replayed: &bool) -> bool {
     !*replayed
 }
 
-fn install_runtime_server_workshop_budgets(
-    config: &Config,
-) -> crate::tools::large_output_router::WorkshopConfig {
-    crate::tools::large_output_router::WorkshopConfig::install_active(config.workshop.as_ref())
+fn install_runtime_server_workshop_budgets(config: &Config) -> codewhale_config::WorkshopConfig {
+    codewhale_runtime::active_workshop::install_active_workshop(config.workshop.as_ref())
 }
 
 #[cfg(test)]
@@ -1674,11 +1905,8 @@ fn open_runtime_threads_for_server(
     config: &Config,
     workspace: PathBuf,
     manager_config: RuntimeThreadManagerConfig,
-    plugin_registry: Arc<crate::plugins::PluginRegistry>,
-) -> Result<(
-    SharedRuntimeThreadManager,
-    crate::tools::large_output_router::WorkshopConfig,
-)> {
+    plugin_registry: Arc<codewhale_plugins::PluginRegistry>,
+) -> Result<(SharedRuntimeThreadManager, codewhale_config::WorkshopConfig)> {
     open_runtime_threads_for_host(
         config,
         workspace,
@@ -1694,23 +1922,20 @@ pub(crate) fn open_runtime_threads_for_host(
     config: &Config,
     workspace: PathBuf,
     manager_config: RuntimeThreadManagerConfig,
-    plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    plugin_registry: Arc<codewhale_plugins::PluginRegistry>,
     acp: bool,
-    preheld_lock: Option<crate::runtime_threads::RuntimeProcessOwnerLock>,
-    binding: Option<&crate::runtime_threads::RuntimeStoreBinding>,
-) -> Result<(
-    SharedRuntimeThreadManager,
-    crate::tools::large_output_router::WorkshopConfig,
-)> {
+    preheld_lock: Option<codewhale_engine::runtime_threads::RuntimeProcessOwnerLock>,
+    binding: Option<&codewhale_engine::runtime_threads::RuntimeStoreBinding>,
+) -> Result<(SharedRuntimeThreadManager, codewhale_config::WorkshopConfig)> {
     // The Runtime API lazily creates engines after the HTTP/Web server starts.
     // Install the resolved process-wide read/tool byte limits before the
     // thread manager can spawn any of those engines, matching interactive and
     // headless exec startup.
     let workshop_activation = install_runtime_server_workshop_budgets(config);
     let profile = if acp {
-        crate::core::engine::EngineHostProfile::Acp
+        codewhale_engine::core::engine::EngineHostProfile::Acp
     } else {
-        crate::core::engine::EngineHostProfile::Normal
+        codewhale_engine::core::engine::EngineHostProfile::Normal
     };
     let manager = Arc::new(RuntimeThreadManager::open_host(
         config.clone(),
@@ -1722,14 +1947,26 @@ pub(crate) fn open_runtime_threads_for_host(
         binding,
     )?);
     if let Some(skills_dir) = config.bundled_skills_install_dir()
-        && let Err(error) = crate::skills::install_system_skills(&skills_dir)
+        && let Err(error) =
+            codewhale_skills::install_system_skills(&skills_dir, &config.skills_config().bundled)
     {
-        crate::logging::warn(format!("Failed to install system skills: {error}"));
+        codewhale_runtime::logging::warn(format!("Failed to install system skills: {error}"));
     }
     // Publish the same exact endpoint-scoped catalog as interactive startup
     // before the server admits turns. A cached model list alone does not make
     // its capabilities available to route resolution.
-    crate::provider_catalog_live::maybe_load_persisted_cache_for_config(config);
+    codewhale_engine::models_dev_live::maybe_load_persisted_cache();
+    codewhale_engine::provider_catalog_live::maybe_load_persisted_cache_for_config(config);
+    if let Ok(identity) = config.active_provider_identity()
+        && identity.provider == ProviderKind::Ollama
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        let config = config.clone();
+        handle.spawn(async move {
+            codewhale_engine::provider_lake::refresh_local_ollama_catalog(&config, &identity).await;
+        });
+    }
+    codewhale_engine::models_dev_live::spawn_background_refresh();
     Ok((manager, workshop_activation))
 }
 
@@ -1737,8 +1974,8 @@ pub(crate) fn open_runtime_threads_for_host(
 enum RuntimeHostAdmission {
     Attached(Box<codewhale_app_server::daemon_client::OwnerClient>),
     Bootstrap {
-        lock: crate::runtime_threads::RuntimeProcessOwnerLock,
-        binding: Option<crate::runtime_threads::RuntimeStoreBinding>,
+        lock: codewhale_engine::runtime_threads::RuntimeProcessOwnerLock,
+        binding: Option<codewhale_engine::runtime_threads::RuntimeStoreBinding>,
         recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
     },
 }
@@ -1752,7 +1989,7 @@ async fn admit_runtime_host(
     selected_store: PathBuf,
 ) -> Result<RuntimeHostAdmission> {
     use codewhale_app_server::daemon_client::{HostOwnerProbe, PublicationChangedBeforeAttach};
-    use codewhale_app_server::daemon_socket::owner_work;
+    use codewhale_runtime::runtime_control::owner_work;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let probe = match codewhale_app_server::daemon_client::probe_owner_for_host_startup(
@@ -1777,7 +2014,7 @@ async fn admit_runtime_host(
             let create = recovery.is_none();
             let lock = owner_work(move || {
                 if let Some(binding) = existing.as_ref() { binding.validate_existing_store()?; }
-                crate::runtime_threads::RuntimeProcessOwnerLock::try_acquire_for_host(&store, create)
+                codewhale_engine::runtime_threads::RuntimeProcessOwnerLock::try_acquire_for_host(&store, create)
             }).await?;
             let Some(lock) = lock else {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1811,15 +2048,18 @@ pub const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
 
 /// Start the runtime API server.
 pub async fn run_http_server(
-    config: Config,
+    mut config: Config,
     workspace: PathBuf,
-    plugin_discovery: Arc<crate::plugins::PluginDiscoveryContext>,
+    plugin_discovery: Arc<codewhale_plugins::PluginDiscoveryContext>,
     options: RuntimeApiOptions,
 ) -> Result<()> {
+    let inherited_listener = listener::take(&options.host, options.port, options.insecure_no_auth)?;
+    config.session_provider_keys_only =
+        secrets::session_keys_required().map_err(|error| anyhow!(error.message))?;
     validate_runtime_listener_security(&options)?;
     let acp_selected = matches!(
         options.control_frontend.as_ref(),
-        Some(codewhale_app_server::RuntimeControlFrontend::Acp { .. })
+        Some(codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { .. })
     );
 
     let task_default_model = runtime_request_model(&config, None).unwrap_or_else(|_| "auto".into());
@@ -1857,13 +2097,21 @@ pub async fn run_http_server(
     #[cfg(not(any(unix, windows)))]
     let preheld_lock = None;
     #[cfg(not(any(unix, windows)))]
-    let existing_binding: Option<crate::runtime_threads::RuntimeStoreBinding> = None;
+    let existing_binding: Option<codewhale_engine::runtime_threads::RuntimeStoreBinding> = None;
     #[cfg(any(unix, windows))]
     if let Some(control) = published {
+        anyhow::ensure!(
+            inherited_listener.is_none(),
+            "An inherited Runtime listener cannot attach to an already running owner"
+        );
+        anyhow::ensure!(
+            !(acp_selected && control.routing().is_some_and(|routing| routing.acp_only)),
+            "Another `codewhale serve --acp` already owns this runtime, and a second ACP server cannot attach to it. Close the other editor's agent session and try again, or set CODEWHALE_RUNTIME_DIR to a different directory."
+        );
         validate_selected_owner(&control, selected_store.clone()).await?;
         let observed_owner = control.receipt().clone();
         let client = match options.control_frontend.as_ref() {
-            Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }) => {
+            Some(codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { model }) => {
                 drop(control);
                 let client =
                     codewhale_app_server::daemon_client::connect_selected_acp_if_published(
@@ -1890,8 +2138,8 @@ pub async fn run_http_server(
                 client
             }
             Some(
-                codewhale_app_server::RuntimeControlFrontend::Stdio
-                | codewhale_app_server::RuntimeControlFrontend::Socket { .. },
+                codewhale_runtime::runtime_control::RuntimeControlFrontend::Stdio
+                | codewhale_runtime::runtime_control::RuntimeControlFrontend::Socket { .. },
             ) => {
                 drop(control);
                 codewhale_app_server::daemon_client::connect_scoped_control_if_published(
@@ -1949,9 +2197,12 @@ pub async fn run_http_server(
     // No publication permits guessing an owner or bypassing its lease. The
     // real manager open below is still the exclusive bootstrap authority.
     let addr = runtime_bind_address(&options.host, options.port)?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind {addr}"))?;
+    let listener = match inherited_listener {
+        Some(listener) => listener,
+        None => TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("Failed to bind {addr}"))?,
+    };
     let bound_addr = listener
         .local_addr()
         .context("Failed to read Runtime API listener address")?;
@@ -1969,6 +2220,18 @@ pub async fn run_http_server(
         existing_binding.as_ref(),
     )?;
     let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
+    let sub_agent_manager = codewhale_runtime::runtime_control::owner_work({
+        let workspace = workspace.clone();
+        let workers = options.workers;
+        move || runtime_api_sub_agent_manager(&workspace, workers)
+    })
+    .await?;
+    runtime_threads
+        .attach_subagent_manager(sub_agent_manager.clone())
+        .await?;
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
     if let Some(tap) = options.runtime_event_tap {
         tap(runtime_threads.subscribe_events());
     }
@@ -1978,6 +2241,7 @@ pub async fn run_http_server(
     let _task_shutdown = task_manager.shutdown_guard();
     let mut automation_service = AutomationManager::default_location()?;
     automation_service.bind_task_manager(&task_manager)?;
+    automation_service.set_thread_event_sink(runtime_threads.thread_event_sink());
     let automations = Arc::new(Mutex::new(automation_service));
     runtime_threads.attach_automation_manager(automations.clone());
     let scheduler_cancel = CancellationToken::new();
@@ -1990,7 +2254,7 @@ pub async fn run_http_server(
 
     // Repair the saved-session store once per server start (#6144); this
     // server's own store is open by now, so it reads as in use.
-    crate::session_reconcile::spawn_background_reconcile(None);
+    codewhale_engine::session_reconcile::spawn_background_reconcile(None);
     let runtime_token_env = runtime_token_environment(&|name| std::env::var(name).ok());
     let runtime_token_alias_warning =
         runtime_token_alias_warning(options.auth_token.as_deref(), &runtime_token_env);
@@ -2018,7 +2282,6 @@ pub async fn run_http_server(
     };
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
-    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let shutdown = RuntimeServerShutdown::default();
     // Opening a thread is every client's first read, and the store can only
     // answer it after one pass over the whole items directory (an item's
@@ -2031,9 +2294,7 @@ pub async fn run_http_server(
             tracing::warn!(%error, "thread item index warm-up failed");
         }
     });
-    let workspace_scopes =
-        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
-    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
+
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -2061,15 +2322,18 @@ pub async fn run_http_server(
         shutdown: shutdown.clone(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+        provider_connect: Default::default(),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
     #[cfg(any(unix, windows))]
-    let (owner_frontend, control_state) = bind_captured_runtime_frontends(
+    let (owner_endpoint, control_state) = bind_captured_runtime_frontends(
         &state,
         control_socket.clone(),
         match options.control_frontend.as_ref() {
-            Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }) => model.clone(),
+            Some(codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { model }) => {
+                model.clone()
+            }
             _ => task_default_model.clone(),
         },
         options.workers,
@@ -2080,17 +2344,18 @@ pub async fn run_http_server(
     let listener_workspace = state.workspace.clone();
     let app = build_router(state);
     #[cfg(any(unix, windows))]
-    let app = app.merge(codewhale_app_server::runtime_compatibility_router(
+    let app = app.merge(codewhale_app_server::http::runtime_compatibility_router(
         control_state.clone(),
         &options.cors_origins,
         runtime_token.clone(),
         Some(listener_workspace),
     ));
+    let app = with_loopback_host_guard(app, runtime_token.is_none());
     let owned_stdio = matches!(
         options.control_frontend.as_ref(),
         Some(
-            codewhale_app_server::RuntimeControlFrontend::Stdio
-                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+            codewhale_runtime::runtime_control::RuntimeControlFrontend::Stdio
+                | codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { .. }
         )
     );
 
@@ -2121,7 +2386,9 @@ pub async fn run_http_server(
                 "Codewhale web bootstrap (single-use, expires in {} min): {bootstrap_url}",
                 web::BOOTSTRAP_TTL.as_secs() / 60
             );
-            if let Some(warning) = web_launcher_warning(crate::utils::open_url(&bootstrap_url)) {
+            if let Some(warning) =
+                web_launcher_warning(codewhale_runtime::browser::open_url(&bootstrap_url))
+            {
                 println!("{warning}");
             }
         }
@@ -2151,8 +2418,6 @@ pub async fn run_http_server(
     let signal_registration = SignalShutdownRegistration::register(&shutdown);
     #[cfg(any(unix, windows))]
     let (serve_result, owner_result) = {
-        let owner_handle = owner_frontend.shutdown_handle();
-        let mut owner_task = tokio::spawn(owner_frontend.serve());
         let stdio = async {
             if acp_selected {
                 codewhale_app_server::run_owned_acp(control_state).await
@@ -2162,31 +2427,24 @@ pub async fn run_http_server(
                 std::future::pending::<Result<()>>().await
             }
         };
-        tokio::pin!(stdio);
-        let serve = serve_runtime_api(listener, app, shutdown.clone());
-        tokio::pin!(serve);
-        tokio::select! {
-            result = &mut serve => {
-                owner_handle.trigger();
-                let owner = owner_task.await.context("owner control frontend task failed")
-                    .and_then(|result| result.map_err(Into::into));
-                (result.map_err(|e| anyhow!("Runtime API server error: {e}")), owner)
-            }
-            result = &mut stdio => {
-                shutdown.requested.cancel();
-                let served = serve.await.map_err(|error|anyhow!("Runtime API server error: {error}"));
-                owner_handle.trigger();
-                let owner=owner_task.await.context("owner control frontend task failed").and_then(|result|result.map_err(Into::into));
-                (result.and(served),owner)
-            }
-            owner = &mut owner_task => {
-                shutdown.requested.cancel();
-                let result = serve.await.map_err(|e| anyhow!("Runtime API server error: {e}"));
-                let owner = owner.context("owner control frontend task failed")
-                    .and_then(|result| result.map_err(Into::into));
-                (result, owner.and_then(|()| Err(anyhow!("owner control frontend stopped before its Runtime host"))))
-            }
-        }
+        // `None` when this filesystem cannot hold the private endpoint
+        // directory. The Runtime API over HTTP is what clients connect to, so it
+        // runs either way; the endpoint socket is how a second client discovers
+        // this owner, and `bind_captured_owner` has already said what was lost.
+        let endpoint = owner_endpoint.map(|endpoint| {
+            let stop = {
+                let handle = endpoint.shutdown_handle();
+                move || handle.trigger()
+            };
+            (tokio::spawn(endpoint.serve()), stop)
+        });
+        supervise_frontends(
+            serve_runtime_api(listener, app, shutdown.clone()),
+            stdio,
+            endpoint,
+            &shutdown,
+        )
+        .await
     };
     #[cfg(not(any(unix, windows)))]
     let serve_result = serve_runtime_api(listener, app, shutdown)
@@ -2203,7 +2461,9 @@ pub async fn run_http_server(
 
 fn selected_control_socket(options: &RuntimeApiOptions) -> Option<PathBuf> {
     match options.control_frontend.as_ref() {
-        Some(codewhale_app_server::RuntimeControlFrontend::Socket { path }) => path.clone(),
+        Some(codewhale_runtime::runtime_control::RuntimeControlFrontend::Socket { path }) => {
+            path.clone()
+        }
         _ => None,
     }
 }
@@ -2221,19 +2481,15 @@ fn selected_control_socket(options: &RuntimeApiOptions) -> Option<PathBuf> {
 ///
 /// `selected_store` is the store root this run resolved, the same value the
 /// thread manager will open.
-///
-/// Unix only, with `daemon_socket::store_selected_socket_path`: a Windows
-/// owner endpoint is a named pipe whose derived-name form is follow-up work,
-/// so Windows keeps the well-known endpoint and the explicit selection.
 #[cfg(unix)]
 async fn store_selected_control_socket(
     explicit: Option<PathBuf>,
     selected_store: &FsPath,
 ) -> Result<PathBuf> {
     let selected_store = selected_store.to_path_buf();
-    codewhale_app_server::daemon_socket::owner_work(move || {
-        let store_override = crate::runtime_threads::canonical_runtime_dir_override()?;
-        let inputs = codewhale_app_server::daemon_socket::SocketPathInputs::from_environment(None)?;
+    codewhale_runtime::runtime_control::owner_work(move || {
+        let store_override = codewhale_engine::runtime_threads::canonical_runtime_dir_override()?;
+        let inputs = codewhale_paths::daemon_socket::SocketPathInputs::from_environment(None)?;
         store_selected_control_socket_with(
             explicit,
             &selected_store,
@@ -2254,7 +2510,7 @@ fn store_selected_control_socket_with(
     explicit: Option<PathBuf>,
     selected_store: &FsPath,
     store_override: Option<&FsPath>,
-    inputs: &codewhale_app_server::daemon_socket::SocketPathInputs,
+    inputs: &codewhale_paths::daemon_socket::SocketPathInputs,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
@@ -2263,10 +2519,11 @@ fn store_selected_control_socket_with(
     // (`canonical_runtime_dir_override`), and the store selection is whatever
     // the store chain resolved. Comparing them in different forms would let a
     // symlinked or relative override silently keep the default endpoint.
-    let selected =
-        crate::runtime_threads::checked_runtime_store_root(selected_store.to_path_buf())?;
+    let selected = codewhale_engine::runtime_threads::checked_runtime_store_root(
+        selected_store.to_path_buf(),
+    )?;
     let derived_from = store_override.filter(|dir| *dir == selected);
-    codewhale_app_server::daemon_socket::store_selected_socket_path(derived_from, inputs)
+    codewhale_paths::daemon_socket::store_selected_socket_path(derived_from, inputs)
         .map_err(Into::into)
 }
 
@@ -2284,9 +2541,10 @@ pub(crate) async fn validate_selected_owner(
 async fn validate_selected_owner_receipt(
     receipt: codewhale_protocol::RuntimeOwnerReceipt,
     selected_store: PathBuf,
-) -> Result<crate::runtime_threads::RuntimeStoreBinding> {
-    codewhale_app_server::daemon_socket::owner_work(move || {
-        let selected = crate::runtime_threads::RuntimeStoreBinding::for_store_dir(&selected_store)?;
+) -> Result<codewhale_engine::runtime_threads::RuntimeStoreBinding> {
+    codewhale_runtime::runtime_control::owner_work(move || {
+        let selected =
+            codewhale_engine::runtime_threads::RuntimeStoreBinding::for_store_dir(&selected_store)?;
         selected.validate_existing_store()?;
         anyhow::ensure!(
             selected.data_dir == receipt.data_dir
@@ -2308,19 +2566,19 @@ async fn bind_captured_runtime_frontends(
     generated_auth: bool,
     recovery: Option<Arc<codewhale_app_server::daemon_client::UnavailablePublication>>,
 ) -> Result<(
-    codewhale_app_server::daemon_socket::DaemonSocket,
+    Option<codewhale_app_server::daemon_socket::DaemonSocket>,
     codewhale_app_server::AppState,
 )> {
     let captured_manager = state.runtime_threads.clone();
-    let (binding, generation) = codewhale_app_server::daemon_socket::owner_work(move || {
+    let (binding, generation) = codewhale_runtime::runtime_control::owner_work(move || {
         captured_manager.capture_control_owner()
     })
     .await?;
     let config_path = state.config_path.clone();
     let socket_path =
-        codewhale_app_server::daemon_socket::owner_work(move || match selected_socket {
+        codewhale_runtime::runtime_control::owner_work(move || match selected_socket {
             Some(path) => Ok(path),
-            None => codewhale_app_server::daemon_socket::default_socket_path().map_err(Into::into),
+            None => default_socket_path().map_err(Into::into),
         })
         .await?;
     let process_start =
@@ -2329,7 +2587,7 @@ async fn bind_captured_runtime_frontends(
     let principal =
         codewhale_config::private_directory::PrivateDirectory::current_user_id().to_string();
     #[cfg(windows)]
-    let principal = codewhale_app_server::daemon_socket::owner_work(|| {
+    let principal = codewhale_runtime::runtime_control::owner_work(|| {
         codewhale_config::windows_identity::CurrentWindowsUser::open()?.sid_string()
     })
     .await?;
@@ -2376,7 +2634,7 @@ async fn run_attached_frontend(
         .context("authenticated owner has no selected frontend facts")?;
     let acp_selected = matches!(
         options.control_frontend.as_ref(),
-        Some(codewhale_app_server::RuntimeControlFrontend::Acp { .. })
+        Some(codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { .. })
     );
     anyhow::ensure!(
         (!acp_selected || routing.acp) && (acp_selected || !routing.acp_only),
@@ -2385,17 +2643,25 @@ async fn run_attached_frontend(
     if matches!(
         options.control_frontend.as_ref(),
         Some(
-            codewhale_app_server::RuntimeControlFrontend::Stdio
-                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+            codewhale_runtime::runtime_control::RuntimeControlFrontend::Stdio
+                | codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { .. }
         )
     ) {
-        return client
+        let forwarded = client
             .forward(tokio::io::stdin(), tokio::io::stdout())
             .await;
+        if acp_selected && let Err(error) = forwarded.as_ref() {
+            eprintln!("error: {error}");
+            for cause in error.chain().skip(1) {
+                eprintln!("  caused by: {cause}");
+            }
+            std::process::exit(1);
+        }
+        return forwarded;
     }
     if matches!(
         options.control_frontend.as_ref(),
-        Some(codewhale_app_server::RuntimeControlFrontend::Socket { .. })
+        Some(codewhale_runtime::runtime_control::RuntimeControlFrontend::Socket { .. })
     ) {
         println!(
             "Attached to the authenticated Runtime control owner at {}.",
@@ -2439,7 +2705,7 @@ async fn run_attached_frontend(
 fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()> {
     if matches!(
         options.control_frontend.as_ref(),
-        Some(codewhale_app_server::RuntimeControlFrontend::LegacyHttp)
+        Some(codewhale_runtime::runtime_control::RuntimeControlFrontend::LegacyHttp)
     ) && !is_loopback_bind_host(&options.host)
         && options
             .auth_token
@@ -2451,9 +2717,9 @@ fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()>
     if matches!(
         options.control_frontend.as_ref(),
         Some(
-            codewhale_app_server::RuntimeControlFrontend::Stdio
-                | codewhale_app_server::RuntimeControlFrontend::Socket { .. }
-                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+            codewhale_runtime::runtime_control::RuntimeControlFrontend::Stdio
+                | codewhale_runtime::runtime_control::RuntimeControlFrontend::Socket { .. }
+                | codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { .. }
         )
     ) && !is_loopback_bind_host(&options.host)
     {
@@ -2482,6 +2748,41 @@ fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn with_loopback_host_guard(app: Router, unauthenticated: bool) -> Router {
+    if unauthenticated {
+        app.layer(middleware::from_fn(require_loopback_host_header))
+    } else {
+        app
+    }
+}
+
+async fn require_loopback_host_header(request: Request, next: middleware::Next) -> Response {
+    let loopback = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(host_header_is_loopback);
+    if loopback {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        "This unauthenticated Runtime only answers requests addressed to 127.0.0.1, ::1 or localhost.",
+    )
+        .into_response()
+}
+
+fn host_header_is_loopback(value: &str) -> bool {
+    let host = match value.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(host, _)| host),
+        None => value.rsplit_once(':').map_or(value, |(host, _)| host),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn is_loopback_bind_host(host: &str) -> bool {
@@ -2612,7 +2913,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route(
             "/v1/stream",
             post(stream_turn).layer(DefaultBodyLimit::max(
-                codewhale_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
+                codewhale_app_server_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
             )),
         )
         .route("/v1/git", get(git::git_status_detail))
@@ -2640,7 +2941,12 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/threads/{id}/notices/{notice_id}",
             delete(ack_thread_notice),
         )
-        .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route(
+            "/v1/threads/{id}",
+            get(get_thread)
+                .patch(update_thread)
+                .delete(thread_delete::delete_thread),
+        )
         .route(
             "/v1/threads/{id}/history",
             get(thread_history::snapshot_thread_history),
@@ -2683,6 +2989,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(jobs::resize_thread_job),
         )
         .route("/v1/threads/{id}/context", get(context::get_thread_context))
+        .route(
+            "/v1/threads/{id}/members",
+            post(members::start_thread_member),
+        )
         .route("/v1/threads/{id}/plan", get(plans::get_thread_plan))
         .route("/v1/threads/{id}/todo", get(plans::get_thread_todo))
         .route("/v1/plan", get(plans::latest_plan))
@@ -2694,6 +3004,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(targets::list_targets).post(targets::create_target),
         )
         .route("/v1/targets/switch", post(targets::switch_target))
+        .route("/v1/tailnet", get(targets::tailnet_inventory))
+        .route(
+            "/v1/fleet/placement",
+            post(targets::placement_preview).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/v1/remote", get(targets::remote_status))
         .route("/v1/remote/connect", post(targets::remote_connect))
         .route(
@@ -2727,9 +3042,13 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(get_thread_turn_operation),
         )
         .route(
+            "/v1/threads/{id}/reviews",
+            post(review::start_thread_review).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
             "/v1/threads/{id}/turns",
             post(start_thread_turn).layer(DefaultBodyLimit::max(
-                codewhale_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
+                codewhale_app_server_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
             )),
         )
         .route(
@@ -2777,6 +3096,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/threads/{id}/agent-mail/{message_id}/read",
             post(mark_agent_mail_read),
         )
+        .route("/v1/threads/{id}/read", post(mark_thread_read))
         .route(
             "/v1/threads/{id}/agent-mail/{message_id}/cancel",
             post(cancel_agent_mail),
@@ -2798,13 +3118,18 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route(
             "/v1/user-input/{thread_id}/{input_id}",
-            post(submit_user_input),
+            post(submit_user_input).delete(cancel_user_input_request),
         )
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/skills", get(list_skills))
         .route("/v1/commands", get(list_commands))
+        .route("/v1/threads/{id}/commands", post(run_thread_command))
+        .route(
+            "/v1/threads/{id}/commands/{operation_key}",
+            get(get_thread_command).delete(cancel_thread_command),
+        )
         .route("/v1/hooks", get(list_hooks))
         .route(
             "/v1/skills/{name}",
@@ -2907,6 +3232,8 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/automations/{id}/pause", post(pause_automation))
         .route("/v1/automations/{id}/resume", post(resume_automation))
         .route("/v1/automations/{id}/runs", get(list_automation_runs))
+        .route("/v1/triggers", get(list_triggers).post(create_trigger))
+        .route("/v1/triggers/{id}", get(get_trigger).delete(cancel_trigger))
         .route(
             "/v1/operate",
             get(get_operate).post(start_operate).patch(patch_operate),
@@ -2945,6 +3272,14 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .layer(DefaultBodyLimit::max(
                     secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
                 )),
+        )
+        .route(
+            "/v1/providers/{id}/connect",
+            post(secrets::start_provider_connect),
+        )
+        .route(
+            "/v1/providers/{id}/connect/{attempt_id}",
+            get(secrets::get_provider_connect).delete(secrets::cancel_provider_connect),
         )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
@@ -3023,10 +3358,11 @@ async fn mobile_page(State(state): State<RuntimeApiState>) -> Result<Response, A
         )
             .into_response());
     }
-    let settings = tokio::task::spawn_blocking(crate::settings::Settings::load_read_only)
-        .await
-        .map_err(|err| ApiError::internal(format!("mobile settings task failed: {err}")))?
-        .map_err(|err| ApiError::internal(format!("mobile settings unavailable: {err}")))?;
+    let settings =
+        tokio::task::spawn_blocking(codewhale_runtime::settings::Settings::load_read_only)
+            .await
+            .map_err(|err| ApiError::internal(format!("mobile settings task failed: {err}")))?
+            .map_err(|err| ApiError::internal(format!("mobile settings unavailable: {err}")))?;
     let locale = codewhale_localization::resolve_locale(&settings.locale);
     let mut response = Html(mobile_html(locale)).into_response();
     secure_mobile_response(&mut response);
@@ -3226,6 +3562,33 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+async fn refresh_local_default_catalog(
+    state: &RuntimeApiState,
+    requested: Option<&str>,
+    provider: Option<&str>,
+    provider_id: Option<&str>,
+) {
+    if requested.is_some_and(|model| {
+        !model.trim().is_empty()
+            && !model.trim().eq_ignore_ascii_case("auto")
+            && !codewhale_runtime::config::is_unresolved_local_ollama_model(model)
+    }) {
+        return;
+    }
+    let config = state.config.read().clone();
+    let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+    let identity = if provider.is_some() || provider_id.is_some() {
+        config.resolve_persisted_provider_identity(provider, provider_id)
+    } else {
+        config.active_provider_identity()
+    };
+    if let Ok(identity) = identity
+        && identity.provider == ProviderKind::Ollama
+    {
+        codewhale_engine::provider_lake::refresh_local_ollama_catalog(&config, &identity).await;
+    }
+}
+
 fn runtime_request_model(config: &Config, requested: Option<&str>) -> Result<String, ApiError> {
     if let Some(model) = requested {
         return Ok(model.to_string());
@@ -3252,6 +3615,13 @@ async fn create_task(
     if req.workspace.is_none() {
         req.workspace = Some(state.workspace.clone());
     }
+    refresh_local_default_catalog(
+        &state,
+        req.model.as_deref(),
+        req.model_provider.as_deref(),
+        req.model_provider_id.as_deref(),
+    )
+    .await;
     if req.model.is_none() && req.model_provider.is_none() && req.model_provider_id.is_none() {
         req.model = Some(runtime_request_model(&state.config.read(), None)?);
     }
@@ -3273,6 +3643,13 @@ async fn create_thread(
     if req.mode.as_ref().is_none_or(|m| m.trim().is_empty()) {
         req.mode = Some("agent".to_string());
     }
+    refresh_local_default_catalog(
+        &state,
+        req.model.as_deref(),
+        req.model_provider.as_deref(),
+        req.model_provider_id.as_deref(),
+    )
+    .await;
 
     let thread = state
         .runtime_threads
@@ -3282,7 +3659,13 @@ async fn create_thread(
             state.config_profile.as_deref(),
         )
         .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        .map_err(|e| {
+            if e.is::<codewhale_engine::runtime_threads::manager::RuntimeThreadCreateConflict>() {
+                ApiError::conflict(e.to_string())
+            } else {
+                ApiError::bad_request(e.to_string())
+            }
+        })?;
     Ok((StatusCode::CREATED, Json(thread)))
 }
 
@@ -3303,7 +3686,7 @@ async fn list_threads(
 /// accounting (#6180). One call, no inference from latest-turn status.
 async fn list_running_threads(
     State(state): State<RuntimeApiState>,
-) -> Result<Json<Vec<crate::runtime_threads::RunningThread>>, ApiError> {
+) -> Result<Json<Vec<codewhale_engine::runtime_threads::manager::RunningThread>>, ApiError> {
     let running = state
         .runtime_threads
         .running_threads()
@@ -3318,7 +3701,7 @@ async fn list_running_threads(
 async fn list_thread_notices(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<crate::runtime_threads::ActiveNotice>>, ApiError> {
+) -> Result<Json<Vec<codewhale_engine::runtime_threads::manager::ActiveNotice>>, ApiError> {
     state
         .runtime_threads
         .get_thread(&id)
@@ -3478,6 +3861,14 @@ async fn list_threads_summary(
         let facts = facts.get(&thread.id);
         let latest_status = facts.and_then(|facts| facts.latest_turn_status.clone());
         let pending_attention_count = facts.map_or(0, |facts| facts.pending_attention_count);
+        let newest_item_id = facts.and_then(|facts| facts.newest_item_id.as_deref());
+        let unread = thread.last_read.as_ref().map(|marker| {
+            !marker.last_in_turn || marker.watermark_item_id.as_deref() != newest_item_id
+        });
+        let last_read_item_id = thread
+            .last_read
+            .as_ref()
+            .map(|marker| marker.item_id.clone());
         let latest_input_summary =
             facts.and_then(|facts| facts.latest_turn_input_summary.as_deref());
 
@@ -3523,6 +3914,9 @@ async fn list_threads_summary(
             latest_turn_id: thread.latest_turn_id,
             latest_turn_status: latest_status,
             pending_attention_count,
+            last_read_item_id,
+            unread,
+            parent_thread_id: thread.parent_thread_id,
         });
     }
 
@@ -3548,7 +3942,7 @@ fn same_agent_worker_launch(current: &AgentWorkerRecord, expected: &AgentWorkerR
 
 fn fleet_worker_has_selected_lease(
     record: &AgentWorkerRecord,
-    fleet: &crate::fleet::ledger::FleetLedgerState,
+    fleet: &codewhale_engine::fleet::ledger::FleetLedgerState,
 ) -> bool {
     fleet.tasks.values().any(|task| {
         task.entry.run_id.0 == record.spec.run_id
@@ -3559,7 +3953,7 @@ fn fleet_worker_has_selected_lease(
 async fn workspace_agent_runs(state: &RuntimeApiState) -> Result<Vec<AgentWorkerRecord>, ApiError> {
     let manager = state.sub_agent_manager.clone().read_owned().await;
     let selected_state = state.clone();
-    codewhale_app_server::daemon_socket::owner_work(move || {
+    codewhale_runtime::runtime_control::owner_work(move || {
         let projected = manager
             .worker_records_for_workspace(&selected_state.workspace)
             .map_err(anyhow::Error::msg)?;
@@ -3669,7 +4063,7 @@ async fn cancel_agent_run(
         let manager = state.sub_agent_manager.clone().read_owned().await;
         let selected_workspace = state.workspace.clone();
         let expected = selected_record.clone();
-        codewhale_app_server::daemon_socket::owner_work(move || {
+        codewhale_runtime::runtime_control::owner_work(move || {
             Ok(manager
                 .worker_records_for_workspace(&selected_workspace)
                 .map_err(anyhow::Error::msg)?
@@ -3698,7 +4092,7 @@ async fn cancel_agent_run(
         let selected_workspace = state.workspace.clone();
         let selected_state = state.clone();
         let expected_record = record.clone();
-        let cancelled = codewhale_app_server::daemon_socket::owner_work(move || {
+        let cancelled = codewhale_runtime::runtime_control::owner_work(move || {
             let (current, needs_lease) = manager
                 .worker_records_for_workspace(&selected_workspace)
                 .map_err(anyhow::Error::msg)?
@@ -3734,10 +4128,16 @@ async fn cancel_agent_run(
         .map_err(|err| {
             ApiError::conflict(format!("agent run '{run_id}' could not be stopped: {err}"))
         })?;
-        let cancelled =
-            crate::tools::subagent::settle_requested_child(&state.sub_agent_manager, cancelled)
-                .await;
-        crate::tools::subagent::preserve_cancelled_work(&state.sub_agent_manager, cancelled).await;
+        let cancelled = codewhale_engine::tools::subagent::settle_requested_child(
+            &state.sub_agent_manager,
+            cancelled,
+        )
+        .await;
+        codewhale_engine::tools::subagent::preserve_cancelled_work(
+            &state.sub_agent_manager,
+            cancelled,
+        )
+        .await;
         let manager = state.sub_agent_manager.read().await;
         let record = manager
             .list_worker_records()
@@ -3778,7 +4178,7 @@ async fn cancel_agent_run(
         )));
     };
     engine
-        .send(crate::core::ops::Op::CancelSubAgent {
+        .send(codewhale_engine::core::ops::Op::CancelSubAgent {
             agent_id: record.spec.worker_id.clone(),
         })
         .await
@@ -3836,6 +4236,11 @@ async fn create_fleet_run(
     State(state): State<RuntimeApiState>,
     Json(request): Json<CreateFleetRunRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if state.config.read().session_provider_keys_only {
+        return Err(ApiError::conflict(
+            "External Fleet workers are unavailable under session-only provider key policy; use in-process subagents",
+        ));
+    }
     if request.target != FleetRuntimeTarget::ThisComputer {
         return Err(ApiError::not_implemented(format!(
             "Fleet target {:?} is not available in this local Runtime; choose this_computer",
@@ -4012,7 +4417,7 @@ fn managed_fleet_token(field: &str, value: &str) -> Result<String, ApiError> {
 }
 
 fn reject_parallel_write_collisions(tasks: &[FleetTaskSpec]) -> Result<(), ApiError> {
-    let mut claims: Vec<(String, String)> = Vec::new();
+    let mut claims = Vec::new();
     for task in tasks {
         let write_roots = fleet_write_roots(task).map_err(|error| {
             ApiError::bad_request(format!(
@@ -4021,15 +4426,26 @@ fn reject_parallel_write_collisions(tasks: &[FleetTaskSpec]) -> Result<(), ApiEr
             ))
         })?;
         for normalized in write_roots {
-            for (owner, existing) in &claims {
-                if owner != &task.id && managed_paths_overlap(existing.as_str(), &normalized) {
-                    return Err(ApiError::bad_request(format!(
-                        "Parallel Workflow write scope collision: tasks '{owner}' and '{}' both claim overlapping paths",
-                        task.id
-                    )));
-                }
+            claims.push((task.id.as_str(), normalized));
+        }
+    }
+    claims.sort_unstable_by(|(_, left), (_, right)| {
+        (left.as_str() != ".")
+            .cmp(&(right.as_str() != "."))
+            .then_with(|| left.split('/').cmp(right.split('/')))
+    });
+    let mut covering: Option<(&str, &str)> = None;
+    for (owner, path) in &claims {
+        if let Some((existing_owner, existing)) = covering
+            && managed_paths_overlap(existing, path)
+        {
+            if existing_owner != *owner {
+                return Err(ApiError::bad_request(format!(
+                    "Parallel Workflow write scope collision: tasks '{existing_owner}' and '{owner}' both claim overlapping paths"
+                )));
             }
-            claims.push((task.id.clone(), normalized));
+        } else {
+            covering = Some((*owner, path.as_str()));
         }
     }
     Ok(())
@@ -4083,7 +4499,13 @@ async fn start_fleet_run(
         ));
     }
     let run_id = FleetRunId::from(run_id);
-    let report = manager.activate_run(&run_id).map_err(|error| {
+    let activation_manager = manager.clone();
+    let activation_run = run_id.clone();
+    let report = codewhale_runtime::runtime_control::owner_work(move || {
+        activation_manager.activate_run(&activation_run)
+    })
+    .await
+    .map_err(|error| {
         let message = format!("Failed to start Fleet run '{}': {error}", run_id.0);
         if message.contains("already terminal") {
             ApiError::conflict(message)
@@ -4103,12 +4525,12 @@ async fn start_fleet_run(
     let workspace_scope = state.workspace_scope.clone();
     tokio::spawn(async move {
         let _workspace_scope = workspace_scope;
-        let mut executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
+        let executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
         if let Err(error) = manager
             .run_to_completion(
                 &execution_run_id,
                 max_workers,
-                &mut executor,
+                executor,
                 &codewhale_binary,
                 None,
                 Duration::from_millis(250),
@@ -4308,70 +4730,85 @@ fn fleet_sse_event(event: &FleetRuntimeEvent) -> SseEvent {
 }
 
 async fn list_fleet_runs(State(state): State<RuntimeApiState>) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let runs: Vec<_> = ledger_state
-        .runs
-        .values()
-        .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
-        .collect::<Result<Vec<_>, _>>()?;
-    let status = manager
-        .status()
-        .map_err(|err| ApiError::internal(format!("Failed to read Fleet status: {err}")))?;
-    Ok(Json(json!({
-        "status": fleet_status_json(&status),
-        "runs": runs,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let runs: Vec<_> = ledger_state
+            .runs
+            .values()
+            .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
+            .collect::<Result<Vec<_>, _>>()?;
+        let status = manager
+            .status()
+            .map_err(|err| ApiError::internal(format!("Failed to read Fleet status: {err}")))?;
+        Ok::<_, ApiError>(json!({
+            "status": fleet_status_json(&status),
+            "runs": runs,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet run listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_run(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let run = ledger_state
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
-    Ok(Json(fleet_run_detail_json(&manager, run, &ledger_state)?))
+    let detail = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let run = ledger_state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
+        fleet_run_detail_json(&manager, run, &ledger_state)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet run read task failed: {error}")))??;
+    Ok(Json(detail))
 }
 
 async fn list_fleet_run_workers(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let run = ledger_state
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
-    let workers = run
-        .worker_specs
-        .iter()
-        .map(|worker| {
-            manager
-                .inspect_worker(&worker.id)
-                .map(|inspection| fleet_worker_json(&inspection))
-                .map_err(|err| {
-                    ApiError::internal(format!(
-                        "Failed to inspect Fleet worker {}: {err}",
-                        worker.id
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(json!({
-        "run_id": run_id,
-        "workers": workers,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let run = ledger_state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
+        let workers = run
+            .worker_specs
+            .iter()
+            .map(|worker| {
+                manager
+                    .inspect_worker(&worker.id)
+                    .map(|inspection| fleet_worker_json(&inspection))
+                    .map_err(|err| {
+                        ApiError::internal(format!(
+                            "Failed to inspect Fleet worker {}: {err}",
+                            worker.id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "workers": workers,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet worker listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_worker(
@@ -4420,7 +4857,13 @@ async fn restart_fleet_worker(
     Path(worker_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let manager = open_fleet_manager(&state)?;
-    let report = manager.restart_worker(&worker_id).map_err(|err| {
+    let restart_manager = manager.clone();
+    let restart_worker = worker_id.clone();
+    let report = codewhale_runtime::runtime_control::owner_work(move || {
+        restart_manager.restart_worker(&restart_worker)
+    })
+    .await
+    .map_err(|err| {
         ApiError::bad_request(format!(
             "Failed to restart Fleet worker '{worker_id}': {err}"
         ))
@@ -4434,12 +4877,12 @@ async fn restart_fleet_worker(
     let workspace_scope = state.workspace_scope.clone();
     tokio::spawn(async move {
         let _workspace_scope = workspace_scope;
-        let mut executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
+        let executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
         if let Err(err) = manager
             .run_to_completion(
                 &run_id,
                 max_workers,
-                &mut executor,
+                executor,
                 &codewhale_binary,
                 None,
                 Duration::from_millis(250),
@@ -4488,104 +4931,121 @@ async fn list_fleet_run_receipts(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    if !ledger_state.runs.contains_key(&run_id) {
-        return Err(ApiError::not_found(format!(
-            "Fleet run '{run_id}' not found"
-        )));
-    }
-    let run_id_parsed = FleetRunId::from(run_id.clone());
-    let receipts: Vec<Value> = ledger_state
-        .receipts
-        .values()
-        .filter(|r| r.run_id == run_id_parsed)
-        .map(fleet_receipt_json)
-        .collect();
-    Ok(Json(json!({
-        "run_id": run_id,
-        "receipts": receipts,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        if !ledger_state.runs.contains_key(&run_id) {
+            return Err(ApiError::not_found(format!(
+                "Fleet run '{run_id}' not found"
+            )));
+        }
+        let run_id_parsed = FleetRunId::from(run_id.clone());
+        let receipts: Vec<Value> = ledger_state
+            .receipts
+            .values()
+            .filter(|r| r.run_id == run_id_parsed)
+            .map(fleet_receipt_json)
+            .collect();
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "receipts": receipts,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet receipt listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_run_receipt(
     State(state): State<RuntimeApiState>,
     Path((run_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let key = format!("{run_id}:{task_id}");
-    let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
-        ApiError::not_found(format!(
-            "no receipt found for run '{run_id}' task '{task_id}'"
-        ))
-    })?;
-    Ok(Json(fleet_receipt_json(receipt)))
+    let receipt = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let key = format!("{run_id}:{task_id}");
+        let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no receipt found for run '{run_id}' task '{task_id}'"
+            ))
+        })?;
+        Ok::<_, ApiError>(fleet_receipt_json(receipt))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet receipt read task failed: {error}")))??;
+    Ok(Json(receipt))
 }
 
 async fn inspect_fleet_run_receipt_evidence(
     State(state): State<RuntimeApiState>,
     Path((run_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let key = format!("{run_id}:{task_id}");
-    let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
-        ApiError::not_found(format!(
-            "no receipt found for run '{run_id}' task '{task_id}'"
-        ))
-    })?;
-    // Locate the most recent Receipt-kind artifact.
-    let receipt_artifact = receipt
-        .artifacts
-        .iter()
-        .rfind(|a| a.kind == FleetArtifactKind::Receipt)
-        .ok_or_else(|| {
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let key = format!("{run_id}:{task_id}");
+        let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
             ApiError::not_found(format!(
-                "no verifier evidence file for run '{run_id}' task '{task_id}'"
+                "no receipt found for run '{run_id}' task '{task_id}'"
             ))
         })?;
-    // Receipt artifacts are workspace-relative paths recorded by the verifier;
-    // reject absolute paths and `..` escapes before joining onto the workspace.
-    // An EMPTY recorded path is not a path at all: joining it would resolve
-    // to the workspace directory itself and read it as a file.
-    if receipt_artifact.path.as_os_str().is_empty() {
-        return Err(ApiError::not_found(format!(
-            "no verifier evidence file recorded for run '{run_id}' task '{task_id}'"
-        )));
-    }
-    if !crate::fleet::artifacts::path_is_confined(&receipt_artifact.path) {
-        return Err(ApiError::bad_request(format!(
-            "evidence path for run '{run_id}' task '{task_id}' escapes the workspace"
-        )));
-    }
-    let (raw, size_bytes) = crate::fleet::artifacts::read_verified(
-        &state.workspace,
-        receipt_artifact,
-        MAX_RECEIPT_EVIDENCE_READ_BYTES,
-    )
-    .map_err(|err| {
-        ApiError::bad_request(format!("Receipt evidence could not be verified: {err}"))
-    })?;
-    let truncated = size_bytes > MAX_RECEIPT_EVIDENCE_READ_BYTES;
-    // Parse as JSON if possible; fall back to a raw string representation.
-    let content: Value = serde_json::from_slice(&raw)
-        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
-    Ok(Json(json!({
-        "run_id": run_id,
-        "task_id": task_id,
-        "path": receipt_artifact.path,
-        "checksum": receipt_artifact.checksum,
-        "size_bytes": size_bytes,
-        "truncated": truncated,
-        "content": content,
-    })))
+        // Locate the most recent Receipt-kind artifact.
+        let receipt_artifact = receipt
+            .artifacts
+            .iter()
+            .rfind(|a| a.kind == FleetArtifactKind::Receipt)
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "no verifier evidence file for run '{run_id}' task '{task_id}'"
+                ))
+            })?;
+        // Receipt artifacts are workspace-relative paths recorded by the verifier;
+        // reject absolute paths and `..` escapes before joining onto the workspace.
+        // An EMPTY recorded path is not a path at all: joining it would resolve
+        // to the workspace directory itself and read it as a file.
+        if receipt_artifact.path.as_os_str().is_empty() {
+            return Err(ApiError::not_found(format!(
+                "no verifier evidence file recorded for run '{run_id}' task '{task_id}'"
+            )));
+        }
+        if !codewhale_engine::fleet::artifacts::path_is_confined(&receipt_artifact.path) {
+            return Err(ApiError::bad_request(format!(
+                "evidence path for run '{run_id}' task '{task_id}' escapes the workspace"
+            )));
+        }
+        let (raw, size_bytes) = codewhale_engine::fleet::artifacts::read_verified(
+            &state.workspace,
+            receipt_artifact,
+            MAX_RECEIPT_EVIDENCE_READ_BYTES,
+        )
+        .map_err(|err| {
+            ApiError::bad_request(format!("Receipt evidence could not be verified: {err}"))
+        })?;
+        let truncated = size_bytes > MAX_RECEIPT_EVIDENCE_READ_BYTES;
+        // Parse as JSON if possible; fall back to a raw string representation.
+        let content: Value = serde_json::from_slice(&raw)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "task_id": task_id,
+            "path": receipt_artifact.path,
+            "checksum": receipt_artifact.checksum,
+            "size_bytes": size_bytes,
+            "truncated": truncated,
+            "content": content,
+        }))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal(format!("Fleet receipt evidence read task failed: {error}"))
+    })??;
+    Ok(Json(response))
 }
 
 fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError> {
@@ -4949,10 +5409,10 @@ struct CommandCatalogEntry {
     palette_runs_directly: bool,
     /// Listed when the slash menu opens with no filter text.
     show_in_empty_discovery: bool,
-    /// `builtin` is registered code; `user` expands a stored template.
+    /// `builtin` and `extension` are registered code; `user` expands a stored template.
     kind: &'static str,
-    /// `host` runs locally and never reaches the model; `prompt` expands into
-    /// the request the model sees.
+    /// `host` runs locally, `extension` invokes the Runtime command endpoint,
+    /// and `prompt` expands into the request the model sees.
     binding: &'static str,
     /// `primary` | `advanced` | `compatibility` — builtins only; `hidden`
     /// covers rows the product does not advertise anywhere.
@@ -4965,6 +5425,10 @@ struct CommandCatalogEntry {
     /// Alias spellings of this builtin taken by user commands.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shadowed_aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registration_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4973,8 +5437,8 @@ struct CommandsResponse {
 }
 
 fn command_catalog(
-    builtins: &[crate::command_catalog::BuiltinCommand],
-    users: &[crate::command_catalog::UserCommand],
+    builtins: &[codewhale_engine::command_catalog::BuiltinCommand],
+    users: &[codewhale_engine::command_catalog::UserCommand],
 ) -> Vec<CommandCatalogEntry> {
     let mut commands = Vec::new();
     for info in builtins {
@@ -5021,6 +5485,8 @@ fn command_catalog(
             hidden: info.unlisted,
             shadowed_by,
             shadowed_aliases,
+            origin: None,
+            registration_id: None,
         });
     }
     for command in users.iter().filter(|command| !command.extension) {
@@ -5042,30 +5508,182 @@ fn command_catalog(
             hidden: command.hidden,
             shadowed_by: None,
             shadowed_aliases: Vec::new(),
+            origin: None,
+            registration_id: None,
         });
     }
     commands
 }
 
+#[derive(Debug, Deserialize)]
+struct CommandsQuery {
+    thread_id: Option<String>,
+}
+
 async fn list_commands(
     State(state): State<RuntimeApiState>,
+    Query(query): Query<CommandsQuery>,
 ) -> Result<Json<CommandsResponse>, ApiError> {
-    let catalog = crate::command_catalog::installed()
+    let catalog = codewhale_engine::command_catalog::installed()
         .ok_or_else(|| ApiError::internal("command catalog is not installed"))?;
-    let workspace = state.workspace.clone();
+    let (workspace, extensions) = if let Some(thread_id) = query.thread_id.as_deref() {
+        let thread = state
+            .runtime_threads
+            .get_thread(thread_id)
+            .await
+            .map_err(map_thread_err)?;
+        let extensions = state
+            .runtime_threads
+            .extension_commands(thread_id)
+            .await
+            .map_err(map_thread_err)?;
+        (thread.workspace, extensions)
+    } else {
+        (
+            state.workspace.clone(),
+            codewhale_engine::extension_host::live_commands_for(&state.workspace),
+        )
+    };
     #[cfg(test)]
     let env_ticket = crate::test_support::env_scope_ticket();
     let commands = tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
-        command_catalog(
-            &catalog.builtins(),
-            &catalog.user_commands(workspace.as_path()),
-        )
+        let mut commands = command_catalog(&catalog.builtins(), &catalog.user_commands(&workspace));
+        let mut counts = std::collections::HashMap::new();
+        for entry in &extensions {
+            *counts
+                .entry(entry.registration.name.clone())
+                .or_insert(0usize) += 1;
+        }
+        for entry in extensions {
+            let registration = &entry.registration;
+            if counts[&registration.name] != 1
+                || catalog.answers_to(&registration.name)
+                || commands.iter().any(|command| {
+                    command.name == registration.name
+                        || command.aliases.contains(&registration.name)
+                })
+            {
+                continue;
+            }
+            let reference = entry.reference();
+            let takes_arguments = registration.argument_hint.is_some();
+            commands.push(CommandCatalogEntry {
+                name: registration.name.clone(),
+                aliases: Vec::new(),
+                summary: Some(registration.description.clone()),
+                usage: Some(match &registration.argument_hint {
+                    Some(hint) => format!("/{} {hint}", registration.name),
+                    None => format!("/{}", registration.name),
+                }),
+                subcommands: Vec::new(),
+                takes_arguments,
+                requires_argument: takes_arguments,
+                requires_required_argument: false,
+                composer_wants_trailing_space: takes_arguments,
+                palette_runs_directly: !takes_arguments,
+                show_in_empty_discovery: true,
+                kind: "extension",
+                binding: "extension",
+                discovery: None,
+                hidden: false,
+                shadowed_by: None,
+                shadowed_aliases: Vec::new(),
+                origin: Some(reference.origin.clone()),
+                registration_id: query
+                    .thread_id
+                    .as_deref()
+                    .map(|thread_id| reference.registration_id(thread_id)),
+            });
+        }
+        commands
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(CommandsResponse { commands }))
+}
+
+async fn run_thread_command(
+    State(state): State<RuntimeApiState>,
+    Path(thread_id): Path<String>,
+    Json(request): Json<codewhale_engine::runtime_threads::manager::RuntimeCommandRequest>,
+) -> Result<Json<codewhale_engine::runtime_threads::manager::RuntimeCommandResult>, ApiError> {
+    let operation_key = request.operation_key.clone();
+    match state
+        .runtime_threads
+        .run_extension_command(&thread_id, request)
+        .await
+    {
+        Ok(result) => Ok(Json(result)),
+        Err(error)
+            if error
+                .to_string()
+                .starts_with("Command registration is stale")
+                || error.to_string().starts_with("Command workspace changed") =>
+        {
+            state
+                .runtime_threads
+                .cancel_extension_command(&thread_id, &operation_key)
+                .await
+                .map_err(map_command_err)?;
+            let status = state
+                .runtime_threads
+                .extension_command_status(&thread_id, &operation_key)
+                .await
+                .map_err(map_command_err)?;
+            if status
+                .as_ref()
+                .is_some_and(|status| status["status"] == "cancelled" && status["name"] == "")
+            {
+                Err(ApiError::conflict(error.to_string()).with_code("command_not_started"))
+            } else {
+                Err(ApiError::conflict(
+                    "Command operation already has an outcome; look up its receipt",
+                )
+                .with_code("command_pending"))
+            }
+        }
+        Err(error) => Err(map_command_err(error)),
+    }
+}
+
+async fn get_thread_command(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, operation_key)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .runtime_threads
+        .extension_command_status(&thread_id, &operation_key)
+        .await
+        .map_err(map_command_err)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("Command operation not found"))
+}
+
+async fn cancel_thread_command(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, operation_key)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let cancelled = state
+        .runtime_threads
+        .cancel_extension_command(&thread_id, &operation_key)
+        .await
+        .map_err(map_command_err)?;
+    Ok(Json(json!({ "cancelled": cancelled })))
+}
+
+fn map_command_err(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.starts_with("Command operation was cancelled") {
+        ApiError::conflict(message).with_code("command_cancelled")
+    } else if message.starts_with("Command operation")
+        || message.contains("already has an active command")
+    {
+        ApiError::conflict(message).with_code("command_pending")
+    } else {
+        map_thread_err(error)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5184,7 +5802,7 @@ async fn list_hooks(
         problems: hooks_config
             .problems
             .iter()
-            .map(crate::hooks::HookConfigProblem::summary)
+            .map(codewhale_engine::hooks::config::problem_summary)
             .collect(),
     }))
 }
@@ -5192,11 +5810,11 @@ async fn list_hooks(
 async fn list_skills(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<SkillsResponse>, ApiError> {
-    let (skills_dir, mode) = {
+    let (skills_dir, skills_config) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
-        (skills_dir, mode)
+        let skills_config = config.skills_config();
+        (skills_dir, skills_config)
     };
     let plugin_registry = state
         .plugin_discovery
@@ -5204,7 +5822,7 @@ async fn list_skills(
     let (registry, directories) = discover_skills_for_runtime_api(
         &state.workspace,
         &skills_dir,
-        mode,
+        &skills_config,
         Some(plugin_registry.as_ref()),
     );
     let mut skill_state = state.skill_state.lock().await;
@@ -5233,11 +5851,11 @@ async fn set_skill_enabled(
     Path(name): Path<String>,
     Json(req): Json<SetSkillEnabledRequest>,
 ) -> Result<Json<SetSkillEnabledResponse>, ApiError> {
-    let (skills_dir, mode) = {
+    let (skills_dir, skills_config) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
-        (skills_dir, mode)
+        let skills_config = config.skills_config();
+        (skills_dir, skills_config)
     };
     let plugin_registry = state
         .plugin_discovery
@@ -5245,7 +5863,7 @@ async fn set_skill_enabled(
     let (registry, directories) = discover_skills_for_runtime_api(
         &state.workspace,
         &skills_dir,
-        mode,
+        &skills_config,
         Some(plugin_registry.as_ref()),
     );
     let exists = registry.list().iter().any(|skill| skill.name == name);
@@ -5286,11 +5904,11 @@ async fn get_skill_detail(
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
-        let (skills_dir, mode) = {
+        let (skills_dir, skills_config) = {
             let config = state.config.read();
             let skills_dir = resolve_skills_dir(&config, &state.workspace);
-            let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
-            (skills_dir, mode)
+            let skills_config = config.skills_config();
+            (skills_dir, skills_config)
         };
         let plugin_registry = state
             .plugin_discovery
@@ -5298,7 +5916,7 @@ async fn get_skill_detail(
         let (registry, directories) = discover_skills_for_runtime_api(
             &state.workspace,
             &skills_dir,
-            mode,
+            &skills_config,
             Some(plugin_registry.as_ref()),
         );
         let Some(skill) = registry.get(&name) else {
@@ -5314,20 +5932,20 @@ async fn get_skill_detail(
         // authority its snapshot was reviewed under. Field derivation itself is
         // `skill_entry_for`'s, shared with the listing.
         match &skill.source {
-            crate::skills::SkillSource::Native if !skill.path.is_file() => {
+            codewhale_skills::SkillSource::Native if !skill.path.is_file() => {
                 return Err(ApiError::not_found(format!(
                     "skill '{}' is registered at {} but that file no longer exists on disk",
                     skill.name,
                     skill.path.display()
                 )));
             }
-            crate::skills::SkillSource::Plugin { authority, .. } => {
+            codewhale_skills::SkillSource::Plugin { authority, .. } => {
                 // The same gate the TUI's own activation path runs: a plugin whose
                 // trust or enablement changed since discovery must not hand its
                 // body to a client.
-                crate::plugins::registry::verify_plugin_component_authority(
+                codewhale_plugins::registry::verify_plugin_component_authority(
                     authority,
-                    crate::plugins::activation::PluginActivationCapability::Skills,
+                    codewhale_plugins::activation::PluginActivationCapability::Skills,
                 )
                 .map_err(|reason| {
                     ApiError::forbidden(format!(
@@ -5342,7 +5960,7 @@ async fn get_skill_detail(
                     )));
                 }
             }
-            crate::skills::SkillSource::Native => {}
+            codewhale_skills::SkillSource::Native => {}
         }
 
         let mut skill_state = state.skill_state.blocking_lock();
@@ -5362,23 +5980,23 @@ async fn get_skill_detail(
 
 // ─── Skill lifecycle helpers ────────────────────────────────────────────────
 
-/// Build a [`crate::skills::mutation::MutationContext`] from the current
+/// Build a [`codewhale_skills::mutation::MutationContext`] from the current
 /// server state. Reads the network policy and installer settings directly
 /// from the config already held in `state`.
 fn mutation_context_settings(
     state: &RuntimeApiState,
 ) -> (
-    crate::network_policy::NetworkPolicy,
+    codewhale_net::network_policy::NetworkPolicy,
     u64,
     String,
     Option<PathBuf>,
 ) {
-    use crate::skills::install::{DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL};
+    use codewhale_skill_install::install::{DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL};
     let config = state.config.read();
     let network = config
         .network
         .clone()
-        .map(|p| p.into_runtime())
+        .map(codewhale_net::network_policy::NetworkPolicy::from)
         .unwrap_or_default();
     let skills_cfg = config.skills.as_ref();
     let max_size = skills_cfg
@@ -5393,11 +6011,11 @@ fn mutation_context_settings(
 
 fn parse_api_scope(
     scope: Option<&str>,
-) -> Result<Option<crate::skills::mutation::SkillTargetScope>, ApiError> {
+) -> Result<Option<codewhale_skills::mutation::SkillTargetScope>, ApiError> {
     match scope {
         None => Ok(None),
-        Some("project") => Ok(Some(crate::skills::mutation::SkillTargetScope::Project)),
-        Some("global") => Ok(Some(crate::skills::mutation::SkillTargetScope::Global)),
+        Some("project") => Ok(Some(codewhale_skills::mutation::SkillTargetScope::Project)),
+        Some("global") => Ok(Some(codewhale_skills::mutation::SkillTargetScope::Global)),
         Some(other) => Err(ApiError::bad_request(format!(
             "invalid scope '{other}'; expected \"project\" or \"global\""
         ))),
@@ -5405,10 +6023,10 @@ fn parse_api_scope(
 }
 
 fn receipt_to_response(
-    receipt: &crate::skills::mutation::SkillMutationReceipt,
+    receipt: &codewhale_skills::mutation::SkillMutationReceipt,
 ) -> SkillMutationReceiptResponse {
-    use crate::skills::mutation::SkillMutationOutcome;
-    use crate::skills::roots::SkillScope;
+    use codewhale_skills::mutation::SkillMutationOutcome;
+    use codewhale_skills::roots::SkillScope;
 
     const TRUST_NOTE: &str = "The .trusted marker is advisory and digest-bound; \
          it records your review intent but does not sandbox or auto-authorize scripts.";
@@ -5445,21 +6063,21 @@ fn receipt_to_response(
     }
 }
 
-fn outcome_is_policy_error(outcome: &crate::skills::mutation::SkillMutationOutcome) -> bool {
+fn outcome_is_policy_error(outcome: &codewhale_skills::mutation::SkillMutationOutcome) -> bool {
     matches!(
         outcome,
-        crate::skills::mutation::SkillMutationOutcome::NeedsApproval(_)
-            | crate::skills::mutation::SkillMutationOutcome::NetworkDenied(_)
+        codewhale_skills::mutation::SkillMutationOutcome::NeedsApproval(_)
+            | codewhale_skills::mutation::SkillMutationOutcome::NetworkDenied(_)
     )
 }
 
-fn policy_error_message(outcome: &crate::skills::mutation::SkillMutationOutcome) -> String {
+fn policy_error_message(outcome: &codewhale_skills::mutation::SkillMutationOutcome) -> String {
     match outcome {
-        crate::skills::mutation::SkillMutationOutcome::NeedsApproval(host) => format!(
+        codewhale_skills::mutation::SkillMutationOutcome::NeedsApproval(host) => format!(
             "network access to '{host}' requires explicit approval; \
              approve the host in your network policy before installing this skill"
         ),
-        crate::skills::mutation::SkillMutationOutcome::NetworkDenied(host) => {
+        codewhale_skills::mutation::SkillMutationOutcome::NetworkDenied(host) => {
             format!("network access to '{host}' was denied by the active network policy")
         }
         _ => "operation denied by policy".to_string(),
@@ -5472,8 +6090,8 @@ async fn install_skill_api(
     State(state): State<RuntimeApiState>,
     Json(req): Json<InstallSkillRequest>,
 ) -> Result<(StatusCode, Json<SkillMutationReceiptResponse>), ApiError> {
-    use crate::skills::install::InstallSource;
-    use crate::skills::mutation::{MutationContext, SkillMutationRequest, SkillTargetScope};
+    use codewhale_skill_install::install::InstallSource;
+    use codewhale_skills::mutation::{MutationContext, SkillMutationRequest, SkillTargetScope};
 
     let source = InstallSource::parse(&req.source)
         .map_err(|err| ApiError::bad_request(format!("invalid install source: {err}")))?;
@@ -5481,10 +6099,10 @@ async fn install_skill_api(
 
     let (network, max_size, registry_url, configured_skills_dir) =
         mutation_context_settings(&state);
-    let home = crate::config::effective_home_dir();
+    let home = codewhale_paths::user_home();
     let workspace = state.workspace.clone();
 
-    let receipt = crate::skills::mutation::execute(
+    let receipt = codewhale_skills::mutation::execute(
         SkillMutationRequest::InstallRemote { source, target },
         &MutationContext {
             workspace: &workspace,
@@ -5502,7 +6120,7 @@ async fn install_skill_api(
         return Err(ApiError::forbidden(policy_error_message(&receipt.outcome)));
     }
 
-    let status = if receipt.outcome == crate::skills::mutation::SkillMutationOutcome::Installed {
+    let status = if receipt.outcome == codewhale_skills::mutation::SkillMutationOutcome::Installed {
         StatusCode::CREATED
     } else {
         StatusCode::OK
@@ -5517,15 +6135,15 @@ async fn update_skill_api(
     Path(name): Path<String>,
     Json(req): Json<UpdateSkillRequest>,
 ) -> Result<Json<SkillMutationReceiptResponse>, ApiError> {
-    use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+    use codewhale_skills::mutation::{MutationContext, SkillMutationRequest};
 
     let scope = parse_api_scope(req.scope.as_deref())?;
     let (network, max_size, registry_url, configured_skills_dir) =
         mutation_context_settings(&state);
-    let home = crate::config::effective_home_dir();
+    let home = codewhale_paths::user_home();
     let workspace = state.workspace.clone();
 
-    let receipt = crate::skills::mutation::execute(
+    let receipt = codewhale_skills::mutation::execute(
         SkillMutationRequest::UpdateByName {
             name: name.clone(),
             scope,
@@ -5564,14 +6182,14 @@ async fn uninstall_skill_api(
     Path(name): Path<String>,
     Query(query): Query<UninstallSkillQuery>,
 ) -> Result<Json<SkillMutationReceiptResponse>, ApiError> {
-    use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+    use codewhale_skills::mutation::{MutationContext, SkillMutationRequest};
 
     let scope = parse_api_scope(query.scope.as_deref())?;
     let (network, max_size, registry_url, configured_skills_dir) =
         mutation_context_settings(&state);
-    let home = crate::config::effective_home_dir();
+    let home = codewhale_paths::user_home();
 
-    let receipt = crate::skills::mutation::execute_sync(
+    let receipt = codewhale_skills::mutation::execute_sync(
         SkillMutationRequest::RemoveByName {
             name: name.clone(),
             scope,
@@ -5605,14 +6223,14 @@ async fn trust_skill_api(
     Path(name): Path<String>,
     Json(req): Json<TrustSkillRequest>,
 ) -> Result<Json<SkillMutationReceiptResponse>, ApiError> {
-    use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+    use codewhale_skills::mutation::{MutationContext, SkillMutationRequest};
 
     let scope = parse_api_scope(req.scope.as_deref())?;
     let (network, max_size, registry_url, configured_skills_dir) =
         mutation_context_settings(&state);
-    let home = crate::config::effective_home_dir();
+    let home = codewhale_paths::user_home();
 
-    let receipt = crate::skills::mutation::execute_sync(
+    let receipt = codewhale_skills::mutation::execute_sync(
         SkillMutationRequest::TrustByName {
             name: name.clone(),
             scope,
@@ -5646,19 +6264,19 @@ async fn audit_skill_api(
     Path(name): Path<String>,
     Query(query): Query<SkillScopeQuery>,
 ) -> Result<Json<SkillAuditResponse>, ApiError> {
-    use crate::skills::audit::{
+    use codewhale_skills::audit::{
         AuditedSkill, DigestState, IntegrityState, SkillActionKind, SkillAuditMode,
         SkillAuditWarning, SkillSourceKind, TrustState, scan_with_configured,
     };
-    use crate::skills::roots::SkillRootKind;
+    use codewhale_skills::roots::SkillRootKind;
 
     let scope_filter = parse_api_scope(query.scope.as_deref())?;
-    let home = crate::config::effective_home_dir();
+    let home = codewhale_paths::user_home();
     let configured_skills_dir = {
         let config = state.config.read();
         config.skills_dir.as_ref().map(PathBuf::from)
     };
-    let canonical = crate::skills::normalize_skill_name_for_lookup(&name);
+    let canonical = codewhale_skill_install::skill_parse::normalize_skill_name_for_lookup(&name);
 
     let snap = scan_with_configured(
         &state.workspace,
@@ -5676,8 +6294,10 @@ async fn audit_skill_api(
 
     if let Some(scope) = scope_filter {
         let want = match scope {
-            crate::skills::mutation::SkillTargetScope::Project => SkillRootKind::CodeWhaleProject,
-            crate::skills::mutation::SkillTargetScope::Global => SkillRootKind::CodeWhaleGlobal,
+            codewhale_skills::mutation::SkillTargetScope::Project => {
+                SkillRootKind::CodeWhaleProject
+            }
+            codewhale_skills::mutation::SkillTargetScope::Global => SkillRootKind::CodeWhaleGlobal,
         };
         matches.retain(|s| s.root.kind == want);
     }
@@ -5797,16 +6417,16 @@ struct ApprovalHistoryRow {
     /// Who resolved it: `user`, `session_rule`, `posture`, or `host`.
     /// Absent while pending and on records written before deciders were kept.
     #[serde(skip_serializing_if = "Option::is_none")]
-    decided_by: Option<crate::approval_log::ApprovalDecider>,
+    decided_by: Option<codewhale_engine::approval_log::ApprovalDecider>,
     asked_at: chrono::DateTime<Utc>,
     decided_at: Option<chrono::DateTime<Utc>>,
 }
 
 fn approval_row_standing_rule(
-    outcome: &crate::approval_log::ApprovalOutcome,
-    decided_by: Option<crate::approval_log::ApprovalDecider>,
+    outcome: &codewhale_engine::approval_log::ApprovalOutcome,
+    decided_by: Option<codewhale_engine::approval_log::ApprovalDecider>,
 ) -> Option<&'static str> {
-    use crate::approval_log::{ApprovalDecider, ApprovalOutcome};
+    use codewhale_engine::approval_log::{ApprovalDecider, ApprovalOutcome};
     match (outcome, decided_by) {
         (ApprovalOutcome::ApprovedOnce, Some(ApprovalDecider::SessionRule)) => Some("allow"),
         (ApprovalOutcome::Denied, Some(ApprovalDecider::SessionRule)) => Some("deny"),
@@ -5814,8 +6434,10 @@ fn approval_row_standing_rule(
     }
 }
 
-fn approval_outcome_label(outcome: &crate::approval_log::ApprovalOutcome) -> &'static str {
-    use crate::approval_log::ApprovalOutcome;
+fn approval_outcome_label(
+    outcome: &codewhale_engine::approval_log::ApprovalOutcome,
+) -> &'static str {
+    use codewhale_engine::approval_log::ApprovalOutcome;
     match outcome {
         ApprovalOutcome::ApprovedOnce => "allowed_once",
         ApprovalOutcome::Denied => "denied",
@@ -5829,7 +6451,9 @@ fn approval_outcome_label(outcome: &crate::approval_log::ApprovalOutcome) -> &'s
 /// Flatten one session's replay into history rows, newest ask first. Pending
 /// asks sort by asked time alongside decided rows — they are the newest
 /// entries while live, and sink into place once decided.
-fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<ApprovalHistoryRow> {
+fn approval_history_rows(
+    replay: &codewhale_engine::approval_log::ApprovalReplay,
+) -> Vec<ApprovalHistoryRow> {
     let mut rows: Vec<ApprovalHistoryRow> = replay
         .completed
         .iter()
@@ -5874,7 +6498,7 @@ async fn list_approvals(
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let sessions_dir = state.sessions_dir.clone();
     let mut rows = tokio::task::spawn_blocking(move || {
-        let store = crate::approval_log::ApprovalReceiptStore::new(sessions_dir);
+        let store = codewhale_engine::approval_log::ApprovalReceiptStore::new(sessions_dir);
         let mut rows = Vec::new();
         for session_id in store.sessions_with_logs() {
             match store.replay(&session_id) {
@@ -5957,20 +6581,33 @@ async fn submit_user_input(
     Path((thread_id, input_id)): Path<(String, String)>,
     Json(req): Json<SubmitUserInputBody>,
 ) -> Result<Json<SubmitUserInputResponse>, ApiError> {
-    use crate::tools::user_input::{UserInputAnswer, UserInputResponse};
-    let answers: Vec<UserInputAnswer> = req
-        .answers
-        .into_iter()
-        .map(|a| UserInputAnswer {
-            id: a.id,
-            label: a.label,
-            value: a.value,
-        })
-        .collect();
-    let response = UserInputResponse { answers };
+    let response = codewhale_engine::tools::user_input::UserInputResponse {
+        answers: req.answers,
+    };
     let delivered = state
         .runtime_threads
         .submit_user_input(&thread_id, &input_id, response)
+        .await
+        .map_err(map_thread_err)?;
+    if !delivered {
+        return Err(ApiError::not_found(format!(
+            "no pending user-input request with id '{input_id}'"
+        )));
+    }
+    Ok(Json(SubmitUserInputResponse {
+        ok: true,
+        input_id,
+        delivered,
+    }))
+}
+
+async fn cancel_user_input_request(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, input_id)): Path<(String, String)>,
+) -> Result<Json<SubmitUserInputResponse>, ApiError> {
+    let delivered = state
+        .runtime_threads
+        .cancel_user_input(&thread_id, &input_id)
         .await
         .map_err(map_thread_err)?;
     if !delivered {
@@ -5991,12 +6628,18 @@ async fn runtime_info(
 ) -> Json<RuntimeInfoResponse> {
     let version = env!("CARGO_PKG_VERSION");
     let commit = option_env!("CODEWHALE_BUILD_COMMIT").unwrap_or("unknown");
-    let api_base = runtime_account_api_base();
+    let api_base = codewhale_engine::profile_constitution::runtime_account_api_base();
     let account = runtime_account_info_for_request(
         runtime_request_is_authorized(&request, &state),
         &api_base,
         || runtime_account_info(state.config_profile.as_deref(), &api_base),
     );
+    let session_only = state.config.read().session_provider_keys_only;
+    let mut capabilities = default_runtime_capabilities();
+    capabilities.session_provider_keys = session_only;
+    capabilities.fleet_run_create = !session_only;
+    capabilities.fleet_run_start = !session_only;
+    capabilities.fleet_local_target = !session_only;
     Json(RuntimeInfoResponse {
         service: "codewhale-runtime-api",
         runtime_api_version: RUNTIME_API_VERSION,
@@ -6006,7 +6649,7 @@ async fn runtime_info(
         port: state.bind_port,
         auth_required: state.auth_required,
         transports: vec!["http", "sse"],
-        capabilities: default_runtime_capabilities(),
+        capabilities,
         account,
         experimental: RuntimeExperimentalCapabilities::default(),
         version,
@@ -6042,37 +6685,6 @@ fn runtime_account_info_for_request(
     }
 }
 
-pub(crate) fn runtime_account_api_base() -> String {
-    std::env::var(ACCOUNT_API_BASE_ENV)
-        .ok()
-        .and_then(|value| normalize_runtime_account_api_base(&value))
-        .unwrap_or_else(|| DEFAULT_ACCOUNT_API_BASE.to_string())
-}
-
-fn normalize_runtime_account_api_base(value: &str) -> Option<String> {
-    let mut url = reqwest::Url::parse(value.trim()).ok()?;
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !matches!(url.path(), "" | "/")
-    {
-        return None;
-    }
-    let host = url.host_str()?;
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        return None;
-    }
-    url.set_path("/");
-    Some(url.as_str().trim_end_matches('/').to_string())
-}
-
 /// Ownership is derived using the same trust/precedence as the existing MCP
 /// loader. A global editor must never silently change a shadowed project entry
 /// or manufacture an override for a reviewed plugin component.
@@ -6080,7 +6692,7 @@ fn mcp_management_config(
     state: &RuntimeApiState,
 ) -> Result<
     (
-        crate::mcp::McpConfig,
+        codewhale_mcp::config::McpConfig,
         std::collections::HashMap<String, &'static str>,
     ),
     ApiError,
@@ -6089,26 +6701,28 @@ fn mcp_management_config(
     let plugins = state
         .plugin_discovery
         .registry_for_workspace(&state.workspace);
-    let config = crate::mcp::load_config_with_workspace_and_plugins(
+    let config = codewhale_engine::mcp::load_config_with_workspace_and_plugins(
         &global_path,
         &state.workspace,
         plugins.as_ref(),
     )
     .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-    let global = crate::mcp::load_config(&global_path)
+    let global = codewhale_engine::mcp::load_config(&global_path)
         .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-    let project_path = crate::mcp::workspace_mcp_config_path(&state.workspace);
+    let project_path = codewhale_engine::mcp::workspace_mcp_config_path(&state.workspace);
     let same_source = project_path == global_path
         || project_path
             .canonicalize()
             .ok()
             .zip(global_path.canonicalize().ok())
             .is_some_and(|(project, global)| project == global);
-    let project = if !same_source && crate::config::is_workspace_trusted(&state.workspace) {
-        crate::mcp::load_config(&project_path)
+    let project = if !same_source
+        && codewhale_runtime::config::is_workspace_trusted(&state.workspace)
+    {
+        codewhale_engine::mcp::load_config(&project_path)
             .map_err(|e| ApiError::internal(format!("Failed to load project MCP config: {e}")))?
     } else {
-        crate::mcp::McpConfig::default()
+        codewhale_mcp::config::McpConfig::default()
     };
     let origins = config
         .servers
@@ -6139,7 +6753,7 @@ impl std::fmt::Display for McpManagementFailure {
 impl std::error::Error for McpManagementFailure {}
 
 fn mcp_mutation_error(error: anyhow::Error) -> ApiError {
-    if error.is::<crate::mcp::McpRevisionConflict>() {
+    if error.is::<codewhale_engine::mcp::McpRevisionConflict>() {
         ApiError {
             status: StatusCode::PRECONDITION_FAILED,
             message: error.to_string(),
@@ -6185,7 +6799,7 @@ fn mcp_expected_revision(headers: &axum::http::HeaderMap) -> Result<String, ApiE
 async fn mutate_mcp_management<T: Send + 'static>(
     state: RuntimeApiState,
     headers: axum::http::HeaderMap,
-    mutate: impl FnOnce(&RuntimeApiState, &mut crate::mcp::McpConfig) -> Result<T, ApiError>
+    mutate: impl FnOnce(&RuntimeApiState, &mut codewhale_mcp::config::McpConfig) -> Result<T, ApiError>
     + Send
     + 'static,
 ) -> Result<(T, String), ApiError> {
@@ -6200,7 +6814,7 @@ async fn mutate_mcp_management<T: Send + 'static>(
             .validate_sync()
             .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
         let path = state.config.read().mcp_config_path();
-        let result = crate::mcp::mutate_config(&path, Some(&expected), |config| {
+        let result = codewhale_engine::mcp::mutate_config(&path, Some(&expected), |config| {
             mutate(&state, config).map_err(|error| anyhow::Error::new(McpManagementFailure(error)))
         })
         .map_err(mcp_mutation_error)?;
@@ -6219,7 +6833,7 @@ async fn mcp_management_snapshot(
 ) -> Result<
     (
         (
-            crate::mcp::McpConfig,
+            codewhale_mcp::config::McpConfig,
             std::collections::HashMap<String, &'static str>,
         ),
         String,
@@ -6235,7 +6849,7 @@ async fn mcp_management_snapshot(
         codewhale_config::with_config_write_lock(&path, |path| {
             let config = mcp_management_config(&state)
                 .map_err(|error| anyhow::Error::new(McpManagementFailure(error)))?;
-            Ok((config, crate::mcp::read_config_revision(path)?))
+            Ok((config, codewhale_engine::mcp::read_config_revision(path)?))
         })
         .map_err(mcp_mutation_error)
     })
@@ -6280,52 +6894,62 @@ async fn mcp_pool_handle(
             .workspace_scopes
             .mcp_generation
             .load(std::sync::atomic::Ordering::SeqCst);
+        let policy = mcp_pool_policy(&state.config.read());
         if let Some((admitted, pool)) = slot.as_ref() {
-            if *admitted == generation {
+            let policy_changed = *state.workspace_scope.mcp_policy.lock() != policy;
+            if *admitted == generation && !policy_changed {
                 return Ok(Some(pool.clone()));
             }
             let mut held = pool.clone().lock_owned().await;
             let current = state.clone();
             #[cfg(test)]
             let env_ticket = crate::test_support::env_scope_ticket();
-            codewhale_app_server::daemon_socket::owner_work(move || {
-                #[cfg(test)]
-                let _membership = crate::test_support::join_env_scope(env_ticket);
-                // Keep the exact scope/owner alive through synchronous disk
-                // reload even if this request is cancelled after admission.
-                current.workspace_scope.validate_sync()?;
-                let path = current.config.read().mcp_config_path();
-                let plugins = current
-                    .plugin_discovery
-                    .registry_for_workspace(&current.workspace);
-                held.switch_workspace_config_source(&path, &current.workspace, plugins)
-            })
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+            if policy_changed {
+                let (rebuilt, admitted_policy) =
+                    codewhale_runtime::runtime_control::owner_work(move || {
+                        #[cfg(test)]
+                        let _membership = crate::test_support::join_env_scope(env_ticket);
+                        load_mcp_management_pool(&current)
+                    })
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(format!("Failed to load MCP config: {error}"))
+                    })?;
+                held.shutdown_all().await;
+                *held = rebuilt;
+                *state.workspace_scope.mcp_policy.lock() = admitted_policy;
+            } else {
+                codewhale_runtime::runtime_control::owner_work(move || {
+                    #[cfg(test)]
+                    let _membership = crate::test_support::join_env_scope(env_ticket);
+                    // Keep the exact scope/owner alive through synchronous disk
+                    // reload even if this request is cancelled after admission.
+                    current.workspace_scope.validate_sync()?;
+                    let path = current.config.read().mcp_config_path();
+                    let plugins = current
+                        .plugin_discovery
+                        .registry_for_workspace(&current.workspace);
+                    held.switch_workspace_config_source(&path, &current.workspace, plugins)
+                })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            }
             slot.as_mut().expect("retained pool").0 = generation;
         } else if create {
             let current = state.clone();
             #[cfg(test)]
             let env_ticket = crate::test_support::env_scope_ticket();
-            let pool = codewhale_app_server::daemon_socket::owner_work(move || {
-                #[cfg(test)]
-                let _membership = crate::test_support::join_env_scope(env_ticket);
-                current.workspace_scope.validate_sync()?;
-                let path = current.config.read().mcp_config_path();
-                let plugins = current
-                    .plugin_discovery
-                    .registry_for_workspace(&current.workspace);
-                let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
-                    &path,
-                    &current.workspace,
-                    plugins,
-                )?
-                .with_backend(crate::mcp::McpBackend::from_config(&current.config.read()));
-                pool.dynamic_servers = current.workspace_scopes.dynamic_servers.clone();
-                Ok(pool)
-            })
-            .await
-            .map_err(|error| ApiError::internal(format!("Failed to load MCP config: {error}")))?;
+            let (pool, admitted_policy) =
+                codewhale_runtime::runtime_control::owner_work(move || {
+                    #[cfg(test)]
+                    let _membership = crate::test_support::join_env_scope(env_ticket);
+                    load_mcp_management_pool(&current)
+                })
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to load MCP config: {error}"))
+                })?;
+            *state.workspace_scope.mcp_policy.lock() = admitted_policy;
             *slot = Some((generation, Arc::new(Mutex::new(pool))));
         } else {
             return Ok(None);
@@ -6333,6 +6957,45 @@ async fn mcp_pool_handle(
         // A concurrent global mutation may have settled during disk work.
         // Repeat validation under the same pool; no second connection owner.
     }
+}
+
+fn mcp_pool_policy(config: &Config) -> Value {
+    json!([
+        config
+            .network
+            .clone()
+            .map(codewhale_net::network_policy::NetworkPolicy::from),
+        config.mcp_oauth_callback_port,
+        config.mcp_oauth_callback_url,
+    ])
+}
+
+fn load_mcp_management_pool(state: &RuntimeApiState) -> Result<(McpPool, Value)> {
+    state.workspace_scope.validate_sync()?;
+    let path = state.config.read().mcp_config_path();
+    let plugins = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let mut pool = McpPool::from_config_path_with_workspace_and_plugins_and_auth_context(
+        &path,
+        &state.workspace,
+        plugins,
+        state.runtime_threads.mcp_auth_context(),
+    )?;
+    let config = state.config.read();
+    pool = pool.with_backend(config.mcp_backend()).with_oauth_callback(
+        config.mcp_oauth_callback_port,
+        config.mcp_oauth_callback_url.clone(),
+    );
+    if let Some(network) = config.network.clone() {
+        pool = pool.with_network_policy(
+            codewhale_net::network_policy::NetworkPolicyDecider::with_default_audit(
+                codewhale_net::network_policy::NetworkPolicy::from(network),
+            ),
+        );
+    }
+    pool.dynamic_servers = state.workspace_scopes.dynamic_servers.clone();
+    Ok((pool, mcp_pool_policy(&config)))
 }
 
 fn mcp_connection_outcome(
@@ -6344,8 +7007,12 @@ fn mcp_connection_outcome(
         server: server.to_owned(),
         connected: pool.connected_servers().contains(&server),
         auth_required: pool.server_needs_auth(server),
-        error: error
-            .map(|error| truncate_text(&crate::mcp::format_mcp_error_for_display(error), 2048)),
+        error: error.map(|error| {
+            truncate_text(
+                &codewhale_engine::mcp::format_mcp_error_for_display(error),
+                2048,
+            )
+        }),
     }
 }
 
@@ -6556,7 +7223,7 @@ async fn create_mcp_server(
     }
 
     if let Some(Some(transport)) = &req.transport {
-        crate::mcp::validate_mcp_transport(Some(transport.as_str()))
+        codewhale_engine::mcp::validate_mcp_transport(Some(transport.as_str()))
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
 
@@ -6600,7 +7267,7 @@ async fn update_mcp_server(
     Json(req): Json<McpServerWriteRequest>,
 ) -> Result<Json<McpServerDetail>, ApiError> {
     if let Some(Some(transport)) = &req.transport {
-        crate::mcp::validate_mcp_transport(Some(transport.as_str()))
+        codewhale_engine::mcp::validate_mcp_transport(Some(transport.as_str()))
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
 
@@ -6785,10 +7452,10 @@ async fn reconnect_mcp_server(
 /// Build a fresh [`McpServerConfig`] from a create request.
 fn mcp_server_config_from_write_request(
     req: McpServerWriteRequest,
-    _existing: Option<&crate::mcp::McpServerConfig>,
-) -> crate::mcp::McpServerConfig {
+    _existing: Option<&codewhale_mcp::config::McpServerConfig>,
+) -> codewhale_mcp::config::McpServerConfig {
     let enabled = req.enabled.unwrap_or(true);
-    crate::mcp::McpServerConfig {
+    codewhale_mcp::config::McpServerConfig {
         command: req.command.flatten(),
         args: req.args.unwrap_or_default(),
         env: req.env.unwrap_or_default(),
@@ -6818,7 +7485,7 @@ fn mcp_server_config_from_write_request(
 
 /// Nonsecret indicator and retargeting guard. Treat environment and OAuth
 /// configuration as authority even when it only references a credential.
-fn mcp_credential_configured(cfg: &crate::mcp::McpServerConfig) -> bool {
+fn mcp_credential_configured(cfg: &codewhale_mcp::config::McpServerConfig) -> bool {
     !cfg.env.is_empty()
         || !cfg.headers.is_empty()
         || !cfg.env_headers.is_empty()
@@ -6831,7 +7498,7 @@ fn mcp_credential_configured(cfg: &crate::mcp::McpServerConfig) -> bool {
 /// Apply a partial update from a PATCH request onto an existing config entry.
 fn apply_write_request_to_config(
     req: McpServerWriteRequest,
-    cfg: &mut crate::mcp::McpServerConfig,
+    cfg: &mut codewhale_mcp::config::McpServerConfig,
 ) {
     if let Some(v) = req.command {
         cfg.command = v;
@@ -6947,10 +7614,12 @@ where
     let run = async {
         match run.await {
             Ok(value) => Ok(Ok(value)),
-            Err(err) => match err.downcast_ref::<crate::automation_manager::RevisionConflict>() {
-                Some(conflict) => Ok(Err(conflict.current)),
-                None => Err(map_err(err)),
-            },
+            Err(err) => {
+                match err.downcast_ref::<codewhale_engine::automation_manager::RevisionConflict>() {
+                    Some(conflict) => Ok(Err(conflict.current)),
+                    None => Err(map_err(err)),
+                }
+            }
         }
     };
     let conflict_response = |current: u64| {
@@ -7008,17 +7677,17 @@ where
         .idempotency_lookup(&key, &fingerprint)
         .map_err(|e| ApiError::internal(format!("Idempotency store unavailable: {e}")))?;
     match lookup {
-        crate::automation_manager::IdempotencyLookup::Replay { status, body } => {
+        codewhale_engine::automation_manager::IdempotencyLookup::Replay { status, body } => {
             let status = StatusCode::from_u16(status).unwrap_or(ok_status);
             return Ok(respond(status, body, true));
         }
-        crate::automation_manager::IdempotencyLookup::KeyReused => {
+        codewhale_engine::automation_manager::IdempotencyLookup::KeyReused => {
             return Err(ApiError::unprocessable(
                 "Idempotency-Key was already used for a different request",
             )
             .with_code("idempotency_key_reuse"));
         }
-        crate::automation_manager::IdempotencyLookup::Miss => {}
+        codewhale_engine::automation_manager::IdempotencyLookup::Miss => {}
     }
     let value = match run.await? {
         Ok(value) => value,
@@ -7041,11 +7710,167 @@ where
     Ok(respond(ok_status, body, false))
 }
 
+async fn require_destination_thread(
+    state: &RuntimeApiState,
+    thread_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(thread_id) = thread_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    let thread = state
+        .runtime_threads
+        .get_thread(thread_id)
+        .await
+        .map_err(map_thread_err)?;
+    if thread.archived {
+        return Err(ApiError::conflict(format!(
+            "Destination thread {thread_id} is archived"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct TriggerListQuery {
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    status: Option<DelayedTriggerStatus>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CreateTriggerApiRequest {
+    message: String,
+    #[serde(default)]
+    fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    delay_minutes: Option<u32>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    workspace: Option<PathBuf>,
+    #[serde(default)]
+    owner_session_id: Option<String>,
+}
+
+async fn list_triggers(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<TriggerListQuery>,
+) -> Result<Json<Vec<DelayedTriggerRecord>>, ApiError> {
+    let mut triggers = state
+        .automations
+        .lock()
+        .await
+        .list_triggers(query.status, None)
+        .map_err(|e| ApiError::internal(format!("Failed to list triggers: {e}")))?;
+    if let Some(thread_id) = query.thread_id.as_deref() {
+        triggers.retain(|trigger| trigger.destination_thread_id.as_deref() == Some(thread_id));
+    }
+    triggers.truncate(query.limit.unwrap_or(50).clamp(1, 200));
+    Ok(Json(triggers))
+}
+
+async fn get_trigger(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<DelayedTriggerRecord>, ApiError> {
+    let trigger = state
+        .automations
+        .lock()
+        .await
+        .get_trigger(&id)
+        .map_err(map_trigger_err)?;
+    Ok(Json(trigger))
+}
+
+async fn create_trigger(
+    State(state): State<RuntimeApiState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateTriggerApiRequest>,
+) -> Result<Response, ApiError> {
+    let fire_at = match (req.fire_at, req.delay_minutes) {
+        (Some(fire_at), None) => fire_at,
+        (None, Some(minutes)) if minutes >= 1 => {
+            chrono::Utc::now() + chrono::Duration::minutes(i64::from(minutes))
+        }
+        (None, Some(_)) => return Err(ApiError::bad_request("delay_minutes must be >= 1")),
+        _ => {
+            return Err(ApiError::bad_request(
+                "exactly one of fire_at or delay_minutes is required",
+            ));
+        }
+    };
+    let destination = req
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    require_destination_thread(&state, destination.as_deref()).await?;
+    let owner_session_id = req
+        .owner_session_id
+        .clone()
+        .or_else(|| destination.clone())
+        .ok_or_else(|| {
+            ApiError::bad_request("a trigger without thread_id needs owner_session_id")
+        })?;
+    if state.automations.lock().await.execution_scope().is_none() {
+        return Err(ApiError::conflict(
+            "This Runtime has no automation execution owner",
+        ));
+    }
+    let create = CreateDelayedTriggerRequest {
+        fire_at,
+        message: req.message.clone(),
+        workspace: req.workspace.clone(),
+        owner_session_id: Some(owner_session_id),
+        parent_trigger_id: None,
+        destination_thread_id: destination,
+    };
+    automation_mutation(
+        &state,
+        &headers,
+        "POST /v1/triggers",
+        &req,
+        StatusCode::CREATED,
+        |e| ApiError::bad_request(e.to_string()),
+        async { state.automations.lock().await.create_trigger(create) },
+    )
+    .await
+}
+
+async fn cancel_trigger(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<DelayedTriggerRecord>, ApiError> {
+    let trigger = state
+        .automations
+        .lock()
+        .await
+        .cancel_trigger(&id)
+        .map_err(map_trigger_err)?;
+    Ok(Json(trigger))
+}
+
+fn map_trigger_err(err: anyhow::Error) -> ApiError {
+    let message = format!("{err:#}");
+    if message.contains("not found") {
+        ApiError::not_found(message)
+    } else if message.contains("cannot be canceled") {
+        ApiError::conflict(message)
+    } else {
+        ApiError::bad_request(message)
+    }
+}
+
 async fn create_automation(
     State(state): State<RuntimeApiState>,
     headers: HeaderMap,
     Json(req): Json<CreateAutomationRequest>,
 ) -> Result<Response, ApiError> {
+    require_destination_thread(&state, req.destination_thread_id.as_deref()).await?;
     automation_mutation(
         &state,
         &headers,
@@ -7080,6 +7905,7 @@ async fn update_automation(
     headers: HeaderMap,
     Json(mut req): Json<UpdateAutomationRequest>,
 ) -> Result<Response, ApiError> {
+    require_destination_thread(&state, req.destination_thread_id.as_deref()).await?;
     req.expected_revision = req.expected_revision.or(query.expected_revision);
     automation_mutation(
         &state,
@@ -7121,7 +7947,7 @@ async fn run_automation(
         &query.expected_revision,
         StatusCode::OK,
         map_automation_err,
-        crate::automation_manager::run_now_shared_if(
+        codewhale_engine::automation_manager::run_now_shared_if(
             &state.automations,
             &id,
             query.expected_revision,
@@ -7137,7 +7963,7 @@ async fn set_automation_status(
     query: AutomationPreconditionQuery,
     headers: HeaderMap,
     action: &str,
-    status: crate::automation_manager::AutomationStatus,
+    status: codewhale_engine::automation_manager::AutomationStatus,
 ) -> Result<Response, ApiError> {
     let req = UpdateAutomationRequest {
         status: Some(status),
@@ -7168,7 +7994,7 @@ async fn pause_automation(
         query,
         headers,
         "pause",
-        crate::automation_manager::AutomationStatus::Paused,
+        codewhale_engine::automation_manager::AutomationStatus::Paused,
     )
     .await
 }
@@ -7185,7 +8011,7 @@ async fn resume_automation(
         query,
         headers,
         "resume",
-        crate::automation_manager::AutomationStatus::Active,
+        codewhale_engine::automation_manager::AutomationStatus::Active,
     )
     .await
 }
@@ -7239,39 +8065,39 @@ struct KeepAliveOperateRequest {
 struct OperateView {
     /// `None` until an operation is actually started — a GET before that
     /// must not fabricate an identity the client can never mutate.
-    operation: Option<crate::operate::Operation>,
+    operation: Option<codewhale_engine::operate::Operation>,
     board: String,
 }
 
-fn operate_store() -> Result<crate::operate::OperationStore, ApiError> {
-    crate::operate::OperationStore::open(crate::operate::default_operate_dir())
+fn operate_store() -> Result<codewhale_engine::operate::OperationStore, ApiError> {
+    codewhale_engine::operate::OperationStore::open(codewhale_engine::operate::default_operate_dir())
         .map_err(|e| ApiError::internal(format!("Failed to open operate store: {e}")))
 }
 
 async fn operate_readiness(state: &RuntimeApiState) -> Result<(String, bool), ApiError> {
     let config = state.config.read().clone();
     let manager = state.automations.lock().await;
-    crate::operate::keepalive_readiness(&manager, &config, None)
+    codewhale_engine::operate::keepalive_readiness(&manager, &config, None)
         .map_err(|error| ApiError::bad_request(format!("Operate route unavailable: {error}")))
 }
 
-fn operate_view(operation: crate::operate::Operation) -> Json<OperateView> {
+fn operate_view(operation: codewhale_engine::operate::Operation) -> Json<OperateView> {
     Json(OperateView {
-        board: crate::operate::render_plan_board(&operation),
+        board: codewhale_engine::operate::render_plan_board(&operation),
         operation: Some(operation),
     })
 }
 
 fn load_operate(
-    store: &crate::operate::OperationStore,
-) -> Result<Option<crate::operate::Operation>, ApiError> {
+    store: &codewhale_engine::operate::OperationStore,
+) -> Result<Option<codewhale_engine::operate::Operation>, ApiError> {
     store
         .load()
         .map_err(|e| ApiError::internal(format!("Failed to load operate: {e}")))
 }
 
 fn parse_request_burn_rate(value: Option<&serde_json::Value>) -> Result<Option<f64>, ApiError> {
-    Ok(crate::operate::parse_burn_rate(value)
+    Ok(codewhale_engine::operate::parse_burn_rate(value)
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .map(|rate| rate.amount_usd_per_hour))
 }
@@ -7304,10 +8130,10 @@ async fn start_operate(
     let config = state.config.read().clone();
     let (model, credentials) = {
         let manager = state.automations.lock().await;
-        crate::operate::upsert_keepalive(&manager, &state.workspace, true, &config, None)
+        codewhale_engine::operate::upsert_keepalive(&manager, &state.workspace, true, &config, None)
             .map_err(|e| ApiError::bad_request(format!("Failed to keep operate alive: {e}")))?
     };
-    let operation = crate::operate::start_operation(
+    let operation = codewhale_engine::operate::start_operation(
         &store,
         &state.workspace,
         req.direction,
@@ -7331,7 +8157,7 @@ async fn patch_operate(
     let operation = store
         .mutate(|op| {
             let before = op.direction.clone();
-            crate::operate::apply_operate_patch(op, &patch)?;
+            codewhale_engine::operate::apply_operate_patch(op, &patch)?;
             direction_changed.set(op.direction != before);
             op.set_lead_model(&model);
             op.credentials_present = credentials;
@@ -7350,7 +8176,7 @@ async fn patch_operate(
     // run forward so the operation does not idle until the next recurrence.
     if direction_changed.get() {
         let manager = state.automations.lock().await;
-        crate::operate::kick_keepalive(&manager)
+        codewhale_engine::operate::kick_keepalive(&manager)
             .map_err(|e| ApiError::internal(format!("Failed to reschedule operate: {e}")))?;
     }
     Ok(operate_view(operation))
@@ -7373,7 +8199,7 @@ async fn keepalive_operate(
             if let Some(model) = &model {
                 op.set_lead_model(model);
             }
-            crate::operate::keep_alive_observation(
+            codewhale_engine::operate::keep_alive_observation(
                 op,
                 req.observed_burn_usd_per_hour,
                 req.spent_usd,
@@ -7393,7 +8219,7 @@ async fn put_operate_plan(
     let store = operate_store()?;
     let patch = serde_json::json!({ "leadPlan": plan });
     let operation = store
-        .mutate(|op| crate::operate::apply_operate_patch(op, &patch))
+        .mutate(|op| codewhale_engine::operate::apply_operate_patch(op, &patch))
         .map_err(|e| {
             if e.to_string().contains("cancelled") {
                 ApiError::conflict(e.to_string())
@@ -7411,14 +8237,14 @@ async fn cancel_operate(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<OperateView>, ApiError> {
     let store = operate_store()?;
-    let operation = crate::operate::cancel_operation(&store)
+    let operation = codewhale_engine::operate::cancel_operation(&store)
         .map_err(|e| ApiError::internal(format!("Failed to cancel operate: {e}")))?
         .ok_or_else(|| ApiError::not_found("Unknown Operation."))?;
     // Cancel tears down the keepalive too: an unattended hourly lead run
     // after cancel is pure cost.
     {
         let manager = state.automations.lock().await;
-        crate::operate::pause_keepalive(&manager)
+        codewhale_engine::operate::pause_keepalive(&manager)
             .map_err(|e| ApiError::internal(format!("Failed to pause operate keepalive: {e}")))?;
     }
     Ok(operate_view(operation))
@@ -7445,13 +8271,15 @@ async fn check_operate_auto_merge(
     State(state): State<RuntimeApiState>,
     Json(req): Json<OperateAutoMergeCheckRequest>,
 ) -> Result<Json<OperateAutoMergeCheckView>, ApiError> {
-    crate::operate::validate_auto_merge_request(&crate::operate::AutoMergeRequest {
-        repo: &req.repo,
-        pr: &req.pr,
-        role: &req.agent,
-    })
+    codewhale_engine::operate::validate_auto_merge_request(
+        &codewhale_engine::operate::AutoMergeRequest {
+            repo: &req.repo,
+            pr: &req.pr,
+            role: &req.agent,
+        },
+    )
     .map_err(ApiError::bad_request)?;
-    let checker = crate::operate::discover_auto_merge_checker(&state.workspace);
+    let checker = codewhale_engine::operate::discover_auto_merge_checker(&state.workspace);
     let repo = req.repo.clone();
     let pr = req.pr.clone();
     let agent = req.agent.clone();
@@ -7459,8 +8287,8 @@ async fn check_operate_auto_merge(
     // The checker shells out synchronously (`python3 …; .status()`); run it on
     // the blocking pool so a slow `gh`/network wait cannot pin a Tokio worker.
     let decision = tokio::task::spawn_blocking(move || {
-        crate::operate::evaluate_auto_merge(
-            crate::operate::AutoMergeRequest {
+        codewhale_engine::operate::evaluate_auto_merge(
+            codewhale_engine::operate::AutoMergeRequest {
                 repo: &repo,
                 pr: &pr,
                 role: &agent,
@@ -7471,15 +8299,17 @@ async fn check_operate_auto_merge(
     .await
     .map_err(|e| ApiError::internal(format!("auto-merge check join failed: {e}")))?;
     let (allow, reason) = match decision {
-        crate::operate::AutoMergeDecision::Allow => (true, None),
-        crate::operate::AutoMergeDecision::Deny { reason } => (false, Some(reason)),
+        codewhale_engine::operate::AutoMergeDecision::Allow => (true, None),
+        codewhale_engine::operate::AutoMergeDecision::Deny { reason } => (false, Some(reason)),
     };
     Ok(Json(OperateAutoMergeCheckView {
         allow,
         reason,
         checker: checker.as_ref().map(|path| path.display().to_string()),
-        check_args: crate::operate::check_auto_merge_args(&req.repo, &req.pr, &req.agent),
-        merge_args: crate::operate::auto_merge_pr_args(&req.repo, &req.pr, &req.agent),
+        check_args: codewhale_engine::operate::check_auto_merge_args(
+            &req.repo, &req.pr, &req.agent,
+        ),
+        merge_args: codewhale_engine::operate::auto_merge_pr_args(&req.repo, &req.pr, &req.agent),
     }))
 }
 
@@ -7529,7 +8359,7 @@ async fn get_thread_usage(
 async fn get_thread_receipt(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+) -> Result<Json<codewhale_engine::receipts::Receipt>, ApiError> {
     thread_receipt(&state, &id, None).await.map(Json)
 }
 
@@ -7538,7 +8368,7 @@ async fn get_thread_receipt(
 async fn get_turn_receipt(
     State(state): State<RuntimeApiState>,
     Path((id, turn_id)): Path<(String, String)>,
-) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+) -> Result<Json<codewhale_engine::receipts::Receipt>, ApiError> {
     thread_receipt(&state, &id, Some(&turn_id)).await.map(Json)
 }
 
@@ -7546,7 +8376,7 @@ async fn thread_receipt(
     state: &RuntimeApiState,
     id: &str,
     turn: Option<&str>,
-) -> Result<crate::receipts::Receipt, ApiError> {
+) -> Result<codewhale_engine::receipts::Receipt, ApiError> {
     let detail = state
         .runtime_threads
         .get_thread_detail(id)
@@ -7557,8 +8387,14 @@ async fn thread_receipt(
         .events_since_async(id, None)
         .await
         .map_err(map_thread_err)?;
-    crate::receipts::thread_receipt(&detail.thread, &detail.turns, &detail.items, &events, turn)
-        .map_err(|error| ApiError::not_found(error.to_string()))
+    codewhale_engine::receipts::thread_receipt(
+        &detail.thread,
+        &detail.turns,
+        &detail.items,
+        &events,
+        turn,
+    )
+    .map_err(|error| ApiError::not_found(error.to_string()))
 }
 
 async fn update_thread(
@@ -7608,6 +8444,9 @@ struct UndoTurnRequest {
     /// How many turns back to undo (default 0 = last turn only).
     #[serde(default)]
     depth: Option<usize>,
+    /// The user turn to undo, with every turn after it. Wins over `depth`.
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7618,7 +8457,7 @@ struct UndoTurnResponse {
     /// so the GUI can pre-populate the input box.
     original_user_text: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    original_user_images: Vec<codewhale_protocol::runtime::RuntimeImageInput>,
+    original_user_images: Vec<codewhale_app_server_protocol::runtime::RuntimeImageInput>,
 }
 
 async fn undo_thread_turn(
@@ -7626,12 +8465,25 @@ async fn undo_thread_turn(
     Path(id): Path<String>,
     Json(req): Json<UndoTurnRequest>,
 ) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
-    let depth = req.depth.unwrap_or(0);
-    let (forked_thread, original_user_text, original_user_images, _) = state
-        .runtime_threads
-        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
-        .await
-        .map_err(map_thread_err)?;
+    let (forked_thread, original_user_text, original_user_images, _) = match req.turn_id {
+        Some(turn_id) => {
+            state
+                .runtime_threads
+                .fork_dropping_user_turn_in_sessions_dir(&id, &turn_id, &state.sessions_dir)
+                .await
+        }
+        None => {
+            state
+                .runtime_threads
+                .fork_at_user_message_in_sessions_dir(
+                    &id,
+                    req.depth.unwrap_or(0),
+                    &state.sessions_dir,
+                )
+                .await
+        }
+    }
+    .map_err(map_thread_err)?;
     Ok((
         StatusCode::CREATED,
         Json(UndoTurnResponse {
@@ -7683,12 +8535,12 @@ async fn fork_thread_at_turn(
 /// Result of the snapshot-based file rollback step of patch-undo, reported
 /// alongside the new forked thread.
 #[derive(Debug, Serialize)]
-struct PatchUndoResult {
+pub(crate) struct PatchUndoResult {
     /// Whether files were restored from a snapshot.
     files_restored: bool,
     /// Human-readable summary: one `<action> <path>` line per restored file,
     /// or why nothing needed restoring.
-    summary: Option<String>,
+    pub(crate) summary: Option<String>,
     /// Label of the pre-turn snapshot the files went back to (e.g.
     /// "pre-turn:3: fix the parser").
     snapshot_label: Option<String>,
@@ -7703,7 +8555,7 @@ struct PatchUndoResponse {
     /// The original user text from the removed turn (for re-editing).
     original_user_text: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    original_user_images: Vec<codewhale_protocol::runtime::RuntimeImageInput>,
+    original_user_images: Vec<codewhale_app_server_protocol::runtime::RuntimeImageInput>,
 }
 
 async fn patch_undo_thread_turn(
@@ -7802,8 +8654,8 @@ const PATCH_UNDO_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
 /// the snapshot store still holds.
 struct UndoSegment {
     turn_id: String,
-    pre: crate::snapshot::SnapshotId,
-    post: crate::snapshot::SnapshotId,
+    pre: codewhale_snapshot::SnapshotId,
+    post: codewhale_snapshot::SnapshotId,
     pre_label: String,
     /// Paths that changed in the window only while one of the turn's own
     /// tool calls was running: the turn's changes.
@@ -7821,9 +8673,9 @@ struct UndoSegment {
 /// turn and is skipped. `None` means a window the engine never closed (the
 /// turn died before its post-turn snapshot) or no window at all.
 fn turn_snapshot_windows(
-    snapshots: &[crate::snapshot::WorkspaceSnapshotRef],
+    snapshots: &[codewhale_snapshot::WorkspaceSnapshotRef],
 ) -> Option<Vec<std::ops::RangeInclusive<usize>>> {
-    use crate::snapshot::WorkspaceSnapshotKind;
+    use codewhale_snapshot::WorkspaceSnapshotKind;
     let mut windows = Vec::new();
     let mut open = None;
     for (index, snapshot) in snapshots.iter().enumerate() {
@@ -7874,7 +8726,7 @@ fn declared_write_path(workspace: &FsPath, raw: &str) -> Option<PathBuf> {
         .components()
         .filter(|component| !matches!(component, Component::CurDir))
         .collect();
-    crate::snapshot::workspace_relative_path(workspace, rel.to_str()?)
+    codewhale_snapshot::workspace_relative_path(workspace, rel.to_str()?)
 }
 
 /// Who could have changed the workspace in the span after one receipt.
@@ -7895,7 +8747,7 @@ enum SpanWriter {
 fn attribute_window(
     workspace: &FsPath,
     turn_id: &str,
-    receipts: &[crate::snapshot::WorkspaceSnapshotRef],
+    receipts: &[codewhale_snapshot::WorkspaceSnapshotRef],
 ) -> Result<
     (
         std::collections::BTreeSet<PathBuf>,
@@ -7903,7 +8755,7 @@ fn attribute_window(
     ),
     ApiError,
 > {
-    use crate::snapshot::WorkspaceSnapshotKind;
+    use codewhale_snapshot::WorkspaceSnapshotKind;
     let mut owned = std::collections::BTreeSet::new();
     let mut foreign = std::collections::BTreeSet::new();
     // Undeclared calls whose `post_tool` receipt is still ahead: everything
@@ -7990,12 +8842,12 @@ fn no_restore_point(turn_id: &str, why: &str) -> ApiError {
 ///
 /// # Ownership
 ///
-/// The restore points are the `pre_turn`/`post_turn` receipts recorded on the
-/// dropped turns themselves (`TurnRecord::workspace_snapshots`), resolved by
-/// tree and session tag against the snapshot store. Nothing is selected by
-/// scanning the shared store, so another thread's (or the TUI's) snapshots in
-/// the same workspace are never candidates, and a fork restores the turns it
-/// inherited because it carries their records.
+/// The Runtime handler passes receipts recorded on the dropped turns themselves
+/// (`TurnRecord::workspace_snapshots`), including the turns a fork inherited.
+/// The TUI caller binds owned request windows to persisted host execution IDs
+/// and checks their prompt text, refusing missing or ambiguous tool spans.
+/// Both callers resolve those receipts by tree and session tag against the
+/// snapshot store before any restoration.
 ///
 /// # What is restored
 ///
@@ -8029,9 +8881,9 @@ fn no_restore_point(turn_id: &str, why: &str) -> ApiError {
 ///
 /// `trusted` mirrors the gate the TUI's `patch_undo()` applies
 /// (`yolo || trust_mode`), evaluated once a real change is known.
-fn patch_undo_workspace_files(
+pub(crate) fn patch_undo_workspace_files(
     workspace: &FsPath,
-    dropped_turns: &[crate::runtime_threads::DroppedTurnSnapshots],
+    dropped_turns: &[codewhale_engine::runtime_threads::manager::DroppedTurnSnapshots],
     trusted: bool,
 ) -> Result<PatchUndoResult, ApiError> {
     // An unreadable workspace directory (unmounted volume, disconnected
@@ -8083,7 +8935,7 @@ fn patch_undo_workspace_files(
 
     // Every repository failure is operational and aborts: "nothing to
     // restore" cannot be proven while Git is unavailable.
-    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace).map_err(|e| {
+    let repo = codewhale_snapshot::SnapshotRepo::open_or_init(workspace).map_err(|e| {
         ApiError::internal(format!(
             "Snapshot repo unavailable; conversation preserved: {e}"
         ))
@@ -8094,8 +8946,8 @@ fn patch_undo_workspace_files(
         .list(usize::MAX)
         .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
     let resolve = |turn_id: &str,
-                   receipt: &crate::snapshot::WorkspaceSnapshotRef|
-     -> Result<(crate::snapshot::SnapshotId, String), ApiError> {
+                   receipt: &codewhale_snapshot::WorkspaceSnapshotRef|
+     -> Result<(codewhale_snapshot::SnapshotId, String), ApiError> {
         listed
             .iter()
             .find(|snapshot| receipt.matches(snapshot))
@@ -8177,7 +9029,10 @@ fn patch_undo_workspace_files(
     // path -> (content to restore, content the dropped turns left)
     let mut plan: std::collections::BTreeMap<
         PathBuf,
-        (crate::snapshot::SnapshotId, crate::snapshot::SnapshotId),
+        (
+            codewhale_snapshot::SnapshotId,
+            codewhale_snapshot::SnapshotId,
+        ),
     > = std::collections::BTreeMap::new();
     for segment in &segments {
         let changed = repo
@@ -8280,7 +9135,7 @@ fn patch_undo_workspace_files(
         .with_code(PATCH_UNDO_UNTRUSTED));
     }
 
-    let restore_plan: Vec<(PathBuf, crate::snapshot::SnapshotId)> = to_restore
+    let restore_plan: Vec<(PathBuf, codewhale_snapshot::SnapshotId)> = to_restore
         .iter()
         .map(|(path, before, _)| (path.clone(), before.clone()))
         .collect();
@@ -8418,7 +9273,7 @@ async fn revert_thread_file(
 }
 
 fn snapshot_id_is_well_formed(id: &str) -> bool {
-    crate::snapshot::SnapshotId::is_well_formed(id)
+    codewhale_snapshot::SnapshotId::is_well_formed(id)
 }
 
 fn expected_hash_is_well_formed(hash: &str) -> bool {
@@ -8433,7 +9288,7 @@ fn expected_hash_is_well_formed(hash: &str) -> bool {
 
 fn revert_file_from_snapshot(
     workspace: &FsPath,
-    owned: &[crate::snapshot::WorkspaceSnapshotRef],
+    owned: &[codewhale_snapshot::WorkspaceSnapshotRef],
     req: &RevertThreadFileRequest,
 ) -> Result<RevertThreadFileResponse, ApiError> {
     // Every caller-supplied path passes through this one gate. It accepts a
@@ -8441,20 +9296,21 @@ fn revert_file_from_snapshot(
     // rejects everything else (`..`, empty, or outside the work tree). The
     // name is used literally: brackets, spaces and glob characters are part
     // of the filename, never a pattern.
-    let rel = crate::snapshot::workspace_relative_path(workspace, &req.path).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "path must name a regular file inside the thread workspace {}; got '{}'",
-            workspace.display(),
-            req.path
-        ))
-    })?;
+    let rel =
+        codewhale_snapshot::workspace_relative_path(workspace, &req.path).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "path must name a regular file inside the thread workspace {}; got '{}'",
+                workspace.display(),
+                req.path
+            ))
+        })?;
     if !workspace.is_dir() {
         return Err(ApiError::conflict(format!(
             "Workspace directory {} is not available; mount or restore it before restoring files.",
             workspace.display()
         )));
     }
-    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+    let repo = codewhale_snapshot::SnapshotRepo::open_or_init(workspace)
         .map_err(|e| ApiError::internal(format!("Snapshot repo unavailable: {e}")))?;
     repo.validate_restore_file(&rel)
         .map_err(map_file_restore_err)?;
@@ -8468,13 +9324,13 @@ fn revert_file_from_snapshot(
     // `tree_id` its turn record holds (a prune rewrites commit ids but keeps
     // trees). A foreign, unrecorded or pruned id is a conflict the client
     // resolves by refreshing its change record.
-    let restore_points: Vec<&crate::snapshot::WorkspaceSnapshotRef> = owned
+    let restore_points: Vec<&codewhale_snapshot::WorkspaceSnapshotRef> = owned
         .iter()
         .filter(|receipt| {
             matches!(
                 receipt.kind,
-                crate::snapshot::WorkspaceSnapshotKind::Tool
-                    | crate::snapshot::WorkspaceSnapshotKind::PreTurn
+                codewhale_snapshot::WorkspaceSnapshotKind::Tool
+                    | codewhale_snapshot::WorkspaceSnapshotKind::PreTurn
             )
         })
         .collect();
@@ -8548,7 +9404,7 @@ struct RetryTurnRequest {
     /// them, so a retry the client starts must re-send them; without it the
     /// retried turn silently lost tools such as the desktop's `open_in_app`.
     #[serde(default)]
-    dynamic_tools: Vec<codewhale_protocol::runtime::DynamicToolSpec>,
+    dynamic_tools: Vec<codewhale_app_server_protocol::runtime::DynamicToolSpec>,
 }
 
 #[derive(Debug, Serialize)]
@@ -8565,18 +9421,42 @@ async fn retry_thread_turn(
     Json(req): Json<RetryTurnRequest>,
 ) -> Result<(StatusCode, Json<RetryTurnResponse>), ApiError> {
     let depth = req.depth.unwrap_or(0);
-    let (forked_thread, original_user_text, original_user_images, max_output_tokens) = state
+    let (reservation, _) = state
         .runtime_threads
-        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
+        .thread_restore_guard(&id)
         .await
         .map_err(map_thread_err)?;
-
-    let retry_prompt = req.prompt.or(original_user_text).unwrap_or_default();
-    if retry_prompt.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "No user message to retry — the dropped turn had no user text",
-        ));
-    }
+    let runtime = state.runtime_threads.clone();
+    let sessions_dir = state.sessions_dir.clone();
+    let prompt = req.prompt;
+    let (forked_thread, retry_prompt, original_user_images, max_output_tokens) =
+        tokio::spawn(async move {
+            let _reservation = reservation;
+            let prepared = runtime
+                .prepare_fork_at_user_message_in_sessions_dir(&id, depth, &sessions_dir)
+                .await
+                .map_err(map_thread_err)?;
+            let retry_prompt = prompt
+                .or_else(|| prepared.original_user_text().map(str::to_string))
+                .unwrap_or_default();
+            if retry_prompt.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "No user message to retry — the dropped turn had no user text",
+                ));
+            }
+            let (forked_thread, _, original_user_images, max_output_tokens) = runtime
+                .publish_prepared_fork(prepared)
+                .await
+                .map_err(map_thread_err)?;
+            Ok((
+                forked_thread,
+                retry_prompt,
+                original_user_images,
+                max_output_tokens,
+            ))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Retry fork task failed: {e}")))??;
 
     let turn = state
         .runtime_threads
@@ -8655,7 +9535,7 @@ async fn get_thread_turn_operation(
     State(state): State<RuntimeApiState>,
     Path((id, operation_key)): Path<(String, String)>,
 ) -> Result<Json<TurnRecord>, ApiError> {
-    use crate::runtime_threads::RuntimeTurnOperationLookupError;
+    use codewhale_engine::runtime_threads::manager::RuntimeTurnOperationLookupError;
     let turn = state
         .runtime_threads
         .lookup_turn_operation(&id, &operation_key)
@@ -8745,6 +9625,19 @@ async fn mark_agent_mail_read(
         .await
         .map_err(map_agent_mail_err)?;
     Ok(Json(envelope))
+}
+
+async fn mark_thread_read(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<MarkThreadReadRequest>,
+) -> Result<Json<ThreadRecord>, ApiError> {
+    let thread = state
+        .runtime_threads
+        .mark_thread_read(&id, &req.item_id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(thread))
 }
 
 /// Withdraw a queued envelope before delivery (#6176). Idempotent: a
@@ -9007,11 +9900,6 @@ async fn upsert_thread_goal(
     } else {
         StatusCode::OK
     };
-    // Emit a replayable goal-updated event so SSE subscribers can react.
-    let _ = state
-        .runtime_threads
-        .emit_goal_updated_event(&id, goal.clone())
-        .await;
     // Inject the goal into a cached engine (if any) and dispatch the kickoff
     // turn while the thread is idle. Errors are advisory: the goal record is
     // already durable and a subsequent turn still carries it.
@@ -9040,7 +9928,6 @@ async fn delete_thread_goal(
     if !deleted {
         return Err(ApiError::not_found(format!("thread '{id}' has no goal")));
     }
-    let _ = state.runtime_threads.emit_goal_cleared_event(&id).await;
     state
         .runtime_threads
         .sync_engine_goal_status(&id)
@@ -9089,10 +9976,6 @@ async fn complete_thread_goal(
             message: format!("goal for thread '{id}' changed concurrently; retry"),
             code: None,
         })?;
-    let _ = state
-        .runtime_threads
-        .emit_goal_updated_event(&id, updated.clone())
-        .await;
     state
         .runtime_threads
         .sync_engine_goal_status(&id)
@@ -9142,10 +10025,6 @@ async fn block_thread_goal(
             message: format!("goal for thread '{id}' changed concurrently; retry"),
             code: None,
         })?;
-    let _ = state
-        .runtime_threads
-        .emit_goal_updated_event(&id, updated.clone())
-        .await;
     state
         .runtime_threads
         .sync_engine_goal_status(&id)
@@ -9346,7 +10225,7 @@ fn thread_stream_end(thread_id: &str, end: ThreadStreamEnd, last_seq: u64) -> Ss
 fn thread_journal_frame(
     thread_id: &str,
     last_seq: &mut u64,
-    event: crate::runtime_threads::RuntimeEventRecord,
+    event: codewhale_engine::runtime_threads::RuntimeEventRecord,
 ) -> Option<SseEvent> {
     if event.thread_id != thread_id || event.seq <= *last_seq {
         return None;
@@ -9363,11 +10242,11 @@ fn thread_journal_frame(
 }
 
 type ThreadReplayBatches = tokio::sync::mpsc::Receiver<
-    std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
+    std::result::Result<Vec<codewhale_engine::runtime_threads::RuntimeEventRecord>, String>,
 >;
 
 enum ThreadReplayStep {
-    Events(Vec<crate::runtime_threads::RuntimeEventRecord>),
+    Events(Vec<codewhale_engine::runtime_threads::RuntimeEventRecord>),
     Complete,
     Failed(String),
     Shutdown,
@@ -9394,7 +10273,9 @@ fn replay_live_thread_events(
     thread_id: String,
     mut last_seq: u64,
     mut backlog: ThreadReplayBatches,
-    mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
+    mut live: tokio::sync::broadcast::Receiver<
+        codewhale_engine::runtime_threads::RuntimeEventRecord,
+    >,
     progress: bool,
     shutdown: CancellationToken,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
@@ -9539,8 +10420,9 @@ async fn stream_turn(
         return Err(ApiError::bad_request("prompt is required"));
     }
 
-    crate::image_attach::prepare_runtime_images(&req.images).map_err(map_thread_err)?;
+    codewhale_engine::image_attach::prepare_runtime_images(&req.images).map_err(map_thread_err)?;
 
+    refresh_local_default_catalog(&state, req.model.as_deref(), None, None).await;
     let model = runtime_request_model(&state.config.read(), req.model.as_deref())?;
     if req.max_output_tokens.is_some() {
         let config = state.config.read();
@@ -9812,7 +10694,7 @@ async fn stream_turn(
 }
 
 fn take_compat_turn_event(
-    event: &crate::runtime_threads::RuntimeEventRecord,
+    event: &codewhale_engine::runtime_threads::RuntimeEventRecord,
     thread_id: &str,
     turn_id: &str,
     last_seq: &mut u64,
@@ -9824,13 +10706,15 @@ fn take_compat_turn_event(
         return None;
     }
     *last_seq = event.seq;
-    Some((
-        map_compat_stream_event(event),
-        event.event == "turn.completed",
-    ))
+    let terminal = event.event == "turn.completed"
+        || (event.event == codewhale_engine::runtime_threads::RUNTIME_STORE_FAILURE_EVENT
+            && event.payload.get("terminal").and_then(Value::as_bool) == Some(true));
+    Some((map_compat_stream_event(event), terminal))
 }
 
-fn runtime_event_payload(event: crate::runtime_threads::RuntimeEventRecord) -> serde_json::Value {
+fn runtime_event_payload(
+    event: codewhale_engine::runtime_threads::RuntimeEventRecord,
+) -> serde_json::Value {
     let event_name = event.event.clone();
     let timestamp = event.timestamp.to_rfc3339();
     let schema_version = RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION;
@@ -9851,7 +10735,7 @@ fn runtime_event_payload(event: crate::runtime_threads::RuntimeEventRecord) -> s
 }
 
 fn runtime_event_payload_with_previous(
-    event: crate::runtime_threads::RuntimeEventRecord,
+    event: codewhale_engine::runtime_threads::RuntimeEventRecord,
     previous_seq: u64,
 ) -> serde_json::Value {
     let mut payload = runtime_event_payload(event);
@@ -9861,7 +10745,9 @@ fn runtime_event_payload_with_previous(
     payload
 }
 
-fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -> Option<SseEvent> {
+fn map_compat_stream_event(
+    event: &codewhale_engine::runtime_threads::RuntimeEventRecord,
+) -> Option<SseEvent> {
     let payload = &event.payload;
     match event.event.as_str() {
         "item.delta" => {
@@ -10039,6 +10925,7 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
                     "thread_id": event.thread_id,
                     "turn_id": event.turn_id,
                     "status": status,
+                    "outcome": payload.get("outcome"),
                     "terminal": payload.get("terminal").and_then(Value::as_bool).unwrap_or(false),
                 }),
             ))
@@ -10046,8 +10933,8 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
         "sandbox.denied" => Some(sse_json("sandbox.denied", payload.clone())),
         // The operator's own store failed; the payload names the file and
         // the next action, so compat clients see it too (#5931).
-        crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT => Some(sse_json(
-            crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT,
+        codewhale_engine::runtime_threads::RUNTIME_STORE_FAILURE_EVENT => Some(sse_json(
+            codewhale_engine::runtime_threads::RUNTIME_STORE_FAILURE_EVENT,
             payload.clone(),
         )),
         "turn.completed" => {
@@ -10094,8 +10981,9 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         if config.skills_dir.is_some() {
             return config.skills_dir();
         }
-        if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
-            && crate::skills::skills_dir_allowed_by_workspace_trust(
+        if let Some(codewhale_skills_dir) =
+            codewhale_skills::codewhale_workspace_skills_dir(workspace)
+            && codewhale_skills::skills_dir_allowed_by_workspace_trust(
                 workspace,
                 &codewhale_skills_dir,
             )
@@ -10128,7 +11016,7 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         if let Ok(canon) = fs::canonicalize(&candidate)
             && canon.starts_with(&canonical_workspace)
             && canon.is_dir()
-            && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canon)
+            && codewhale_skills::skills_dir_allowed_by_workspace_trust(workspace, &canon)
         {
             return canon;
         }
@@ -10138,7 +11026,7 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         && let Ok(canonical) = fs::canonicalize(&flat)
         && canonical.starts_with(&canonical_workspace)
         && canonical.is_dir()
-        && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canonical)
+        && codewhale_skills::skills_dir_allowed_by_workspace_trust(workspace, &canonical)
     {
         return canonical;
     }
@@ -10148,28 +11036,29 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
 fn skills_search_directories(
     workspace: &FsPath,
     skills_dir: &FsPath,
-    mode: crate::skills::SkillDiscoveryMode,
+    mode: codewhale_skills::SkillDiscoveryMode,
 ) -> Vec<PathBuf> {
-    crate::skills::skill_directories_for_workspace_and_dir(workspace, skills_dir, mode)
+    codewhale_skills::skill_directories_for_workspace_and_dir(workspace, skills_dir, mode)
 }
 
 fn discover_skills_for_runtime_api(
     workspace: &FsPath,
     skills_dir: &FsPath,
-    mode: crate::skills::SkillDiscoveryMode,
-    plugins: Option<&crate::plugins::PluginRegistry>,
-) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
-    let directories = skills_search_directories(workspace, skills_dir, mode);
-    let registry = crate::skills::discover_from_directories_in_workspace(
-        directories.clone(),
-        Some(workspace),
-        plugins,
+    config: &codewhale_runtime::config::SkillsConfig,
+    plugins: Option<&codewhale_plugins::PluginRegistry>,
+) -> (codewhale_skills::SkillRegistry, Vec<PathBuf>) {
+    let directories = skills_search_directories(
+        workspace,
+        skills_dir,
+        codewhale_skills::SkillDiscoveryMode::from_config(config),
     );
+    let registry =
+        codewhale_skills::discover_for_workspace(workspace, Some(skills_dir), config, plugins);
     (registry, directories)
 }
 
-fn skill_entry_is_bundled(skill: &crate::skills::Skill, skills_dir: &FsPath) -> bool {
-    if !crate::skills::is_bundled_skill_name(&skill.name) {
+fn skill_entry_is_bundled(skill: &codewhale_skills::Skill, skills_dir: &FsPath) -> bool {
+    if !codewhale_skills::is_bundled_skill_name(&skill.name) {
         return false;
     }
 
@@ -10180,16 +11069,20 @@ fn skill_entry_is_bundled(skill: &crate::skills::Skill, skills_dir: &FsPath) -> 
 /// One `/v1/skills` row, and the row half of `GET /v1/skills/{name}`. Both
 /// sites read the same fields from the same `Skill`, so a new routing field
 /// lands in the listing and the detail together or not at all.
-fn skill_entry_for(skill: &crate::skills::Skill, enabled: bool, skills_dir: &FsPath) -> SkillEntry {
+fn skill_entry_for(
+    skill: &codewhale_skills::Skill,
+    enabled: bool,
+    skills_dir: &FsPath,
+) -> SkillEntry {
     let (path, source, plugin_id, plugin_generation, plugin_content_hash) = match &skill.source {
-        crate::skills::SkillSource::Native => (
+        codewhale_skills::SkillSource::Native => (
             Some(skill.path.clone()),
             "native".to_string(),
             None,
             None,
             None,
         ),
-        crate::skills::SkillSource::Plugin {
+        codewhale_skills::SkillSource::Plugin {
             plugin_id,
             plugin_name,
             authority,
@@ -10214,10 +11107,10 @@ fn skill_entry_for(skill: &crate::skills::Skill, enabled: bool, skills_dir: &FsP
         enabled,
         is_bundled,
         invocation: match skill.invocation {
-            crate::skills::SkillInvocation::ModelAndUser => "model+user",
-            crate::skills::SkillInvocation::ExplicitOnly => "explicit-only",
-            crate::skills::SkillInvocation::ModelOnly => "model-only",
-            crate::skills::SkillInvocation::Disabled => "disabled",
+            codewhale_skill_install::skill_parse::SkillInvocation::ModelAndUser => "model+user",
+            codewhale_skill_install::skill_parse::SkillInvocation::ExplicitOnly => "explicit-only",
+            codewhale_skill_install::skill_parse::SkillInvocation::ModelOnly => "model-only",
+            codewhale_skill_install::skill_parse::SkillInvocation::Disabled => "disabled",
         },
         aliases: skill.aliases.clone(),
         // Reported only when `is_bundled` is true, so the two fields cannot
@@ -10226,7 +11119,7 @@ fn skill_entry_for(skill: &crate::skills::Skill, enabled: bool, skills_dir: &FsP
         // pre-existing path test (`skills_dir/<name>/SKILL.md`), and this does
         // not change what it means.
         bundled_tier: is_bundled
-            .then(|| crate::skills::bundled_skill_tier(&skill.name))
+            .then(|| codewhale_skills::bundled_skill_tier(&skill.name))
             .flatten()
             .map(|tier| tier.label()),
     }
@@ -10353,9 +11246,9 @@ async fn restore_snapshot(
 }
 
 fn restore_snapshot_for_workspace(workspace: &FsPath, id: &str) -> Result<(), ApiError> {
-    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+    let repo = codewhale_snapshot::SnapshotRepo::open_or_init(workspace)
         .map_err(|e| ApiError::internal(format!("Snapshot repo init failed: {e}")))?;
-    let snapshot_id = crate::snapshot::SnapshotId::parse(id)
+    let snapshot_id = codewhale_snapshot::SnapshotId::parse(id)
         .map_err(|e| ApiError::bad_request(format!("Invalid snapshot id: {e}")))?;
     repo.restore(&snapshot_id)
         .map_err(|e| ApiError::internal(format!("Snapshot restore failed: {e}")))
@@ -10376,7 +11269,7 @@ fn snapshot_entries_for_workspace(
             )));
         }
     };
-    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+    let repo = codewhale_snapshot::SnapshotRepo::open_or_init(workspace)
         .map_err(|e| ApiError::internal(format!("Snapshot repo unavailable: {e}")))?;
     let snapshots = repo
         .list(limit)
@@ -10435,9 +11328,9 @@ struct ProviderEntry {
     /// "your key is owned elsewhere and this control cannot change it".
     #[serde(rename = "credentialSource")]
     credential_source: secrets::ProviderCredentialSource,
-    /// Whether `PUT`/`DELETE /v1/providers/{id}/key` will act on this route.
-    /// False means the write would be refused, so the control should be
-    /// disabled rather than allowed to fail late.
+    /// Whether durable `PUT`/`DELETE /v1/providers/{id}/key` can act on this route.
+    /// False means durable credential writes are refused; session-key removal
+    /// remains available independently of this owner.
     #[serde(rename = "credentialWritable")]
     credential_writable: bool,
     /// Why a write is refused, as user-facing copy. Present only when
@@ -10447,6 +11340,8 @@ struct ProviderEntry {
         skip_serializing_if = "Option::is_none"
     )]
     credential_writable_reason: Option<&'static str>,
+    #[serde(rename = "browserConnect", skip_serializing_if = "std::ops::Not::not")]
+    browser_connect: bool,
 }
 
 /// Stable, non-secret wire projection of provider readiness.
@@ -10465,9 +11360,9 @@ enum ProviderCredentialState {
     Legacy,
 }
 
-impl From<crate::provider_readiness::CredentialState> for ProviderCredentialState {
-    fn from(value: crate::provider_readiness::CredentialState) -> Self {
-        use crate::provider_readiness::CredentialState;
+impl From<codewhale_engine::provider_readiness::CredentialState> for ProviderCredentialState {
+    fn from(value: codewhale_engine::provider_readiness::CredentialState) -> Self {
+        use codewhale_engine::provider_readiness::CredentialState;
 
         match value {
             CredentialState::Saved | CredentialState::ImportedToken => Self::Configured,
@@ -10506,6 +11401,8 @@ struct ProviderModelEntry {
     reasoning_effort: codewhale_config::route::CapabilityState,
     reasoning_effort_levels: Vec<String>,
     reasoning_effort_source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    facts: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10685,7 +11582,7 @@ fn push_unique_model(models: &mut Vec<String>, model: &str) {
 
 fn provider_models_for_api(
     config: &Config,
-    identity: &crate::config::ProviderIdentity,
+    identity: &codewhale_runtime::config::ProviderIdentity,
 ) -> Vec<String> {
     if config.verify_provider_identity(identity).is_err() {
         return Vec::new();
@@ -10704,7 +11601,7 @@ fn provider_models_for_api(
             push_unique_model(&mut models, &active_model);
         }
     }
-    let exact_catalog = crate::provider_catalog_live::cached_entry_for_route(
+    let exact_catalog = codewhale_engine::provider_catalog_live::cached_entry_for_route(
         provider,
         identity.key.as_str(),
         &config.base_url_for_route(identity),
@@ -10717,14 +11614,14 @@ fn provider_models_for_api(
     // lake's next layers (Models.dev, then the bundled snapshot) answer.
     if !config.model_ids_pass_through_for_provider(identity)
         || exact_catalog
-        || crate::provider_lake::live_catalog_unavailable(config, identity)
+        || codewhale_engine::provider_lake::live_catalog_unavailable(config, identity)
     {
-        for model in crate::provider_lake::models_for_provider(config, identity) {
+        for model in codewhale_engine::provider_lake::models_for_provider(config, identity) {
             push_unique_model(&mut models, &model);
         }
     }
     for model in config.custom_models.as_deref().unwrap_or_default() {
-        if crate::provider_lake::configured_model_for_route(
+        if codewhale_runtime::config::configured_model_for_route(
             config,
             provider,
             identity.key.as_str(),
@@ -10738,48 +11635,56 @@ fn provider_models_for_api(
         }
     }
     if provider == ProviderKind::Ollama {
-        models.retain(|model| !crate::config::is_unresolved_local_ollama_model(model));
+        models.retain(|model| !codewhale_runtime::config::is_unresolved_local_ollama_model(model));
     }
     models
 }
 
 fn provider_model_image_input_for_api(
     config: &Config,
-    identity: &crate::config::ProviderIdentity,
+    identity: &codewhale_runtime::config::ProviderIdentity,
     model: &str,
 ) -> codewhale_config::route::CapabilityState {
-    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
-        .map(|route| route.candidate.capabilities().image_input)
-        .unwrap_or_default()
+    codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        identity,
+        Some(model),
+    )
+    .map(|route| route.candidate.capabilities().image_input)
+    .unwrap_or_default()
 }
 
 fn provider_model_output_token_limit_for_api(
     config: &Config,
-    identity: &crate::config::ProviderIdentity,
+    identity: &codewhale_runtime::config::ProviderIdentity,
     model: &str,
 ) -> codewhale_config::route::CapabilityState {
     use codewhale_config::route::CapabilityState;
-    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
-        .map(|route| {
-            if crate::route_budget::route_supports_output_token_limit(
-                route.identity.provider,
-                route.candidate.protocol(),
-            ) {
-                CapabilityState::Supported
-            } else {
-                CapabilityState::Unsupported
-            }
-        })
-        .unwrap_or_default()
+    codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        identity,
+        Some(model),
+    )
+    .map(|route| {
+        if codewhale_engine::route_budget::route_supports_output_token_limit(
+            route.identity.provider,
+            route.candidate.protocol(),
+        ) {
+            CapabilityState::Supported
+        } else {
+            CapabilityState::Unsupported
+        }
+    })
+    .unwrap_or_default()
 }
 
 fn provider_model_entry_for_api(
     config: &Config,
-    identity: &crate::config::ProviderIdentity,
+    identity: &codewhale_runtime::config::ProviderIdentity,
     model: String,
 ) -> ProviderModelEntry {
-    use crate::reasoning_preference::ReasoningEffort;
     use codewhale_config::route::CapabilityState;
+    use codewhale_engine::reasoning_preference::ReasoningEffort;
 
     let provider = identity.provider;
     let mut entry = ProviderModelEntry {
@@ -10789,15 +11694,56 @@ fn provider_model_entry_for_api(
         reasoning_effort: CapabilityState::Unknown,
         reasoning_effort_levels: Vec::new(),
         reasoning_effort_source: None,
+        facts: None,
     };
+    let base = config.base_url_for_route(identity);
+    let offering = codewhale_engine::provider_lake::configured_catalog_offering_for_route(
+        config,
+        provider,
+        identity.key.as_str(),
+        &base,
+        &entry.id,
+    );
+    let resolved = codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        identity,
+        Some(&entry.id),
+    )
+    .ok();
+    if let Some(offering) = offering.as_ref() {
+        let pricing = codewhale_config::pricing::OfferingPricing::from_catalog_offering(offering);
+        entry.facts = Some(serde_json::json!({
+            "wire_model_id": offering.wire_model_id,
+            "canonical_model_id": offering.canonical_model,
+            "name": offering.name,
+            "family": offering.family,
+            "status": offering.status,
+            "advertised_limits": offering.limit,
+            "effective_limits": resolved.as_ref().map(|route| route.candidate.limits()),
+            "effective_context": resolved.as_ref().map(|route| route.context_window),
+            "capabilities": resolved.as_ref().map(|route| route.candidate.capabilities()),
+            "reasoning": offering.reasoning,
+            "reasoning_options": offering.reasoning_options,
+            "modalities": offering.modalities,
+            "temperature": offering.temperature,
+            "source": offering.source,
+            "fact_sources": offering.fact_sources,
+            "pricing_status": pricing.as_ref().map(|pricing| pricing.status_label_at(codewhale_config::catalog::now_unix())),
+            "pricing": pricing,
+            "upstream_last_updated": offering.last_updated,
+            "account_access": "unverified",
+        }));
+    }
     // A provider kind and a familiar model name do not establish the
     // capabilities of a different endpoint or named compatible route.
     if provider == ProviderKind::Custom || config.provider_uses_custom_endpoint(identity) {
         return entry;
     }
     if provider == ProviderKind::OpenaiCodex {
-        let roster = crate::codex_model_cache::model_roster_for(config);
-        if roster.freshness != crate::codex_model_cache::CodexModelCacheFreshness::Fresh {
+        let roster = codewhale_engine::codex_model_cache::model_roster_for(config);
+        if roster.freshness
+            != codewhale_runtime::codex_model_roster::CodexModelCacheFreshness::Fresh
+        {
             return entry;
         }
         let Some(metadata) = roster.metadata_for(&entry.id) else {
@@ -10823,14 +11769,18 @@ fn provider_model_entry_for_api(
         if metadata.reasoning == Some(false) {
             entry.reasoning_effort = CapabilityState::Unsupported;
         }
-    } else if let Some(efforts) = ReasoningEffort::catalog_effort_values(provider, &entry.id) {
+    } else if let Some(efforts) = offering
+        .as_ref()
+        .and_then(ReasoningEffort::catalog_effort_values_for_offering)
+    {
         entry.reasoning_effort_levels = efforts
             .into_iter()
-            .filter(|effort| *effort != ReasoningEffort::Off)
+            .filter(|effort| *effort != ReasoningEffort::Auto)
+            .filter(|effort| *effort != ReasoningEffort::Off || provider == ProviderKind::Deepseek)
             .map(|effort| effort.as_setting().to_string())
             .collect();
         entry.reasoning_effort_source = Some("catalog");
-    } else if crate::route_runtime::resolve_runtime_route_for_identity(
+    } else if codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
         config,
         identity,
         Some(&entry.id),
@@ -10848,11 +11798,13 @@ fn provider_model_entry_for_api(
 
 fn provider_default_model_for_api(
     config: &Config,
-    identity: &crate::config::ProviderIdentity,
+    identity: &codewhale_runtime::config::ProviderIdentity,
 ) -> String {
     let provider = identity.provider;
-    let model = crate::model_inventory::provider_default_model(config, identity);
-    if provider == ProviderKind::Ollama && crate::config::is_unresolved_local_ollama_model(&model) {
+    let model = codewhale_engine::model_inventory::provider_default_model(config, identity);
+    if provider == ProviderKind::Ollama
+        && codewhale_runtime::config::is_unresolved_local_ollama_model(&model)
+    {
         String::new()
     } else {
         model
@@ -10860,7 +11812,7 @@ fn provider_default_model_for_api(
 }
 
 pub(crate) fn runtime_chat_model_id_is_safe(value: &str) -> bool {
-    let sanitized = crate::cost_status::sanitize_persisted_route_label(value);
+    let sanitized = codewhale_runtime::safe_label::sanitize_persisted_route_label(value);
     value == value.trim()
         && !value.is_empty()
         && value.len() <= 256
@@ -10894,7 +11846,7 @@ fn runtime_chat_model_id_looks_like_host_port(value: &str) -> bool {
 }
 
 pub(crate) fn runtime_chat_route_id_is_safe(value: &str) -> bool {
-    let sanitized = crate::cost_status::sanitize_persisted_route_label(value);
+    let sanitized = codewhale_runtime::safe_label::sanitize_persisted_route_label(value);
     value == value.trim()
         && !value.is_empty()
         && value.len() <= 128
@@ -10934,7 +11886,7 @@ pub(crate) fn runtime_chat_relay_catalog(
     config: &Config,
     challenge: &str,
 ) -> Result<Value, String> {
-    use crate::provider_readiness::CredentialState;
+    use codewhale_engine::provider_readiness::CredentialState;
 
     const PROTOCOL: &str = "codewhale.runtime-chat-relay.v1";
     if !(32..=128).contains(&challenge.len())
@@ -10951,7 +11903,9 @@ pub(crate) fn runtime_chat_relay_catalog(
         .ok()
         .is_some_and(|identity| {
             matches!(
-                crate::provider_readiness::credential_state_for_provider(config, &identity),
+                codewhale_engine::provider_readiness::credential_state_for_provider(
+                    config, &identity
+                ),
                 CredentialState::Saved
                     | CredentialState::ImportedToken
                     | CredentialState::Local
@@ -10977,18 +11931,19 @@ pub(crate) fn runtime_chat_relay_catalog(
         .active_provider_identity()
         .map_err(|_| "The active Runtime provider identity is invalid.".to_string())?;
     let provider = identity.provider;
-    let credential_state =
-        match crate::provider_readiness::credential_state_for_provider(config, &identity) {
-            CredentialState::Saved | CredentialState::ImportedToken => "configured",
-            CredentialState::Local => "local",
-            CredentialState::NoAuth => "no_auth",
-            CredentialState::MissingKey
-            | CredentialState::MissingLogin
-            | CredentialState::ExternalConsent
-            | CredentialState::Legacy => {
-                return Err("The active Runtime provider is not ready for Chat.".to_string());
-            }
-        };
+    let credential_state = match codewhale_engine::provider_readiness::credential_state_for_provider(
+        config, &identity,
+    ) {
+        CredentialState::Saved | CredentialState::ImportedToken => "configured",
+        CredentialState::Local => "local",
+        CredentialState::NoAuth => "no_auth",
+        CredentialState::MissingKey
+        | CredentialState::MissingLogin
+        | CredentialState::ExternalConsent
+        | CredentialState::Legacy => {
+            return Err("The active Runtime provider is not ready for Chat.".to_string());
+        }
+    };
 
     let models = runtime_chat_safe_models(provider_models_for_api(config, &identity))?;
     let requested_default = provider_default_model_for_api(config, &identity);
@@ -11019,6 +11974,8 @@ pub(crate) fn runtime_chat_relay_catalog(
             "authRequired": true,
             "capabilities": {
                 "relay_chat_v1": true,
+                "structured_review_turns": true,
+                "structured_review_version": 2,
                 "isolated_chat_threads": true,
                 "turn_operation_idempotency": true,
                 "turn_image_inputs": true,
@@ -11080,7 +12037,7 @@ fn configured_custom_provider_routes(config: &Config) -> Vec<String> {
 /// the built-in provider as before.
 fn provider_entry_for_api(
     config: &Config,
-    identity: &crate::config::ProviderIdentity,
+    identity: &codewhale_runtime::config::ProviderIdentity,
 ) -> ProviderEntry {
     let writeability = secrets::credential_writeability(config, identity);
     ProviderEntry {
@@ -11092,13 +12049,16 @@ fn provider_entry_for_api(
             .unwrap_or_else(|| format!("{} (custom)", identity.key)),
         default_model: provider_default_model_for_api(config, identity),
         has_model_catalog: !provider_models_for_api(config, identity).is_empty(),
-        credential_state: crate::provider_readiness::credential_state_for_provider(
+        credential_state: codewhale_engine::provider_readiness::credential_state_for_provider(
             config, identity,
         )
         .into(),
         credential_source: writeability.source,
         credential_writable: writeability.writable,
         credential_writable_reason: writeability.reason,
+        browser_connect: identity.provider == ProviderKind::Orcarouter
+            && writeability.writable
+            && !config.session_provider_keys_only,
     }
 }
 
@@ -11120,6 +12080,7 @@ async fn list_providers(
             default_model: String::new(), has_model_catalog: false,
             credential_state: ProviderCredentialState::Legacy, credential_source: secrets::ProviderCredentialSource::None,
             credential_writable: false, credential_writable_reason: Some("This configured route is unavailable; repair its exact provider definition before using it."),
+            browser_connect: false,
         }));
         Ok(Json(ProvidersResponse {
             current_provider_id: active_identity.as_ref().and_then(|identity| identity.persisted_id()).map(str::to_string),
@@ -11151,7 +12112,7 @@ fn provider_models_identity(
     config: &Config,
     id: &str,
     exact_id: Option<&str>,
-) -> Result<crate::config::ProviderIdentity, ApiError> {
+) -> Result<codewhale_runtime::config::ProviderIdentity, ApiError> {
     if id.is_empty() || id != id.trim() || id.chars().any(char::is_control) {
         return Err(ApiError::bad_request("provider must be an exact selection"));
     }
@@ -11196,7 +12157,7 @@ async fn list_provider_models(
         .map_err(|error| {
             ApiError::internal(format!("Could not fingerprint provider route: {error}"))
         })?;
-        let route_fingerprint = Some(crate::hashing::sha256_hex(route));
+        let route_fingerprint = Some(codewhale_runtime::hashing::sha256_hex(route));
         let models = provider_models_for_api(&config, &identity)
             .into_iter()
             .map(|id| provider_model_entry_for_api(&config, &identity, id))
@@ -11223,7 +12184,7 @@ async fn refresh_provider_models(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(params): Query<RefreshProviderModelsParams>,
-) -> Result<Json<crate::provider_lake::CatalogUpdateReceipt>, ApiError> {
+) -> Result<Json<codewhale_engine::provider_lake::CatalogUpdateReceipt>, ApiError> {
     let runtime = tokio::runtime::Handle::current();
     #[cfg(test)]
     let env_ticket = crate::test_support::env_scope_ticket();
@@ -11233,7 +12194,7 @@ async fn refresh_provider_models(
         let config = state.config.read().clone();
         let identity = provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
         Ok(Json(runtime.block_on(
-            crate::provider_lake::update_provider_catalog(&config, &identity),
+            codewhale_engine::provider_lake::update_provider_catalog(&config, &identity),
         )))
     })
     .await
@@ -11323,8 +12284,6 @@ async fn switch_provider(
     Path(id): Path<String>,
     Json(req): Json<SwitchProviderRequest>,
 ) -> Result<Json<SwitchProviderResponse>, ApiError> {
-    use crate::config_persistence;
-
     let trimmed_id = id.trim();
     let _target = ProviderKind::parse_config_identity(trimmed_id).ok_or_else(|| {
         // A configured `[providers.<name>]` route is a route this runtime can
@@ -11412,7 +12371,7 @@ async fn switch_provider(
         tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             let _membership = crate::test_support::join_env_scope(env_ticket);
-            let (config_toml, undo) = config_persistence::persist_provider_selection(
+            let (config_toml, undo) = codewhale_engine::route_preferences::persist_provider_selection(
                 state.config_path.as_deref(),
                 &task_identity,
                 task_model.as_deref(),
@@ -11425,10 +12384,9 @@ async fn switch_provider(
             // route is invalid under the new provider — surface it so the GUI can
             // tell the user to fix their config.
             let applied =
-                match Config::load(state.config_path.clone(), state.config_profile.as_deref()) {
+                match codewhale_plugins::providers::load_config(state.config_path.clone(), state.config_profile.as_deref()) {
                     Ok(mut reloaded) => {
-                        reloaded.account_model_access =
-                            state.config.read().account_model_access.clone();
+                        reloaded.preserve_runtime_credentials(&state.config.read());
                         match runtime.block_on(state.runtime_threads.reload_config(reloaded.clone())) {
                             Ok(_) => Ok(reloaded),
                             Err(err) => Err(ApiError::bad_request(format!(
@@ -11572,14 +12530,14 @@ struct SetConfigResponse {
 fn persist_runtime_tui_setting(key: &str, value: &str) -> Result<(), ApiError> {
     // Validate against a throwaway copy first, so an invalid value is still a
     // 400 rather than an internal error raised from inside the transaction.
-    let mut probe = crate::settings::Settings::load_persisted()
+    let mut probe = codewhale_runtime::settings::Settings::load_persisted()
         .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
     probe
         .set(key, value)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     // The write itself re-applies the key inside `Settings::transact`, so it
     // cannot save the stale snapshot above over a concurrent writer's field.
-    crate::settings::Settings::transact(|settings| settings.set(key, value))
+    codewhale_runtime::settings::Settings::transact(|settings| settings.set(key, value))
         .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))
 }
 
@@ -11593,7 +12551,7 @@ async fn get_config(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<GuiConfigResponse>, ApiError> {
     let config = state.config.read();
-    let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
+    let settings = codewhale_runtime::settings::Settings::load_persisted().unwrap_or_default();
     let mcp_config_path = config.mcp_config_path().display().to_string();
 
     let resolved_model = runtime_request_model(&config, None);
@@ -11685,7 +12643,9 @@ async fn set_config(
     State(state): State<RuntimeApiState>,
     Json(req): Json<SetConfigRequest>,
 ) -> Result<Json<SetConfigResponse>, ApiError> {
-    use crate::config_persistence;
+    use codewhale_runtime::config_persistence;
+
+    let _credential_change = state.provider_switches.lock().await;
 
     let key = req.key.to_lowercase();
     let mut value = req.value;
@@ -11808,9 +12768,12 @@ async fn set_config(
                     .read()
                     .resolve_provider_selection_identity(&value)
                     .map_err(ApiError::bad_request)?;
-                let result =
-                    config_persistence::persist_provider_selection(config_path, &identity, None)
-                        .map(|(path, _undo)| path);
+                let result = codewhale_engine::route_preferences::persist_provider_selection(
+                    config_path,
+                    &identity,
+                    None,
+                )
+                .map(|(path, _undo)| path);
                 if result.is_ok() {
                     state.config.write().provider = Some(
                         identity
@@ -11924,12 +12887,12 @@ async fn set_config(
                 // later Tavily key. A POST that differs from the resolved
                 // provider is an explicit change and still persists.
                 let resolution = state.config.read().search_provider_resolution();
-                let posted = crate::config::SearchProvider::parse(&normalized);
+                let posted = codewhale_runtime::config::SearchProvider::parse(&normalized);
                 if posted == Some(resolution.provider)
                     && matches!(
                         resolution.source,
-                        crate::config::SearchProviderSource::Default
-                            | crate::config::SearchProviderSource::TavilyKey
+                        codewhale_runtime::config::SearchProviderSource::Default
+                            | codewhale_runtime::config::SearchProviderSource::TavilyKey
                     )
                 {
                     return Ok(Json(SetConfigResponse {
@@ -12001,9 +12964,10 @@ async fn set_config(
 /// `codewhale_config::SETTINGS_SCHEMA` is the single declaration table: one
 /// entry per setting with kind, closed value set, default, and placement.
 /// This route projects it for HTTP clients — current values resolved from
-/// the owning store (settings.toml via [`crate::settings::Settings`],
+/// the owning store (settings.toml via [`codewhale_runtime::settings::Settings`],
 /// config.toml, or the notifications table), labels and descriptions
-/// resolved through the locale pack. Writes stay on `POST /v1/config`;
+/// resolved through the locale pack: the `?locale=` the client displays,
+/// else the configured `locale`. Writes stay on `POST /v1/config`;
 /// this route never invents a value, an option, or a validator.
 #[derive(Debug, Serialize)]
 struct SettingsSchemaResponse {
@@ -12120,8 +13084,14 @@ fn toml_value_at_path<'a>(document: &'a toml::Value, segments: &[&str]) -> Optio
     Some(current)
 }
 
+#[derive(Debug, Deserialize)]
+struct SettingsSchemaQuery {
+    locale: Option<String>,
+}
+
 async fn get_settings_schema(
     State(state): State<RuntimeApiState>,
+    Query(query): Query<SettingsSchemaQuery>,
 ) -> Result<Json<SettingsSchemaResponse>, ApiError> {
     use codewhale_config::notifications::NotificationSetting;
     use codewhale_config::settings_schema::{
@@ -12130,8 +13100,14 @@ async fn get_settings_schema(
     use codewhale_localization::{MessageId, resolve_locale, tr, tr_key};
 
     let config = state.config.read().clone();
-    let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
-    let locale = resolve_locale(&settings.locale);
+    let settings = codewhale_runtime::settings::Settings::load_persisted().unwrap_or_default();
+    let locale = resolve_locale(
+        query
+            .locale
+            .as_deref()
+            .filter(|tag| !tag.trim().is_empty())
+            .unwrap_or(&settings.locale),
+    );
     let notifications = config.notifications_config();
 
     // Conditional pairs share the TUI's rule: exactly one member is shown,
@@ -12159,16 +13135,16 @@ async fn get_settings_schema(
         match key {
             "permission_posture" => matches!(
                 permission_control,
-                crate::config::ApprovalPolicyControl::Unset
+                codewhale_runtime::config::ApprovalPolicyControl::Unset
             ),
             "approval_policy" => matches!(
                 permission_control,
-                crate::config::ApprovalPolicyControl::RootConfig
+                codewhale_runtime::config::ApprovalPolicyControl::RootConfig
             ),
             "managed_approval_policy" => !matches!(
                 permission_control,
-                crate::config::ApprovalPolicyControl::Unset
-                    | crate::config::ApprovalPolicyControl::RootConfig
+                codewhale_runtime::config::ApprovalPolicyControl::Unset
+                    | codewhale_runtime::config::ApprovalPolicyControl::RootConfig
             ),
             "allow_shell" => shell_control.editable_root(),
             "managed_allow_shell" => !shell_control.editable_root(),
@@ -12269,7 +13245,7 @@ async fn get_settings_schema(
             // to nothing (e.g. permission_posture). The probe reuses the
             // write validator on the declared default, so `editable` cannot
             // claim a key the real write path would reject.
-            let settings_writable = crate::settings::Settings::default()
+            let settings_writable = codewhale_runtime::settings::Settings::default()
                 .set(def.key, def.default)
                 .is_ok();
             let (value, persisted) = if notification_owned {
@@ -12293,7 +13269,7 @@ async fn get_settings_schema(
                 // Feature rows are diagnostics: the effective flag state plus
                 // whether config.toml names the leaf — no decorated phrasing,
                 // the client owns presentation of default-vs-configured.
-                let value = crate::features::FEATURES
+                let value = codewhale_runtime::features::FEATURES
                     .iter()
                     .find(|spec| spec.key == feature_key)
                     .map(|spec| config.features().enabled(spec.id).to_string());
@@ -12307,8 +13283,8 @@ async fn get_settings_schema(
                 // or stays absent for a diagnostic the runtime cannot read.
                 let managed_value = match def.key {
                     "managed_approval_policy" => match permission_control {
-                        crate::config::ApprovalPolicyControl::Unset
-                        | crate::config::ApprovalPolicyControl::RootConfig => None,
+                        codewhale_runtime::config::ApprovalPolicyControl::Unset
+                        | codewhale_runtime::config::ApprovalPolicyControl::RootConfig => None,
                         source => Some(source.label().to_string()),
                     },
                     "managed_allow_shell" if !shell_control.editable_root() => Some(format!(
@@ -12339,7 +13315,7 @@ async fn get_settings_schema(
             let session_locked = def.key == "approval_mode"
                 && !matches!(
                     permission_control,
-                    crate::config::ApprovalPolicyControl::Unset
+                    codewhale_runtime::config::ApprovalPolicyControl::Unset
                 );
             let editable = !endpoint_receipt
                 && !session_locked
@@ -12401,7 +13377,9 @@ fn config_schema_value(key: &str, config: &Config) -> Option<String> {
             .approval_policy
             .clone()
             .or_else(|| Some("suggest".to_string())),
-        "telemetry" => Some(crate::telemetry_notice::saved_preference_enabled(config).to_string()),
+        "telemetry" => {
+            Some(codewhale_engine::telemetry_notice::saved_preference_enabled(config).to_string())
+        }
         "allow_shell" => Some(config.allow_shell().to_string()),
         "base_url" => config
             .active_provider_identity()
@@ -12421,7 +13399,7 @@ fn config_schema_value(key: &str, config: &Config) -> Option<String> {
 
 fn normalize_runtime_config_model(
     config: &Config,
-    identity: &crate::config::ProviderIdentity,
+    identity: &codewhale_runtime::config::ProviderIdentity,
     value: &str,
 ) -> Result<String, ApiError> {
     config
@@ -12429,7 +13407,7 @@ fn normalize_runtime_config_model(
         .map_err(ApiError::bad_request)?;
     let provider = identity.provider;
     let value = value.trim();
-    if crate::provider_lake::configured_model_for_route(
+    if codewhale_runtime::config::configured_model_for_route(
         config,
         provider,
         identity.key.as_str(),
@@ -12440,7 +13418,7 @@ fn normalize_runtime_config_model(
     {
         // The shared resolver preserves exact declarations only after its
         // protocol and provider allowlist guards. Metadata cannot bypass them.
-        return crate::route_runtime::resolve_runtime_route_for_identity(
+        return codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
             config,
             identity,
             Some(value),
@@ -12463,22 +13441,28 @@ fn normalize_runtime_config_model(
 async fn reload_config(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<ReloadConfigResponse>, ApiError> {
-    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
+    tokio::spawn(async move {
+        let _credential_change = state.provider_switches.lock().await;
+        let mut reloaded = codewhale_plugins::providers::load_config(
+            state.config_path.clone(),
+            state.config_profile.as_deref(),
+        )
         .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
-    reloaded.account_model_access = state.config.read().account_model_access.clone();
-    state
-        .runtime_threads
-        .reload_config(reloaded.clone())
-        .await
-        .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
-    {
-        let mut config = state.config.write();
-        *config = reloaded;
-    }
-    Ok(Json(ReloadConfigResponse {
-        message: "Config reloaded from disk; new turns will resolve the updated provider routes"
-            .to_string(),
-    }))
+        reloaded.preserve_runtime_credentials(&state.config.read());
+        state
+            .runtime_threads
+            .reload_config(reloaded.clone())
+            .await
+            .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
+        *state.config.write() = reloaded;
+        Ok(Json(ReloadConfigResponse {
+            message:
+                "Config reloaded from disk; new turns will resolve the updated provider routes"
+                    .to_string(),
+        }))
+    })
+    .await
+    .map_err(|_| ApiError::internal("config reload task failed"))?
 }
 
 // ── Memory inspection and lifecycle endpoints ──
@@ -12551,9 +13535,11 @@ struct ClearMemoryQuery {
 
 /// Build a `NativeMemoryStore` rooted at the same location the TUI uses.
 /// Mirrors `native_store()` in `commands/groups/memory/memory.rs`.
-fn native_store_for_state(state: &RuntimeApiState) -> crate::native_memory::NativeMemoryStore {
+fn native_store_for_state(
+    state: &RuntimeApiState,
+) -> codewhale_runtime::native_memory::NativeMemoryStore {
     let memory_path = state.config.read().memory_path();
-    crate::native_memory::NativeMemoryStore::from_memory_anchor(&memory_path)
+    codewhale_runtime::native_memory::NativeMemoryStore::from_memory_anchor(&memory_path)
 }
 
 /// Derive a scope label from a source path relative to the store root.
@@ -12581,7 +13567,7 @@ fn workspace_id_for_source(source: &FsPath, store_root: &FsPath) -> Option<Strin
 
 /// Convert a `MemoryHit` into a redacted, bounded `MemoryEntryRecord`.
 fn memory_hit_to_record(
-    hit: crate::native_memory::MemoryHit,
+    hit: codewhale_runtime::native_memory::MemoryHit,
     store_root: &FsPath,
 ) -> MemoryEntryRecord {
     let scope = scope_label_for_source(&hit.source, store_root);
@@ -12606,20 +13592,30 @@ fn memory_hit_to_record(
 fn resolve_memory_scope(
     scope_param: &Option<String>,
     workspace: &FsPath,
-) -> Result<(Option<crate::native_memory::MemoryScope>, Option<String>), ApiError> {
+) -> Result<
+    (
+        Option<codewhale_runtime::native_memory::MemoryScope>,
+        Option<String>,
+    ),
+    ApiError,
+> {
     match scope_param.as_deref().unwrap_or("all").trim() {
         "all" | "" => Ok((None, None)),
-        "global" => Ok((Some(crate::native_memory::MemoryScope::Global), None)),
+        "global" => Ok((
+            Some(codewhale_runtime::native_memory::MemoryScope::Global),
+            None,
+        )),
         "workspace" => {
-            let workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(workspace)
-                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
-                .ok_or_else(|| {
-                    ApiError::bad_request(
-                        "workspace scope requires a git repository with a remote origin",
-                    )
-                })?;
+            let workspace_id =
+                codewhale_runtime::native_memory::NativeMemoryStore::workspace_id(workspace)
+                    .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "workspace scope requires a git repository with a remote origin",
+                        )
+                    })?;
             Ok((
-                Some(crate::native_memory::MemoryScope::Workspace),
+                Some(codewhale_runtime::native_memory::MemoryScope::Workspace),
                 Some(workspace_id),
             ))
         }
@@ -12660,11 +13656,12 @@ async fn list_memory(
         // "all" is global memory plus this repository's. With no identity
         // (no origin remote, or git unavailable) there is no workspace memory
         // to show, and the listing still serves global memory.
-        workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(&state.workspace)
-            .unwrap_or_else(|error| {
-                tracing::warn!("memory list shows global memory only: {error}");
-                None
-            });
+        workspace_id =
+            codewhale_runtime::native_memory::NativeMemoryStore::workspace_id(&state.workspace)
+                .unwrap_or_else(|error| {
+                    tracing::warn!("memory list shows global memory only: {error}");
+                    None
+                });
     }
 
     let hits = if let Some(ref q) = query.q {
@@ -12677,12 +13674,14 @@ async fn list_memory(
                 store.search_in_workspace(workspace_id.as_deref(), &state.workspace, q, limit)
             }
             None => store.search(q, limit),
-            Some(crate::native_memory::MemoryScope::Global) => store.search(q, limit).map(|h| {
-                h.into_iter()
-                    .filter(|h| scope_label_for_source(&h.source, &root) == "global")
-                    .collect()
-            }),
-            Some(crate::native_memory::MemoryScope::Workspace) => store
+            Some(codewhale_runtime::native_memory::MemoryScope::Global) => {
+                store.search(q, limit).map(|h| {
+                    h.into_iter()
+                        .filter(|h| scope_label_for_source(&h.source, &root) == "global")
+                        .collect()
+                })
+            }
+            Some(codewhale_runtime::native_memory::MemoryScope::Workspace) => store
                 .search_for_workspace(&state.workspace, q, limit)
                 .map(|h| {
                     h.into_iter()
@@ -12736,22 +13735,23 @@ async fn create_memory_entry(
         req.scope.as_str()
     };
     let scope = match scope_str.trim() {
-        "global" => crate::native_memory::MemoryScope::Global,
-        "workspace" => crate::native_memory::MemoryScope::Workspace,
+        "global" => codewhale_runtime::native_memory::MemoryScope::Global,
+        "workspace" => codewhale_runtime::native_memory::MemoryScope::Workspace,
         other => {
             return Err(ApiError::bad_request(format!(
                 "Invalid scope '{other}': expected 'global' or 'workspace'"
             )));
         }
     };
-    let workspace_id = if scope == crate::native_memory::MemoryScope::Workspace {
-        let id = crate::native_memory::NativeMemoryStore::workspace_id(&state.workspace)
-            .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "workspace scope requires a git repository with a remote origin",
-                )
-            })?;
+    let workspace_id = if scope == codewhale_runtime::native_memory::MemoryScope::Workspace {
+        let id =
+            codewhale_runtime::native_memory::NativeMemoryStore::workspace_id(&state.workspace)
+                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "workspace scope requires a git repository with a remote origin",
+                    )
+                })?;
         Some(id)
     } else {
         None
@@ -12891,6 +13891,7 @@ fn map_thread_err(err: anyhow::Error) -> ApiError {
     } else if message.starts_with("shell commands are restricted by ") {
         ApiError::forbidden(message)
     } else if message.contains("already has an active turn")
+        || message.contains("already has an active command")
         || message.contains("thread permissions changed during update")
         || message.contains("No active turn")
         || message.contains("is not active")
@@ -13108,7 +14109,7 @@ base_url = "http://127.0.0.1:9/v1"
         let root = config_path.parent().expect("fixture root");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace)?;
-        let config = Config::load(Some(config_path.clone()), None)?;
+        let config = codewhale_plugins::providers::load_config(Some(config_path.clone()), None)?;
         let sessions_dir = root.join("sessions");
         let mut manager_config =
             RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime"));
@@ -13117,7 +14118,7 @@ base_url = "http://127.0.0.1:9/v1"
             config.clone(),
             workspace.clone(),
             manager_config,
-            Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
+            Arc::new(codewhale_plugins::PluginRegistry::empty(&workspace)),
         )?);
         let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
         let task_manager = TaskManager::start_with_runtime_manager(
@@ -13137,14 +14138,17 @@ base_url = "http://127.0.0.1:9/v1"
         .await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2)?;
+        runtime_threads
+            .attach_subagent_manager(sub_agent_manager.clone())
+            .await?;
         let workspace_scopes =
             RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
         let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
         let state = RuntimeApiState {
             config: Arc::new(parking_lot::RwLock::new(config)),
             workspace: workspace.clone(),
-            plugin_discovery: crate::plugins::PluginDiscoveryContext::capture_pre_dotenv(),
+            plugin_discovery: codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv(),
             task_manager,
             runtime_threads,
             cors_origins: Vec::new(),
@@ -13172,6 +14176,7 @@ base_url = "http://127.0.0.1:9/v1"
             shutdown: RuntimeServerShutdown::default(),
             git_writes: Arc::new(tokio::sync::Mutex::new(())),
             provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+            provider_connect: Default::default(),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());
@@ -13187,7 +14192,7 @@ base_url = "http://127.0.0.1:9/v1"
     }
 
     async fn post_json(addr: SocketAddr, path: &str, body: Value) -> Result<Value> {
-        let response = crate::tls::reqwest_client()
+        let response = codewhale_release::tls::reqwest_client()
             .post(format!("http://{addr}{path}"))
             .json(&body)
             .send()
@@ -13199,7 +14204,9 @@ base_url = "http://127.0.0.1:9/v1"
     }
 
     fn assert_declared_route(config_path: &FsPath, provider: ProviderKind, model: &str) {
-        let config = Config::load(Some(config_path.to_path_buf()), None).expect("reloaded config");
+        let config =
+            codewhale_plugins::providers::load_config(Some(config_path.to_path_buf()), None)
+                .expect("reloaded config");
         let persisted = config
             .provider_config_for(&config.test_identity_for_kind(provider))
             .and_then(|entry| entry.model.as_deref());
@@ -13207,14 +14214,18 @@ base_url = "http://127.0.0.1:9/v1"
         let selected =
             provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider));
         assert_eq!(selected, model);
-        let route = crate::route_runtime::resolve_runtime_route(&config, provider, Some(&selected))
-            .expect("saved declared route");
+        let route = codewhale_engine::route_runtime::resolve_runtime_route(
+            &config,
+            provider,
+            Some(&selected),
+        )
+        .expect("saved declared route");
         assert_eq!(route.model, model);
         assert!(route.candidate.canonical_model().is_none());
         assert_eq!(route.candidate.limits().context_tokens, Some(96_000));
         assert_eq!(
             route.context_window.source,
-            crate::route_runtime::ContextWindowSource::UserDeclared
+            codewhale_engine::route_runtime::ContextWindowSource::UserDeclared
         );
     }
 
@@ -13247,7 +14258,7 @@ model = "GLM-5.2"
         provider: &str,
         model: &str,
     ) -> Result<Value> {
-        let client = crate::tls::reqwest_client();
+        let client = codewhale_release::tls::reqwest_client();
         let catalog = client
             .get(format!("http://{addr}/v1/providers"))
             .send()
@@ -13293,12 +14304,12 @@ model = "GLM-5.2"
     #[tokio::test(flavor = "current_thread")]
     async fn remembered_selection_aligns_catalog_and_new_thread_after_load() -> Result<()> {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let root = tempfile::tempdir()?;
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let config_path = root.path().join("config.toml");
         write_remembered_selection_fixture(root.path(), &config_path)?;
         let original_config = fs::read(&config_path)?;
@@ -13321,12 +14332,12 @@ model = "GLM-5.2"
     #[tokio::test(flavor = "current_thread")]
     async fn explicit_runtime_selections_migrate_legacy_memory_into_config_once() -> Result<()> {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let root = tempfile::tempdir()?;
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let config_path = root.path().join("config.toml");
         write_remembered_selection_fixture(root.path(), &config_path)?;
         let (addr, state, server) = serve_fixture(config_path.clone()).await?;
@@ -13412,12 +14423,12 @@ model = "GLM-5.2"
     #[tokio::test(flavor = "current_thread")]
     async fn provider_switch_migrates_legacy_selection_before_explicit_choice() -> Result<()> {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let root = tempfile::tempdir()?;
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let config_path = root.path().join("config.toml");
         write_remembered_selection_fixture(root.path(), &config_path)?;
         let original_settings = fs::read(root.path().join("settings.toml"))?;
@@ -13461,12 +14472,12 @@ model = "GLM-5.2"
         }
 
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let home = tempfile::tempdir()?;
         let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let config_path = home.path().join("config.toml");
         fs::write(
             &config_path,
@@ -13538,13 +14549,13 @@ model = "GLM-5.2"
     #[tokio::test(flavor = "current_thread")]
     async fn scoped_runtime_selections_leave_device_memory_unchanged() -> Result<()> {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let root = tempfile::tempdir()?;
         let home = root.path().join("home");
         let _home = EnvVarGuard::set("CODEWHALE_HOME", &home);
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let config_path = root.path().join("project/config.toml");
         write_remembered_selection_fixture(&home, &config_path)?;
         let original_settings = fs::read(home.join("settings.toml"))?;
@@ -13581,12 +14592,12 @@ model = "GLM-5.2"
     #[tokio::test(flavor = "current_thread")]
     async fn declared_model_posts_preserve_exact_identity_after_reload() -> Result<()> {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let home = tempfile::tempdir()?;
         let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         for (provider, model) in [
             (ProviderKind::Deepseek, "deepseek-v4pro"),
             (ProviderKind::Openrouter, "deepseek-v4-pro"),
@@ -13625,7 +14636,7 @@ model = "GLM-5.2"
                     &reloaded,
                     &(reloaded).test_identity_for_kind(provider),
                 );
-                let route = crate::route_runtime::resolve_runtime_route(
+                let route = codewhale_engine::route_runtime::resolve_runtime_route(
                     &reloaded,
                     provider,
                     Some(&selected),
@@ -13643,12 +14654,12 @@ model = "GLM-5.2"
     #[tokio::test(flavor = "current_thread")]
     async fn declared_model_posts_do_not_preserve_alias_at_wrong_endpoint() -> Result<()> {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let root = tempfile::tempdir()?;
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let config_path = root.path().join("config.toml");
         let fixture = fixture("deepseek", "deepseek-v4pro").replace(
             "[providers.deepseek]\nbase_url = \"http://127.0.0.1:9/v1\"",
@@ -13672,7 +14683,7 @@ model = "GLM-5.2"
         .await?;
         assert_eq!(body["value"], "deepseek-v4-pro");
         post_json(addr, "/v1/config/reload", json!({})).await?;
-        let config = Config::load(Some(config_path), None)?;
+        let config = codewhale_plugins::providers::load_config(Some(config_path), None)?;
         assert_eq!(
             config
                 .provider_config_for(&config.test_identity_for_kind(ProviderKind::Deepseek))
@@ -13683,7 +14694,7 @@ model = "GLM-5.2"
             &config,
             &(config).test_identity_for_kind(ProviderKind::Deepseek),
         );
-        let route = crate::route_runtime::resolve_runtime_route(
+        let route = codewhale_engine::route_runtime::resolve_runtime_route(
             &config,
             ProviderKind::Deepseek,
             Some(&selected),
@@ -13693,7 +14704,7 @@ model = "GLM-5.2"
         assert_ne!(route.candidate.limits().context_tokens, Some(96_000));
         assert_ne!(
             route.context_window.source,
-            crate::route_runtime::ContextWindowSource::UserDeclared
+            codewhale_engine::route_runtime::ContextWindowSource::UserDeclared
         );
         server.abort();
         state.task_manager.shutdown_and_wait().await?;
@@ -13703,12 +14714,12 @@ model = "GLM-5.2"
     #[test]
     fn declared_model_normalization_keeps_identity_and_protocol_guards() {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let root = tempfile::tempdir().expect("test root");
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let mut config: Config =
             toml::from_str(&fixture("deepseek", "deepseek-v4pro")).expect("fixture config");
         config.custom_models.as_mut().unwrap()[0].provider = "other".to_string();
@@ -13739,12 +14750,12 @@ model = "GLM-5.2"
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_default_model_reads_and_writes_the_deepseek_cn_slot() -> Result<()> {
         let _env = lock_test_env();
-        let _live = crate::provider_lake::lock_live_snapshot();
+        let _live = codewhale_engine::provider_lake::lock_live_snapshot();
         let root = tempfile::tempdir()?;
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
         let _model_environment = isolate_model_environment();
-        crate::provider_catalog_live::reset_cache_for_test();
-        crate::provider_lake::clear_live_snapshot();
+        codewhale_engine::provider_catalog_live::reset_cache_for_test();
+        codewhale_engine::provider_lake::clear_live_snapshot();
         let config_path = root.path().join("config.toml");
         fs::write(
             &config_path,
@@ -13752,7 +14763,7 @@ model = "GLM-5.2"
         )?;
         let (addr, state, server) = serve_fixture(config_path.clone()).await?;
         let _shutdown = state.task_manager.shutdown_guard();
-        let client = crate::tls::reqwest_client();
+        let client = codewhale_release::tls::reqwest_client();
         // The active CN route resolves `[providers.deepseek_cn].model`; the
         // runtime default_model surface must report that slot, not the primary.
         let reported: Value = client

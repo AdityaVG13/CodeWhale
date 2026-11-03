@@ -634,29 +634,15 @@ workflow({
         let WorkflowNode::Sequence(sequence) = &workflow.nodes[0] else {
             panic!("acceptance fixture should begin with one ordered role chain");
         };
-        let expected_children = [
-            ("explore", 6, 480, 96_000),
-            ("implement", 4, 420, 72_000),
-            ("reviewer", 4, 420, 72_000),
-            ("test", 4, 420, 72_000),
-            ("release_lead", 3, 300, 48_000),
-        ];
-        let mut aggregate_token_cap = 0_u64;
+        let expected_children = ["explore", "implement", "reviewer", "test", "release_lead"];
         assert_eq!(sequence.children.len(), expected_children.len());
-        for (node, (expected_role, max_steps, timeout_secs, max_tokens)) in
-            sequence.children.iter().zip(expected_children)
-        {
+        for (node, expected_role) in sequence.children.iter().zip(expected_children) {
             let WorkflowNode::Leaf(leaf) = node else {
                 panic!("acceptance role chain must contain only agent leaves");
             };
             assert_eq!(leaf.role.as_deref(), Some(expected_role));
             assert_eq!(leaf.mode, TaskMode::ReadOnly);
             assert!(!leaf.permissions.allow_write);
-            // No explicit `allowed_tools` anywhere: the read-only lowering
-            // alone scopes the source-gathering explore role, and its
-            // catalog-visible surface (tool_search + deferred grep_files) is
-            // pinned from the TUI side (scout_surface_keeps_tool_search_
-            // grep_files_activation_path).
             assert!(leaf.permissions.allowed_tools.is_empty());
             assert_eq!(
                 leaf.permissions.deny_all_tools,
@@ -677,17 +663,14 @@ workflow({
             );
             if expected_role == "explore" {
                 assert!(
-                    leaf.prompt.contains("exactly one `tool_search` call")
-                        && leaf.prompt.contains("exactly one `grep_files` call")
-                        && leaf.prompt.contains(
-                            "the content-search tool is deferred, so this activation is required before it can be called"
-                        ),
-                    "the scout must activate the deferred content-search tool before searching with it"
+                    leaf.prompt.contains("use `tool_search` with")
+                        && leaf.prompt.contains("Use `grep_files` with"),
+                    "the scout must name content search and its discovery fallback"
                 );
                 assert!(
-                    leaf.prompt.contains("Make no other tool calls")
-                        && leaf.prompt.contains("nothing else"),
-                    "the scout discovery must stay one bounded activation-plus-search round"
+                    leaf.prompt
+                        .contains("Read and search these files as needed"),
+                    "discovery must be driven by missing evidence"
                 );
                 assert_eq!(
                     leaf.file_scope
@@ -698,7 +681,7 @@ workflow({
                         "fleets/stopship.toml",
                         "crates/cli/src/lib.rs",
                         "crates/workflow/src/role_resolve.rs",
-                        "crates/tui/src/tools/workflow/mod.rs",
+                        "crates/engine/src/tools/workflow/mod.rs",
                         "crates/lane/src/runtime.rs",
                     ],
                     "the scout grep must not include its own authored prompt"
@@ -713,7 +696,7 @@ workflow({
                 }
                 assert!(
                     leaf.prompt.contains(
-                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow/mod.rs`, `crates/lane/src/runtime.rs`]"
+                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/engine/src/tools/workflow/mod.rs`, `crates/lane/src/runtime.rs`]"
                     ) && leaf.prompt.contains("Matches outside that exact include list do not count"),
                     "the grep_files search must constrain the actual tool input, not only file scope metadata"
                 );
@@ -745,43 +728,24 @@ workflow({
                     "fleets/stopship.toml",
                     "crates/cli/src/lib.rs",
                     "crates/workflow/src/role_resolve.rs",
-                    "crates/tui/src/tools/workflow/mod.rs",
+                    "crates/engine/src/tools/workflow/mod.rs",
                     "crates/lane/src/runtime.rs",
                 ],
                 "every acceptance role must carry the same promoted evidence boundary"
             );
-            assert_eq!(leaf.budget.max_steps, Some(max_steps), "{expected_role}");
-            let response_budget = match max_steps {
-                6 => "at most six model responses",
-                4 => "at most four model responses",
-                3 => "at most three model responses",
-                _ => unreachable!("unexpected stopship model-response budget"),
-            };
+            assert_eq!(leaf.budget.max_steps, None, "{expected_role}");
+            assert_eq!(leaf.budget.timeout_secs, None, "{expected_role}");
+            assert_eq!(leaf.budget.max_tokens, None, "{expected_role}");
+            assert!(!leaf.prompt.contains("at most"), "{expected_role}");
             assert!(
-                leaf.prompt.contains(response_budget) && leaf.prompt.contains("with no tool calls"),
-                "{expected_role} must reserve a response for its explicit verdict"
-            );
-            assert_eq!(
-                leaf.budget.timeout_secs,
-                Some(timeout_secs),
+                !leaf.prompt.contains("reserve the verdict"),
                 "{expected_role}"
             );
-            assert_eq!(leaf.budget.max_tokens, Some(max_tokens), "{expected_role}");
-            assert!(
-                max_tokens < u64::from(max_steps) * 24_000,
-                "{expected_role} verdict reserve must not raise its token ceiling"
-            );
-            aggregate_token_cap = aggregate_token_cap.saturating_add(max_tokens);
             assert!(
                 leaf.profile.is_none(),
                 "Fleet must resolve the declared role"
             );
         }
-        assert_eq!(
-            aggregate_token_cap, 360_000,
-            "the fixture must stay globally bounded when no shared override is supplied"
-        );
-
         let expected_gates = [
             ("explore", Some("implement"), "source_evidence"),
             ("implement", Some("reviewer"), "verification_plan"),

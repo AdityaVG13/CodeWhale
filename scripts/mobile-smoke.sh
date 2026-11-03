@@ -103,7 +103,7 @@ assert_body_contains() {
     local body
     body=$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)
 
-    if echo "$body" | grep -q "$substring"; then
+    if grep -q -- "$substring" <<< "$body"; then
         pass "$method $path body contains '$substring'"
     else
         fail "$method $path body missing '$substring'"
@@ -121,7 +121,7 @@ assert_body_not_contains() {
     local body
     body=$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)
 
-    if echo "$body" | grep -q "$substring"; then
+    if grep -q -- "$substring" <<< "$body"; then
         fail "$method $path body unexpectedly contains '$substring'"
     else
         pass "$method $path body does not contain '$substring'"
@@ -209,7 +209,7 @@ else
     fail "mobile unexpectedly accepted a 0.0.0.0 binding"
 fi
 
-if echo "$BIND_OUTPUT" | grep -qi "loopback-only"; then
+if grep -qi -- "loopback-only" <<< "$BIND_OUTPUT"; then
     pass "rejection explains the loopback-only boundary"
 else
     fail "rejection missing loopback-only guidance"

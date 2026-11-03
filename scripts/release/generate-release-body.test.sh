@@ -10,6 +10,8 @@ cat >"${tmp_dir}/CHANGELOG.md" <<'EOF'
 
 ## [1.2.3] - 2026-07-14
 
+Release summary and highlights.
+
 ### Fixed
 
 - A release fix.
@@ -23,6 +25,9 @@ EOF
 
 body="$("${repo_root}/scripts/release/generate-release-body.sh" v1.2.3 "${tmp_dir}/CHANGELOG.md")"
 
+[[ "${body%%$'\n'*}" == "## What's in v1.2.3" ]]
+[[ "${body%%## Install*}" == *"Release summary and highlights."* ]]
+grep -Fq -- '<summary>Full release notes</summary>' <<<"${body}"
 grep -Fq -- "- A release fix." <<<"${body}"
 grep -Fq -- "## Contributors" <<<"${body}"
 grep -Fq -- "[@example](https://github.com/example)" <<<"${body}"

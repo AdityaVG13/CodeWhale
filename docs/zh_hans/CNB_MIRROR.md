@@ -48,7 +48,9 @@ sha256sum -c codewhale-artifacts-sha256.txt --ignore-missing
   `workflow_dispatch`。仅推送标签不会触发发布标签镜像。手动恢复标签也必须
   验证 GitHub 已公开的完整资产清单及不可变的源码提交。
 - **认证：** HTTPS basic auth，用户名为 `cnb`，密码是仓库 secret
-  `CNB_GIT_TOKEN`。
+  `CNB_GIT_TOKEN`。fork 永远不会继承这个 secret，所以 `sync` 作业只在仓库所有者为
+  `codewhale-hq` 时运行；在 fork 上会被跳过而不是失败。本仓库中 secret 缺失或拼写
+  错误时，push 步骤仍会失败。
 - **范围：** 只推送触发本次运行的那个 ref。标签推送就推送该标签。分支推送镜像
   `main`、第一方 `fix/*`/`rebrand/*` 分支，或显式匹配的发布分支。其他功能分支
   和 dependabot ref 有意*不*镜像。

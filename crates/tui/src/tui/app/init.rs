@@ -19,7 +19,7 @@ impl App {
         Self::new_with_plugin_registry(
             options,
             config,
-            std::sync::Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
+            std::sync::Arc::new(codewhale_plugins::PluginRegistry::empty(&workspace)),
         )
     }
 
@@ -27,7 +27,7 @@ impl App {
     pub fn new_with_plugin_registry(
         options: TuiOptions,
         config: &Config,
-        plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
+        plugin_registry: std::sync::Arc<codewhale_plugins::PluginRegistry>,
     ) -> Self {
         let TuiOptions {
             model,
@@ -67,7 +67,7 @@ impl App {
                 &workspace,
             );
             match control {
-                crate::config::ApprovalPolicyControl::Unset => {
+                codewhale_runtime::config::ApprovalPolicyControl::Unset => {
                     if let Err(error) = normalize_legacy_yolo_settings() {
                         tracing::warn!(
                             "failed to normalize legacy YOLO settings; retrying next launch: {error:#}"
@@ -75,20 +75,21 @@ impl App {
                     }
                     true
                 }
-                crate::config::ApprovalPolicyControl::RootConfig => {
-                    let active_config_path = match crate::config::resolve_load_config_path(
-                        config_path.clone(),
-                    ) {
-                        Ok(path) => path,
-                        Err(error) => {
-                            tracing::error!(
-                                error = %error,
-                                "could not resolve the active config path for legacy policy migration"
-                            );
-                            None
-                        }
-                    };
-                    match crate::config_persistence::persist_unset_root_key(
+                codewhale_runtime::config::ApprovalPolicyControl::RootConfig => {
+                    let active_config_path =
+                        match codewhale_runtime::config::resolve_load_config_path(
+                            config_path.clone(),
+                        ) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                tracing::error!(
+                                    error = %error,
+                                    "could not resolve the active config path for legacy policy migration"
+                                );
+                                None
+                            }
+                        };
+                    match codewhale_runtime::config_persistence::persist_unset_root_key(
                         active_config_path.as_deref(),
                         "approval_policy",
                     ) {
@@ -125,30 +126,15 @@ impl App {
         let mut startup_config = config.clone();
         if config_profile.is_some()
             || (startup_config.remembered_selection_scope.is_none()
-                && (crate::config::explicit_launch_provider_override().is_some()
-                    || crate::config::explicit_launch_model_override().is_some()))
+                && (codewhale_runtime::config::explicit_launch_provider_override().is_some()
+                    || codewhale_runtime::config::explicit_launch_model_override().is_some()))
         {
             startup_config.remembered_selection_scope = Some(false);
         }
         let selected = startup_config.apply_saved_selection(&settings);
         let config = &startup_config;
-        // First launch writes `default_text_model = DEFAULT_TEXT_MODEL` into
-        // the generated config.toml; that line is the template, not a choice,
-        // so it must not turn off local discovery on a later launch.
-        let generated_default_model = config.provider.is_none()
-            && config.default_text_model.as_deref() == Some(DEFAULT_TEXT_MODEL);
-        let startup_route_configured = config.provider.is_some()
-            || (config.default_text_model.is_some() && !generated_default_model)
-            || config.legacy_model.is_some()
-            || crate::config::explicit_launch_provider_override().is_some()
-            || crate::config::explicit_launch_model_override().is_some()
-            || config
-                .active_provider_identity()
-                .ok()
-                .as_ref()
-                .and_then(|identity| config.provider_config_for(identity))
-                .is_some_and(|entry| entry.model.is_some())
-            || config.active_route_endpoint_configured();
+        let startup_route_configured =
+            codewhale_engine::local_ollama::startup_route_configured(config);
         // Provider and model come from the same resolved config, even on the
         // first run. An options default must not replace a configured model.
         let model = if selected || startup_route_configured {
@@ -167,17 +153,20 @@ impl App {
         // If settings.toml exists on disk but couldn't be parsed (we fell back
         // to defaults), surface a warning in the TUI so the user knows their
         // file is broken instead of silently losing all settings.
-        let settings_parse_warning = crate::settings::Settings::path().ok().and_then(|p| {
-            if p.exists() {
-                std::fs::read_to_string(&p).ok().and_then(|raw| {
-                    ::toml::from_str::<::toml::Value>(&raw)
-                        .err()
-                        .map(|e| format!("⚠ settings.toml is malformed — using defaults ({e})"))
-                })
-            } else {
-                None
-            }
-        });
+        let settings_parse_warning =
+            codewhale_runtime::settings::Settings::path()
+                .ok()
+                .and_then(|p| {
+                    if p.exists() {
+                        std::fs::read_to_string(&p).ok().and_then(|raw| {
+                            ::toml::from_str::<::toml::Value>(&raw).err().map(|e| {
+                                format!("⚠ settings.toml is malformed — using defaults ({e})")
+                            })
+                        })
+                    } else {
+                        None
+                    }
+                });
         let admission = config.active_provider_identity();
         let admission_error = admission.as_ref().err().cloned();
         let provider_identity = admission.ok();
@@ -208,18 +197,18 @@ impl App {
                 .as_ref()
                 .and_then(|identity| effective_auth_config.provider_config_for(identity))
                 .and_then(|entry| entry.auth_mode.as_deref())
-                .is_some_and(crate::oauth::auth_mode_uses_xai_oauth)
-            && !crate::oauth::credentials_present(
-                crate::oauth::OAuthProvider::Xai,
+                .is_some_and(codewhale_runtime::oauth::auth_mode_uses_xai_oauth)
+            && !codewhale_runtime::oauth::credentials_present(
+                codewhale_runtime::oauth::OAuthProvider::Xai,
                 &effective_auth_config,
             );
         let xai_dangling_repair_message = if xai_oauth_needs_reauth {
-            if crate::oauth::owned_generation_is_dangling(
-                crate::oauth::OAuthProvider::Xai,
+            if codewhale_runtime::oauth::owned_generation_is_dangling(
+                codewhale_runtime::oauth::OAuthProvider::Xai,
                 &effective_auth_config,
             ) {
-                match crate::oauth::clear_dangling_generation(
-                    crate::oauth::OAuthProvider::Xai,
+                match codewhale_runtime::oauth::clear_dangling_generation(
+                    codewhale_runtime::oauth::OAuthProvider::Xai,
                     config_path.as_deref(),
                 ) {
                     Ok(()) => {
@@ -278,8 +267,9 @@ impl App {
         // after settings.default_provider is applied; otherwise a saved
         // third-party provider can be pushed back into DeepSeek onboarding.
         let needs_api_key = !has_api_key(&effective_auth_config);
-        let api_key_env_only =
-            crate::config::active_provider_uses_env_only_api_key(&effective_auth_config);
+        let api_key_env_only = codewhale_runtime::config::active_provider_uses_env_only_api_key(
+            &effective_auth_config,
+        );
         let was_onboarded = crate::tui::onboarding::is_onboarded();
         let settings_auto_compact = settings.auto_compact;
         let auto_compact_user_configured = Settings::auto_compact_explicitly_configured();
@@ -374,8 +364,8 @@ impl App {
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
         // `settings.toml [enabled_models]` is no longer read (#6533): the
         // picker ranks by use, which this index derives from saved sessions.
-        let route_usage = crate::model_relevance::SharedRouteUsage::default();
-        crate::model_relevance::spawn_build(route_usage.clone());
+        let route_usage = codewhale_engine::model_relevance::SharedRouteUsage::default();
+        codewhale_engine::model_relevance::spawn_build(route_usage.clone());
         let active_context_window_override = provider_identity
             .as_ref()
             .and_then(|identity| config.context_window_for_provider_config(identity));
@@ -383,44 +373,53 @@ impl App {
             .as_ref()
             .and_then(|identity| config.model_context_windows_for(identity).cloned());
         let configured_route_base_url = effective_auth_config.active_route_base_url();
-        let (active_route_limits, active_route_base_url, active_context_window_source) =
-            if auto_model {
-                (
-                    active_context_window_override.map(|window| RouteLimits {
-                        context_tokens: Some(u64::from(window)),
-                        ..RouteLimits::default()
-                    }),
+        let (
+            active_route_limits,
+            active_route_base_url,
+            active_context_window_source,
+            active_context_window,
+        ) = if auto_model {
+            (
+                active_context_window_override.map(|window| RouteLimits {
+                    context_tokens: Some(u64::from(window)),
+                    ..RouteLimits::default()
+                }),
+                configured_route_base_url,
+                if active_context_window_override.is_some() {
+                    codewhale_engine::route_runtime::ContextWindowSource::Configured
+                } else {
+                    codewhale_engine::route_runtime::ContextWindowSource::Fallback
+                },
+                None,
+            )
+        } else {
+            provider_identity
+                .as_ref()
+                .ok_or_else(|| "provider identity unavailable".to_string())
+                .and_then(|identity| {
+                    codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
+                        &effective_auth_config,
+                        identity,
+                        Some(&model),
+                    )
+                })
+                .map(|resolution| {
+                    (
+                        codewhale_engine::route_budget::known_route_limits(
+                            resolution.candidate.limits(),
+                        ),
+                        resolution.candidate.endpoint().base_url.clone(),
+                        resolution.context_window.source,
+                        Some(resolution.context_window),
+                    )
+                })
+                .unwrap_or((
+                    None,
                     configured_route_base_url,
-                    if active_context_window_override.is_some() {
-                        crate::route_runtime::ContextWindowSource::Configured
-                    } else {
-                        crate::route_runtime::ContextWindowSource::Fallback
-                    },
-                )
-            } else {
-                provider_identity
-                    .as_ref()
-                    .ok_or_else(|| "provider identity unavailable".to_string())
-                    .and_then(|identity| {
-                        crate::route_runtime::resolve_runtime_route_for_identity(
-                            &effective_auth_config,
-                            identity,
-                            Some(&model),
-                        )
-                    })
-                    .map(|resolution| {
-                        (
-                            crate::route_budget::known_route_limits(resolution.candidate.limits()),
-                            resolution.candidate.endpoint().base_url.clone(),
-                            resolution.context_window.source,
-                        )
-                    })
-                    .unwrap_or((
-                        None,
-                        configured_route_base_url,
-                        crate::route_runtime::ContextWindowSource::Fallback,
-                    ))
-            };
+                    codewhale_engine::route_runtime::ContextWindowSource::Fallback,
+                    None,
+                ))
+        };
         let reasoning_effort_explicit = config.fleet_operator_reasoning_applied
             || settings.reasoning_effort.is_some()
             || config.reasoning_effort_is_explicit();
@@ -440,16 +439,18 @@ impl App {
         } else {
             model.as_str()
         };
-        let compact_threshold = crate::route_budget::compaction_threshold_for_route_at_percent(
-            provider,
-            threshold_model,
-            active_route_limits,
-            auto_compact_threshold_percent,
-        );
+        let compact_threshold =
+            codewhale_engine::route_budget::compaction_threshold_for_route_at_percent_with_window(
+                provider,
+                threshold_model,
+                active_route_limits,
+                active_context_window.map(|window| window.tokens),
+                auto_compact_threshold_percent,
+            );
         let auto_compact = if auto_compact_user_configured {
             settings_auto_compact
         } else {
-            crate::route_budget::auto_compact_default_for_route(
+            codewhale_engine::route_budget::auto_compact_default_for_route(
                 provider,
                 threshold_model,
                 active_route_limits,
@@ -480,7 +481,7 @@ impl App {
         };
         if !auto_model
             && !reasoning_effort_explicit
-            && let Some(effort) = crate::config::legacy_deepseek_alias_effort_for_route(
+            && let Some(effort) = codewhale_runtime::config::legacy_deepseek_alias_effort_for_route(
                 provider,
                 &effective_auth_config.active_route_base_url(),
                 &model,
@@ -489,7 +490,7 @@ impl App {
             reasoning_effort = ReasoningEffort::from_setting_for_provider(effort, provider);
         }
         if !auto_model
-            && crate::config::is_exact_direct_moonshot_k3_route(
+            && codewhale_runtime::config::is_exact_direct_moonshot_k3_route(
                 provider,
                 &active_route_base_url,
                 &model,
@@ -500,10 +501,14 @@ impl App {
             reasoning_effort =
                 reasoning_effort.normalize_for_route(provider, &active_route_base_url, &model);
         } else if !auto_model && !reasoning_effort_explicit {
-            if let Some(default) = ReasoningEffort::catalog_default(provider, &model) {
+            if let Some(default) =
+                ReasoningEffort::catalog_default(provider, &active_route_base_url, &model)
+            {
                 reasoning_effort = default;
             }
-        } else if !auto_model && ReasoningEffort::catalog_effort_values(provider, &model).is_some()
+        } else if !auto_model
+            && ReasoningEffort::catalog_effort_values(provider, &active_route_base_url, &model)
+                .is_some()
         {
             reasoning_effort =
                 reasoning_effort.normalize_for_route(provider, &active_route_base_url, &model);
@@ -561,7 +566,8 @@ impl App {
         // YOLO is a permission change. A locked policy must not be sidestepped
         // by --yolo, default_mode=yolo, /zidong, or Alt+Y.
         let yolo_compat = yolo_requested && !approval_policy_locked;
-        let needs_workspace_trust = !yolo_compat && crate::config::needs_trust(&workspace);
+        let needs_workspace_trust =
+            !yolo_compat && codewhale_runtime::config::needs_trust(&workspace);
         // The language screen is required only when the locale cannot be
         // confidently inferred from settings or the environment; returning
         // users never see it.
@@ -624,7 +630,7 @@ impl App {
 
         // Initialize hooks executor from config, reviewed plugin snapshots,
         // then project-local `.codewhale/hooks.toml` (#3026).
-        let hooks_config = crate::hooks::HooksConfig::load_with_project_and_plugins(
+        let hooks_config = codewhale_engine::hooks::config::load_with_project_and_plugins(
             config.hooks_config(),
             &workspace,
             Some(plugin_registry.as_ref()),
@@ -648,16 +654,17 @@ impl App {
         // Initialize plan state
         let plan_state = new_shared_plan_state();
         let todos = new_shared_todo_list();
-        let work_runtime =
-            crate::work_graph::new_shared_work_runtime(todos.clone(), plan_state.clone());
+        let work_runtime = codewhale_engine::work_graph::new_shared_work_runtime(
+            todos.clone(),
+            plan_state.clone(),
+        );
 
-        let skills_discovery_mode =
-            crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
+        let skills_config = std::sync::Arc::new(config.skills_config());
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
         let cached_skills = Self::discover_cached_skills(
             &workspace,
             &skills_dir,
-            skills_discovery_mode,
+            &skills_config,
             plugin_registry.as_ref(),
         );
 
@@ -685,17 +692,17 @@ impl App {
                 _ => (String::new(), 0, false),
             };
         let (mcp_configured_count, mcp_connecting) =
-            crate::mcp::load_config_with_workspace_and_plugins(
+            codewhale_engine::mcp::load_config_with_workspace_and_plugins(
                 &mcp_config_path,
                 &workspace,
                 plugin_registry.as_ref(),
             )
             .map(|cfg| {
-                // Boot is lazy (#6033): the pre-event "connecting" prediction
-                // is the eager set — `required` servers plus ones the user's
-                // `tools.always_load` selection covers — not every enabled
-                // server. The engine's first boot event replaces this with
-                // the real in-flight set.
+                // The pre-event "connecting" prediction names only servers a
+                // session must start — `required` ones plus those the user's
+                // `tools.always_load` selection covers — not every server the
+                // boot pass starts. The engine's first boot event replaces
+                // this with the real in-flight set.
                 let requested = config
                     .tools
                     .as_ref()
@@ -714,7 +721,7 @@ impl App {
                     .filter(|(_, server)| server.is_enabled())
                     .filter(|(name, server)| {
                         server.required
-                            || crate::mcp::tool_selection_covers_server(&requested, name)
+                            || codewhale_engine::mcp::tool_selection_covers_server(&requested, name)
                     })
                     .map(|(name, _)| name.clone())
                     .collect::<Vec<_>>();
@@ -736,6 +743,12 @@ impl App {
             .as_ref()
             .and_then(|tui| tui.composer_arrows_scroll)
             .is_some();
+        // The initial `connecting` list is a prediction about the pass the
+        // engine is about to run, so it carries the boot stamp (#7035).
+        let mcp_boot_initializing = !mcp_connecting.is_empty()
+            && config
+                .features()
+                .enabled(codewhale_runtime::features::Feature::Mcp);
         let mut app = Self {
             mode: initial_mode,
             hotbar_actions,
@@ -798,13 +811,15 @@ impl App {
             paused_goal_objective: None,
             history: Vec::new(),
             history_version: 0,
+            details_epoch: 0,
             transcript_identity_epoch: 0,
             history_revisions: Vec::new(),
             tool_run_cache: ToolRunCache::default(),
             next_history_revision: 1,
             api_messages: Arc::new(Vec::new()),
             api_message_stamps: Vec::new(),
-            session_journal: crate::session_tree::SessionJournal::new(),
+            window_reroot_cause: None,
+            session_journal: codewhale_runtime::session_tree::SessionJournal::new(),
             completed_assistant_outputs: Vec::new(),
             pending_plan_handoff: None,
             context_token_cache: std::cell::RefCell::new(Default::default()),
@@ -845,6 +860,7 @@ impl App {
             pinned_models: settings.pinned_models.clone(),
             auto_model,
             last_effective_model: None,
+            last_effective_budget: None,
             last_effective_provider: None,
             last_effective_provider_identity: None,
             last_auto_route_receipt: None,
@@ -855,12 +871,14 @@ impl App {
             provider_identity: provider_identity.clone(),
             provider_chain,
             provider_readiness,
-            provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
+            provider_health:
+                codewhale_engine::provider_readiness::ProviderReadinessSnapshot::default(),
             last_fallback_reason: None,
             model_ids_passthrough,
             active_route_limits,
             active_route_base_url,
             active_context_window_source,
+            active_context_window,
             active_context_window_override,
             active_model_context_windows,
             pending_provider_switch: None,
@@ -874,12 +892,12 @@ impl App {
             goal_continuation_waiting: false,
             configured_sandbox_mode: config.sandbox_mode.clone(),
             configured_sandbox_network: config.sandbox_network_access,
-            sandbox_backend: crate::sandbox::get_platform_sandbox_with_bwrap_preference(
+            sandbox_backend: codewhale_sandbox::get_platform_sandbox_with_bwrap_preference(
                 config.prefers_bwrap(),
             ),
             // #4022: the worker thread is spawned lazily on first submit, so
             // constructing an App never costs a thread.
-            lane_control: crate::lane_control::LaneControlQueue::new(),
+            lane_control: codewhale_runtime::lane_control::LaneControlQueue::new(),
             plugin_registry,
             config_path,
             config_profile,
@@ -890,7 +908,7 @@ impl App {
                 .map(PathBuf::from),
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
-            skills_discovery_mode,
+            skills_config,
             project_context_pack_enabled: config.project_context_pack_enabled(),
             memory_path,
             use_memory,
@@ -902,6 +920,7 @@ impl App {
             bracketed_paste_seen: false,
             bracketed_paste_trusted: crate::tui::paste::terminal_delivers_bracketed_paste(),
             system_prompt: None,
+            instruction_assembly: None,
             auto_compact,
             auto_compact_user_configured,
             auto_compact_threshold_percent,
@@ -921,6 +940,7 @@ impl App {
             focus_texture,
             launch,
             pending_launch_action: None,
+            pending_claude_login: None,
             pending_composer_submit: None,
             pending_hotbar_slot: None,
             synchronized_output_enabled,
@@ -938,8 +958,8 @@ impl App {
             constitution_reviewed_digest: None,
             cost_currency,
             billing_presentation: provider_identity.as_ref().map_or(
-                crate::route_billing::BillingPresentation::Unknown,
-                |identity| crate::route_billing::for_route(config, identity),
+                codewhale_engine::route_billing::BillingPresentation::Unknown,
+                |identity| codewhale_engine::route_billing::for_route(config, identity),
             ),
             composer_density,
             composer_border,
@@ -1008,6 +1028,7 @@ impl App {
             onboarding_had_provider_step: !was_onboarded && needs_api_key,
             onboarding_had_trust_step: !was_onboarded && needs_workspace_trust,
             local_runtime_detected: false,
+            local_ollama_probe: None,
             api_key_env_only,
             hooks,
             lifecycle_outbox,
@@ -1033,7 +1054,10 @@ impl App {
             pending_child_requests: std::collections::BTreeMap::new(),
             child_agent_sessions: std::collections::HashMap::new(),
             backtrack: crate::tui::backtrack::BacktrackState::new(),
+            undo_selection: false,
             current_session_id: None,
+            session_write_receipt: None,
+            session_write_owner: None,
             offline_queue_lease: None,
             last_known_work_state: None,
             last_known_goal_state: None,
@@ -1048,7 +1072,7 @@ impl App {
                 .tui
                 .as_ref()
                 .and_then(|tui| tui.status_items.clone())
-                .unwrap_or_else(crate::config::StatusItem::default_footer),
+                .unwrap_or_else(codewhale_runtime::config::StatusItem::default_footer),
             posture_bar: config
                 .tui
                 .as_ref()
@@ -1058,7 +1082,7 @@ impl App {
                 .tui
                 .as_ref()
                 .and_then(|tui| tui.metrics_line)
-                .unwrap_or(crate::config::ChromeRowPreset::Compact),
+                .unwrap_or(codewhale_runtime::config::ChromeRowPreset::Compact),
             // Prose wrap cap (`[transcript] prose_measure`, #5436). Resolved
             // once here so every render pass — main cache and full-screen
             // overlay — shares one effective width; `None` = full width.
@@ -1069,13 +1093,13 @@ impl App {
             runtime_services: RuntimeToolServices {
                 shell_manager: Some(shell_manager),
                 work: Some(work_runtime),
-                media_originals_dir: crate::media_originals::default_store_dir(),
+                media_originals_dir: codewhale_runtime::media_originals::default_store_dir(),
                 ..RuntimeToolServices::default()
             },
             coordination_detail: None,
             mcp_snapshot: None,
-            mcp_initializing: !mcp_connecting.is_empty()
-                && config.features().enabled(crate::features::Feature::Mcp),
+            mcp_initializing: mcp_boot_initializing,
+            mcp_boot_predicted_at: mcp_boot_initializing.then(std::time::Instant::now),
             mcp_snapshot_generation: 0,
             mcp_snapshot_generation_invalidated: false,
             mcp_connecting,
@@ -1102,7 +1126,6 @@ impl App {
             agent_roster_session_id: None,
             agent_roster_print_requested: false,
             active_tool_entry_completed_at: HashMap::new(),
-            exploring_cell: None,
             exploring_entries: HashMap::new(),
             ignored_tool_calls: HashSet::new(),
             last_exec_wait_command: None,
@@ -1110,6 +1133,7 @@ impl App {
             streaming_source_receipt: None,
             suppress_stream_events_until_turn_complete: false,
             streaming_thinking_active_entry: None,
+            pending_thinking_translation_cells: HashMap::new(),
             thinking_revision_last_bump_at: None,
             streaming_state: StreamingState::new(),
             streaming_output_token_estimate: 0,
@@ -1120,6 +1144,7 @@ impl App {
             pending_gate_receipts: Vec::new(),
             child_gate_receipts: std::collections::HashMap::new(),
             queued_messages: VecDeque::new(),
+            held_restored_queue: 0,
             queued_draft: None,
             pending_steers: VecDeque::new(),
             inflight_steers: VecDeque::new(),
@@ -1203,10 +1228,11 @@ impl App {
             workspace_follow_symlinks: settings.workspace_follow_symlinks,
             session_title: None,
             window_title: None,
+            composer_color: None,
             title_default: config
                 .title
                 .as_deref()
-                .map(crate::session_manager::sanitize_session_title)
+                .map(codewhale_engine::session_manager::sanitize_session_title)
                 .map(|title| title.trim().to_string())
                 .filter(|title| !title.is_empty()),
             receipt_text: None,
@@ -1230,11 +1256,11 @@ impl App {
 ///
 /// The normalization happens during parsing, so an empty transaction *is* the
 /// migration: load (which normalizes), then save. Doing it as its own
-/// [`crate::settings::Settings::transact`] rather than saving the snapshot
+/// [`codewhale_runtime::settings::Settings::transact`] rather than saving the snapshot
 /// `App::new` already loaded matters twice over. It cannot write back a stale
 /// pre-image, and — because `App::new` runs on the same hot path as several
 /// hundred tests — it keeps the transaction lock out of the common construction
 /// path entirely, taking it only when a legacy file actually needs migrating.
 fn normalize_legacy_yolo_settings() -> anyhow::Result<()> {
-    crate::settings::Settings::transact(|_normalized_on_load| Ok(()))
+    codewhale_runtime::settings::Settings::transact(|_normalized_on_load| Ok(()))
 }

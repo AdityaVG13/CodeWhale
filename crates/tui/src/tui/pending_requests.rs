@@ -8,10 +8,10 @@
 
 use std::time::Instant;
 
-use crate::core::events::Event as EngineEvent;
-use crate::tools::subagent::{AgentWorkerStatus, SubAgentManager};
 use crate::tui::app::App;
 use crate::tui::approval::ApprovalOwner;
+use codewhale_engine::core::events::Event as EngineEvent;
+use codewhale_engine::tools::subagent::{AgentWorkerStatus, SubAgentManager};
 use codewhale_localization::MessageId;
 
 /// Everything needed to re-raise a hidden child card.
@@ -212,7 +212,7 @@ pub(crate) fn footer_rows(app: &App) -> Vec<String> {
 pub(crate) fn repush_for_agent(
     app: &mut App,
     agent_id: &str,
-    default_selection: crate::config::ApprovalDefaultSelection,
+    default_selection: codewhale_runtime::config::ApprovalDefaultSelection,
     timeout: Option<std::time::Duration>,
 ) -> bool {
     let mut waiting: Vec<(String, PendingChildRequest)> = app

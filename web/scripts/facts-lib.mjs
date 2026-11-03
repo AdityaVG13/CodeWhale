@@ -5,10 +5,10 @@
  *
  * Sources of truth:
  *   - <repo>/Cargo.toml                         → version, workspace crates
- *   - <repo>/crates/tui/src/sandbox/mod.rs      → enforced sandbox markers
+ *   - <repo>/crates/sandbox/src/lib.rs           → enforced sandbox markers
  * *   - <repo>/crates/config/assets/provider_descriptors.json → provider labels and default model
  *   - <repo>/npm/codewhale/package.json         → node engines
- *   - <repo>/crates/tui/src/tools/*.rs          → tool count (ToolSpec impls)
+ *   - <repo>/crates/engine/src/tools/*.rs          → tool count (ToolSpec impls)
  *   - <repo>/LICENSE                            → license
  *   - <repo>/web/data/latest-published-release.json → latest published release
  */
@@ -46,7 +46,7 @@ export function deriveCrates() {
 }
 
 export function deriveSandboxBackends() {
-  const source = read("crates/tui/src/sandbox/mod.rs");
+  const source = read("crates/sandbox/src/lib.rs");
   return source ? deriveSandboxBackendsFromSource(source) : [];
 }
 
@@ -88,7 +88,7 @@ export function deriveModels() {
 }
 
 export function deriveToolCount() {
-  const dir = join(REPO_ROOT, "crates/tui/src/tools");
+  const dir = join(REPO_ROOT, "crates/engine/src/tools");
   if (!existsSync(dir)) return null;
   let count = 0;
   for (const f of readdirSync(dir)) {
@@ -97,6 +97,17 @@ export function deriveToolCount() {
     count += (body.match(/^impl ToolSpec for /gm) ?? []).length;
   }
   return count > 0 ? count : null;
+}
+
+export function deriveContributorCount() {
+  const contributors = JSON.parse(read("docs/contributors.json") ?? "null");
+  const people = contributors?.people;
+  if (!Array.isArray(people) || people.length === 0 || people.some((person) =>
+    !person || typeof person.login !== "string" || person.login.trim().length === 0)
+    || new Set(people.map((person) => person.login.toLowerCase())).size !== people.length) {
+    throw new Error("missing or malformed contributor roster");
+  }
+  return people.length;
 }
 
 export function deriveLicense() {
@@ -149,7 +160,7 @@ export function deriveFeatures() {
     }
     ids.add(row.id);
     for (const [surface, state] of Object.entries(row.surfaces)) {
-      if (!["tui", "api", "web"].includes(surface) || !["stable", "partial", "preview", "none"].includes(state)) {
+      if (!["tui", "desktop", "web", "api"].includes(surface) || !["stable", "partial", "preview", "none"].includes(state)) {
         throw new Error(`invalid feature surface: ${row.id}/${surface}`);
       }
     }
@@ -195,6 +206,7 @@ export function buildFacts() {
     defaultModel: deriveDefaultModel(),
     nodeEngines: deriveNodeEngines(),
     toolCount: deriveToolCount(),
+    contributorCount: deriveContributorCount(),
     license: deriveLicense(),
     latestPublishedRelease: deriveLatestPublishedRelease(),
   };

@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::sandbox::SandboxPolicy;
 use crate::tui::shell_key_routing::{self, Focus, ShellBindingId};
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ElevationWidget, Renderable};
 use codewhale_localization::Locale;
+use codewhale_sandbox::SandboxPolicy;
 
 /// Options for elevating sandbox permissions after a denial.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,12 +158,12 @@ impl ElevationView {
 
     fn select_prev(&mut self) {
         self.selected =
-            crate::tui::list_nav::wrap_index(self.selected, self.request.options.len(), -1);
+            codewhale_tui_kit::list_nav::wrap_index(self.selected, self.request.options.len(), -1);
     }
 
     fn select_next(&mut self) {
         self.selected =
-            crate::tui::list_nav::wrap_index(self.selected, self.request.options.len(), 1);
+            codewhale_tui_kit::list_nav::wrap_index(self.selected, self.request.options.len(), 1);
     }
 
     fn current_option(&self) -> &ElevationOption {

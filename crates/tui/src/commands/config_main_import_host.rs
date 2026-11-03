@@ -14,29 +14,33 @@ use std::path::Path;
 /// Build the import plan from the host's home/workspace; `None` when nothing
 /// was found.
 pub(in crate::commands) fn build_plan(app: &mut App) -> Option<CommandClaudePlan> {
-    let home = crate::config::effective_home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let (sources, claude, settings) = crate::import_claude::read_sources(&home);
+    let home = codewhale_paths::user_home().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let (sources, claude, settings) = codewhale_net::import_claude::read_sources(&home);
 
     // MCP candidates come from the same discovery the `/mcp import` consent
     // flow uses, filtered to the Claude sources: provenance stays single-sourced.
     let markets = Vec::new();
-    let mcp_candidates =
-        crate::mcp::external_import::discover_external_sources(&home, &app.workspace, &markets)
-            .into_iter()
-            .filter(|candidate| {
-                matches!(
-                    candidate.source_kind,
-                    crate::mcp::external_import::ExternalMcpSourceKind::ClaudeJson
-                )
-            })
-            .map(|candidate| CommandMcpCandidate {
-                summary: candidate.summary,
-                hard_blocked: candidate.hard_blocked,
-                name: candidate.name,
-            })
-            .collect::<Vec<_>>();
+    let mcp_candidates = codewhale_engine::mcp::external_import::discover_external_sources(
+        &home,
+        &app.workspace,
+        &markets,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        matches!(
+            candidate.source_kind,
+            codewhale_engine::mcp::external_import::ExternalMcpSourceKind::ClaudeJson
+        )
+    })
+    .map(|candidate| CommandMcpCandidate {
+        summary: candidate.summary,
+        hard_blocked: candidate.hard_blocked,
+        name: candidate.name,
+    })
+    .collect::<Vec<_>>();
 
-    let plan = crate::import_claude::build_plan(sources, claude, settings, &home, mcp_candidates);
+    let plan =
+        codewhale_net::import_claude::build_plan(sources, claude, settings, &home, mcp_candidates);
     if plan.is_empty() { None } else { Some(plan) }
 }
 
@@ -85,14 +89,14 @@ pub(in crate::commands) fn apply_plan(
         match codewhale_config::codewhale_home() {
             Ok(home) => {
                 let destination = home.join("instructions.md");
-                let source = crate::config::effective_home_dir()
+                let source = codewhale_paths::user_home()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join(".claude")
                     .join("CLAUDE.md");
                 if destination.exists() {
                     manual.push(CommandImportFollowUp::InstructionsKeptExisting {
-                        destination: crate::utils::display_path(&destination).to_string(),
-                        source: crate::utils::display_path(&source).to_string(),
+                        destination: codewhale_util::utils::display_path(&destination).to_string(),
+                        source: codewhale_util::utils::display_path(&source).to_string(),
                     });
                 } else {
                     let copy_source = source.clone();
@@ -109,7 +113,7 @@ pub(in crate::commands) fn apply_plan(
                                     #[cfg(test)]
                                     let _membership = crate::test_support::join_env_scope(ticket);
                                     std::fs::read(&copy_source).is_ok_and(|bytes| {
-                                        codewhale_config::private_directory::PrivateDirectory::open(
+                                        codewhale_config::private_directory::PrivateDirectory::open_trusting_mount(
                                             &copy_home,
                                         )
                                         .and_then(|directory| {
@@ -130,7 +134,7 @@ pub(in crate::commands) fn apply_plan(
                             #[cfg(test)]
                             let _membership = crate::test_support::join_env_scope(ticket);
                             std::fs::read(&copy_source).is_ok_and(|bytes| {
-                                codewhale_config::private_directory::PrivateDirectory::open(
+                                codewhale_config::private_directory::PrivateDirectory::open_trusting_mount(
                                     &copy_home,
                                 )
                                 .and_then(|directory| {
@@ -145,12 +149,14 @@ pub(in crate::commands) fn apply_plan(
                     };
                     if copied {
                         done.push(CommandImportFollowUp::InstructionsCopied {
-                            destination: crate::utils::display_path(&destination).to_string(),
+                            destination: codewhale_util::utils::display_path(&destination)
+                                .to_string(),
                         });
                     } else {
                         manual.push(CommandImportFollowUp::InstructionsCopyFailed {
-                            source: crate::utils::display_path(&source).to_string(),
-                            destination: crate::utils::display_path(&destination).to_string(),
+                            source: codewhale_util::utils::display_path(&source).to_string(),
+                            destination: codewhale_util::utils::display_path(&destination)
+                                .to_string(),
                         });
                     }
                 }
@@ -197,8 +203,8 @@ pub(in crate::commands) fn apply_plan(
 mod tests {
     use super::*;
     use crate::commands::CommandResult;
-    use crate::config::Config;
     use crate::tui::app::TuiOptions;
+    use codewhale_runtime::config::Config;
     use std::fs;
     use tempfile::TempDir;
 

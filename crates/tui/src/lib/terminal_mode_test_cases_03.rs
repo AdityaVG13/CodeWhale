@@ -10,14 +10,14 @@
         let defaulted = exec_max_steps(args.max_turns);
         assert_eq!(
             defaulted,
-            crate::core::engine::turn_budget::DEFAULT_MAX_MODEL_STEPS
+            codewhale_runtime::turn_budget::DEFAULT_MAX_MODEL_STEPS
         );
         assert_eq!(
-            crate::core::turn::TurnContext::new(defaulted).step_limit(),
+            codewhale_engine::core::turn::TurnContext::new(defaulted).step_limit(),
             None
         );
         assert_eq!(exec_max_steps(Some(7)), 7);
-        let mut capped = crate::core::turn::TurnContext::new(exec_max_steps(Some(7)));
+        let mut capped = codewhale_engine::core::turn::TurnContext::new(exec_max_steps(Some(7)));
         for _ in 0..7 {
             capped.next_step();
         }
@@ -25,8 +25,8 @@
         assert_eq!(capped.stop_diagnostics.effective_max_steps, Some(7));
         assert_eq!(
             exec_max_steps(Some(u32::MAX)),
-            crate::core::engine::turn_budget::MAX_MAX_MODEL_STEPS,
-            "even the largest override stays finite"
+            codewhale_runtime::turn_budget::DEFAULT_MAX_MODEL_STEPS,
+            "the compatibility sentinel remains unbounded"
         );
     }
 
@@ -456,6 +456,7 @@
             prompt_cache_write_tokens: Some(0),
             reasoning_replay_tokens: Some(40),
             duration_ms: 1834,
+            finish_reason: None,
         };
 
         let value = exec_stream_value(&event).expect("serializes");
@@ -491,6 +492,7 @@
             prompt_cache_write_tokens: None,
             reasoning_replay_tokens: None,
             duration_ms: 250,
+            finish_reason: None,
         };
 
         let value = exec_stream_value(&event).expect("serializes");
@@ -696,7 +698,7 @@
                 duration_ms: 2500,
                 retry_count: None,
                 approval_posture: "ask".to_string(),
-                sandbox_posture: "configured_default".to_string(),
+                sandbox_posture: "workspace-write".to_string(),
                 binary_sha256: Some("sha256:binary".to_string()),
                 config_sha256: None,
                 prompt_sha256: "sha256:prompt".to_string(),
@@ -763,11 +765,11 @@
             exec_stream_final_answer_excerpt("  short reply \n"),
             "short reply"
         );
-        let long = "x".repeat(crate::fleet::executor::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 5);
+        let long = "x".repeat(codewhale_engine::fleet::executor::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 5);
         let excerpt = exec_stream_final_answer_excerpt(&long);
         assert_eq!(
             excerpt.chars().count(),
-            crate::fleet::executor::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
+            codewhale_engine::fleet::executor::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
         );
         assert!(excerpt.ends_with("..."));
         let leaked = exec_stream_final_answer_excerpt("token: sk-ant-must-not-leak-1234567890");
@@ -965,13 +967,13 @@
 
     #[test]
     fn review_receipt_check_public_json_omits_private_details() {
-        let validation = crate::tools::review::ReviewReceiptValidation {
+        let validation = codewhale_engine::tools::review::ReviewReceiptValidation {
             passed: false,
             reason: "secret reason with /tmp/private/receipt.json".to_string(),
             diff_fingerprint: "sha256:current".to_string(),
             receipt_fingerprint: Some("sha256:current".to_string()),
             receipt_path: Some(PathBuf::from("/tmp/private/receipt.json")),
-            unresolved_risk: Some(crate::tools::review::ReviewReceiptRisk {
+            unresolved_risk: Some(codewhale_engine::tools::review::ReviewReceiptRisk {
                 unresolved: true,
                 level: "error".to_string(),
                 summary: "secret summary".to_string(),
@@ -1040,8 +1042,8 @@
     #[test]
     fn config_never_selects_the_inline_screen() {
         let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
+        let config = {
+            let __cw_config_init_0_0 = Some(codewhale_runtime::config::TuiConfig {
                 alternate_screen: Some("never".to_string()),
                 mouse_capture: None,
                 selection_copy_markdown: None,
@@ -1062,8 +1064,10 @@
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-            }),
-            ..Config::default()
+            });
+            let mut __cw_config_init_0_value: Config = Config::default();
+            __cw_config_init_0_value.tui = __cw_config_init_0_0;
+            __cw_config_init_0_value
         };
 
         assert_eq!(startup_screen_mode(&cli, &config), ScreenMode::Inline);
@@ -1146,8 +1150,8 @@
     #[test]
     fn config_can_disable_default_mouse_capture() {
         let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
+        let config = {
+            let __cw_config_init_1_0 = Some(codewhale_runtime::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(false),
                 selection_copy_markdown: None,
@@ -1168,8 +1172,10 @@
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-            }),
-            ..Config::default()
+            });
+            let mut __cw_config_init_1_value: Config = Config::default();
+            __cw_config_init_1_value.tui = __cw_config_init_1_0;
+            __cw_config_init_1_value
         };
 
         assert!(!should_use_mouse_capture_with(
@@ -1190,8 +1196,8 @@
     #[test]
     fn config_can_enable_mouse_capture() {
         let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
+        let config = {
+            let __cw_config_init_2_0 = Some(codewhale_runtime::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 selection_copy_markdown: None,
@@ -1212,8 +1218,10 @@
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-            }),
-            ..Config::default()
+            });
+            let mut __cw_config_init_2_value: Config = Config::default();
+            __cw_config_init_2_value.tui = __cw_config_init_2_0;
+            __cw_config_init_2_value
         };
 
         assert!(should_use_mouse_capture_with(
@@ -1288,8 +1296,8 @@
     #[test]
     fn config_mouse_capture_true_overrides_jetbrains_default() {
         let cli = parse_cli(&["codewhale"]);
-        let config = Config {
-            tui: Some(crate::config::TuiConfig {
+        let config = {
+            let __cw_config_init_3_0 = Some(codewhale_runtime::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 selection_copy_markdown: None,
@@ -1310,8 +1318,10 @@
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-            }),
-            ..Config::default()
+            });
+            let mut __cw_config_init_3_value: Config = Config::default();
+            __cw_config_init_3_value.tui = __cw_config_init_3_0;
+            __cw_config_init_3_value
         };
 
         assert!(should_use_mouse_capture_with(
@@ -1366,14 +1376,15 @@
 
     #[test]
     fn default_max_turns_does_not_add_a_hidden_worker_cap() {
-        use crate::fleet::executor::build_worker_exec_command_with_launch_spec;
-        use crate::fleet::worker_runtime::fleet_task_to_worker_spec_with_profiles;
+        use codewhale_engine::fleet::executor::build_worker_exec_command_with_launch_spec;
+        use codewhale_engine::fleet::worker_runtime::fleet_task_to_worker_spec_with_profiles;
         use codewhale_config::FleetExecConfig;
         use codewhale_protocol::fleet::{FleetHostSpec, FleetTaskSpec, FleetWorkerSpec};
 
         let exec = FleetExecConfig::default();
         let workspace = tempfile::TempDir::new().unwrap();
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker 1".to_string(),
             host: FleetHostSpec::Local,
@@ -1427,7 +1438,7 @@
             assert_eq!(args.max_tool_calls, None);
             // Follow omission beyond argv through the real CLI resolver. This
             // previously installed 200 despite correct unbounded launch args.
-            let turn = crate::core::turn::TurnContext::new(exec_max_steps(args.max_turns));
+            let turn = codewhale_engine::core::turn::TurnContext::new(exec_max_steps(args.max_turns));
             assert_eq!(turn.step_limit(), expected);
             assert_eq!(turn.stop_diagnostics.effective_max_steps, expected);
         }

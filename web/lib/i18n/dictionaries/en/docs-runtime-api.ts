@@ -21,12 +21,12 @@ export const docsRuntimeApi: DocsRuntimeApiDict = {
       blocks: [
         {
           code: `codewhale exec "Reply with exactly: pong"
-codewhale exec --auto "fix the failing test and run it again"
-codewhale exec --auto --output-format stream-json "update the changelog"`,
+codewhale exec --auto --sandbox workspace-write "fix the failing test and run it again"
+codewhale exec --auto --sandbox workspace-write --output-format stream-json "update the changelog"`,
           lang: "Terminal",
         },
         {
-          p: "Plain `exec` answers once without tools. `--auto` lets it use tools and approves them automatically, so use it only in a repository or container you trust; it never widens the [sandbox](/docs/sandbox). `--output-format stream-json` prints one JSON event per line and saves the session so `--continue` can pick it up. `--max-turns` and `--allowed-tools` put limits on a run.",
+          p: "Plain `exec` answers once without tools. By default, `--auto` enables Full Access: tools run without asking, shell commands have no Codewhale sandbox, and trust mode lets file tools write outside the workspace. Any `--sandbox` other than `danger-full-access` (or the equivalent `sandbox_mode` in config) keeps trust mode off. Add `--sandbox workspace-write` for the [shell sandbox, where available](/docs/sandbox), and file-tool workspace restrictions; `external-sandbox` relies on your own isolation. Put flags before the prompt, and use `--` before prompt text that starts with `-` or contains literal exec flags. Runs that offer tools are saved in every output format. `--output-format stream-json` prints one JSON event per line and also saves answer-only runs so `--continue` can pick them up. `--max-turns` and `--allowed-tools` put limits on a run.",
         },
       ],
     },

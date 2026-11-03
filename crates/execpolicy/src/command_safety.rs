@@ -382,12 +382,23 @@ pub fn prefix_allow_matches(pattern: &str, command: &str) -> bool {
 
     // Fallback: normalised exact match for patterns not in the arity table
     // (e.g. exact-match rules like `"ls -la"` that lack a dictionary entry).
+    // A prefix grant never covers a compound or expansion-bearing command: the
+    // allow is for one inert invocation, so a shell operator fails closed here
+    // rather than depending on the caller having classified it first.
     let command_norm: String = command
         .trim()
         .to_ascii_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    if command_norm.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\n' | '\r'
+        )
+    }) {
+        return false;
+    }
     command_norm == pattern_norm || command_norm.starts_with(&format!("{pattern_norm} "))
 }
 
@@ -2042,6 +2053,13 @@ fn split_command_segments(command: &str) -> Vec<String> {
             continue;
         }
         match ch {
+            '\\' if chars
+                .peek()
+                .is_some_and(|next| matches!(next, '"' | '\'' | '\\')) =>
+            {
+                current.push(ch);
+                current.push(chars.next().unwrap());
+            }
             '\'' | '"' => {
                 quote = Some(ch);
                 current.push(ch);
@@ -2130,7 +2148,15 @@ fn nested_shell_script(words: &[String], index: usize) -> Option<String> {
 /// callers use it to *hold* catastrophic commands, never to allow anything.
 /// `None` when words nest deeper than `MAX_WRAPPER_DEPTH`: fail closed.
 pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
-    fn collect(command: &str, depth: usize, out: &mut Vec<Vec<String>>) -> bool {
+    walk_invocations(command, false)
+}
+
+pub fn destroyer_floor_invocations(command: &str) -> Option<Vec<Vec<String>>> {
+    walk_invocations(command, true)
+}
+
+fn walk_invocations(command: &str, quote_blind: bool) -> Option<Vec<Vec<String>>> {
+    fn collect(command: &str, depth: usize, quote_blind: bool, out: &mut Vec<Vec<String>>) -> bool {
         if depth > MAX_WRAPPER_DEPTH {
             return false;
         }
@@ -2148,16 +2174,31 @@ pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
                 // closed once a `&` made the word reproduce itself.
                 if word.contains(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '&' | '|'))
                     && let Some(script) = nested_shell_script(&words, index)
-                    && !collect(&script, depth + 1, out)
+                    && !collect(&script, depth + 1, quote_blind, out)
                 {
                     return false;
+                }
+            }
+        }
+        if quote_blind
+            && (command.contains("$'")
+                || command.contains("${")
+                || command.contains("<<")
+                || command.contains(['(', '`', '#']))
+        {
+            for segment in command.split(['\n', ';', '&', '|', '(', ')', '`']) {
+                let words = shell_words(segment);
+                for (index, word) in words.iter().enumerate() {
+                    let mut argv = words[index..].to_vec();
+                    argv[0] = command_word(word);
+                    out.push(argv);
                 }
             }
         }
         true
     }
     let mut out = Vec::new();
-    collect(command, 0, &mut out).then_some(out)
+    collect(command, 0, quote_blind, &mut out).then_some(out)
 }
 
 /// How many wrappers (`sudo env nice sh -c ...`) the classifier will peel
@@ -3040,6 +3081,8 @@ mod tests {
             "echo x & rm -rf /etc",
             "echo x&rm -rf /etc",
             r#"printf "\\";rm -rf /etc"#,
+            r#"echo \";rm -rf /etc"#,
+            r#"echo \';rm -rf /etc"#,
             "npm test 2>&1&rm -rf /etc",
             "curl https://example.com & rm -rf /etc",
         ] {

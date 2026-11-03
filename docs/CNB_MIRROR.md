@@ -53,7 +53,10 @@ GitHub Actions workflow:
   recovery. A tag push alone does not mirror a release tag. Manual tag recovery
   also verifies the complete public GitHub asset inventory and immutable source.
 - **Auth:** HTTPS basic auth as user `cnb` with the `CNB_GIT_TOKEN`
-  repository secret as the password.
+  repository secret as the password. Forks never inherit the secret, so the
+  `sync` job runs only when the repository owner is `codewhale-hq`; on a fork
+  it is skipped instead of failing. In this repository a missing or misspelled
+  secret still fails the push step.
 - **Scope:** only the ref that triggered the run is pushed. Tag pushes
   push exactly that tag. Branch pushes mirror `main`, first-party
   `fix/*`/`rebrand/*` branches, or explicitly matched release branches. Other

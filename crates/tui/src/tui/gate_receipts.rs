@@ -13,14 +13,14 @@
 
 use std::borrow::Cow;
 
-use crate::core::events::{ToolGate, ToolGateVerdict, bounded_gate_reason};
+use codewhale_engine::core::events::{ToolGate, ToolGateVerdict, bounded_gate_reason};
 use codewhale_localization::{Locale, MessageId, tr};
 
 /// Longest tool name echoed into a receipt. Tool names are model-authored
 /// text on some wire dialects, so they are bounded like every other field.
 const MAX_TOOL_NAME_CHARS: usize = 64;
 
-/// One transcript line for a [`crate::core::events::Event::ToolGateDecision`].
+/// One transcript line for a [`codewhale_engine::core::events::Event::ToolGateDecision`].
 #[must_use]
 pub fn tool_gate_receipt(
     locale: Locale,
@@ -135,7 +135,7 @@ mod tests {
 
         // Written where every other audit event goes.
         let home = tempfile::tempdir().expect("tempdir");
-        crate::audit::log_sensitive_event_in(home.path(), "tool.gate.decision", record);
+        codewhale_runtime::audit::log_sensitive_event_in(home.path(), "tool.gate.decision", record);
         let log = std::fs::read_to_string(home.path().join("audit.log")).expect("audit.log");
         assert!(log.contains("\"event\":\"tool.gate.decision\""), "{log}");
         assert!(

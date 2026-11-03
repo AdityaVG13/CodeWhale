@@ -25,7 +25,7 @@ CONFIG_RS = ROOT / "crates" / "config" / "src" / "lib.rs"
 # ProviderKind's enum + identity impl were split out of lib.rs into this module.
 PROVIDER_KIND_RS = ROOT / "crates" / "config" / "src" / "provider_kind.rs"
 PROVIDER_RS = ROOT / "crates" / "config" / "src" / "provider.rs"
-TUI_CONFIG_RS = ROOT / "crates" / "tui" / "src" / "config.rs"
+TUI_CONFIG_RS = ROOT / "crates" / "runtime" / "src" / "config.rs"
 # Default provider model/base-URL constants were split out of config.rs into
 # this leaf module (#3311); read them from there for the default-string check.
 PROVIDER_DATA = ROOT / "crates" / "config" / "assets" / "provider_descriptors.json"
@@ -37,7 +37,7 @@ WEB_FACTS_DRIFT = ROOT / "web" / "lib" / "facts-drift.ts"
 WEB_FACTS_GENERATED = ROOT / "web" / "lib" / "facts.generated.ts"
 README_MD = ROOT / "README.md"
 CONFIG_EXAMPLE_TOML = ROOT / "config.example.toml"
-TUI_PROVIDER_READINESS_RS = ROOT / "crates" / "tui" / "src" / "provider_readiness.rs"
+PROVIDER_READINESS_RS = ROOT / "crates" / "engine" / "src" / "provider_readiness.rs"
 TUI_LIB_RS = ROOT / "crates" / "tui" / "src" / "lib.rs"
 
 
@@ -159,7 +159,7 @@ def presentation_provider_ids() -> set[str]:
 
 def provider_tables(config_rs: str) -> set[str]:
     struct_start = require_index(
-        config_rs, "pub struct ProvidersToml", "crates/config/src/lib.rs"
+        config_rs, "pub struct ProvidersToml", "crates/config/src/provider_toml.rs"
     )
     struct_end = require_index(config_rs, "\n}", "ProvidersToml struct", struct_start)
     fields = re.findall(
@@ -212,16 +212,21 @@ def report_tui_catalog_contract(tui_config_rs: str) -> list[str]:
         errors.append("TUI must not define a duplicate provider enum or ordinal bridge")
     # The exact private historical enum in config/tests.rs is the serde
     # counterpart, not a production owner. Check every other Rust consumer.
-    counterpart = ROOT / "crates/tui/src/config/tests.rs"
+    counterpart = ROOT / "crates/tui/src/config_stay_tests/config.rs"
     for path in (ROOT / "crates").rglob("*.rs"):
         source = read(path)
         if path != counterpart and re.search(r"\bApiProvider\b", source):
             errors.append(f"retired provider enum consumer: {path.relative_to(ROOT)}")
         if re.search(r"KIND_LOOKUP|FROM_KIND_LOOKUP|ProviderKind::from_kind\(", source):
             errors.append(f"retired provider ordinal bridge: {path.relative_to(ROOT)}")
-    for signature in ("pub(crate) fn active_provider_identity", "pub(crate) fn provider_identities", "pub(crate) fn resolve_provider_selection_identity", "pub(crate) fn verify_provider_identity"):
-        if signature not in tui_config_rs:
-            errors.append(f"missing canonical config identity boundary: {signature}")
+    for function_name in (
+        "active_provider_identity",
+        "provider_identities",
+        "resolve_provider_selection_identity",
+        "verify_provider_identity",
+    ):
+        if not re.search(rf"\bpub(?:\(crate\))?\s+fn\s+{function_name}\b", tui_config_rs):
+            errors.append(f"missing canonical config identity boundary: {function_name}")
     descriptor_source = read(ROOT / "crates/config/src/descriptors.rs")
     if "PROVIDER_COMPATIBILITY" not in descriptor_source or "pub fn compatibility_for_selector" not in descriptor_source:
         errors.append("released presentation identities must use the existing generated descriptor owner")
@@ -231,7 +236,7 @@ def report_tui_catalog_contract(tui_config_rs: str) -> list[str]:
 
 
 def report_tombstone_runtime_contract(
-    provider_kind_rs: str, tui_provider_readiness_rs: str, tui_lib_rs: str
+    provider_kind_rs: str, provider_readiness_rs: str, tui_lib_rs: str
 ) -> list[str]:
     """The tombstone must resolve under every legacy spelling and never read
     as a credentialed or advertised slot on a running-product surface."""
@@ -254,7 +259,7 @@ def report_tombstone_runtime_contract(
 
     if (
         "provider == ProviderKind::Antigravity"
-        not in tui_provider_readiness_rs
+        not in provider_readiness_rs
     ):
         errors.append(
             "provider_readiness::credential_state_for_provider must classify "
@@ -262,7 +267,7 @@ def report_tombstone_runtime_contract(
         )
 
     if "for provider in doctor_api_key_providers()" not in tui_lib_rs or (
-        "*provider != crate::config::ProviderKind::Antigravity" not in tui_lib_rs
+        "*provider != codewhale_config::ProviderKind::Antigravity" not in tui_lib_rs
     ):
         errors.append(
             "`codewhale doctor` API Keys rows must iterate doctor_api_key_providers() "
@@ -486,7 +491,7 @@ def report_huggingface_coverage(
         config_rs, "ProviderKind", "Huggingface", "crates/config/src/lib.rs"
     )
     tui_aliases = parse_aliases_for_variant(
-        tui_config_rs, "ProviderIdentity", "Huggingface", "crates/tui/src/config.rs"
+        tui_config_rs, "ProviderIdentity", "Huggingface", "crates/runtime/src/config.rs"
     )
     errors += report_set(
         "ProviderKind Hugging Face aliases",
@@ -523,7 +528,7 @@ def report_huggingface_coverage(
                 label, config_rs, env_order, "crates/config/src/lib.rs"
             )
         errors += report_env_lookup_order(
-            label, tui_config_rs, env_order, "crates/tui/src/config.rs"
+            label, tui_config_rs, env_order, "crates/runtime/src/config.rs"
         )
         errors += report_string_order(label, providers_md, env_order, "docs/PROVIDERS.md")
 
@@ -567,7 +572,7 @@ def provider_table_name(provider_id: str) -> str:
 
 def main() -> int:
     try:
-        config_rs = read(CONFIG_RS)
+        config_rs = "\n".join(read(path) for path in sorted(CONFIG_RS.parent.glob("*.rs")) if path.name != "tests.rs")
         provider_kind_rs = read(PROVIDER_KIND_RS)
         tui_config_rs = read(TUI_CONFIG_RS)
         agent_rs = read(AGENT_RS)
@@ -578,7 +583,7 @@ def main() -> int:
         web_facts_generated = read(WEB_FACTS_GENERATED)
         readme_md = read(README_MD)
         config_example_toml = read(CONFIG_EXAMPLE_TOML)
-        tui_provider_readiness_rs = read(TUI_PROVIDER_READINESS_RS)
+        provider_readiness_rs = read(PROVIDER_READINESS_RS)
         tui_lib_rs = read(TUI_LIB_RS)
 
         variant_to_id = provider_kind_ids(config_rs)
@@ -598,7 +603,7 @@ def main() -> int:
         errors += report_provider_kind_selector_contract(provider_kind_rs)
         errors += report_tui_catalog_contract(tui_config_rs)
         errors += report_tombstone_runtime_contract(
-            provider_kind_rs, tui_provider_readiness_rs, tui_lib_rs
+            provider_kind_rs, provider_readiness_rs, tui_lib_rs
         )
         errors += report_set(
             "legacy provider identities in ProviderKind::ALL",

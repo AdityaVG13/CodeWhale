@@ -5,7 +5,7 @@ import type { DocsAuthDict } from "../types";
  * ("Connect a provider"). Every command and lookup order is checked against
  * docs/INSTALL.md §8, docs/PROVIDERS.md (local models), and the CLI
  * definitions in crates/cli/src/lib.rs (`auth`, `login`) and
- * crates/cli/src/cloud.rs (`account`).
+ * crates/account-cli/src/lib.rs (`account`).
  */
 export const docsAuth: DocsAuthDict = {
   metaTitle: "Connect a provider · Codewhale Docs",
@@ -83,17 +83,16 @@ codewhale --provider ollama --model <model-tag>`,
     },
     {
       id: "account",
-      title: "Sign in to a Codewhale account (optional)",
+      title: "Codewhale accounts",
       blocks: [
         {
-          p: "A provider key and a Codewhale account are different things. The account is for account features only, such as cloud agents and continuing a session from the web app. Installing Codewhale and working locally never need one.",
+          p: "A provider key and a Codewhale account are different things. Codewhale never needs an account, and new accounts are not open. Provider keys stay on your machine with `codewhale auth set`.",
         },
         {
           rows: [
             ["codewhale login", "Sign in through your browser with a one-time code."],
             ["codewhale account status", "Show which account this profile is signed in to."],
             ["codewhale account logout", "Remove this profile's session."],
-            ["codewhale account keys list", "List provider keys saved in your account. Values are never shown."],
           ],
           codeTerms: true,
         },

@@ -121,6 +121,24 @@ impl CommandSkillsContext for Skills {
 
 struct Workspace;
 impl CommandWorkspaceContext for Workspace {
+    fn effective_home_dir(&self) -> Option<std::path::PathBuf> {
+        unreachable!("navigation is not used by this fixture")
+    }
+    fn inspect_workspace_target(&self, _: &std::path::Path) -> crate::navigation::WorkspaceTarget {
+        unreachable!("navigation is not used by this fixture")
+    }
+    fn read_anchor_document(&self) -> Result<Option<String>, String> {
+        unreachable!("anchors are not used by this fixture")
+    }
+    fn append_anchor_bytes(
+        &mut self,
+        _: &[&[u8]],
+    ) -> Result<std::path::PathBuf, crate::navigation::AnchorWriteError> {
+        unreachable!("anchors are not used by this fixture")
+    }
+    fn replace_anchor_document(&mut self, _: &[u8]) -> Result<(), String> {
+        unreachable!("anchors are not used by this fixture")
+    }
     fn workspace(&self) -> PathBuf {
         PathBuf::from(".")
     }
@@ -646,6 +664,24 @@ impl CommandMediaContext for Media {
 
 struct DigestWorkspace;
 impl CommandWorkspaceContext for DigestWorkspace {
+    fn effective_home_dir(&self) -> Option<std::path::PathBuf> {
+        unreachable!("navigation is not used by digest")
+    }
+    fn inspect_workspace_target(&self, _: &std::path::Path) -> crate::navigation::WorkspaceTarget {
+        unreachable!("navigation is not used by digest")
+    }
+    fn read_anchor_document(&self) -> Result<Option<String>, String> {
+        unreachable!("anchors are not used by digest")
+    }
+    fn append_anchor_bytes(
+        &mut self,
+        _: &[&[u8]],
+    ) -> Result<std::path::PathBuf, crate::navigation::AnchorWriteError> {
+        unreachable!("anchors are not used by digest")
+    }
+    fn replace_anchor_document(&mut self, _: &[u8]) -> Result<(), String> {
+        unreachable!("anchors are not used by digest")
+    }
     fn workspace(&self) -> PathBuf {
         PathBuf::from(".")
     }
@@ -1765,8 +1801,10 @@ impl FakeSkillGroup {
                 workspace: "/ws".into(),
                 skills_dir: "/ws/.codewhale/skills".into(),
                 mode_label: "compatible".into(),
+                bundled_status: vec![],
                 dirs: vec!["/ws/.codewhale/skills".into()],
                 entries: vec![SkillEntry {
+                    index_note: None,
                     name: "demo".into(),
                     description: "Demo skill".into(),
                     source: SkillSourceKind::Native,
@@ -2629,6 +2667,14 @@ impl CommandSessionControlContext for FakeControl {
         self.clear_title
             .clone()
             .unwrap_or_else(|| Err("unexpected clear_window_title() on empty fake".to_string()))
+    }
+    fn composer_color(&self) -> Option<String> {
+        None
+    }
+    fn set_composer_color(&mut self, color: Option<String>) -> Result<(), String> {
+        Err(format!(
+            "unexpected set_composer_color({color:?}) on empty fake"
+        ))
     }
     fn remote_status(&self) -> String {
         self.remote_status
@@ -3556,6 +3602,8 @@ fn structcopy_capability_preserves_all_published_identities() {
         CommandCapabilities::TRUST,
         CommandCapabilities::LOGIN,
         CommandCapabilities::WORK_SURFACE,
+        CommandCapabilities::NAVIGATION,
+        CommandCapabilities::VOICE_INPUT,
     ];
     let exact = CommandCapabilities::SESSION_STRUCTCOPY | CommandCapabilities::PRESENTATION;
     for (index, capability) in capabilities.into_iter().enumerate() {
@@ -3620,6 +3668,8 @@ fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
         trust,
         login,
         work_surface,
+        navigation,
+        voice_input,
     } = CommandContexts::empty()
         .with_structcopy(&mut fixture)
         .with_presentation(&mut presentation)
@@ -3669,6 +3719,8 @@ fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
         trust.is_some(),
         login.is_some(),
         work_surface.is_some(),
+        navigation.is_some(),
+        voice_input.is_some(),
     ] {
         assert!(!present);
     }

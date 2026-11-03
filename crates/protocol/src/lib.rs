@@ -11,13 +11,14 @@ use serde_json::Value;
 
 pub mod agent_mail;
 pub mod agent_run;
+pub mod avatar;
 pub mod engine_owner;
 pub mod event_msg;
 pub mod fleet;
 pub mod ids;
 pub mod journal;
 pub mod op;
-pub mod runtime;
+pub mod placement;
 
 /// Common trait for lifecycle status enums across the protocol layer.
 ///
@@ -181,8 +182,9 @@ pub enum CanonicalHistorySource {
         runtime_thread_id: String,
         expected_document_digest: String,
     },
-    /// Local mounted handoff supplies the already protected complete document;
-    /// the actual owner reopens it and compares the same whole-document digest.
+    /// Local mounted handoff supplies the already protected document without
+    /// its journal-derived messages; the actual owner rebuilds them from the
+    /// journal, reopens the file and compares the same whole-document digest.
     SavedSession {
         session: Value,
         expected_document_digest: String,
@@ -596,8 +598,10 @@ pub enum ThreadRequest {
     Message {
         thread_id: String,
         input: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        images: Vec<runtime::RuntimeImageInput>,
+        images: Vec<codewhale_app_server_protocol::runtime::RuntimeImageInput>,
         #[serde(
             default,
             rename = "maxOutputTokens",
@@ -703,6 +707,8 @@ pub struct AppResponse {
 /// A simple prompt request that sends text to the model and returns output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
     #[serde(
         default,
         rename = "maxOutputTokens",
@@ -716,7 +722,7 @@ pub struct PromptRequest {
     /// The prompt text.
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<runtime::RuntimeImageInput>,
+    pub images: Vec<codewhale_app_server_protocol::runtime::RuntimeImageInput>,
     /// Model override, or the default if omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -934,19 +940,43 @@ pub struct UserInputOptionEvent {
     /// Short label for the option (also the value submitted when picked).
     pub label: String,
     /// Longer description shown alongside the label.
+    #[serde(default)]
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum UserInputIntentEvent {
+    PlanReview {
+        approve: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserInputAnswerKindEvent {
+    Choice,
+    Custom,
+    Skipped,
 }
 
 /// A single clarification question posed to the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserInputQuestionEvent {
     /// Compact header shown as the question title.
+    #[serde(default)]
     pub header: String,
     /// Stable identifier used to correlate answers back to this question.
     pub id: String,
     /// The question body.
     pub question: String,
-    /// 2-4 suggested answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<UserInputIntentEvent>,
+    #[serde(default)]
     pub options: Vec<UserInputOptionEvent>,
     /// When `true`, the client should also offer a free-text response.
     #[serde(default)]
@@ -969,16 +999,19 @@ pub struct UserInputRequestEvent {
     pub turn_id: String,
     /// Unique identifier for this user-input request (clients reply with it).
     pub request_id: String,
-    /// 1-3 questions to present.
+    #[serde(default)]
+    pub require_typed_answers: bool,
     pub questions: Vec<UserInputQuestionEvent>,
 }
 
 /// One answer to a clarification question.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserInputAnswerEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<UserInputAnswerKindEvent>,
     /// The `id` of the question this answer corresponds to.
     pub id: String,
-    /// The selected option's label, or `"Other"` for a free-text response.
+    /// The selected option's label, or empty for typed custom/skip responses.
     pub label: String,
     /// The resolved value (option label, or the typed free-text).
     pub value: String,

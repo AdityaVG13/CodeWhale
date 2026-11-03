@@ -177,13 +177,17 @@ def validate_order(
 def main() -> int:
     args = parse_args()
     try:
-        packages = workspace_packages(load_metadata(args.metadata_file))
+        metadata = load_metadata(args.metadata_file)
+        packages = workspace_packages(metadata)
         version, dependency_flags = validate_order(packages, args.crates)
     except ValidationError as error:
         print(error, file=sys.stderr)
         return 1
 
     print(f"version\t{version}\t")
+    build_directory = metadata.get("build_directory") or metadata.get("target_directory")
+    if isinstance(build_directory, str) and build_directory:
+        print(f"build-dir\t{build_directory}\t")
     for name in sorted(dependency_flags):
         print(f"crate\t{name}\t{1 if dependency_flags[name] else 0}")
     return 0

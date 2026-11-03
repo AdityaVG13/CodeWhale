@@ -56,12 +56,6 @@ export interface ChromeDict {
   installCta: string;
 
   /**
-   * The header's one identity door to the Codewhale app (app.codewhale.net).
-   * Account creation is offered on the sign-in page, not beside it.
-   */
-  authSignIn: string;
-
-  /**
    * BCP 47 tag used for the masthead weekday via `toLocaleDateString` — not
    * rendered copy, but per-locale, so it belongs beside it. Without this the
    * masthead date renders in English for every non-Chinese locale.
@@ -168,6 +162,7 @@ export interface HomeDict {
   /** "Latest release {tag}" */
   latestRelease: string;
   releaseUnavailable: string;
+  proofContributors: string;
   /** "Source" / "Unreleased" — prepended to `v{version}`. */
   currentSource: string;
   sourceCandidate: string;
@@ -198,7 +193,6 @@ export interface HomeDict {
   availabilityLede: string;
   availability: [string, string, string, string?][];
   availabilityNote: string;
-  accountLink: string;
 
   surfacesHeading: string;
   /** Five [name, description] surfaces. */
@@ -420,8 +414,6 @@ export interface DocsPageDict {
 
 export type DocsReviewDict = DocsPageDict;
 
-export type DocsComputersDict = DocsPageDict;
-
 export type DocsAuthDict = DocsPageDict;
 
 export type DocsTrustDict = DocsPageDict;
@@ -449,10 +441,18 @@ export interface ChangelogDict {
   /** "{shown} of {total} entries" */
   moreEntries: string;
   fullNotes: string;
-  /** "Full notes for {version}" — per-release deep link into CHANGELOG.md. */
+  /** "Full notes for {version}" — links /changelog/<version>, or CHANGELOG.md for Unreleased. */
   releaseNotesLink: string;
   emptyTitle: string;
   emptyBody: string;
+  /** `/changelog/[version]` — every entry for one release. */
+  versionMetaTitle: string;
+  versionMetaDescription: string;
+  versionKicker: string;
+  /** "Released {date}. …" */
+  versionLead: string;
+  versionLeadUndated: string;
+  allReleasesLink: string;
 }
 
 export interface LegalTermsDict {

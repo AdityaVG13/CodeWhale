@@ -24,13 +24,13 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{App, SidebarHoverRow, SidebarHoverSection};
-use crate::tui::ui_text::truncate_line_to_width;
 use codewhale_localization::MessageId;
 use codewhale_palette::{ChromeInk, chrome_style};
+use codewhale_tui_kit::ui_text::truncate_line_to_width;
 
 use super::model::{
     DockTabHitbox, DockTabTarget, RailPanel, WorkHitbox, WorkRow, WorkSurfacePlacement, WorkTone,
-    visible_rows_for, visible_rows_for_panel,
+    plan_step_row_ids, visible_rows_for, visible_rows_for_panel,
 };
 
 mod layout;
@@ -121,6 +121,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         HashMap::new()
     };
     let ordinal_width = todo_ordinals.len().max(1).to_string().len();
+    let todo_ids = plan_step_row_ids(app);
     let goal_title = placement.is_strip().then(|| top_goal_title(app)).flatten();
     let todo_progress = placement
         .is_strip()
@@ -276,7 +277,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             let laid_out = layout_agent_row(
                 usize::from(content_area.width).saturating_sub(queued_width),
                 UnicodeWidthStr::width(prefix.as_str()),
-                agent_identity(row, identity_cap),
+                &agent_identity(row, identity_cap),
                 identity_column,
                 status_column,
                 facts,
@@ -357,7 +358,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         };
         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
         let row_width = usize::from(content_area.width);
-        let label_budget = row_width.saturating_sub(prefix_width).max(1);
+        let detail_room = if todo_ids.contains(&row.id.0) {
+            UnicodeWidthStr::width(detail_candidate.as_str())
+                .min(row_width.saturating_sub(prefix_width) / 2)
+        } else {
+            0
+        };
+        let label_budget = row_width.saturating_sub(prefix_width + detail_room).max(1);
         let label = truncate_line_to_width(&row.label, label_budget);
         let detail_budget =
             row_width.saturating_sub(prefix_width + UnicodeWidthStr::width(label.as_str()));

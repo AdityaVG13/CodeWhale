@@ -2,15 +2,15 @@
   theme · live preview ────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-     1. System                            Follow terminal background (COLORFGBG / macOS appearance)
-     2. Terminal                          Inherit terminal colors fully (transparent surfaces, ANSI accents)
-     3. Shoreline                         Warm charcoal, one restrained blue — the desktop client's palette
-     4. Shoreline Light                   Shoreline on warm paper — the desktop client's light mode
-   ▸ 5. Underwater                        The painted ocean field: ombre water, ambient life, the whale
-     6. Underwater Retro                  Flat phosphor-teal ocean: the legacy deepsea look, no ombre
-     7. Blue Stage                        Stage black, action blue, and one Signal Gold human beacon
-     8. Blue Stage Light                  Paper, cobalt action, and one Signal Gold human beacon
-     9. Grayscale                         Color-minimal high contrast
+      1. System                            Follow terminal background (COLORFGBG / macOS appearance)
+      2. Terminal                          Inherit terminal colors fully (transparent surfaces, ANSI accents)
+      3. Shoreline                         Warm charcoal, one restrained blue — the desktop client's palette
+      4. Shoreline Light                   Shoreline on warm paper — the desktop client's light mode
+   ▸  5. Underwater                        The painted ocean field: ombre water, ambient life, the whale
+      6. Underwater Retro                  Flat phosphor-teal ocean: the legacy deepsea look, no ombre
+      7. Blue Stage                        Stage black, action blue, and one Signal Gold human beacon
+      8. Blue Stage Light                  Paper, cobalt action, and one Signal Gold human beacon
+      9. Grayscale                         Color-minimal high contrast
      10. Catppuccin Mocha                  Soft pastels on warm dark
      11. Tokyo Night                       Deep blue/violet night palette
      12. Dracula                           Classic high-contrast purple

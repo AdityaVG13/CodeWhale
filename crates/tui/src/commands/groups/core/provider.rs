@@ -5,9 +5,10 @@
 //! keeps the v0.6.6 CLI form for muscle-memory + scripted use.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::config::{ProviderKind, canonical_model_id_for_provider, provider_passes_model_through};
 use crate::tui::app::{App, AppAction};
+use codewhale_config::ProviderKind;
 use codewhale_localization::MessageId;
+use codewhale_runtime::config::{canonical_model_id_for_provider, provider_passes_model_through};
 
 use super::CommandResult;
 
@@ -59,7 +60,7 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
         };
     }
 
-    if crate::config::is_legacy_antigravity_identity(name) {
+    if codewhale_runtime::config::is_legacy_antigravity_identity(name) {
         return CommandResult::error(
             codewhale_config::LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE.to_string(),
         );
@@ -111,6 +112,8 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
         .as_ref()
         .is_some_and(|identity| identity.key == selected_key)
         && model.is_none()
+        && !(target == ProviderKind::Ollama
+            && codewhale_runtime::config::is_unresolved_local_ollama_model(&app.model))
     {
         return CommandResult::message(format!("Already on provider: {}", selected_key));
     }
@@ -122,7 +125,7 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
 }
 
 pub(in crate::commands) fn provider_setup_action_for_name(raw: &str) -> Result<AppAction, String> {
-    if crate::config::is_legacy_antigravity_identity(raw) {
+    if codewhale_runtime::config::is_legacy_antigravity_identity(raw) {
         return Err(codewhale_config::LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE.to_string());
     }
     if raw.eq_ignore_ascii_case("ds4") || raw.eq_ignore_ascii_case("dwarfstar") {
@@ -209,9 +212,9 @@ fn expand_model_alias_for_provider(provider: ProviderKind, name: &str) -> String
     let lower = trimmed.to_ascii_lowercase();
     if matches!(provider, ProviderKind::XiaomiMimo) {
         return match lower.as_str() {
-            "pro" | "mimo" => "mimo-v2.5-pro".to_string(),
+            "pro" | "mimo" => "mimo-v2.6-pro".to_string(),
             "ultraspeed" | "pro-ultraspeed" => "mimo-v2.5-pro-ultraspeed".to_string(),
-            "text" | "omni" | "v2.5-omni" => "mimo-v2.5".to_string(),
+            "text" | "omni" | "v2.5-omni" => "mimo-v2.6-flash".to_string(),
             "tts" | "speech" | "mimo-tts" => "mimo-v2.5-tts".to_string(),
             "voicedesign" | "voice-design" | "mimo-voice-design" => {
                 "mimo-v2.5-tts-voicedesign".to_string()
@@ -227,7 +230,7 @@ fn expand_model_alias_for_provider(provider: ProviderKind, name: &str) -> String
 
     match lower.as_str() {
         "pro" | "v4-pro" => "deepseek-v4-pro".to_string(),
-        "flash" | "v4-flash" => "deepseek-v4-flash".to_string(),
+        "flash" | "v4-flash" => "deepseek-flash".to_string(),
         // Not a shorthand: keep the id as typed (case preserved for opaque
         // model tags on passthrough providers like Ollama/HuggingFace).
         _ => trimmed.to_string(),
@@ -237,9 +240,9 @@ fn expand_model_alias_for_provider(provider: ProviderKind, name: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::test_support::lock_test_env;
     use crate::tui::app::TuiOptions;
+    use codewhale_runtime::config::Config;
     use std::path::PathBuf;
 
     fn create_test_app() -> App {
@@ -248,7 +251,7 @@ mod tests {
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = codewhale_localization::Locale::En;
-        app.api_provider = crate::config::ProviderKind::Deepseek;
+        app.api_provider = codewhale_config::ProviderKind::Deepseek;
         app
     }
 
@@ -271,7 +274,7 @@ mod tests {
             let message = result.message.expect("tombstone message");
             assert!(message.contains("non-runnable"), "{identity}: {message}");
             assert!(message.contains("GEMINI_API_KEY"), "{identity}: {message}");
-            assert_eq!(app.api_provider, crate::config::ProviderKind::Deepseek);
+            assert_eq!(app.api_provider, codewhale_config::ProviderKind::Deepseek);
 
             let setup = provider_setup_action_for_name(identity)
                 .expect_err("setup must not open for the tombstone");
@@ -413,8 +416,8 @@ mod tests {
         for (input, expected) in [
             ("xiaomi-mimo pro-ultraspeed", "mimo-v2.5-pro-ultraspeed"),
             ("xiaomi-mimo ultraspeed", "mimo-v2.5-pro-ultraspeed"),
-            ("xiaomi-mimo omni", "mimo-v2.5"),
-            ("xiaomi-mimo v2.5-omni", "mimo-v2.5"),
+            ("xiaomi-mimo omni", "mimo-v2.6-flash"),
+            ("xiaomi-mimo v2.5-omni", "mimo-v2.6-flash"),
         ] {
             let result = provider(&mut app, Some(input));
             match result.action {
@@ -537,7 +540,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Siliconflow.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -550,7 +553,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::SiliconflowCN.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -576,7 +579,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Together.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -589,7 +592,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Sglang.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -602,7 +605,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Vllm.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -628,6 +631,18 @@ mod tests {
         let msg = result.message.expect("expected message");
         assert!(msg.contains("Already on provider"));
         assert!(result.action.is_none());
+        app.provider_identity = Some(
+            codewhale_runtime::config::Config::default()
+                .builtin_provider_identity(ProviderKind::Ollama)
+                .unwrap(),
+        );
+        app.model = "unknown".into();
+        assert!(matches!(
+            provider(&mut app, Some("ollama")).action,
+            Some(AppAction::SwitchProvider { model: None, .. })
+        ));
+        app.model = "qwen3:4b".into();
+        assert!(provider(&mut app, Some("ollama")).action.is_none());
     }
 
     #[test]
@@ -651,7 +666,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::NvidiaNim.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
         }
@@ -677,7 +692,7 @@ mod tests {
         match result.action {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider.as_str(), ProviderKind::Deepseek.as_str());
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(model.as_deref(), Some("deepseek-flash"));
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
         }
@@ -717,14 +732,15 @@ mod tests {
                         let official_base_url = row.base_url;
                         let intrinsic = row.kind;
                         assert_eq!(
-                            crate::config::wire_model_for_provider_route(
+                            codewhale_runtime::config::wire_model_for_provider_route(
                                 intrinsic,
                                 official_base_url,
                                 model.as_deref().expect("command model"),
                             ),
-                            crate::config::DEEPSEEK_ALIAS_REPLACEMENT
+                            codewhale_config::catalog::reviewed::constants::DEEPSEEK_ALIAS_REPLACEMENT
                         );
-                        app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::Max;
+                        app.reasoning_effort =
+                            codewhale_engine::reasoning_preference::ReasoningEffort::Max;
                         app.reasoning_effort_preference = None;
                         app.apply_provider_switch_reasoning_effort(
                             intrinsic,
@@ -734,9 +750,9 @@ mod tests {
                         assert_eq!(
                             app.reasoning_effort,
                             if alias == "deepseek-chat" {
-                                crate::reasoning_preference::ReasoningEffort::Off
+                                codewhale_engine::reasoning_preference::ReasoningEffort::Off
                             } else {
-                                crate::reasoning_preference::ReasoningEffort::High
+                                codewhale_engine::reasoning_preference::ReasoningEffort::High
                             },
                             "{provider:?} {alias}"
                         );
@@ -770,14 +786,14 @@ mod tests {
         assert_eq!(provider.as_str(), ProviderKind::Deepseek.as_str());
         assert_eq!(model, "deepseek-reasoner");
         assert_eq!(
-            crate::config::wire_model_for_provider_route(
+            codewhale_runtime::config::wire_model_for_provider_route(
                 ProviderKind::Deepseek,
                 "https://models.example/v1",
                 &model,
             ),
             "deepseek-reasoner"
         );
-        app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::Max;
+        app.reasoning_effort = codewhale_engine::reasoning_preference::ReasoningEffort::Max;
         app.reasoning_effort_preference = None;
         app.apply_provider_switch_reasoning_effort(
             ProviderKind::Deepseek,
@@ -786,19 +802,20 @@ mod tests {
         );
         assert_eq!(
             app.reasoning_effort,
-            crate::reasoning_preference::ReasoningEffort::Max,
+            codewhale_engine::reasoning_preference::ReasoningEffort::Max,
             "custom endpoint owns alias semantics"
         );
 
-        app.reasoning_effort_preference = Some(crate::reasoning_preference::ReasoningEffort::Max);
+        app.reasoning_effort_preference =
+            Some(codewhale_engine::reasoning_preference::ReasoningEffort::Max);
         app.apply_provider_switch_reasoning_effort(
             ProviderKind::Deepseek,
-            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            codewhale_config::descriptors::defaults::DEFAULT_DEEPSEEK_BASE_URL,
             Some(&model),
         );
         assert_eq!(
             app.reasoning_effort,
-            crate::reasoning_preference::ReasoningEffort::Max,
+            codewhale_engine::reasoning_preference::ReasoningEffort::Max,
             "explicit effort must beat compatibility inference"
         );
     }
@@ -836,13 +853,18 @@ mod tests {
     #[test]
     fn provider_fallback_reset_targets_primary_even_when_on_fallback() {
         let _lock = lock_test_env();
-        let mut providers = crate::config::ProvidersConfig::default();
+        let mut providers = codewhale_runtime::config::ProvidersConfig::default();
         providers.openrouter.api_key = Some("fixture-fallback-key".to_string());
-        let config = crate::config::Config {
-            provider: Some("deepseek".to_string()),
-            fallback_providers: vec![ProviderKind::Openrouter],
-            providers: Some(providers),
-            ..Default::default()
+        let config = {
+            let __cw_config_init_0_0 = Some("deepseek".to_string());
+            let __cw_config_init_0_1 = vec![ProviderKind::Openrouter];
+            let __cw_config_init_0_2 = Some(providers);
+            let mut __cw_config_init_0_value: codewhale_runtime::config::Config =
+                Default::default();
+            __cw_config_init_0_value.provider = __cw_config_init_0_0;
+            __cw_config_init_0_value.fallback_providers = __cw_config_init_0_1;
+            __cw_config_init_0_value.providers = __cw_config_init_0_2;
+            __cw_config_init_0_value
         };
         let mut app = App::new(
             crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),

@@ -35,3 +35,8 @@ export function changelogAnchor(release: {
   unreleased: boolean;
 }): string;
 export function renderChangelogModule(parsed: ParsedChangelog, sourcePath?: string): string;
+export function parseReleaseNotes(markdown: string): ParsedChangelogRelease[];
+export function renderReleaseNotesModule(
+  releases: ParsedChangelogRelease[],
+  sourcePath?: string,
+): string;

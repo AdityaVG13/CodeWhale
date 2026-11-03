@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Bots and the maintainer account: real authors of most commits, never
 # "contributors" in the credit sense this file guards.
 SKIP = {
-    "codewhale bot", "codewhalebot", "claude", "codex", "dependabot[bot]",
+    "codewhale bot", "codewhalebot", "codewhale agent", "claude", "codex", "dependabot[bot]",
     "codewhale-maint",
     "hunter bown", "hunter b", "hmbown", "deepseek-v41-flash", "devin",
 }
@@ -107,6 +107,29 @@ def main() -> int:
             missing.append(f"  @{handle} ({why}) -- not in: {', '.join(absent)}")
 
     print(f"Contributor credit since {since}: {len(owed)} contributor(s) found.")
+    amap = author_map()
+    lost = []
+    for entry in sh("git", "log", f"{since}..HEAD", "--format=%h\t%an\t%ae\t%B%x00").split("\0"):
+        parts = entry.strip().split("\t", 3)
+        if len(parts) < 4:
+            continue
+        sha, name, email, body = parts
+        m = re.search(r"\d+\+([^@<>\s]+)@users\.noreply\.github\.com", email)
+        author = (amap.get(email.lower()) or amap.get(name.lower()) or (m.group(1) if m else name)).lower()
+        for handle in re.findall(r"(?i)harvested from PR #\d+ by @([A-Za-z0-9-]+)", body):
+            if handle.lower() != author:
+                lost.append(f"  {sha} harvested @{handle} but is authored by {name}")
+        if any(author.startswith(skip) for skip in SKIP):
+            for co_name, co_email in re.findall(r"(?im)^co-authored-by:\s*(.+?)\s*<([^>]+)>", body):
+                cm = re.search(r"\d+\+([^@<>\s]+)@users\.noreply\.github\.com", co_email)
+                human = amap.get(co_email.lower()) or amap.get(co_name.strip().lower()) or (cm.group(1) if cm else None)
+                low = co_name.strip().lower()
+                if human and not any(h.startswith(skip) for skip in SKIP for h in (human.lower(), low)) \
+                        and "[bot]" not in co_email.lower() and not co_email.lower().endswith(("noreply@anthropic.com", "noreply@openai.com")):
+                    lost.append(f"  {sha} credits @{human} only as a co-author; authored by {name}")
+    if lost:
+        print("\nCommits whose human contributor is not the commit author (GitHub's contributor list will miss them):\n")
+        print("\n".join(lost))
     if missing:
         print("\nUncredited work landed in this release:\n")
         print("\n".join(missing))

@@ -24,23 +24,21 @@ url = "https://models.dev/catalog.json"
 [meta]
 about = "Offline fallback Models.dev-shaped catalog snapshot for Codewhale (#3385, demoted by #4188, generated since #6396)."
 schema = "Matches crates/config/src/models_dev.rs ModelsDevCatalog ({ models, providers })."
+compatibility_fallback = "Legacy Together and Fireworks defaults and previously reviewed curated IDs retain their dated metadata when absent upstream; they do not prove current availability. See each curated reason. Refreshed provider/catalog rows and explicit configuration remain authoritative."
 role = "NOT a competing source of truth. Preferred metadata is the live Models.dev catalog published into ProviderLake (#4187). This asset is used only when live/cache rows are unavailable (offline startup, failed refresh, or empty cache)."
 source = "Rows are projected unedited from Models.dev onto the fields models_dev.rs reads; provider headers, id mapping, defaults and canonical joins come from scripts/catalog/models_dev_seed.toml."
 corrections = "Deliberate holds (withheld prices, clamped limits) are not in this file. They live in crates/config/assets/catalog_corrections.json and apply to this seed and to live refresh alike."
 default_rows = "Each provider's `default: true` wire id equals that provider's built-in DEFAULT_*_MODEL so RouteResolver::new() and the descriptor stay in agreement when offline."
 pending_release_metadata = "GLM-5.3 is live on the Z.ai Coding Plan (docs.z.ai/devpack/overview and docs.z.ai/devpack/latest-model, recorded 2026-08-13) and is the default direct Z.ai model (DEFAULT_ZAI_MODEL); explicit GLM-5.2 selections keep their own id. First-party wire id is GLM-5.3; OpenRouter mirror is z-ai/glm-5.3. Capability/limit/dialect values still inherit from GLM-5.2 until Z.ai publishes distinct 5.3 numbers. Pricing stays absent: Coding Plan publishes credit multipliers, not a USD PAYG row we can stand behind. Z.ai may auto-route GLM-5.2/GLM-5.1 requests to GLM-5.3 on their side; Codewhale still sends the selected picker id. Do not send a [1m] suffix. Scope stays first-party Z.ai plus the OpenRouter mirror; add third-party gateway rows only against that gateway's own published roster."
 
-# Canonical `models` entries. The two bare DeepSeek keys are the canonical ids
-# every hosted DeepSeek `base_model`, the route layer and pricing name;
-# renaming them is a canonical-identity migration, not a seed refresh.
+# Canonical entries retain the upstream lab/model identities; provider wire
+# ids and configured model selections stay in their own provider rows.
 
 [[canonical]]
-key = "deepseek-v4-pro"
-upstream = "deepseek/deepseek-v4-pro"
+key = "deepseek/deepseek-v4-pro-0813"
 
 [[canonical]]
-key = "deepseek-v4-flash"
-upstream = "deepseek/deepseek-v4-flash"
+key = "deepseek/deepseek-v4.1-flash"
 
 [[canonical]]
 key = "xiaomi/mimo-v2.6-pro"
@@ -56,10 +54,10 @@ npm = "@ai-sdk/openai-compatible"
 env = ["DEEPSEEK_API_KEY"]
 default = "deepseek-flash"
 models = [
-  { id = "deepseek-v4-pro", base_model = "deepseek-v4-pro" },
-  { id = "deepseek-v4-flash", base_model = "deepseek-v4-flash" },
-  { id = "deepseek-v4-flash-vision-exp", base_model = "deepseek-v4-flash" },
-  { id = "deepseek-flash", base_model = "deepseek-flash" },
+  { id = "deepseek-v4-pro", base_model = "deepseek/deepseek-v4-pro-0813" },
+  { id = "deepseek-v4-flash", base_model = "deepseek/deepseek-v4.1-flash-1017" },
+  { id = "deepseek-v4-flash-vision-exp", base_model = "deepseek/deepseek-v4.1-flash-1017" },
+  { id = "deepseek-flash", base_model = "deepseek/deepseek-v4.1-flash-1017" },
 ]
 
 [[providers]]
@@ -86,6 +84,8 @@ npm = "@ai-sdk/openai-compatible"
 env = ["MOONSHOT_API_KEY", "KIMI_API_KEY"]
 default = "kimi-k2.7-code"
 models = [
+  "kimi-k3.1-pro",
+  "kimi-k3.1-pro-highspeed",
   "kimi-k3",
   "kimi-k2.7-code",
   "kimi-k2.7-code-highspeed",
@@ -100,6 +100,7 @@ npm = "@ai-sdk/openai-compatible"
 env = ["MINIMAX_API_KEY"]
 default = "MiniMax-M3"
 models = [
+  "MiniMax-M3.1-Flash",
   "MiniMax-M3",
   "MiniMax-M2.7",
   "MiniMax-M2.7-highspeed",
@@ -114,6 +115,7 @@ npm = "@ai-sdk/anthropic"
 env = ["MINIMAX_API_KEY"]
 default = "MiniMax-M3"
 models = [
+  "MiniMax-M3.1-Flash",
   "MiniMax-M3",
   "MiniMax-M2.7",
   "MiniMax-M2.7-highspeed",
@@ -129,7 +131,6 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   "qwen3.8-max",
-  "qwen3.8-max-preview",
   "qwen3.7-plus",
   "qwen3.7-max",
   "qwen3.6-flash",
@@ -148,7 +149,6 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   "qwen3.8-max",
-  "qwen3.8-max-preview",
   "qwen3.7-plus",
   "qwen3.7-max",
   "qwen3.6-flash",
@@ -167,10 +167,7 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   { id = "qwen3.8-max", from = "alibaba-token-plan" },
-  { id = "qwen3.8-max-preview", from = "alibaba-token-plan" },
   "qwen3.7-plus",
-  "qwen3.7-max",
-  "qwen3.6-flash",
   { id = "deepseek-v4-pro", from = "alibaba-token-plan" },
   { id = "deepseek-v4-flash-0731", from = "alibaba-token-plan" },
   { id = "glm-5.2", from = "alibaba-token-plan" },
@@ -186,10 +183,7 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   { id = "qwen3.8-max", from = "alibaba-token-plan" },
-  { id = "qwen3.8-max-preview", from = "alibaba-token-plan" },
   "qwen3.7-plus",
-  "qwen3.7-max",
-  "qwen3.6-flash",
   { id = "deepseek-v4-pro", from = "alibaba-token-plan" },
   { id = "deepseek-v4-flash-0731", from = "alibaba-token-plan" },
   { id = "glm-5.2", from = "alibaba-token-plan" },
@@ -206,6 +200,9 @@ models = [
   "muse-spark-1.1",
   "muse-spark-1.2",
   "muse-spark-1.2-contributor",
+  "muse-spark-1.3",
+  "muse-spark-1.3-contributor",
+  "muse-wonder-1.0",
 ]
 
 [[providers]]
@@ -223,6 +220,11 @@ models = [
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   "gpt-5.3-codex",
+  "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6-luna",
+  "gpt-6.1-sol",
+  "gpt-6.1-terra",
 ]
 
 [[providers]]
@@ -231,7 +233,7 @@ name = "Anthropic"
 api = "https://api.anthropic.com"
 npm = "@ai-sdk/anthropic"
 env = ["ANTHROPIC_API_KEY"]
-default = "claude-sonnet-4-6"
+default = "claude-sonnet-5-5"
 models = [
   "claude-sonnet-4-6",
   "claude-opus-4-8",
@@ -239,6 +241,10 @@ models = [
   "claude-opus-5",
   "claude-sonnet-5",
   "claude-fable-5",
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+  "claude-haiku-5-5",
+  "claude-fable-5-1",
 ]
 
 [[providers]]
@@ -249,8 +255,8 @@ npm = "@openrouter/ai-sdk-provider"
 env = ["OPENROUTER_API_KEY"]
 default = "deepseek/deepseek-v4-pro"
 models = [
-  { id = "deepseek/deepseek-v4-pro", base_model = "deepseek-v4-pro" },
-  { id = "deepseek/deepseek-v4-flash", base_model = "deepseek-v4-flash" },
+  { id = "deepseek/deepseek-v4-pro", base_model = "deepseek/deepseek-v4-pro" },
+  { id = "deepseek/deepseek-v4-flash", base_model = "deepseek/deepseek-v4-flash" },
   "qwen/qwen3.8-flash",
   "qwen/qwen3.6-flash",
   "qwen/qwen3.6-plus",
@@ -272,7 +278,7 @@ npm = "@ai-sdk/openai-compatible"
 env = ["TOGETHER_API_KEY"]
 default = "deepseek-ai/DeepSeek-V4-Pro"
 models = [
-  { id = "deepseek-ai/DeepSeek-V4-Pro", base_model = "deepseek-v4-pro" },
+  { id = "deepseek-ai/DeepSeek-V4-Pro", base_model = "deepseek-v4-pro", curated = true },
   { id = "deepseek-ai/DeepSeek-V4-Flash", base_model = "deepseek-v4-flash", curated = true },
 ]
 
@@ -285,7 +291,7 @@ npm = "@ai-sdk/openai-compatible"
 env = ["FIREWORKS_API_KEY"]
 default = "accounts/fireworks/models/deepseek-v4-pro"
 models = [
-  { id = "accounts/fireworks/models/deepseek-v4-pro", base_model = "deepseek-v4-pro" },
+  { id = "accounts/fireworks/models/deepseek-v4-pro", base_model = "deepseek-v4-pro", curated = true },
 ]
 
 [[providers]]
@@ -297,8 +303,7 @@ npm = "@ai-sdk/openai-compatible"
 env = ["NOVITA_API_KEY"]
 default = "deepseek/deepseek-v4-pro"
 models = [
-  { id = "deepseek/deepseek-v4-pro", base_model = "deepseek-v4-pro" },
-  { id = "deepseek/deepseek-v4-flash", base_model = "deepseek-v4-flash" },
+  { id = "deepseek/deepseek-v4-pro", base_model = "deepseek/deepseek-v4-pro" },
 ]
 
 [[providers]]
@@ -309,8 +314,8 @@ npm = "@ai-sdk/openai-compatible"
 env = ["SILICONFLOW_API_KEY"]
 default = "deepseek-ai/DeepSeek-V4-Pro"
 models = [
-  { id = "deepseek-ai/DeepSeek-V4-Pro", base_model = "deepseek-v4-pro" },
-  { id = "deepseek-ai/DeepSeek-V4-Flash", base_model = "deepseek-v4-flash" },
+  { id = "deepseek-ai/DeepSeek-V4-Pro", base_model = "deepseek/deepseek-v4-pro" },
+  { id = "deepseek-ai/DeepSeek-V4-Flash", base_model = "deepseek/deepseek-v4-flash" },
 ]
 
 [[providers]]
@@ -346,10 +351,8 @@ name = "Xiaomi MiMo"
 api = "https://api-mimo.xiaomi.com/v1"
 npm = "@ai-sdk/openai-compatible"
 env = ["XIAOMI_MIMO_API_KEY", "MIMO_API_KEY"]
-default = "mimo-v2.5-pro"
+default = "mimo-v2.6-pro"
 models = [
-  "mimo-v2.5-pro",
-  "mimo-v2.5",
   "mimo-v2.6-pro",
   "mimo-v2.6-flash",
 ]
@@ -360,12 +363,60 @@ name = "StepFun / StepFlash"
 api = "https://api.stepfun.ai/v1"
 npm = "@ai-sdk/openai-compatible"
 env = ["STEPFUN_API_KEY", "STEP_API_KEY"]
-default = "step-3.7-flash"
+default = "step-5-preview"
 models = [
   "step-3.5-flash",
   "step-3.5-flash-2603",
   "step-3.7-flash",
   "step-5-preview",
+]
+
+[[providers]]
+id = "google"
+name = "Google"
+api = "https://generativelanguage.googleapis.com/v1beta/openai/"
+npm = "@ai-sdk/google"
+env = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"]
+default = "gemini-3.1-pro-preview"
+models = [
+  "gemini-4-argon",
+  "gemini-3.8-flash",
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-pro-preview",
+  "gemini-3.1-flash-lite",
+  "gemini-flash-latest",
+  "gemini-flash-lite-latest",
+  "gemma-4-31b-it",
+  "gemma-4-26b-a4b-it",
+]
+
+[[providers]]
+id = "orcarouter"
+name = "OrcaRouter"
+api = "https://api.orcarouter.ai/v1"
+npm = "@ai-sdk/openai-compatible"
+env = ["ORCAROUTER_API_KEY"]
+default = "deepseek/deepseek-v4.1-flash-1017"
+models = [
+  { id = "deepseek/deepseek-v4.1-flash-1017", curated = true },
+  "deepseek/deepseek-v4-pro-0813",
+  "deepseek/deepseek-v4-flash-0731",
+  "z-ai/glm-5.3",
+  "z-ai/glm-5.3-flash",
+  "qwen/qwen3.8-max",
+  "qwen/qwen3.8-27b",
+  "grok/grok-4.6",
+  "anthropic/claude-opus-5",
+  "anthropic/claude-sonnet-5",
+  "openai/gpt-5.6-sol",
+  "kimi/kimi-k3",
+  "meta/muse-spark-1.2",
+  "google/gemini-flash-latest",
+  "tencent/hy3",
+  "orcarouter/free",
 ]
 
 [[curated]]
@@ -393,3 +444,65 @@ reasoning = true
 tool_call = true
 modalities = { input = ["text"], output = ["text"] }
 limit = { context = 128000 }
+
+[[curated]]
+provider = "together"
+id = "deepseek-ai/DeepSeek-V4-Pro"
+reason = "The existing default is absent from the public 2026-10-12 catalog. Retain prior bundled compatibility metadata without changing selected wire IDs or claiming current account access. Prior snapshot: 2026-09-26T09:07:10Z; sha256 1e559956cfa16dad77e1fd5f1f38ae533276b397aca15c2b0ebb71d6e50e64a3. New dated models come from the live catalog."
+
+[curated.row]
+name = "DeepSeek V4 Pro"
+family = "deepseek"
+attachment = false
+reasoning = true
+reasoning_options = [{ "type" = "toggle" }, { "type" = "effort", "values" = ["high", "max"] }]
+interleaved = { "field" = "reasoning_content" }
+tool_call = true
+structured_output = true
+temperature = true
+open_weights = true
+modalities = { "input" = ["text"], "output" = ["text"] }
+limit = { "context" = 512000, "output" = 384000 }
+cost = { "input" = 1.74, "output" = 3.48, "cache_read" = 0.2 }
+
+[[curated]]
+provider = "fireworks"
+id = "accounts/fireworks/models/deepseek-v4-pro"
+reason = "The existing default is absent from the public 2026-10-12 catalog. Retain prior bundled compatibility metadata without changing selected wire IDs or claiming current account access. Prior snapshot: 2026-09-26T09:07:10Z; sha256 1e559956cfa16dad77e1fd5f1f38ae533276b397aca15c2b0ebb71d6e50e64a3. New dated models come from the live catalog."
+
+[curated.row]
+name = "DeepSeek V4 Pro"
+family = "deepseek-thinking"
+attachment = false
+reasoning = true
+reasoning_options = [{ "type" = "toggle" }, { "type" = "effort", "values" = ["high", "max"] }]
+interleaved = { "field" = "reasoning_content" }
+tool_call = true
+structured_output = true
+temperature = true
+open_weights = true
+modalities = { "input" = ["text"], "output" = ["text"] }
+limit = { "context" = 1000000, "output" = 384000 }
+cost = { "input" = 1.2, "output" = 1.2, "cache_read" = 0.6 }
+
+[[curated]]
+provider = "orcarouter"
+id = "deepseek/deepseek-v4.1-flash-1017"
+reason = "OrcaRouter's published feed stopped at 2026-08-27 and does not list this id, yet it is the shipped descriptor default. OrcaRouter publishes no price for it and marks up the sibling flash rows, so no USD row is asserted here. Metadata mirrors the same id under other providers in the 2026-10-23 upstream document. The row exists so the default survives an offline or past-TTL start."
+
+[curated.row]
+name = "DeepSeek V4.1 Flash 1017"
+family = "deepseek-flash"
+attachment = false
+reasoning = true
+reasoning_options = [{ "type" = "toggle" }, { "type" = "effort", "values" = ["low", "high", "max"] }]
+interleaved = { "field" = "reasoning_content" }
+tool_call = true
+structured_output = true
+temperature = true
+open_weights = true
+knowledge = "2025-05"
+release_date = "2026-10-17"
+last_updated = "2026-10-17"
+modalities = { "input" = ["text"], "output" = ["text"] }
+limit = { "context" = 1000000, "output" = 384000 }

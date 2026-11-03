@@ -70,12 +70,17 @@ pub enum DebugAction {
         diff: String,
     },
     OpenContextInspector,
+    OpenUndoSelector,
+    UndoLatestRequest {
+        force: bool,
+    },
     SendMessage(String),
     SyncSession(SessionSyncPayload),
     /// Install and persist a conversation rollback; `/retry` resends its
     /// input only after both succeed, replacing the removed exchange (#6788).
     ConversationUndo {
         sync: SessionSyncPayload,
+        restored_files: usize,
         retry_input: Option<String>,
     },
 }
@@ -162,3 +167,17 @@ pub type ConfigCommandResult = CommandResult<ConfigAction>;
 pub type ConfigPolicyAction = ConfigAction;
 pub type ConfigPolicyCommandResult = ConfigCommandResult;
 pub type ConfigStatusCommandResult = CommandResult<std::convert::Infallible>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreNavigationAction {
+    OpenHotbarSetup,
+    DisableHotbar,
+    RestoreHotbarDefaults,
+    OpenLiveTranscript,
+    OpenTurnInspector,
+    OpenWorktreeManager,
+    SwitchWorkspace { workspace: std::path::PathBuf },
+    VoiceCapture,
+}
+
+pub type CoreNavigationCommandResult = CommandResult<CoreNavigationAction>;

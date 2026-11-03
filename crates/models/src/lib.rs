@@ -2,6 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod auto_route_evidence;
+pub mod hand_pricing;
+pub mod image_window;
+pub mod reasoning_effort_tier;
+pub mod schema_canonicalize;
+pub mod schema_sanitize;
+pub mod tool_projection;
+pub mod turn_classify;
+
 /// Context window used only for legacy DeepSeek model IDs that do not name a
 /// newer V4 alias and do not carry an explicit `*k` suffix.
 pub const LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
@@ -103,7 +112,12 @@ pub fn is_output_limit_stop_reason(reason: Option<&str>) -> bool {
             .unwrap_or_else(|| reason.trim());
         matches!(
             reason.to_ascii_lowercase().as_str(),
-            "length" | "max_tokens" | "max_output_tokens"
+            "length"
+                | "max_tokens"
+                | "max_output_tokens"
+                | "model_length"
+                | "output_limit"
+                | "max_completion_tokens"
         )
     })
 }
@@ -147,7 +161,10 @@ pub fn is_incomplete_stop_reason(reason: Option<&str>) -> bool {
             reason.starts_with("incomplete:")
                 || matches!(
                     reason.as_str(),
-                    "content_filter" | "model_context_window_exceeded"
+                    "content_filter"
+                        | "model_context_window_exceeded"
+                        | "insufficient_system_resource"
+                        | "aborted"
                 )
         })
 }
@@ -176,6 +193,12 @@ pub struct Usage {
     pub prompt_cache_write_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_usages: Vec<Usage>,
     /// Approximate input tokens spent re-sending prior `reasoning_content`
     /// across user-message boundaries in DeepSeek V4 thinking-mode tool-calling
     /// turns (V4 §5.1.1 "Interleaved Thinking"). Estimated client-side at
@@ -193,27 +216,31 @@ pub struct Usage {
 /// Unrecognized DeepSeek family names remain unknown.
 #[must_use]
 pub fn context_window_for_model(model: &str) -> Option<u32> {
-    codewhale_config::catalog::reviewed::intrinsic_model(model)
-        .and_then(|row| row.context_window)
-        .or_else(|| {
-            reviewed_snapshot_model(model).and_then(|id| {
-                codewhale_config::catalog::reviewed::intrinsic_model(id)
-                    .and_then(|row| row.context_window)
-            })
-        })
+    reviewed_model_limit(model, |row| row.context_window)
         .or_else(|| explicit_context_window_hint(&model.to_ascii_lowercase()))
+}
+
+fn reviewed_model_limit(
+    model: &str,
+    limit: impl Fn(codewhale_config::catalog::reviewed::IntrinsicModel) -> Option<u32>,
+) -> Option<u32> {
+    codewhale_config::catalog::reviewed::intrinsic_model(model)
+        .and_then(&limit)
+        .or_else(|| {
+            reviewed_snapshot_model(model)
+                .and_then(codewhale_config::catalog::reviewed::intrinsic_model)
+                .and_then(limit)
+        })
+}
+
+#[must_use]
+pub fn generation_default_for_model(model: &str) -> Option<u32> {
+    reviewed_model_limit(model, |row| row.generation_default)
 }
 
 #[must_use]
 pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
-    codewhale_config::catalog::reviewed::intrinsic_model(model)
-        .and_then(|row| row.generation_default.or(row.max_output))
-        .or_else(|| {
-            reviewed_snapshot_model(model).and_then(|id| {
-                codewhale_config::catalog::reviewed::intrinsic_model(id)
-                    .and_then(|row| row.generation_default.or(row.max_output))
-            })
-        })
+    reviewed_model_limit(model, |row| row.generation_default.or(row.max_output))
 }
 
 /// Catalog-first reasoning capability. `None` means no catalog row and no
@@ -459,7 +486,17 @@ pub fn auto_compact_default_for_model(model: &str) -> bool {
 
 // === Streaming Structures ===
 
-#[allow(dead_code)]
+/// Decode the `redacted_thinking` start-event payload, tolerating the
+/// missing-key shape (`#[serde(default)]`) and an explicit `"data": null`
+/// from nonconforming gateways. Both decode to the empty payload that the
+/// capture site warns about, instead of failing the whole SSE event.
+fn deserialize_redacted_data<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type")]
 /// Streaming event types for SSE responses.
@@ -497,7 +534,6 @@ pub enum StreamEvent {
     Error { error: serde_json::Value },
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type")]
 /// Content block types used in streaming starts.
@@ -506,6 +542,23 @@ pub enum ContentBlockStart {
     Text { text: String },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    /// Anthropic `redacted_thinking`: the provider withheld the whole block
+    /// for safety and replaced it with an encrypted payload that arrives
+    /// complete on the start event (no deltas). It must be captured and
+    /// replayed byte-exact — the API decrypts it to restore the turn's
+    /// reasoning, and dropping it makes the next tool-loop request fail with
+    /// "Expected `thinking` or `redacted_thinking`, but found `tool_use`".
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        /// Tolerant of both a missing and an explicit-null `data`
+        /// (`deserialize_redacted_data` + default): a contract-violating
+        /// start event still decodes (empty payload + capture warn) instead
+        /// of failing the whole event and silently losing the turn. Note
+        /// that `#[serde(default)]` alone only covers the missing key — an
+        /// explicit `"data": null` would still fail `String` decoding.
+        #[serde(default, deserialize_with = "deserialize_redacted_data")]
+        data: String,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -548,7 +601,6 @@ pub enum Delta {
     ReasoningStateDelta { state: OpaqueReasoningState },
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 /// Delta payload for message-level updates.
 pub struct MessageDelta {
@@ -560,6 +612,43 @@ pub struct MessageDelta {
 mod tests {
     use super::*;
     use std::any::TypeId;
+
+    #[test]
+    fn redacted_thinking_stream_start_decodes_with_its_payload() {
+        // A safeguard-triggered redacted block arrives complete on the start
+        // event. Before the variant existed this line failed the whole SSE
+        // event decode and lost the turn.
+        let block: ContentBlockStart = serde_json::from_value(serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "ENC_REDACTED_PAYLOAD",
+        }))
+        .expect("redacted_thinking must decode");
+        match block {
+            ContentBlockStart::RedactedThinking { data } => {
+                assert_eq!(data, "ENC_REDACTED_PAYLOAD");
+            }
+            other => panic!("expected RedactedThinking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_start_tolerates_an_explicit_null_payload() {
+        // `#[serde(default)]` covers a missing key only; a nonconforming
+        // gateway sending `"data": null` must still decode to the empty
+        // payload (capture warn downstream) instead of failing the whole
+        // SSE event and silently losing the turn's redacted block.
+        let block: ContentBlockStart = serde_json::from_value(serde_json::json!({
+            "type": "redacted_thinking",
+            "data": null,
+        }))
+        .expect("an explicit null payload must not fail the event decode");
+        match block {
+            ContentBlockStart::RedactedThinking { data } => {
+                assert_eq!(data, "");
+            }
+            other => panic!("expected RedactedThinking, got {other:?}"),
+        }
+    }
 
     /// #6032: `model_supports_reasoning` consults the catalog before its
     /// hand-maintained pile, so a literal arm that duplicates a catalog row is
@@ -855,9 +944,16 @@ mod tests {
 
     #[test]
     fn deepseek_v4_output_caps_require_exact_catalog_metadata() {
+        // `deepseek-v4.1-flash` used to sit in this list: it had no model-only
+        // row, so its output ceiling came only from a provider offering, and a
+        // custom endpoint that names the model without a vendor prefix fell
+        // through to the 128K window. It now carries an exact row of its own
+        // (see `bundled_catalog_resolves_the_bare_deepseek_v41_flash_spelling`
+        // in `codewhale-config`), so it moved to the resolved list below. The
+        // near-miss spellings stay unresolved — an exact row documents one
+        // identifier, never a family.
         for model in [
             "deepseek-v4.1-flash-expires-on-0910",
-            "deepseek-v4.1-flash",
             "deepseek-v4.1-pro",
             "vendor/deepseek-v4.1-flash",
             "deepseek-v4-flash-vendor",
@@ -873,6 +969,7 @@ mod tests {
             "deepseek-v4-flash",
             "deepseek-v4-pro",
             "deepseek-v4-flash-vision-exp",
+            "deepseek-v4.1-flash",
             "DEEPSEEK-V4-FLASH",
         ] {
             assert_eq!(max_output_tokens_for_model(model), Some(384_000), "{model}");

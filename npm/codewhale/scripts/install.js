@@ -34,6 +34,7 @@ const {
   explicitReleaseBase,
   firstPartyReleaseSources,
   githubReleaseBaseUrl,
+  openHarmonyDirections,
   releaseAssetUrl,
   releaseAssetUrlFromBase,
   releaseBinaryDirectory,
@@ -1702,6 +1703,19 @@ async function run(options = {}) {
   const version = resolvePackageVersion(pkg, env);
   const repo = resolveRepo(env);
   const paths = options.paths || binaryPaths();
+  if (
+    isInstallContext(context) &&
+    (options.platform || os.platform()) === "openharmony" &&
+    !isQuietInstall(env)
+  ) {
+    process.stderr.write(
+      `codewhale: note: installing ${paths.codewhale.asset}, the native HarmonyOS/OpenHarmony build.\n` +
+        `It is code-signed, but a native HarmonyOS terminal (HiShell) is not a Linux shell:\n` +
+        `there is no git and no package manager, and the debugging shell (hdc shell) cannot\n` +
+        `execute it at all. details: docs/HarmonyOS.md\n` +
+        `${openHarmonyDirections()}\n`,
+    );
+  }
   const releaseDir = options.releaseDir || releaseBinaryDirectory();
   await mkdir(releaseDir, { recursive: true });
 

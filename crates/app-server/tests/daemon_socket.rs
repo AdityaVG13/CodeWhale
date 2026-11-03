@@ -207,7 +207,7 @@ impl BootstrapPublicationFixture {
             recovery,
         )
         .await?;
-        Ok(daemon)
+        Ok(daemon.expect("a private endpoint directory is available on this host"))
     }
 
     fn assert_publication(&self, bytes: &[u8]) {
@@ -458,7 +458,11 @@ async fn owner_attaches_round_trips_and_shuts_down_cleanly() {
     for (id, method, params) in [
         (1, "capabilities", json!({})),
         (10, "thread/list", json!({})),
-        (11, "prompt/run", json!({ "prompt": "hi" })),
+        (
+            11,
+            "prompt/run",
+            json!({ "prompt": "hi", "allowed_tools": [] }),
+        ),
     ] {
         let early = client.call(id, method, params).await;
         assert_eq!(early["error"]["code"], json!(-32010), "{method}: {early}");
@@ -1065,6 +1069,7 @@ async fn canonical_cli_scoped_resume_fork_keep_exact_owner_workers_and_refuse_wr
     )
     .await
     .unwrap();
+    let daemon = daemon.expect("a private endpoint directory is available on this host");
     let shutdown = daemon.shutdown_handle();
     let socket = tokio::spawn(daemon.serve());
     let selection = codewhale_app_server::ThreadControlSelection {

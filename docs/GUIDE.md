@@ -351,8 +351,8 @@ direct. Multi-step delegation uses a compact Workflow plan with dependencies,
 bounded scopes, and completion evidence passed between steps. Fleet configures
 and manages those same sub-agents and their roles. One bounded, independent
 task can use a direct agent; continued work reuses it through `followup`.
-Heavy work can also run on a cloud computer with `codewhale dispatch "<task>"`,
-which goes through the signed-in account with a quote and EU-compute consent.
+`codewhale dispatch "<task>"` (running work on a Codewhale cloud computer) is
+not available: cloud computers and accounts are paused for new users.
 
 For trusted workspaces where you intentionally want actions to proceed without
 approval prompts, select the Full Access permission posture with `Shift+Tab`.
@@ -388,6 +388,7 @@ Common commands for first-time users:
 | `/workflows` | Open the live Workflow run dashboard: every run this workspace's journal keeps, with phases, children, progress, and host-side cancel |
 | `/config` | Edit runtime and provider settings |
 | `/statusline` | Choose which footer status chips are visible |
+| `/color` | Give this chat's composer box its own color: bare `/color` cycles red, orange, amber, green, cyan, blue, purple and pink, `/color blue` picks one, `/color off` returns to the theme |
 | `/receipts` | List what this session did: files changed, commands run, web and MCP calls, agents, approvals and who gave them, failures |
 | `/compact` | Summarize long context to recover token budget |
 | `/copy` | Copy the last completed assistant response to the clipboard |
@@ -425,7 +426,7 @@ level per turn. When the DeepSeek routing model is available, Auto may select
 any runnable provider/model pair in the redacted inventory. That classification
 sends the latest request (capped at 4,000 characters) plus a bounded summary of
 up to six recent context rows (900 characters each) to
-`DeepSeek / deepseek-v4-flash`. Credentials, endpoints, and provider error text
+`DeepSeek / deepseek-flash`. Credentials, endpoints, and provider error text
 are not included in the inventory. Without that router, Auto uses a local,
 provider-aware heuristic and sends no routing request. If a classifier attempt
 fails validation or errors, Auto falls back to that heuristic while retaining
@@ -510,16 +511,18 @@ Codewhale keeps these records on your machine, under `~/.codewhale/`:
   in their event log. A call that ran without asking (Full Access, an allow
   rule, a remembered grant) has no approval record; the posture each turn
   ran under is saved with the turn.
-- **Undo points.** Workspace snapshots let you go back. `/undo` takes back
-  your last request in one step: every file it changed, plus the request and
-  its reply. It works in every access mode and lists the files it put back.
-  If one of those files changed after the request, `/undo` changes nothing
-  and says which file. If a request was cut off before Codewhale recorded
-  where its changes end, `/undo` says so; `/undo force` undoes it anyway,
-  including edits made to those files since it started. `/restore` rolls the
-  whole folder back to a point you pick, overwriting later edits, so it
-  needs `/trust on` or Full Access. Esc Esc rewinds the conversation only;
-  `/undo` afterwards puts the files back.
+- **Undo points.** `/undo` takes back your last request and its proven file
+  changes. `/undo select` lets you choose the first request to undo along with
+  all later requests, with visible checking, restoring and saving progress.
+  Neither command changes your access mode. File reversal requires the
+  request's own recorded tool executions, complete restore points and files
+  that still match what those executions left. Missing or incomplete records,
+  including older sessions or turns run with snapshots disabled, cause a
+  refusal that preserves the files and conversation. `/undo force` cannot
+  bypass these checks. A request with no file-writing work can rewind only its
+  conversation. Esc Esc also rewinds the conversation only. `/restore` selects
+  an explicit workspace snapshot and can overwrite later edits; it requires
+  `/trust on` or Full Access.
 - **Security events.** `audit.log` records credential changes, hook
   environment key names, compaction passes, the terminal's approval
   routing, and Auto-Review verdicts. It is not a list of what a session did.
@@ -615,7 +618,8 @@ Use skills when a task has a repeatable process:
 - Using a project-specific memory or wiki workflow.
 
 Inside the TUI, `/skill <name>` activates a skill when one is available, and
-bare `/skills` opens the Skills Manager (owned-only inventory, no network). Use
+bare `/skills` opens Extensions → Skills (owned-only inventory, no network).
+Use `/skills manage` for the manager and
 `/skills <prefix>`, `/skills inspect`, `/skills --remote`, `/skills suggest <task>`,
 or `/skills sync` for the text/registry paths. Suggestions rank the remote
 catalog but never install or activate anything. The command palette can also
@@ -781,6 +785,10 @@ available. A dropped connection keeps local input locked until the last web
 lease expires so two controllers never race. Every folder you enroll from one
 terminal shares a single stable device id, so the web app lists one computer
 per machine rather than one per session.
+
+If remote control fails, the reason remains in the current terminal transcript
+and TUI log after the error toast expires. The footer then shows `/rc status`;
+run it to inspect the failure and whether retrying must wait for a prior lease.
 
 > Note (2026-09-14): the hosted web app at app.codewhale.net sunsets in phases
 > under the 2026-09-14 product-client decision; the native GPUI desktop app

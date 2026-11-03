@@ -1,20 +1,31 @@
-name: Codewhale review
-description: Review a pinned pull request with a checksummed Codewhale release and an explicit outcome receipt.
+name: Codewhale
+description: Review pull requests automatically or on an authorized @codewhale review request, using your chosen model.
+branding:
+  icon: code
+  color: blue
 inputs:
   version:
     description: Exact released CLI tag (vX.Y.Z). Must support review --json.
     required: true
   provider:
-    description: codewhale for an account machine key, or an explicit BYOK provider.
-    default: codewhale
+    description: Explicit BYOK provider (orcarouter, deepseek, anthropic, openrouter, zai, modelstudio-token-plan), or codewhale for a separately verified account machine key.
+    required: true
   model:
     description: Exact model ID. Account mode requires provider/model from the account catalog.
     required: true
+  reasoning-effort:
+    description: Optional Engine reasoning setting (auto, off, low, medium, high, max).
   github-token:
-    description: GitHub token with contents read and pull-requests write.
+    description: GitHub token with contents read and pull-requests read; legacy post:true also requires pull-requests write.
     default: ${{ github.token }}
   pr-number:
     description: PR number for workflow_dispatch; pull_request events use the event snapshot.
+  trigger-phrase:
+    description: Bot mention used for a standalone @name review line in a new PR comment.
+    default: '@codewhale'
+  allow-forks:
+    description: Allow inert fork review only on a write-authorized issue_comment or manual run from the default branch.
+    default: 'false'
   max-chars:
     description: Maximum diff characters per complete pass.
     default: '200000'
@@ -27,7 +38,7 @@ inputs:
     description: Model and publication deadline, in seconds (30–1200).
     default: '600'
   post:
-    description: Publish a COMMENT review; never approve or request changes.
+    description: Legacy direct COMMENT publication. Set false to export findings for a separate publisher job.
     default: 'true'
 outputs:
   outcome:
@@ -36,6 +47,9 @@ outputs:
   receipt:
     description: Absolute path to the sanitized JSON execution receipt (also written on failures).
     value: ${{ steps.review.outputs.receipt }}
+  findings:
+    description: Absolute path to validated findings JSON for a complete post:false review; contains repository-sensitive review text.
+    value: ${{ steps.review.outputs.findings }}
   pr-url:
     description: URL of the pull request, when resolved.
     value: ${{ steps.review.outputs.pr-url }}
@@ -49,7 +63,10 @@ runs:
         CW_VERSION: ${{ inputs.version }}
         CW_PROVIDER: ${{ inputs.provider }}
         CW_MODEL: ${{ inputs.model }}
+        CW_REASONING_EFFORT: ${{ inputs.reasoning-effort }}
         CW_PR_NUMBER: ${{ inputs.pr-number }}
+        CW_TRIGGER_PHRASE: ${{ inputs.trigger-phrase }}
+        CW_ALLOW_FORKS: ${{ inputs.allow-forks }}
         CW_MAX_CHARS: ${{ inputs.max-chars }}
         CW_MAX_PASSES: ${{ inputs.max-passes }}
         CW_MAX_OUTPUT_TOKENS: ${{ inputs.max-output-tokens }}

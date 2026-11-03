@@ -23,7 +23,7 @@ The interactive engine evaluates a model-requested tool call in this order:
 | 3 | Preparation, then `tool_call_before` hooks | Registry preparation is side-effect free. Foreground hooks then fold as `deny > ask > allow`, and a strict matching hook that produces no verdict fails closed. The last `updatedInput` wins; the engine prepares the rewritten input again before later gates inspect it. |
 | 4 | Registered-tool baseline | The prepared tool's `ApprovalRequirement` establishes its ordinary approval need. A hook `ask` is applied after that assignment so the baseline cannot erase it. Non-bypassable registered holds remain forced in postures that can prompt; Full Access auto-approves them instead of opening a contradictory modal. Plan mode also blocks write-capable tools here. |
 | 5 | Typed `permissions.toml` rule | A matching `deny` blocks. A matching `allow` may clear only ordinary registry approval; it cannot clear a hook `ask` or a non-bypassable registered hold. A matching `ask` forces review only in a posture that can prompt. Full Access/auto-approval is not downgraded into a prompt, while an explicit typed `deny` still blocks. |
-| 6 | Auto-review policy and built-in safety floor | Configured block rules run before the built-in floor, then configured allow rules and the deterministic fallback. This layer runs after typed permissions and can add a prompt or block, but cannot remove an earlier hold. Full Access deliberately skips the interactive publish hold; catastrophic destructive background/headless actions remain protected. |
+| 6 | Auto-review policy and built-in safety floor | Configured block rules run before the built-in floor, then configured allow rules and the deterministic fallback. This layer runs after typed permissions and can add a prompt or block, but cannot remove an earlier hold. The built-in floor refuses a shell command, shell input or verifier containing a hidden Unicode character, and holds publish-like actions, destructive background/headless actions and `curl`/`wget` credential uploads with a prompt no grant or allow rule can answer (a block in Auto-Review and Never). Full Access skips the built-in floor. |
 | 7 | Repository law | Protected path invariants can only add a prompt or block. A repo-law prompt becomes a hard block in Full Access, which has no contradictory approval modal. |
 | 8 | Human approval | A remaining prompt is sent to the approval channel. Denial stops the call. Approval authorizes this planned call; session and persistent choices affect later matching calls but do not erase a later gate from this call. |
 | 9 | Tool authority and execution sandbox | Worker authority envelopes, native tool path checks, and the selected OS or external sandbox still apply during execution. A sandbox denial remains a denial unless the user separately authorizes a supported elevation path. |
@@ -143,6 +143,6 @@ cargo test -p codewhale-config --locked project_merge_only_tightens_approval_and
 
 - [Configuration](CONFIGURATION.md) — rule schema, `/permissions`, hooks, and
   project overlays
-- [Modes](MODES.md) — Plan/Act/Operate and permission posture
+- [Modes](MODES.md) — Plan/Work/Operate and permission posture
 - [Sandbox threat model](SANDBOX.md) — platform enforcement and fallbacks
 - [Runtime API](RUNTIME_API.md) — approval events and remote resolution

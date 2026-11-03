@@ -26,7 +26,7 @@ describe("isZh one-way ceiling (#5519)", () => {
       .filter(
         (file) =>
           !file.startsWith(MIGRATION_HOME) &&
-          !/\.test\.[jt]sx?$/.test(file) &&
+          !/\.(test|generated)\.[jt]sx?$/.test(file) &&
           readFileSync(join(ROOT, file), "utf8").includes("isZh"),
       )
       .sort();

@@ -1,0 +1,2537 @@
+{
+  "schema": 2,
+  "profiles": {
+    "windows-x64": {
+      "floor": "Windows 10 x64 1607 (build 14393)",
+      "osArchitecture": "x64",
+      "qualification": {
+        "result": "PASS",
+        "kind": "reporter exact-OS export resolution",
+        "evidence": {
+          "issue": "https://github.com/codewhale-hq/Codewhale/issues/6953",
+          "binary": "https://github.com/codewhale-hq/Codewhale/releases/download/v0.10.1/codewhale-windows-x64.exe",
+          "sha256": "76a6156baa8be350d12cb3d5d049ce1d796597da8475470d3179b51d47d22729",
+          "qualification": "Reporter checked all import pairs in v0.10.0 and v0.10.1 with GetProcAddress on 14393.447: 411/411 and 453/454 resolved. The only unresolved pair, DeriveCapabilitySidsFromName, is excluded. This is a conservative reviewed import surface, not a complete Windows API database or ARM64 execution receipt.",
+          "previous_binary": "https://github.com/codewhale-hq/Codewhale/releases/download/v0.10.0/codewhale-windows-x64.exe",
+          "previous_sha256": "f7b35a1e928f67884637f36b01fc72854f50690130f191bac3bcf62ece3c1d84"
+        },
+        "runtimeAcceptance": "Final 0.10.2 release bytes on 14393 not run",
+        "qualifiedPairs": 456
+      },
+      "imports": {
+        "advapi32.dll": [
+          "AddAccessAllowedAceEx",
+          "AddAce",
+          "AdjustTokenPrivileges",
+          "ConvertSidToStringSidW",
+          "CredDeleteW",
+          "CredFree",
+          "CredReadW",
+          "CredWriteW",
+          "EqualSid",
+          "FreeSid",
+          "GetAce",
+          "GetExplicitEntriesFromAclW",
+          "GetKernelObjectSecurity",
+          "GetLengthSid",
+          "GetSecurityDescriptorControl",
+          "GetSecurityDescriptorDacl",
+          "GetSecurityInfo",
+          "GetTokenInformation",
+          "ImpersonateAnonymousToken",
+          "InitializeAcl",
+          "InitializeSecurityDescriptor",
+          "IsValidAcl",
+          "IsValidSid",
+          "LookupPrivilegeValueA",
+          "OpenProcessToken",
+          "RegCloseKey",
+          "RegEnumValueW",
+          "RegOpenKeyExW",
+          "RevertToSelf",
+          "SetEntriesInAclW",
+          "SetKernelObjectSecurity",
+          "SetSecurityDescriptorControl",
+          "SetSecurityDescriptorDacl",
+          "SetSecurityDescriptorOwner",
+          "SetSecurityInfo",
+          "SystemFunction036"
+        ],
+        "api-ms-win-core-synch-l1-2-0.dll": [
+          "WaitOnAddress",
+          "WakeByAddressAll",
+          "WakeByAddressSingle"
+        ],
+        "api-ms-win-crt-convert-l1-1-0.dll": [
+          "strtod",
+          "strtol"
+        ],
+        "api-ms-win-crt-environment-l1-1-0.dll": [
+          "getenv"
+        ],
+        "api-ms-win-crt-heap-l1-1-0.dll": [
+          "_msize",
+          "_set_new_mode",
+          "calloc",
+          "free",
+          "malloc",
+          "realloc"
+        ],
+        "api-ms-win-crt-locale-l1-1-0.dll": [
+          "_configthreadlocale"
+        ],
+        "api-ms-win-crt-math-l1-1-0.dll": [
+          "__setusermatherr",
+          "_dclass",
+          "_dsign",
+          "_hypot",
+          "acos",
+          "acosh",
+          "asin",
+          "asinh",
+          "atan",
+          "atan2",
+          "atanh",
+          "cbrt",
+          "ceil",
+          "ceilf",
+          "copysign",
+          "cos",
+          "cosh",
+          "exp",
+          "exp2",
+          "expm1",
+          "floor",
+          "floorf",
+          "fmaf",
+          "fmod",
+          "frexp",
+          "hypot",
+          "ldexp",
+          "log",
+          "log10",
+          "log10f",
+          "log1p",
+          "log2",
+          "lrint",
+          "modf",
+          "pow",
+          "powf",
+          "round",
+          "roundf",
+          "scalbn",
+          "sin",
+          "sinf",
+          "sinh",
+          "sqrt",
+          "tan",
+          "tanh",
+          "trunc",
+          "truncf"
+        ],
+        "api-ms-win-crt-runtime-l1-1-0.dll": [
+          "__p___argc",
+          "__p___argv",
+          "_beginthreadex",
+          "_c_exit",
+          "_cexit",
+          "_configure_narrow_argv",
+          "_crt_atexit",
+          "_endthreadex",
+          "_errno",
+          "_exit",
+          "_get_initial_narrow_environment",
+          "_initialize_narrow_environment",
+          "_initialize_onexit_table",
+          "_initterm",
+          "_initterm_e",
+          "_register_onexit_function",
+          "_register_thread_local_exe_atexit_callback",
+          "_seh_filter_exe",
+          "_set_app_type",
+          "_wassert",
+          "abort",
+          "exit",
+          "strerror",
+          "terminate"
+        ],
+        "api-ms-win-crt-stdio-l1-1-0.dll": [
+          "__acrt_iob_func",
+          "__p__commode",
+          "__stdio_common_vfprintf",
+          "__stdio_common_vsnprintf_s",
+          "__stdio_common_vsprintf",
+          "__stdio_common_vsprintf_s",
+          "__stdio_common_vsscanf",
+          "_fileno",
+          "_set_fmode",
+          "_setmode",
+          "fclose",
+          "feof",
+          "ferror",
+          "fflush",
+          "fgets",
+          "fopen",
+          "fputs",
+          "fread",
+          "fseek",
+          "ftell",
+          "fwrite",
+          "putchar"
+        ],
+        "api-ms-win-crt-string-l1-1-0.dll": [
+          "strcat_s",
+          "strcmp",
+          "strcspn",
+          "strlen",
+          "strncmp",
+          "strspn",
+          "wcslen"
+        ],
+        "api-ms-win-crt-time-l1-1-0.dll": [
+          "_localtime64_s"
+        ],
+        "api-ms-win-crt-utility-l1-1-0.dll": [
+          "bsearch",
+          "qsort"
+        ],
+        "bcrypt.dll": [
+          "BCryptGenRandom"
+        ],
+        "bcryptprimitives.dll": [
+          "ProcessPrng"
+        ],
+        "combase.dll": [
+          "CoTaskMemFree"
+        ],
+        "crypt32.dll": [
+          "CertAddEncodedCertificateToStore",
+          "CertCloseStore",
+          "CertCreateCertificateChainEngine",
+          "CertFreeCertificateChain",
+          "CertFreeCertificateChainEngine",
+          "CertFreeCertificateContext",
+          "CertGetCertificateChain",
+          "CertOpenStore",
+          "CertSetCertificateContextProperty",
+          "CertVerifyCertificateChainPolicy"
+        ],
+        "kernel32.dll": [
+          "AcquireSRWLockExclusive",
+          "AcquireSRWLockShared",
+          "AddVectoredExceptionHandler",
+          "AreFileApisANSI",
+          "AssignProcessToJobObject",
+          "CancelIo",
+          "CancelIoEx",
+          "CloseHandle",
+          "CompareStringOrdinal",
+          "ConnectNamedPipe",
+          "CopyFileExW",
+          "CreateConsoleScreenBuffer",
+          "CreateDirectoryW",
+          "CreateEventW",
+          "CreateFileA",
+          "CreateFileMappingW",
+          "CreateFileW",
+          "CreateIoCompletionPort",
+          "CreateJobObjectW",
+          "CreateMutexA",
+          "CreateMutexW",
+          "CreateNamedPipeW",
+          "CreatePipe",
+          "CreateProcessW",
+          "CreateThread",
+          "CreateToolhelp32Snapshot",
+          "CreateWaitableTimerExW",
+          "DeleteCriticalSection",
+          "DeleteFileA",
+          "DeleteFileW",
+          "DeleteProcThreadAttributeList",
+          "DeviceIoControl",
+          "DisconnectNamedPipe",
+          "DuplicateHandle",
+          "EnterCriticalSection",
+          "ExitProcess",
+          "ExpandEnvironmentStringsW",
+          "FillConsoleOutputAttribute",
+          "FillConsoleOutputCharacterA",
+          "FindClose",
+          "FindFirstFileExW",
+          "FindNextFileW",
+          "FlsAlloc",
+          "FlsFree",
+          "FlsSetValue",
+          "FlushFileBuffers",
+          "FlushViewOfFile",
+          "FormatMessageA",
+          "FormatMessageW",
+          "FreeEnvironmentStringsW",
+          "FreeLibrary",
+          "GetCommandLineW",
+          "GetConsoleMode",
+          "GetConsoleOutputCP",
+          "GetConsoleScreenBufferInfo",
+          "GetConsoleWindow",
+          "GetCurrentDirectoryW",
+          "GetCurrentProcess",
+          "GetCurrentProcessId",
+          "GetCurrentProcessorNumber",
+          "GetCurrentThread",
+          "GetCurrentThreadId",
+          "GetDiskFreeSpaceA",
+          "GetDiskFreeSpaceW",
+          "GetEnvironmentStringsW",
+          "GetEnvironmentVariableA",
+          "GetEnvironmentVariableW",
+          "GetExitCodeProcess",
+          "GetFileAttributesA",
+          "GetFileAttributesExW",
+          "GetFileAttributesW",
+          "GetFileInformationByHandle",
+          "GetFileInformationByHandleEx",
+          "GetFileSize",
+          "GetFileType",
+          "GetFinalPathNameByHandleW",
+          "GetFullPathNameA",
+          "GetFullPathNameW",
+          "GetLastError",
+          "GetModuleFileNameW",
+          "GetModuleHandleA",
+          "GetModuleHandleExA",
+          "GetModuleHandleExW",
+          "GetModuleHandleW",
+          "GetNamedPipeClientProcessId",
+          "GetNamedPipeInfo",
+          "GetNamedPipeServerProcessId",
+          "GetNativeSystemInfo",
+          "GetNumberOfConsoleInputEvents",
+          "GetOverlappedResult",
+          "GetProcAddress",
+          "GetProcessHeap",
+          "GetProcessId",
+          "GetProcessTimes",
+          "GetQueuedCompletionStatusEx",
+          "GetStdHandle",
+          "GetSystemDirectoryW",
+          "GetSystemInfo",
+          "GetSystemTime",
+          "GetSystemTimeAsFileTime",
+          "GetSystemTimePreciseAsFileTime",
+          "GetTempPathA",
+          "GetTempPathW",
+          "GetTickCount",
+          "GetTimeZoneInformation",
+          "GetTimeZoneInformationForYear",
+          "GetWindowsDirectoryW",
+          "GlobalAlloc",
+          "GlobalFree",
+          "GlobalLock",
+          "GlobalSize",
+          "GlobalUnlock",
+          "HeapAlloc",
+          "HeapCompact",
+          "HeapCreate",
+          "HeapDestroy",
+          "HeapFree",
+          "HeapReAlloc",
+          "HeapSize",
+          "HeapValidate",
+          "InitOnceExecuteOnce",
+          "InitializeConditionVariable",
+          "InitializeCriticalSection",
+          "InitializeProcThreadAttributeList",
+          "InitializeSListHead",
+          "InitializeSRWLock",
+          "IsThreadAFiber",
+          "LeaveCriticalSection",
+          "LoadLibraryA",
+          "LoadLibraryExA",
+          "LoadLibraryW",
+          "LocalFree",
+          "LockFile",
+          "LockFileEx",
+          "MapViewOfFile",
+          "MoveFileExW",
+          "MultiByteToWideChar",
+          "OpenProcess",
+          "OpenThread",
+          "OutputDebugStringA",
+          "OutputDebugStringW",
+          "PostQueuedCompletionStatus",
+          "Process32FirstW",
+          "Process32NextW",
+          "QueryInformationJobObject",
+          "QueryPerformanceCounter",
+          "QueryPerformanceFrequency",
+          "RaiseException",
+          "ReOpenFile",
+          "ReadConsoleInputW",
+          "ReadConsoleW",
+          "ReadFile",
+          "ReadFileEx",
+          "RegisterWaitForSingleObject",
+          "ReleaseMutex",
+          "ReleaseSRWLockExclusive",
+          "ReleaseSRWLockShared",
+          "RemoveDirectoryW",
+          "ReplaceFileW",
+          "ResumeThread",
+          "RtlCaptureContext",
+          "RtlLookupFunctionEntry",
+          "RtlVirtualUnwind",
+          "SetConsoleActiveScreenBuffer",
+          "SetConsoleCP",
+          "SetConsoleCtrlHandler",
+          "SetConsoleCursorInfo",
+          "SetConsoleCursorPosition",
+          "SetConsoleMode",
+          "SetConsoleOutputCP",
+          "SetConsoleTextAttribute",
+          "SetCurrentDirectoryW",
+          "SetEndOfFile",
+          "SetEnvironmentVariableW",
+          "SetErrorMode",
+          "SetFileAttributesW",
+          "SetFileCompletionNotificationModes",
+          "SetFileInformationByHandle",
+          "SetFilePointer",
+          "SetFilePointerEx",
+          "SetFileTime",
+          "SetHandleInformation",
+          "SetInformationJobObject",
+          "SetLastError",
+          "SetStdHandle",
+          "SetThreadStackGuarantee",
+          "SetUnhandledExceptionFilter",
+          "SetWaitableTimer",
+          "Sleep",
+          "SleepConditionVariableCS",
+          "SleepEx",
+          "SwitchToThread",
+          "SystemTimeToFileTime",
+          "TerminateJobObject",
+          "TerminateProcess",
+          "Thread32First",
+          "Thread32Next",
+          "TlsAlloc",
+          "TlsFree",
+          "TlsGetValue",
+          "TlsSetValue",
+          "TryEnterCriticalSection",
+          "UnlockFile",
+          "UnlockFileEx",
+          "UnmapViewOfFile",
+          "UnregisterWaitEx",
+          "UpdateProcThreadAttribute",
+          "VirtualAlloc",
+          "VirtualFree",
+          "VirtualQuery",
+          "WaitForMultipleObjects",
+          "WaitForSingleObject",
+          "WaitForSingleObjectEx",
+          "WakeConditionVariable",
+          "WideCharToMultiByte",
+          "WriteConsoleA",
+          "WriteConsoleW",
+          "WriteFile",
+          "WriteFileEx",
+          "lstrlenW"
+        ],
+        "ntdll.dll": [
+          "NtCancelIoFileEx",
+          "NtCreateFile",
+          "NtCreateNamedPipeFile",
+          "NtDeviceIoControlFile",
+          "NtOpenFile",
+          "NtReadFile",
+          "NtSetInformationFile",
+          "NtWriteFile",
+          "RtlNtStatusToDosError"
+        ],
+        "oleaut32.dll": [
+          "SysFreeString",
+          "SysStringLen"
+        ],
+        "shell32.dll": [
+          "SHGetKnownFolderPath"
+        ],
+        "shlwapi.dll": [
+          "AssocQueryStringW"
+        ],
+        "user32.dll": [
+          "CloseClipboard",
+          "EmptyClipboard",
+          "EnumWindows",
+          "GetClipboardData",
+          "GetForegroundWindow",
+          "GetKeyboardLayout",
+          "GetWindow",
+          "GetWindowInfo",
+          "GetWindowRect",
+          "GetWindowThreadProcessId",
+          "IsClipboardFormatAvailable",
+          "IsWindowVisible",
+          "MessageBeep",
+          "OpenClipboard",
+          "RegisterClipboardFormatW",
+          "SetClipboardData",
+          "SetWindowPos",
+          "ShowWindowAsync",
+          "ToUnicodeEx"
+        ],
+        "userenv.dll": [
+          "CreateAppContainerProfile",
+          "DeleteAppContainerProfile",
+          "GetUserProfileDirectoryW"
+        ],
+        "vcruntime140.dll": [
+          "_CxxThrowException",
+          "__C_specific_handler",
+          "__CxxFrameHandler3",
+          "__current_exception",
+          "__current_exception_context",
+          "__std_terminate",
+          "memchr",
+          "memcmp",
+          "memcpy",
+          "memmove",
+          "memset",
+          "strchr",
+          "strrchr"
+        ],
+        "vcruntime140_1.dll": [
+          "__CxxFrameHandler4"
+        ],
+        "winmm.dll": [
+          "PlaySoundW"
+        ],
+        "ws2_32.dll": [
+          "WSACleanup",
+          "WSAGetLastError",
+          "WSAIoctl",
+          "WSASend",
+          "WSASocketW",
+          "WSAStartup",
+          "accept",
+          "bind",
+          "closesocket",
+          "connect",
+          "freeaddrinfo",
+          "getaddrinfo",
+          "getpeername",
+          "getsockname",
+          "getsockopt",
+          "ioctlsocket",
+          "listen",
+          "recv",
+          "send",
+          "setsockopt",
+          "shutdown"
+        ]
+      }
+    },
+    "windows-arm64": {
+      "floor": "Windows 11 ARM64 target; exports observed on builds 26300 (debug, 2026-10-13) and 26200 (release, 2026-10-16), minimum supported build unqualified",
+      "osArchitecture": "arm64",
+      "qualification": {
+        "result": "PASS",
+        "kind": "exact native system export resolution",
+        "time": "2026-10-16T10:57:53.0754367Z",
+        "osVersion": "10.0.26200.0",
+        "osBuild": "26200.9457",
+        "processArchitecture": "ARM64",
+        "runner": "GitHub-hosted windows-11-arm; its registry ProductName reads \"Windows 10 Enterprise\", as Windows 11 reports it",
+        "source": "db34bc8949a5b5e7e6fd5a88cb67e998011ad9df",
+        "sourceUrl": "https://github.com/codewhale-hq/Codewhale/commit/db34bc8949a5b5e7e6fd5a88cb67e998011ad9df",
+        "binarySha256": "a9a2a521d8d0c971b9d49c2c463cdb49d0c7a4eb700b73e6fed2c743e688eebb",
+        "binaries": [
+          "codewhale-windows-arm64.exe",
+          "codew-windows-arm64.exe",
+          "codewhale-tui-windows-arm64.exe"
+        ],
+        "resolved": 445,
+        "unresolved": 0,
+        "buildRun": "https://github.com/codewhale-hq/Codewhale/actions/runs/38867608774",
+        "probeRun": "https://github.com/codewhale-hq/Codewhale/actions/runs/38890634267",
+        "probeWorkflow": ".github/workflows/windows-arm64-export-probe.yml",
+        "profile": "release, built by release-artifacts.yml (windows-arm64 job) in release candidate run 38867608774",
+        "runtimeAcceptance": "Static export resolution only; this probe did not launch the release executables. The only ARM64 runtime acceptance is the cf7199b52e debug application run of 2026-10-13; the packaged release and older OS builds are unproven",
+        "exportProbeMethod": "ARM64 process: LoadLibraryExW per imported DLL with LOAD_LIBRARY_SEARCH_SYSTEM32 (0x00000800), then GetProcAddress for every imported symbol; module path and SHA256 recorded",
+        "scope": "System-context export resolution only; no Authenticode check, oldest supported OS, or ordinary-user install inference",
+        "systemModuleHashes": {
+          "advapi32.dll": "021452c20f89c50d64c304391ec18169f95a9fa14762f76cfd2dded627dbf0bb",
+          "api-ms-win-core-synch-l1-2-0.dll": "26be64c26bac33368a650372cb5fb1e3235f1bd7883471bd3291dbf6372ae274",
+          "api-ms-win-crt-convert-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-heap-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-locale-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-math-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-runtime-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-stdio-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-string-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-time-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "api-ms-win-crt-utility-l1-1-0.dll": "529e795875178b906ea8758abc8de5c28339f336b3e7a121d7778ae040908de9",
+          "bcrypt.dll": "12e3562488e5ca3a26884408d99d81898237c8ca3c5c3c9e40ca6b8f5ed361cd",
+          "bcryptprimitives.dll": "d3da1097e9e1fc16c910350e40c4405ef52f36f134f9bf165fbe02194c1eaa82",
+          "combase.dll": "850b43094ae61a5d3b8f40f0cddf89b4a90190bf5fc57c5242e0bf5b06644b2f",
+          "crypt32.dll": "e3e800f1905658674ce4af1d3efb31d722b9255aaae4fa46c54302d329ba4ab6",
+          "kernel32.dll": "6a7bd4daff9c0c4cc8b9478ecd9828c3f19be257a4a18db9559cae929197fffa",
+          "ntdll.dll": "60ef561645b50dce71ad0919dbbef3ad334a0489432cde718e75b73b558c7997",
+          "oleaut32.dll": "5ebb761b3f96b227006e79d6a92cf5d98ac5a5fd3c136d35dd05391bed867753",
+          "shell32.dll": "ef0fbd71a46fe4b35bff893ea65241cd08ea5231de704c106e39920c03698fe9",
+          "shlwapi.dll": "67f713491bc18614d6ea29b920e3c609cabf9eecf054990e030476a2e9f76a2c",
+          "user32.dll": "f2fc06e7e5016a15ad7f7f4ee250154b7d41d0a0706bf14927a3bbd4c42727dd",
+          "userenv.dll": "18bd1660ab7cacd90789f1bebe35bc6a5730b1e75e5582f53575473fae3db530",
+          "vcruntime140.dll": "3c56f4167e2b3d8e6338497731e6aae8cd7ec46bd6789f9423a8d9cf9a630310",
+          "winmm.dll": "2ebb728e5c510492df8fde4ec81b8a8554f2f33d1686b837d22c962b7d2fa9b7",
+          "ws2_32.dll": "e1266872f796f68b4be9c20640ca940a7a96e1ba98c741d472ae305fccf87ca9"
+        },
+        "supersedes": {
+          "time": "2026-10-13T10:43:07.5742747Z",
+          "osVersion": "10.0.26300",
+          "osBuild": "26300",
+          "source": "cf7199b52ecb9147e4670ae7874924ffc30a6a67",
+          "binarySha256": "ca51f91562a0569ee43855715856e1cfee74e8a834bd6206183a3175373fdb2d",
+          "resolved": 453,
+          "unresolved": 0,
+          "buildCommand": "cargo build --locked --target aarch64-pc-windows-msvc -p codewhale-cli --bin codewhale",
+          "profile": "debug, default features",
+          "runtimeAcceptance": "Only cf7199b52e ARM64 debug application acceptance; final packaged release and older OS unproven"
+        }
+      },
+      "imports": {
+        "advapi32.dll": [
+          "AddAccessAllowedAceEx",
+          "AddAce",
+          "AdjustTokenPrivileges",
+          "ConvertSidToStringSidW",
+          "CredDeleteW",
+          "CredFree",
+          "CredReadW",
+          "CredWriteW",
+          "EqualSid",
+          "FreeSid",
+          "GetAce",
+          "GetExplicitEntriesFromAclW",
+          "GetKernelObjectSecurity",
+          "GetLengthSid",
+          "GetSecurityDescriptorControl",
+          "GetSecurityDescriptorDacl",
+          "GetSecurityInfo",
+          "GetTokenInformation",
+          "ImpersonateAnonymousToken",
+          "InitializeAcl",
+          "InitializeSecurityDescriptor",
+          "IsValidAcl",
+          "IsValidSid",
+          "LookupPrivilegeValueA",
+          "OpenProcessToken",
+          "RegCloseKey",
+          "RegEnumValueW",
+          "RegOpenKeyExW",
+          "RevertToSelf",
+          "SetEntriesInAclW",
+          "SetKernelObjectSecurity",
+          "SetSecurityDescriptorControl",
+          "SetSecurityDescriptorDacl",
+          "SetSecurityDescriptorOwner",
+          "SetSecurityInfo",
+          "SystemFunction036"
+        ],
+        "api-ms-win-core-synch-l1-2-0.dll": [
+          "WaitOnAddress",
+          "WakeByAddressAll",
+          "WakeByAddressSingle"
+        ],
+        "api-ms-win-crt-convert-l1-1-0.dll": [
+          "strtod",
+          "strtol"
+        ],
+        "api-ms-win-crt-environment-l1-1-0.dll": [
+          "_wgetenv",
+          "getenv"
+        ],
+        "api-ms-win-crt-heap-l1-1-0.dll": [
+          "_msize",
+          "_set_new_mode",
+          "calloc",
+          "free",
+          "malloc",
+          "realloc"
+        ],
+        "api-ms-win-crt-locale-l1-1-0.dll": [
+          "_configthreadlocale"
+        ],
+        "api-ms-win-crt-math-l1-1-0.dll": [
+          "__setusermatherr",
+          "_dclass",
+          "_dsign",
+          "_fdsign",
+          "_hypot",
+          "_ldsign",
+          "acos",
+          "acosh",
+          "asin",
+          "asinh",
+          "atan",
+          "atan2",
+          "atanh",
+          "cbrt",
+          "copysign",
+          "cos",
+          "cosh",
+          "exp",
+          "exp2",
+          "expf",
+          "expm1",
+          "fmod",
+          "frexp",
+          "hypot",
+          "ldexp",
+          "log",
+          "log10",
+          "log10f",
+          "log1p",
+          "log2",
+          "lrint",
+          "modf",
+          "pow",
+          "powf",
+          "round",
+          "scalbn",
+          "sin",
+          "sinf",
+          "sinh",
+          "sqrt",
+          "tan",
+          "tanh",
+          "trunc"
+        ],
+        "api-ms-win-crt-runtime-l1-1-0.dll": [
+          "__p___argc",
+          "__p___argv",
+          "_beginthreadex",
+          "_c_exit",
+          "_cexit",
+          "_configure_narrow_argv",
+          "_crt_atexit",
+          "_endthreadex",
+          "_errno",
+          "_exit",
+          "_get_initial_narrow_environment",
+          "_initialize_narrow_environment",
+          "_initialize_onexit_table",
+          "_initterm",
+          "_initterm_e",
+          "_register_onexit_function",
+          "_register_thread_local_exe_atexit_callback",
+          "_seh_filter_exe",
+          "_set_app_type",
+          "_wassert",
+          "abort",
+          "exit",
+          "signal",
+          "strerror",
+          "terminate"
+        ],
+        "api-ms-win-crt-stdio-l1-1-0.dll": [
+          "__acrt_iob_func",
+          "__p__commode",
+          "__stdio_common_vfprintf",
+          "__stdio_common_vsnprintf_s",
+          "__stdio_common_vsprintf",
+          "__stdio_common_vsprintf_s",
+          "__stdio_common_vsscanf",
+          "_fileno",
+          "_set_fmode",
+          "_setmode",
+          "clearerr",
+          "fclose",
+          "feof",
+          "ferror",
+          "fflush",
+          "fgets",
+          "fopen",
+          "fputs",
+          "fread",
+          "fseek",
+          "ftell",
+          "fwrite",
+          "putchar"
+        ],
+        "api-ms-win-crt-string-l1-1-0.dll": [
+          "strcat_s",
+          "strcmp",
+          "strcspn",
+          "strlen",
+          "strncmp",
+          "strspn",
+          "wcslen"
+        ],
+        "api-ms-win-crt-time-l1-1-0.dll": [
+          "_localtime64_s"
+        ],
+        "api-ms-win-crt-utility-l1-1-0.dll": [
+          "bsearch",
+          "qsort",
+          "qsort_s"
+        ],
+        "bcrypt.dll": [
+          "BCryptGenRandom"
+        ],
+        "bcryptprimitives.dll": [
+          "ProcessPrng"
+        ],
+        "combase.dll": [
+          "CoTaskMemFree"
+        ],
+        "crypt32.dll": [
+          "CertAddEncodedCertificateToStore",
+          "CertCloseStore",
+          "CertCreateCertificateChainEngine",
+          "CertFreeCertificateChain",
+          "CertFreeCertificateChainEngine",
+          "CertFreeCertificateContext",
+          "CertGetCertificateChain",
+          "CertOpenStore",
+          "CertSetCertificateContextProperty",
+          "CertVerifyCertificateChainPolicy"
+        ],
+        "kernel32.dll": [
+          "AcquireSRWLockExclusive",
+          "AcquireSRWLockShared",
+          "AddVectoredExceptionHandler",
+          "AreFileApisANSI",
+          "AssignProcessToJobObject",
+          "CancelIo",
+          "CancelIoEx",
+          "CloseHandle",
+          "CompareStringOrdinal",
+          "ConnectNamedPipe",
+          "CopyFileExW",
+          "CreateConsoleScreenBuffer",
+          "CreateDirectoryW",
+          "CreateEventW",
+          "CreateFileA",
+          "CreateFileMappingW",
+          "CreateFileW",
+          "CreateIoCompletionPort",
+          "CreateJobObjectW",
+          "CreateMutexA",
+          "CreateMutexW",
+          "CreateNamedPipeW",
+          "CreatePipe",
+          "CreateProcessW",
+          "CreateThread",
+          "CreateToolhelp32Snapshot",
+          "CreateWaitableTimerExW",
+          "DeleteCriticalSection",
+          "DeleteFileA",
+          "DeleteFileW",
+          "DeleteProcThreadAttributeList",
+          "DeviceIoControl",
+          "DisconnectNamedPipe",
+          "DuplicateHandle",
+          "EnterCriticalSection",
+          "ExitProcess",
+          "ExpandEnvironmentStringsW",
+          "FillConsoleOutputAttribute",
+          "FillConsoleOutputCharacterA",
+          "FindClose",
+          "FindFirstFileExW",
+          "FindNextFileW",
+          "FlsAlloc",
+          "FlsFree",
+          "FlsSetValue",
+          "FlushFileBuffers",
+          "FlushViewOfFile",
+          "FormatMessageA",
+          "FormatMessageW",
+          "FreeEnvironmentStringsW",
+          "FreeLibrary",
+          "GetCommandLineW",
+          "GetConsoleMode",
+          "GetConsoleOutputCP",
+          "GetConsoleScreenBufferInfo",
+          "GetConsoleWindow",
+          "GetCurrentDirectoryW",
+          "GetCurrentProcess",
+          "GetCurrentProcessId",
+          "GetCurrentProcessorNumber",
+          "GetCurrentThread",
+          "GetCurrentThreadId",
+          "GetDiskFreeSpaceA",
+          "GetDiskFreeSpaceW",
+          "GetEnvironmentStringsW",
+          "GetEnvironmentVariableA",
+          "GetEnvironmentVariableW",
+          "GetExitCodeProcess",
+          "GetFileAttributesA",
+          "GetFileAttributesExW",
+          "GetFileAttributesW",
+          "GetFileInformationByHandle",
+          "GetFileInformationByHandleEx",
+          "GetFileSize",
+          "GetFileType",
+          "GetFinalPathNameByHandleW",
+          "GetFullPathNameA",
+          "GetFullPathNameW",
+          "GetLastError",
+          "GetModuleFileNameW",
+          "GetModuleHandleA",
+          "GetModuleHandleExA",
+          "GetModuleHandleExW",
+          "GetModuleHandleW",
+          "GetNamedPipeClientProcessId",
+          "GetNamedPipeInfo",
+          "GetNamedPipeServerProcessId",
+          "GetNativeSystemInfo",
+          "GetNumberOfConsoleInputEvents",
+          "GetOverlappedResult",
+          "GetProcAddress",
+          "GetProcessHeap",
+          "GetProcessId",
+          "GetProcessTimes",
+          "GetQueuedCompletionStatusEx",
+          "GetStdHandle",
+          "GetSystemDirectoryW",
+          "GetSystemInfo",
+          "GetSystemTime",
+          "GetSystemTimeAsFileTime",
+          "GetSystemTimePreciseAsFileTime",
+          "GetTempPathA",
+          "GetTempPathW",
+          "GetTickCount",
+          "GetTimeZoneInformation",
+          "GetTimeZoneInformationForYear",
+          "GetWindowsDirectoryW",
+          "GlobalAlloc",
+          "GlobalFree",
+          "GlobalLock",
+          "GlobalSize",
+          "GlobalUnlock",
+          "HeapAlloc",
+          "HeapCompact",
+          "HeapCreate",
+          "HeapDestroy",
+          "HeapFree",
+          "HeapReAlloc",
+          "HeapSize",
+          "HeapValidate",
+          "InitOnceExecuteOnce",
+          "InitializeConditionVariable",
+          "InitializeCriticalSection",
+          "InitializeProcThreadAttributeList",
+          "InitializeSListHead",
+          "InitializeSRWLock",
+          "IsProcessorFeaturePresent",
+          "IsThreadAFiber",
+          "LeaveCriticalSection",
+          "LoadLibraryA",
+          "LoadLibraryExA",
+          "LoadLibraryExW",
+          "LoadLibraryW",
+          "LocalFree",
+          "LockFile",
+          "LockFileEx",
+          "MapViewOfFile",
+          "MoveFileExW",
+          "MultiByteToWideChar",
+          "OpenProcess",
+          "OpenThread",
+          "OutputDebugStringA",
+          "OutputDebugStringW",
+          "PostQueuedCompletionStatus",
+          "Process32FirstW",
+          "Process32NextW",
+          "QueryInformationJobObject",
+          "QueryPerformanceCounter",
+          "QueryPerformanceFrequency",
+          "RaiseException",
+          "ReOpenFile",
+          "ReadConsoleInputW",
+          "ReadConsoleW",
+          "ReadFile",
+          "ReadFileEx",
+          "RegisterWaitForSingleObject",
+          "ReleaseMutex",
+          "ReleaseSRWLockExclusive",
+          "ReleaseSRWLockShared",
+          "RemoveDirectoryW",
+          "ReplaceFileW",
+          "ResumeThread",
+          "RtlCaptureContext",
+          "RtlLookupFunctionEntry",
+          "RtlVirtualUnwind",
+          "SetConsoleActiveScreenBuffer",
+          "SetConsoleCP",
+          "SetConsoleCtrlHandler",
+          "SetConsoleCursorInfo",
+          "SetConsoleCursorPosition",
+          "SetConsoleMode",
+          "SetConsoleOutputCP",
+          "SetConsoleTextAttribute",
+          "SetEndOfFile",
+          "SetEnvironmentVariableW",
+          "SetErrorMode",
+          "SetFileAttributesW",
+          "SetFileCompletionNotificationModes",
+          "SetFileInformationByHandle",
+          "SetFilePointer",
+          "SetFilePointerEx",
+          "SetFileTime",
+          "SetHandleInformation",
+          "SetInformationJobObject",
+          "SetLastError",
+          "SetNamedPipeHandleState",
+          "SetStdHandle",
+          "SetThreadStackGuarantee",
+          "SetUnhandledExceptionFilter",
+          "SetWaitableTimer",
+          "Sleep",
+          "SleepConditionVariableCS",
+          "SleepEx",
+          "SwitchToThread",
+          "SystemTimeToFileTime",
+          "TerminateJobObject",
+          "TerminateProcess",
+          "Thread32First",
+          "Thread32Next",
+          "TlsAlloc",
+          "TlsFree",
+          "TlsGetValue",
+          "TlsSetValue",
+          "TryAcquireSRWLockShared",
+          "TryEnterCriticalSection",
+          "UnlockFile",
+          "UnlockFileEx",
+          "UnmapViewOfFile",
+          "UnregisterWaitEx",
+          "UpdateProcThreadAttribute",
+          "VirtualAlloc",
+          "VirtualFree",
+          "VirtualProtect",
+          "VirtualQuery",
+          "WaitForMultipleObjects",
+          "WaitForSingleObject",
+          "WaitForSingleObjectEx",
+          "WakeConditionVariable",
+          "WideCharToMultiByte",
+          "WriteConsoleA",
+          "WriteConsoleW",
+          "WriteFile",
+          "WriteFileEx",
+          "lstrlenW"
+        ],
+        "msvcp140.dll": [
+          "?get_new_handler@std@@YAP6AXXZXZ"
+        ],
+        "ntdll.dll": [
+          "NtCancelIoFileEx",
+          "NtCreateFile",
+          "NtCreateNamedPipeFile",
+          "NtDeviceIoControlFile",
+          "NtOpenFile",
+          "NtReadFile",
+          "NtSetInformationFile",
+          "NtWriteFile",
+          "RtlNtStatusToDosError"
+        ],
+        "oleaut32.dll": [
+          "SysFreeString",
+          "SysStringLen"
+        ],
+        "shell32.dll": [
+          "SHGetKnownFolderPath"
+        ],
+        "shlwapi.dll": [
+          "AssocQueryStringW"
+        ],
+        "user32.dll": [
+          "CloseClipboard",
+          "EmptyClipboard",
+          "EnumWindows",
+          "GetClipboardData",
+          "GetForegroundWindow",
+          "GetKeyboardLayout",
+          "GetWindow",
+          "GetWindowInfo",
+          "GetWindowRect",
+          "GetWindowThreadProcessId",
+          "IsClipboardFormatAvailable",
+          "IsWindowVisible",
+          "MessageBeep",
+          "OpenClipboard",
+          "RegisterClipboardFormatW",
+          "SetClipboardData",
+          "SetWindowPos",
+          "ShowWindowAsync",
+          "ToUnicodeEx"
+        ],
+        "userenv.dll": [
+          "CreateAppContainerProfile",
+          "DeleteAppContainerProfile",
+          "GetUserProfileDirectoryW"
+        ],
+        "vcruntime140.dll": [
+          "_CxxThrowException",
+          "__C_specific_handler",
+          "__CxxFrameHandler3",
+          "__current_exception",
+          "__current_exception_context",
+          "__std_terminate",
+          "memchr",
+          "memcmp",
+          "memcpy",
+          "memmove",
+          "memset",
+          "strchr",
+          "strrchr",
+          "strstr"
+        ],
+        "winmm.dll": [
+          "PlaySoundW"
+        ],
+        "ws2_32.dll": [
+          "WSAGetLastError",
+          "WSAIoctl",
+          "WSASend",
+          "WSASocketW",
+          "WSAStartup",
+          "accept",
+          "bind",
+          "closesocket",
+          "connect",
+          "freeaddrinfo",
+          "getaddrinfo",
+          "getpeername",
+          "getsockname",
+          "getsockopt",
+          "ioctlsocket",
+          "listen",
+          "recv",
+          "send",
+          "setsockopt",
+          "shutdown"
+        ]
+      },
+      "minimumSupportedBuild": null
+    },
+    "windows-x86": {
+      "floor": "Windows 10 x64 1607 (build 14393), x86 NSIS setup/plugins under WOW64",
+      "osArchitecture": "x64",
+      "qualification": {
+        "result": "PASS",
+        "kind": "189 documented Microsoft named API minima plus explicit x86 ordinal contract identity",
+        "evidence": {
+          "releaseAsset": "https://github.com/codewhale-hq/Codewhale/releases/download/v0.10.1/CodeWhaleSetup.exe",
+          "releaseAssetSha256": "026efe80160c86c776f254bdcfdd1f1ee71ec1cecddaa3ad229c52a1b4c0c27e",
+          "size": 45831082,
+          "inspection": "SHA matched GitHub release asset digest; non-executing 7-Zip extraction of exact embedded plugin bytes; llvm-objdump static import dump",
+          "images": [
+            {
+              "name": "CodeWhaleSetup-v0.10.1.exe",
+              "sha256": "026efe80160c86c776f254bdcfdd1f1ee71ec1cecddaa3ad229c52a1b4c0c27e",
+              "machine": "windows-x86",
+              "staticImportCount": 163,
+              "delayImportRva": 0,
+              "delayImportSize": 0
+            },
+            {
+              "name": "System.dll",
+              "sha256": "afe032f942e2ed0bf7494ec08ba813f5739fb522c640bde81d30ecaf9f894432",
+              "machine": "windows-x86",
+              "staticImportCount": 19,
+              "delayImportRva": 0,
+              "delayImportSize": 0
+            },
+            {
+              "name": "nsDialogs.dll",
+              "sha256": "9c76f4d53ceee2a471c936e0899688405e1009ce962d140e9acb49ed68d114cb",
+              "machine": "windows-x86",
+              "staticImportCount": 54,
+              "delayImportRva": 0,
+              "delayImportSize": 0
+            }
+          ]
+        },
+        "runtimeAcceptance": "Documented API contracts/static identity only; no historical or candidate installer/uninstaller executed and actual14393 install/runtime acceptance still required",
+        "ordinal": {
+          "dll": "comctl32.dll",
+          "ordinal": 17,
+          "api": "InitCommonControls",
+          "minimumClient": "Windows Vista",
+          "minimumSource": "https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-initcommoncontrols",
+          "sdk": "10.0.26100.0 x86 ComCtl32.Lib: _InitCommonControls@0, ordinal17",
+          "stockExport": "Windows11ARM64 SysWOW64 comctl32.dll, PE machine14C, ordinal17=InitCommonControls",
+          "sdkLibrary": "Windows SDK 10.0.26100.0 um/x86/ComCtl32.Lib",
+          "sdkImportRecord": {
+            "machine": "14C (x86)",
+            "dll": "COMCTL32.dll",
+            "symbol": "_InitCommonControls@0",
+            "type": "code",
+            "nameType": "ordinal",
+            "ordinal": 17
+          },
+          "stockExportRecord": {
+            "os": "Windows11ARM64 build26300",
+            "module": "SysWOW64/comctl32.dll",
+            "machine": "14C (x86)",
+            "ordinal": 17,
+            "name": "InitCommonControls",
+            "rva": "0001F000"
+          }
+        },
+        "namedApiContracts": [
+          {
+            "dll": "advapi32.dll",
+            "symbol": "AdjustTokenPrivileges",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-adjusttokenprivileges"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "LookupPrivilegeValueW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lookupprivilegevaluew"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "OpenProcessToken",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocesstoken"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegCloseKey",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regclosekey"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegCreateKeyExW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regcreatekeyexw"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegDeleteKeyW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletekeyw"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegDeleteValueW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletevaluew"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegEnumKeyW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regenumkeyw"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegEnumValueW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regenumvaluew"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegOpenKeyExW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regopenkeyexw"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegQueryValueExW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regqueryvalueexw"
+          },
+          {
+            "dll": "advapi32.dll",
+            "symbol": "RegSetValueExW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regsetvalueexw"
+          },
+          {
+            "dll": "comctl32.dll",
+            "symbol": "ImageList_AddMasked",
+            "minimumClient": "Windows\u00a0Vista [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-imagelist_addmasked"
+          },
+          {
+            "dll": "comctl32.dll",
+            "symbol": "ImageList_Create",
+            "minimumClient": "Windows\u00a0Vista [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-imagelist_create"
+          },
+          {
+            "dll": "comctl32.dll",
+            "symbol": "ImageList_Destroy",
+            "minimumClient": "Windows\u00a0Vista [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-imagelist_destroy"
+          },
+          {
+            "dll": "comdlg32.dll",
+            "symbol": "CommDlgExtendedError",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/commdlg/nf-commdlg-commdlgextendederror"
+          },
+          {
+            "dll": "comdlg32.dll",
+            "symbol": "GetOpenFileNameW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/commdlg/nf-commdlg-getopenfilenamew"
+          },
+          {
+            "dll": "comdlg32.dll",
+            "symbol": "GetSaveFileNameW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/commdlg/nf-commdlg-getsavefilenamew"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "CreateBrushIndirect",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createbrushindirect"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "CreateFontIndirectW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createfontindirectw"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "DeleteObject",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "GetDeviceCaps",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getdevicecaps"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "SelectObject",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-selectobject"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "SetBkColor",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setbkcolor"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "SetBkMode",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setbkmode"
+          },
+          {
+            "dll": "gdi32.dll",
+            "symbol": "SetTextColor",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-settextcolor"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "CloseHandle",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-closehandle"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "CompareFileTime",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-comparefiletime"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "CopyFileW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-copyfilew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "CreateDirectoryW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "CreateFileW",
+            "minimumClient": "Windows XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "CreateProcessW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "CreateThread",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createthread"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "DeleteFileW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "ExitProcess",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "ExpandEnvironmentStringsW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-expandenvironmentstringsw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "FindClose",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findclose"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "FindFirstFileW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "FindNextFileW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findnextfilew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "FreeLibrary",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freelibrary"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetCommandLineW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getcommandlinew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetCurrentDirectoryW",
+            "minimumClient": "Windows XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getcurrentdirectory",
+            "encodingVariant": "Unicode W variant of the documented TCHAR API",
+            "supplementalExportSource": "https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ee391646(v=vs.85)"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetCurrentProcess",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetDiskFreeSpaceW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespacew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetExitCodeProcess",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetFileAttributesW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetFileSize",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfilesize"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetFullPathNameW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfullpathnamew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetLastError",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-getlasterror"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetModuleFileNameW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulefilenamew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetModuleHandleA",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlea"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetModuleHandleW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetPrivateProfileStringW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprivateprofilestringw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetProcAddress",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetProcessHeap",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-getprocessheap"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetShortPathNameW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getshortpathnamew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetSystemDirectoryW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemdirectoryw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetTempFileNameW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettempfilenamew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetTempPathW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetTickCount",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetVersionExW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getversionexw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GetWindowsDirectoryW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getwindowsdirectoryw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GlobalAlloc",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalalloc"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GlobalFree",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalfree"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GlobalLock",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globallock"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GlobalSize",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalsize"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "GlobalUnlock",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalunlock"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "HeapAlloc",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "HeapFree",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapfree"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "HeapReAlloc",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "LoadLibraryExW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "LoadLibraryW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "MoveFileExW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "MoveFileW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefilew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "MulDiv",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-muldiv"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "MultiByteToWideChar",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-multibytetowidechar"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "ReadFile",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "RemoveDirectoryW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "SearchPathW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-searchpathw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "SetCurrentDirectoryW",
+            "minimumClient": "Windows XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setcurrentdirectory",
+            "encodingVariant": "Unicode W variant of the documented TCHAR API",
+            "supplementalExportSource": "https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ee391646(v=vs.85)"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "SetEnvironmentVariableW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-setenvironmentvariablew"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "SetErrorMode",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-seterrormode"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "SetFileAttributesW",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileattributesw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "SetFilePointer",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfilepointer"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "SetFileTime",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfiletime"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "Sleep",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleep"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "VirtualAlloc",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "VirtualFree",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "VirtualProtect",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualprotect"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "WaitForSingleObject",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "WideCharToMultiByte",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-widechartomultibyte"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "WriteFile",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "WritePrivateProfileStringW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-writeprivateprofilestringw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrcatW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcatw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrcmpW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcmpw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrcmpiA",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcmpia"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrcmpiW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcmpiw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrcpyA",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcpya"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrcpyW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcpyw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrcpynW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcpynw"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrlenA",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrlena"
+          },
+          {
+            "dll": "kernel32.dll",
+            "symbol": "lstrlenW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrlenw"
+          },
+          {
+            "dll": "ole32.dll",
+            "symbol": "CLSIDFromString",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-clsidfromstring"
+          },
+          {
+            "dll": "ole32.dll",
+            "symbol": "CoCreateInstance",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cocreateinstance"
+          },
+          {
+            "dll": "ole32.dll",
+            "symbol": "CoTaskMemFree",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cotaskmemfree"
+          },
+          {
+            "dll": "ole32.dll",
+            "symbol": "IIDFromString",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-iidfromstring"
+          },
+          {
+            "dll": "ole32.dll",
+            "symbol": "OleInitialize",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/ole2/nf-ole2-oleinitialize"
+          },
+          {
+            "dll": "ole32.dll",
+            "symbol": "OleUninitialize",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/ole2/nf-ole2-oleuninitialize"
+          },
+          {
+            "dll": "ole32.dll",
+            "symbol": "StringFromGUID2",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-stringfromguid2"
+          },
+          {
+            "dll": "shell32.dll",
+            "symbol": "SHBrowseForFolderW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shbrowseforfolderw"
+          },
+          {
+            "dll": "shell32.dll",
+            "symbol": "SHFileOperationW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shfileoperationw"
+          },
+          {
+            "dll": "shell32.dll",
+            "symbol": "SHGetFileInfoW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shgetfileinfow"
+          },
+          {
+            "dll": "shell32.dll",
+            "symbol": "SHGetPathFromIDListW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetpathfromidlistw"
+          },
+          {
+            "dll": "shell32.dll",
+            "symbol": "ShellExecuteExW",
+            "minimumClient": "Windows\u00a0XP [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "AppendMenuW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-appendmenuw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "BeginPaint",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-beginpaint"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CallWindowProcW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-callwindowprocw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CharNextA",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-charnexta"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CharNextW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-charnextw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CharPrevW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-charprevw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CheckDlgButton",
+            "minimumClient": "Windows\u00a0Vista [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-checkdlgbutton"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CloseClipboard",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-closeclipboard"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CreateDialogParamW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createdialogparamw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CreatePopupMenu",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createpopupmenu"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "CreateWindowExW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createwindowexw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "DefWindowProcW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-defwindowprocw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "DestroyWindow",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroywindow"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "DialogBoxParamW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dialogboxparamw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "DispatchMessageW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dispatchmessagew"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "DrawFocusRect",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-drawfocusrect"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "DrawTextW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-drawtextw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "EmptyClipboard",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-emptyclipboard"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "EnableMenuItem",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enablemenuitem"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "EnableWindow",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enablewindow"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "EndDialog",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enddialog"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "EndPaint",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-endpaint"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "ExitWindowsEx",
+            "minimumClient": "Windows\u00a0XP [desktop apps | UWP apps]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-exitwindowsex"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "FillRect",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-fillrect"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "FindWindowExW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-findwindowexw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetClassInfoW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassinfow"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetClientRect",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclientrect"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetDC",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdc"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetDlgItem",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdlgitem"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetDlgItemTextW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdlgitemtextw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetMessagePos",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessagepos"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetMessageW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessagew"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetPropW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getpropw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetSysColor",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsyscolor"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetSystemMenu",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmenu"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetSystemMetrics",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmetrics"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetWindowLongW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowlongw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetWindowRect",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "GetWindowTextW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "InvalidateRect",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-invalidaterect"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "IsDialogMessageW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isdialogmessagew"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "IsWindow",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "IsWindowEnabled",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowenabled"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "IsWindowVisible",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "KillTimer",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-killtimer"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "LoadCursorW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadcursorw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "LoadImageW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "MapDialogRect",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mapdialogrect"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "MapWindowPoints",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mapwindowpoints"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "MessageBoxIndirectW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messageboxindirectw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "OpenClipboard",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "PeekMessageW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-peekmessagew"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "PostQuitMessage",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postquitmessage"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "RegisterClassW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerclassw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "ReleaseDC",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-releasedc"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "RemovePropW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-removepropw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "ScreenToClient",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-screentoclient"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SendMessageTimeoutW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SendMessageW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagew"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetClassLongW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclasslongw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetClipboardData",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclipboarddata"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetCursor",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setcursor"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetDlgItemTextW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setdlgitemtextw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetForegroundWindow",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetPropW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setpropw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetTimer",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-settimer"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetWindowLongW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowlongw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetWindowPos",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SetWindowTextW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowtextw"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "ShowWindow",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "SystemParametersInfoW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-systemparametersinfow"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "TrackPopupMenu",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-trackpopupmenu"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "TranslateMessage",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-translatemessage"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "wsprintfA",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-wsprintfa"
+          },
+          {
+            "dll": "user32.dll",
+            "symbol": "wsprintfW",
+            "minimumClient": "Windows\u00a02000 Professional [desktop apps only]",
+            "source": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-wsprintfw"
+          }
+        ]
+      },
+      "imports": {
+        "advapi32.dll": [
+          "AdjustTokenPrivileges",
+          "LookupPrivilegeValueW",
+          "OpenProcessToken",
+          "RegCloseKey",
+          "RegCreateKeyExW",
+          "RegDeleteKeyW",
+          "RegDeleteValueW",
+          "RegEnumKeyW",
+          "RegEnumValueW",
+          "RegOpenKeyExW",
+          "RegQueryValueExW",
+          "RegSetValueExW"
+        ],
+        "comctl32.dll": [
+          "#17",
+          "ImageList_AddMasked",
+          "ImageList_Create",
+          "ImageList_Destroy"
+        ],
+        "comdlg32.dll": [
+          "CommDlgExtendedError",
+          "GetOpenFileNameW",
+          "GetSaveFileNameW"
+        ],
+        "gdi32.dll": [
+          "CreateBrushIndirect",
+          "CreateFontIndirectW",
+          "DeleteObject",
+          "GetDeviceCaps",
+          "SelectObject",
+          "SetBkColor",
+          "SetBkMode",
+          "SetTextColor"
+        ],
+        "kernel32.dll": [
+          "CloseHandle",
+          "CompareFileTime",
+          "CopyFileW",
+          "CreateDirectoryW",
+          "CreateFileW",
+          "CreateProcessW",
+          "CreateThread",
+          "DeleteFileW",
+          "ExitProcess",
+          "ExpandEnvironmentStringsW",
+          "FindClose",
+          "FindFirstFileW",
+          "FindNextFileW",
+          "FreeLibrary",
+          "GetCommandLineW",
+          "GetCurrentDirectoryW",
+          "GetCurrentProcess",
+          "GetDiskFreeSpaceW",
+          "GetExitCodeProcess",
+          "GetFileAttributesW",
+          "GetFileSize",
+          "GetFullPathNameW",
+          "GetLastError",
+          "GetModuleFileNameW",
+          "GetModuleHandleA",
+          "GetModuleHandleW",
+          "GetPrivateProfileStringW",
+          "GetProcAddress",
+          "GetProcessHeap",
+          "GetShortPathNameW",
+          "GetSystemDirectoryW",
+          "GetTempFileNameW",
+          "GetTempPathW",
+          "GetTickCount",
+          "GetVersionExW",
+          "GetWindowsDirectoryW",
+          "GlobalAlloc",
+          "GlobalFree",
+          "GlobalLock",
+          "GlobalSize",
+          "GlobalUnlock",
+          "HeapAlloc",
+          "HeapFree",
+          "HeapReAlloc",
+          "LoadLibraryExW",
+          "LoadLibraryW",
+          "MoveFileExW",
+          "MoveFileW",
+          "MulDiv",
+          "MultiByteToWideChar",
+          "ReadFile",
+          "RemoveDirectoryW",
+          "SearchPathW",
+          "SetCurrentDirectoryW",
+          "SetEnvironmentVariableW",
+          "SetErrorMode",
+          "SetFileAttributesW",
+          "SetFilePointer",
+          "SetFileTime",
+          "Sleep",
+          "VirtualAlloc",
+          "VirtualFree",
+          "VirtualProtect",
+          "WaitForSingleObject",
+          "WideCharToMultiByte",
+          "WriteFile",
+          "WritePrivateProfileStringW",
+          "lstrcatW",
+          "lstrcmpW",
+          "lstrcmpiA",
+          "lstrcmpiW",
+          "lstrcpyA",
+          "lstrcpyW",
+          "lstrcpynW",
+          "lstrlenA",
+          "lstrlenW"
+        ],
+        "ole32.dll": [
+          "CLSIDFromString",
+          "CoCreateInstance",
+          "CoTaskMemFree",
+          "IIDFromString",
+          "OleInitialize",
+          "OleUninitialize",
+          "StringFromGUID2"
+        ],
+        "shell32.dll": [
+          "SHBrowseForFolderW",
+          "SHFileOperationW",
+          "SHGetFileInfoW",
+          "SHGetPathFromIDListW",
+          "ShellExecuteExW"
+        ],
+        "user32.dll": [
+          "AppendMenuW",
+          "BeginPaint",
+          "CallWindowProcW",
+          "CharNextA",
+          "CharNextW",
+          "CharPrevW",
+          "CheckDlgButton",
+          "CloseClipboard",
+          "CreateDialogParamW",
+          "CreatePopupMenu",
+          "CreateWindowExW",
+          "DefWindowProcW",
+          "DestroyWindow",
+          "DialogBoxParamW",
+          "DispatchMessageW",
+          "DrawFocusRect",
+          "DrawTextW",
+          "EmptyClipboard",
+          "EnableMenuItem",
+          "EnableWindow",
+          "EndDialog",
+          "EndPaint",
+          "ExitWindowsEx",
+          "FillRect",
+          "FindWindowExW",
+          "GetClassInfoW",
+          "GetClientRect",
+          "GetDC",
+          "GetDlgItem",
+          "GetDlgItemTextW",
+          "GetMessagePos",
+          "GetMessageW",
+          "GetPropW",
+          "GetSysColor",
+          "GetSystemMenu",
+          "GetSystemMetrics",
+          "GetWindowLongW",
+          "GetWindowRect",
+          "GetWindowTextW",
+          "InvalidateRect",
+          "IsDialogMessageW",
+          "IsWindow",
+          "IsWindowEnabled",
+          "IsWindowVisible",
+          "KillTimer",
+          "LoadCursorW",
+          "LoadImageW",
+          "MapDialogRect",
+          "MapWindowPoints",
+          "MessageBoxIndirectW",
+          "OpenClipboard",
+          "PeekMessageW",
+          "PostQuitMessage",
+          "RegisterClassW",
+          "ReleaseDC",
+          "RemovePropW",
+          "ScreenToClient",
+          "SendMessageTimeoutW",
+          "SendMessageW",
+          "SetClassLongW",
+          "SetClipboardData",
+          "SetCursor",
+          "SetDlgItemTextW",
+          "SetForegroundWindow",
+          "SetPropW",
+          "SetTimer",
+          "SetWindowLongW",
+          "SetWindowPos",
+          "SetWindowTextW",
+          "ShowWindow",
+          "SystemParametersInfoW",
+          "TrackPopupMenu",
+          "TranslateMessage",
+          "wsprintfA",
+          "wsprintfW"
+        ]
+      }
+    }
+  },
+  "purpose": "Static import contract qualification only. A profile PASS does not certify the final release executable, installer, minimum OS build, ordinary-user behavior, or all product features."
+}

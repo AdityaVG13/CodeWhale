@@ -22,9 +22,9 @@ use crate::tui::history::{
     CellFoldAction, CellFoldActionTarget, HistoryCell, TranscriptActionOwner, TranscriptFold,
     TranscriptRenderOptions,
 };
-use crate::tui::scrolling::TranscriptLineMeta;
-use crate::tui::ui_text::CopyLineSeparator;
 use codewhale_localization::{MessageId, tr};
+use codewhale_tui_kit::scrolling::TranscriptLineMeta;
+use codewhale_tui_kit::ui_text::CopyLineSeparator;
 
 /// Revision-bound render output. Arcs keep cache enumeration O(cells) instead
 /// of deep-cloning every rendered line on ambient frames (issue #78); the
@@ -38,7 +38,7 @@ struct CachedCell {
     /// newlines while allowing copy to remove visual soft-wrap breaks; prefix
     /// widths strip visual rails. All four vectors remain index-aligned.
     lines: Arc<Vec<Line<'static>>>,
-    links: Arc<Vec<Vec<crate::tui::osc8::LineLink>>>,
+    links: Arc<Vec<Vec<codewhale_tui_kit::osc8::LineLink>>>,
     copy_separators: Arc<Vec<CopyLineSeparator>>,
     copy_prefix_widths: Arc<Vec<usize>>,
     /// Empty/blank facts keep spacing decisions independent of rendered text.
@@ -52,7 +52,8 @@ struct CachedCell {
     fold_action: Option<CellFoldAction>,
     /// Only the changing Assistant cell carries incremental parser state;
     /// stable lines stay above its replaceable-tail index.
-    incremental_markdown: Option<Box<crate::tui::markdown_render::IncrementalMarkdownRenderCache>>,
+    incremental_markdown:
+        Option<Box<codewhale_tui_kit::markdown_render::IncrementalMarkdownRenderCache>>,
     /// Settled form of the animation-mutated hot tail, restored on append so
     /// the stable prefix is not reparsed.
     hot_tail_original: Option<(usize, Line<'static>)>,
@@ -141,8 +142,16 @@ pub struct TranscriptViewCache {
     /// first-changed-cell search compare this against the caller's revisions
     /// without touching a single cached render (#6652).
     seen_revisions: Vec<u64>,
+    /// Caller-supplied whole-vector freshness key (history_version, history
+    /// length, active revision, active length hashed together). A match proves
+    /// the revision vector is identical to the previously accepted frame, so
+    /// the O(n) unchanged-prefix scan can be skipped (#6652 steady state).
+    /// `None` until a frame both supplies and accepts a key.
+    accepted_revision_key: Option<u64>,
+    /// Key staged by `note_revision_key` for the next `ensure_*` call.
+    pending_revision_key: Option<u64>,
     lines: Vec<Line<'static>>,
-    line_links: Vec<Vec<crate::tui::osc8::LineLink>>,
+    line_links: Vec<Vec<codewhale_tui_kit::osc8::LineLink>>,
     line_meta: Vec<TranscriptLineMeta>,
     /// Visual-only prefix widths let selection copy strip rails without glyph guesses.
     rail_prefix_widths: Vec<usize>,
@@ -157,6 +166,11 @@ pub struct TranscriptViewCache {
     /// renders nothing.
     #[cfg(test)]
     cells_rendered: u64,
+    /// Times the unchanged-prefix revision scan ran. Proves the keyed
+    /// steady state skips it (#6652): a key match must not scan, while a
+    /// missing or mismatched key must.
+    #[cfg(test)]
+    revision_scan_runs: u64,
 }
 
 impl TranscriptViewCache {
@@ -174,6 +188,8 @@ impl TranscriptViewCache {
             fold_action_rendered_cell: None,
             per_cell: Vec::new(),
             seen_revisions: Vec::new(),
+            accepted_revision_key: None,
+            pending_revision_key: None,
             lines: Vec::new(),
             line_links: Vec::new(),
             line_meta: Vec::new(),
@@ -184,6 +200,8 @@ impl TranscriptViewCache {
             streaming_meta_rows_scanned: 0,
             #[cfg(test)]
             cells_rendered: 0,
+            #[cfg(test)]
+            revision_scan_runs: 0,
         }
     }
 
@@ -195,7 +213,7 @@ impl TranscriptViewCache {
     pub(crate) fn streaming_render_work(
         &self,
         cell_index: usize,
-    ) -> Option<crate::tui::markdown_render::MarkdownRenderWork> {
+    ) -> Option<codewhale_tui_kit::markdown_render::MarkdownRenderWork> {
         self.per_cell
             .get(cell_index)?
             .incremental_markdown
@@ -249,6 +267,46 @@ impl TranscriptViewCache {
             None,
             None,
         );
+    }
+
+    /// Stage a whole-vector revision freshness key for the next `ensure_*`
+    /// call. When the key equals the previously accepted frame's key, the
+    /// unchanged-prefix scan is skipped entirely (O(1) steady state). The
+    /// contract: every mutation that can change any cell revision supplied to
+    /// the cache must move at least one key component — `history_version`
+    /// (bumped by every history mutation helper), history length, the active
+    /// cell revision, the active entry count, or the projection generation
+    /// (view-level collapse state). A key that is merely stale degrades to
+    /// the ordinary full scan; only a key that misses a real mutation would
+    /// serve stale frames, which is why the composition is audited against
+    /// every `history_revisions` write site.
+    pub fn note_revision_key(&mut self, key: u64) {
+        self.pending_revision_key = Some(key);
+    }
+
+    /// Whether an `ensure_*` call with these inputs would be a no-op: the
+    /// staged revision key matches the accepted frame and every non-cell
+    /// cache input (width, options, folds, row count, action owner) is
+    /// unchanged. Pins every `ensure_iter` input — cell contents by the key
+    /// contract, layout by direct comparison, hint target by owner equality —
+    /// so the caller may skip building per-frame revision/ref vectors and
+    /// skip the call itself.
+    #[must_use]
+    pub fn keyed_skip_available(
+        &self,
+        width: u16,
+        options: TranscriptRenderOptions,
+        cell_folds: &HashMap<usize, TranscriptFold>,
+        total_cells: usize,
+        action_owner: Option<TranscriptActionOwner>,
+    ) -> bool {
+        self.pending_revision_key
+            .is_some_and(|key| self.accepted_revision_key == Some(key))
+            && self.width == width
+            && self.options == options
+            && self.cell_folds == *cell_folds
+            && self.seen_revisions.len() == total_cells
+            && self.transcript_action_owner == action_owner
     }
 
     /// Ensure logically concatenated shards without cloning history plus the
@@ -339,6 +397,15 @@ impl TranscriptViewCache {
         let layout_changed = self.width != width || self.options != options || identity_changed;
         let folded_changed = self.cell_folds != *cell_folds;
         let revisions_match = cell_revisions.len() == total_cells;
+        // Consume the staged whole-vector key: a match proves the revision
+        // vector is identical to the previously accepted frame, so the O(n)
+        // prefix scan below is redundant. A missing or mismatched key falls
+        // through to the ordinary scan.
+        let revision_key = self.pending_revision_key.take();
+        let revision_key_matches = revision_key.is_some_and(|key| {
+            self.accepted_revision_key
+                .is_some_and(|accepted| accepted == key)
+        });
         // Cells `0..unchanged` were rendered at exactly these revisions, so
         // their cached output (and what they are: kind, supersession) is
         // current. Layout, fold, or a mismatched revision vector (never
@@ -347,13 +414,23 @@ impl TranscriptViewCache {
         // looking at a cell (#6652).
         let mut unchanged = if layout_changed || folded_changed || !revisions_match {
             0
+        } else if revision_key_matches {
+            self.seen_revisions.len().min(total_cells)
         } else {
+            #[cfg(test)]
+            {
+                self.revision_scan_runs = self.revision_scan_runs.saturating_add(1);
+            }
             self.seen_revisions
                 .iter()
                 .zip(cell_revisions)
                 .position(|(seen, current)| seen != current)
                 .unwrap_or_else(|| self.seen_revisions.len().min(total_cells))
         };
+        // Accept the staged key for the next frame's comparison. A frame that
+        // stages none clears the accepted key so a later staged key can never
+        // match across an unkeyed frame.
+        self.accepted_revision_key = revision_key;
         // `todo_write` replaces the whole list on every call, so only the
         // newest snapshot is worth a full card (#5871). When a new one lands
         // the previous newest must re-render collapsed; its own revision has
@@ -696,7 +773,7 @@ impl TranscriptViewCache {
         line_in_cell: usize,
     ) -> (
         Line<'static>,
-        Vec<crate::tui::osc8::LineLink>,
+        Vec<codewhale_tui_kit::osc8::LineLink>,
         usize,
         TranscriptLineMeta,
     ) {
@@ -721,12 +798,16 @@ impl TranscriptViewCache {
             hinted
         });
         let line = hinted.as_ref().unwrap_or(line);
-        let rail = tool_group_rail(
-            self.per_cell.as_slice(),
-            cell_index,
-            line_in_cell,
-            rendered_line_count,
-        );
+        let rail = if self.options.calm_cards() && cached.is_tool_groupable {
+            (line_in_cell > 0).then_some(crate::tui::widgets::tool_card::CardRail::Indent)
+        } else {
+            tool_group_rail(
+                self.per_cell.as_slice(),
+                cell_index,
+                line_in_cell,
+                rendered_line_count,
+            )
+        };
         let final_line = line_with_group_rail(line, rail, usize::from(self.width));
         let final_links = if is_hint {
             Vec::new()
@@ -737,7 +818,11 @@ impl TranscriptViewCache {
                 usize::from(self.width),
             )
         };
-        let rail_prefix_width = compute_rail_prefix_width(&final_line);
+        let rail_prefix_width = if rail == Some(crate::tui::widgets::tool_card::CardRail::Indent) {
+            2 + compute_rail_prefix_width(line)
+        } else {
+            compute_rail_prefix_width(&final_line)
+        };
         let copy_prefix_width = if is_hint {
             final_line.width().saturating_sub(rail_prefix_width)
         } else {
@@ -895,8 +980,7 @@ impl TranscriptViewCache {
             let cached = &self.per_cell[cell_index];
             if let Some(next) = next_visible_cell(&self.per_cell, cell_index) {
                 let separator = separator_between(cached, next, spacing);
-                let rail = separator
-                    .railed
+                let rail = (separator.railed && !self.options.calm_cards())
                     .then_some(crate::tui::widgets::tool_card::CardRail::Middle);
                 for _ in 0..separator.rows {
                     let line = line_with_group_rail(&Line::from(""), rail, usize::from(self.width));
@@ -917,7 +1001,7 @@ impl TranscriptViewCache {
     }
 
     #[must_use]
-    pub fn line_links(&self) -> &[Vec<crate::tui::osc8::LineLink>] {
+    pub fn line_links(&self) -> &[Vec<codewhale_tui_kit::osc8::LineLink>] {
         &self.line_links
     }
 
@@ -1148,11 +1232,9 @@ const fn spacer_rows_for_boundary(
     match (boundary, spacing) {
         (TranscriptBoundary::Joined | TranscriptBoundary::GroupedTool, _) => 0,
         (TranscriptBoundary::Activity, TranscriptSpacing::Compact) => 0,
-        (TranscriptBoundary::Activity, _) => BLOCK_SEPARATOR_ROWS,
-        (TranscriptBoundary::Turn, TranscriptSpacing::Compact | TranscriptSpacing::Comfortable) => {
-            BLOCK_SEPARATOR_ROWS
-        }
-        (TranscriptBoundary::Turn, TranscriptSpacing::Spacious) => BLOCK_SEPARATOR_ROWS + 1,
+        (TranscriptBoundary::Activity, TranscriptSpacing::Spacious) => BLOCK_SEPARATOR_ROWS + 1,
+        (TranscriptBoundary::Turn, TranscriptSpacing::Compact) => BLOCK_SEPARATOR_ROWS,
+        (TranscriptBoundary::Turn, TranscriptSpacing::Spacious) => BLOCK_SEPARATOR_ROWS + 2,
     }
 }
 
@@ -1223,10 +1305,10 @@ fn line_with_group_rail(
 }
 
 fn links_with_group_rail(
-    links: &[crate::tui::osc8::LineLink],
+    links: &[codewhale_tui_kit::osc8::LineLink],
     rail: Option<crate::tui::widgets::tool_card::CardRail>,
     max_width: usize,
-) -> Vec<crate::tui::osc8::LineLink> {
+) -> Vec<codewhale_tui_kit::osc8::LineLink> {
     let shift = rail
         .map(crate::tui::widgets::tool_card::rail_glyph)
         .filter(|glyph| !glyph.is_empty())

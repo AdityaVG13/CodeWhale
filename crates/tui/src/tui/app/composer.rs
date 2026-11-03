@@ -712,6 +712,10 @@ impl ComposerState {
 
 impl App {
     pub fn insert_str(&mut self, text: &str) {
+        self.insert_str_with_raw_mouse_recovery(text, true);
+    }
+
+    fn insert_str_with_raw_mouse_recovery(&mut self, text: &str, recover_raw_mouse: bool) {
         if text.is_empty() {
             return;
         }
@@ -727,7 +731,9 @@ impl App {
         self.input.insert_str(byte_index, text);
         self.resync_command_line_claim();
         self.cursor_position = cursor + char_count(text);
-        self.strip_raw_mouse_reports_from_input();
+        if recover_raw_mouse {
+            self.strip_raw_mouse_reports_from_input();
+        }
         self.slash_menu_hidden = false;
         self.mention_menu_hidden = false;
         self.mention_menu_selected = 0;
@@ -744,7 +750,7 @@ impl App {
         }
         let normalized = normalize_paste_text(text);
         if !normalized.is_empty() {
-            self.insert_str(&normalized);
+            self.insert_str_with_raw_mouse_recovery(&normalized, false);
         }
         self.paste_burst.clear_after_explicit_paste();
         // Large pasted input stays editable and visible until submit. The
@@ -767,7 +773,7 @@ impl App {
         if self.input.trim_start().starts_with(['/', '!']) {
             return false;
         }
-        let Some(paths) = crate::image_attach::pasted_image_paths(text) else {
+        let Some(paths) = codewhale_engine::image_attach::pasted_image_paths(text) else {
             return false;
         };
         for path in &paths {
@@ -858,6 +864,7 @@ impl App {
             self.selected_attachment_index = None;
             return false;
         };
+        self.clear_input_history_navigation();
         let reference = references[index].clone();
         let cursor_byte = byte_index_at_char(&self.input, self.cursor_position);
         let new_cursor_byte = if cursor_byte <= reference.start_byte {
@@ -1404,17 +1411,26 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Move the cursor to the end of the current logical line (vim `$`).
+    /// Move the cursor onto the last character of the current logical line
+    /// (vim `$`).
     pub fn vim_move_line_end(&mut self) {
-        let text = self.input.clone();
-        let cursor_byte = byte_index_at_char(&text, self.cursor_position);
-        // Walk forward to the next newline or end-of-string.
-        let line_end_char = text[cursor_byte..].find('\n').map_or_else(
-            || char_count(&text),
-            |rel| char_count(&text[..cursor_byte + rel]),
-        );
-        self.cursor_position = line_end_char;
-        self.needs_redraw = true;
+        self.move_cursor_line_end();
+        self.vim_step_off_line_end();
+    }
+
+    fn vim_step_off_line_end(&mut self) {
+        let cursor = self.cursor_position.min(char_count(&self.input));
+        let cursor_byte = byte_index_at_char(&self.input, cursor);
+        let line_start_byte = self.input[..cursor_byte]
+            .rfind('\n')
+            .map_or(0, |idx| idx + 1);
+        let on_line_end = self.input[cursor_byte..]
+            .chars()
+            .next()
+            .is_none_or(|ch| ch == '\n');
+        if on_line_end && cursor_byte > line_start_byte {
+            self.cursor_position = prev_grapheme_boundary(&self.input, cursor);
+        }
     }
 
     /// Move forward one word (vim `w`).  Skips over the current word then any
@@ -1431,26 +1447,28 @@ impl App {
 
     /// Delete the character under the cursor (vim `x`).
     pub fn vim_delete_char_under_cursor(&mut self) {
+        self.clear_input_history_navigation();
         self.auto_expand_oversized_paste();
         let total = char_count(&self.input);
         if self.cursor_position >= total {
             return;
         }
         let pos = self.cursor_position;
+        if self.input[byte_index_at_char(&self.input, pos)..].starts_with('\n') {
+            return;
+        }
         // Grapheme-aware: `x` deletes the whole cluster under the cursor.
         let end = next_grapheme_boundary(&self.input, pos);
         remove_char_range(&mut self.input, pos, end);
         self.resync_command_line_claim();
-        // Keep cursor in bounds after deletion, on the last cluster's start.
-        let new_total = char_count(&self.input);
-        if self.cursor_position > 0 && self.cursor_position >= new_total {
-            self.cursor_position = prev_grapheme_boundary(&self.input, new_total);
-        }
+        // Keep cursor in bounds after deletion, on the line's last cluster's start.
+        self.vim_step_off_line_end();
         self.needs_redraw = true;
     }
 
     /// Delete the entire current logical line (vim `dd`).
     pub fn vim_delete_line(&mut self) {
+        self.clear_input_history_navigation();
         let text = self.input.clone();
         let cursor_byte = byte_index_at_char(&text, self.cursor_position);
         let line_start_byte = text[..cursor_byte].rfind('\n').map_or(0, |idx| idx + 1);
@@ -1486,7 +1504,10 @@ impl App {
     /// Enter insert mode after the cursor (vim `a`).
     pub fn vim_enter_append(&mut self) {
         let total = char_count(&self.input);
-        if self.cursor_position < total {
+        if self.cursor_position < total
+            && !self.input[byte_index_at_char(&self.input, self.cursor_position)..]
+                .starts_with('\n')
+        {
             // After the whole cluster under the cursor, not one scalar in.
             self.cursor_position = next_grapheme_boundary(&self.input, self.cursor_position);
         }
@@ -1497,7 +1518,7 @@ impl App {
     /// Open a new line below and enter insert mode (vim `o`).
     pub fn vim_open_line_below(&mut self) {
         // Move to end of line, then insert a newline.
-        self.vim_move_line_end();
+        self.move_cursor_line_end();
         self.insert_char('\n');
         self.vim_mode = VimMode::Insert;
     }
@@ -1586,6 +1607,16 @@ impl App {
     pub fn clear_input_recoverable(&mut self) {
         self.stash_current_input_for_recovery();
         self.clear_input();
+    }
+
+    pub fn clear_composer_draft(&mut self) {
+        self.backtrack.reset();
+        self.disarm_quit();
+        self.edit_in_progress = false;
+        self.clear_input_recoverable();
+        let _ = self.maybe_show_behavioral_tip(
+            crate::tui::behavioral_tips::BehavioralTip::ClearedInputRestore,
+        );
     }
 
     pub fn start_history_search(&mut self) {
@@ -1733,7 +1764,8 @@ impl App {
         // keys, or the question written on the same line) still attaches.
         if !claimed_command
             && !self.input.trim_start().starts_with('!')
-            && let Some((path, rest)) = crate::image_attach::leading_dropped_image(&self.input)
+            && let Some((path, rest)) =
+                codewhale_engine::image_attach::leading_dropped_image(&self.input)
         {
             let reference = media_attachment_reference("image", &path, None);
             self.input = if rest.is_empty() {
@@ -1815,9 +1847,19 @@ impl App {
         Some(input)
     }
 
-    /// Put a message that was never sent back in the composer as it was
-    /// first sent, skill and all, so Enter sends the same request again.
+    /// Restore unsent user input to the composer; keep command-generated prompts
+    /// as receipts that require invoking their original command again.
     pub fn restore_unsent_message(&mut self, message: QueuedMessage) {
+        if let Some((command, _)) = message.extension_command.as_ref() {
+            self.add_message(crate::tui::history::HistoryCell::System {
+                content: format!(
+                    "{} command prompt was not submitted. Run the command again to retry.\n{}",
+                    command.origin, message.display
+                ),
+            });
+            self.needs_redraw = true;
+            return;
+        }
         self.input = message.display;
         self.resync_command_line_claim();
         self.cursor_position = char_count(&self.input);
@@ -1858,6 +1900,8 @@ impl App {
     pub fn apply_external_edit(&mut self, new: String) {
         self.input = new;
         self.resync_command_line_claim();
+        self.pending_paste_reference = None;
+        self.oversized_paste_full_text = None;
         self.cursor_position = char_count(&self.input);
         self.history_index = None;
         self.history_navigation_draft = None;
@@ -1889,7 +1933,7 @@ impl App {
         true
     }
 
-    /// Composer-Enter dispatch. Returns `Some(input)` when the press should
+    /// Composer dispatch with paste protection for bare Enter. Returns `Some(input)` when the press should
     /// fire a submit; `None` when Enter was absorbed (paste-burst Enter
     /// suppression — see #1073).
     ///
@@ -1914,8 +1958,8 @@ impl App {
     ///
     /// Outside both cases the call falls through to [`Self::submit_input`]
     /// unchanged so normal Enter-to-send behaviour is preserved.
-    pub fn handle_composer_enter(&mut self) -> Option<String> {
-        if self.use_paste_burst_detection {
+    pub fn handle_composer_enter(&mut self, protect_paste: bool) -> Option<String> {
+        if protect_paste && self.use_paste_burst_detection {
             let now = Instant::now();
             if self
                 .paste_burst
@@ -1939,8 +1983,9 @@ impl App {
     /// same two predicates `handle_composer_enter` acts on — the burst
     /// window and the trimmed-empty buffer — without mutating anything.
     #[must_use]
-    pub fn composer_enter_would_submit(&self) -> bool {
-        if self.use_paste_burst_detection
+    pub fn composer_enter_would_submit(&self, protect_paste: bool) -> bool {
+        if protect_paste
+            && self.use_paste_burst_detection
             && self
                 .paste_burst
                 .newline_should_insert_instead_of_submit(Instant::now())
@@ -1998,7 +2043,8 @@ impl App {
         // Confined to the workspace: a linked `.codewhale` or `pastes`
         // directory must not send the pasted text somewhere else.
         let file_path = self.workspace.join(&rel_path);
-        let written = crate::fs_confined::write(&self.workspace, &file_path, self.input.as_bytes());
+        let written =
+            codewhale_util::fs_confined::write(&self.workspace, &file_path, self.input.as_bytes());
         if let Err(error) = written {
             let limit = MAX_SUBMITTED_INPUT_CHARS.to_string();
             // The toast row sheds clauses to fit and left only "Not sent", so

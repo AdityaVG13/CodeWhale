@@ -20,7 +20,7 @@ use crate::tui::shell_key_routing::ShellBindingId;
 use crate::tui::shell_key_routing::{binding, display_chord};
 
 #[cfg(all(unix, not(target_env = "ohos")))]
-use crate::tools::terminal_session::{self, TerminalSessionInfo};
+use codewhale_engine::tools::terminal_session::{self, TerminalSessionInfo};
 #[cfg(all(unix, not(target_env = "ohos")))]
 use std::{
     path::PathBuf,
@@ -37,6 +37,8 @@ pub(super) struct TerminalDock {
     worker: Option<Worker>,
     #[cfg(all(unix, not(target_env = "ohos")))]
     sessions: Vec<TerminalSessionInfo>,
+    #[cfg(all(unix, not(target_env = "ohos")))]
+    commands: Vec<codewhale_engine::tools::shell::ShellJobSnapshot>,
     #[cfg(all(unix, not(target_env = "ohos")))]
     selected: Option<String>,
     #[cfg(all(unix, not(target_env = "ohos")))]
@@ -79,13 +81,16 @@ struct Worker {
 #[cfg(all(unix, not(target_env = "ohos")))]
 #[derive(Debug)]
 enum Request {
-    Refresh(Option<String>),
-    Create(crate::sandbox::SandboxPolicy),
+    Refresh {
+        selected: Option<String>,
+        session: String,
+    },
+    Create(codewhale_sandbox::SandboxPolicy),
     Input {
         name: String,
         id: String,
         bytes: Vec<u8>,
-        policy: crate::sandbox::SandboxPolicy,
+        policy: codewhale_sandbox::SandboxPolicy,
     },
     Resize {
         name: String,
@@ -102,6 +107,7 @@ enum Reply {
         requested: Option<String>,
         sessions: Vec<TerminalSessionInfo>,
         output: Option<terminal_session::OutputChunk>,
+        commands: Vec<codewhale_engine::tools::shell::ShellJobSnapshot>,
     },
     Created(String),
     InputWritten(String),
@@ -110,7 +116,10 @@ enum Reply {
 
 #[cfg(all(unix, not(target_env = "ohos")))]
 impl Worker {
-    fn start(workspace: PathBuf) -> Result<Self, String> {
+    fn start(
+        workspace: PathBuf,
+        shell_manager: codewhale_engine::tools::shell::SharedShellManager,
+    ) -> Result<Self, String> {
         let (requests, incoming) = mpsc::sync_channel(128);
         let (outgoing, replies) = mpsc::sync_channel(32);
         std::thread::Builder::new()
@@ -118,22 +127,35 @@ impl Worker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     let reply = match request {
-                        Request::Refresh(requested) => match terminal_session::inspect_workspace(
-                            &workspace,
-                            requested.as_deref(),
-                        ) {
-                            Ok((sessions, output)) => Reply::Snapshot {
-                                requested,
-                                sessions,
-                                output,
-                            },
-                            Err(error) => Reply::Error(error),
-                        },
+                        Request::Refresh { selected, session } => {
+                            let pty = selected
+                                .as_deref()
+                                .filter(|id| command_job_id(id).is_none());
+                            match terminal_session::inspect_workspace(&workspace, pty) {
+                                Ok((sessions, output)) => Reply::Snapshot {
+                                    requested: selected,
+                                    sessions,
+                                    output,
+                                    commands: shell_manager
+                                        .lock()
+                                        .map(|mut manager| {
+                                            dock_commands(manager.list_jobs_for_session(&session))
+                                        })
+                                        .unwrap_or_default(),
+                                },
+                                Err(error) => Reply::Error(error),
+                            }
+                        }
                         Request::Create(policy) => {
                             let name =
                                 format!("user-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                            match terminal_session::get_or_create(&name, &workspace, policy)
-                                .and_then(|_| terminal_session::inspect_workspace(&workspace, None))
+                            match terminal_session::get_or_create(
+                                &name,
+                                &workspace,
+                                policy,
+                                &shell_manager,
+                            )
+                            .and_then(|_| terminal_session::inspect_workspace(&workspace, None))
                             {
                                 Ok((sessions, _)) => {
                                     match sessions.into_iter().find(|session| session.name == name)
@@ -189,13 +211,66 @@ impl Worker {
 }
 
 #[cfg(all(unix, not(target_env = "ohos")))]
-fn policy(app: &App) -> crate::sandbox::SandboxPolicy {
-    crate::core::authority::sandbox_policy_for_turn(
+const COMMAND_TAB_PREFIX: &str = "cmd:";
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+const FINISHED_COMMAND_TABS: usize = 5;
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn command_job_id(tab: &str) -> Option<&str> {
+    tab.strip_prefix(COMMAND_TAB_PREFIX)
+}
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn command_tab_id(job: &codewhale_engine::tools::shell::ShellJobSnapshot) -> String {
+    format!("{COMMAND_TAB_PREFIX}{}", job.id)
+}
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn dock_commands(
+    jobs: Vec<codewhale_engine::tools::shell::ShellJobSnapshot>,
+) -> Vec<codewhale_engine::tools::shell::ShellJobSnapshot> {
+    use codewhale_engine::tools::shell::ShellStatus;
+    let (mut running, mut finished): (Vec<_>, Vec<_>) = jobs
+        .into_iter()
+        .partition(|job| job.status == ShellStatus::Running);
+    finished.sort_by_key(|job| std::cmp::Reverse(job.finished_at));
+    finished.truncate(FINISHED_COMMAND_TABS);
+    running.extend(finished);
+    running
+}
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn command_output(job: &codewhale_engine::tools::shell::ShellJobSnapshot) -> Vec<u8> {
+    let mut output = job.stdout_tail.clone();
+    if !job.stderr_tail.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&job.stderr_tail);
+    }
+    output.into_bytes()
+}
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn tab_ids(dock: &TerminalDock) -> Vec<String> {
+    dock.sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .chain(dock.commands.iter().map(command_tab_id))
+        .collect()
+}
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn policy(app: &App) -> codewhale_sandbox::SandboxPolicy {
+    codewhale_engine::core::authority::sandbox_policy_for_turn(
         app.mode,
         app.approval_mode,
         app.configured_sandbox_mode.as_deref(),
         &app.workspace,
-        crate::core::authority::SandboxNetworkAccess::from_config(app.configured_sandbox_network),
+        codewhale_engine::core::authority::SandboxNetworkAccess::from_config(
+            app.configured_sandbox_network,
+        ),
     )
 }
 
@@ -206,6 +281,7 @@ pub(crate) fn poll(app: &mut App) {
         let visible = app.work_surface.panel == RailPanel::Terminal
             && !app.work_surface.dismissed
             && app.work_surface.explicit_view;
+        let session_id = app.current_session_id.clone().unwrap_or_default();
         let dock = &mut app.work_surface.terminal;
         if dock.workspace != app.workspace {
             *dock = TerminalDock {
@@ -222,7 +298,14 @@ pub(crate) fn poll(app: &mut App) {
             "poll"
         );
         if visible && dock.worker.is_none() && dock.error.is_none() {
-            match Worker::start(app.workspace.clone()) {
+            let shell_manager = app
+                .runtime_services
+                .shell_manager
+                .clone()
+                .unwrap_or_else(|| {
+                    codewhale_engine::tools::shell::new_shared_shell_manager(app.workspace.clone())
+                });
+            match Worker::start(app.workspace.clone(), shell_manager) {
                 Ok(worker) => dock.worker = Some(worker),
                 Err(error) => dock.error = Some(error),
             }
@@ -234,6 +317,7 @@ pub(crate) fn poll(app: &mut App) {
                         requested,
                         sessions,
                         output,
+                        commands,
                     } => {
                         tracing::trace!(
                             target: "codewhale::terminal_dock",
@@ -249,22 +333,36 @@ pub(crate) fn poll(app: &mut App) {
                             continue;
                         }
                         if dock.selected.is_none() {
-                            dock.selected = sessions.first().map(|session| session.id.clone());
+                            dock.selected = sessions
+                                .first()
+                                .map(|session| session.id.clone())
+                                .or_else(|| commands.first().map(command_tab_id));
                         }
+                        let selected_command = dock
+                            .selected
+                            .as_deref()
+                            .and_then(command_job_id)
+                            .and_then(|id| commands.iter().find(|job| job.id == id));
                         dock.lost = dock.selected.is_some()
+                            && selected_command.is_none()
                             && !sessions
                                 .iter()
                                 .any(|session| Some(&session.id) == dock.selected.as_ref());
-                        let (bytes, dropped) = output
-                            .map(|chunk| (chunk.bytes, chunk.offset))
-                            .unwrap_or_default();
+                        let (bytes, dropped) = match selected_command {
+                            Some(job) => (command_output(job), 0),
+                            None => output
+                                .map(|chunk| (chunk.bytes, chunk.offset))
+                                .unwrap_or_default(),
+                        };
                         if dock.sessions != sessions
+                            || dock.commands != commands
                             || dock.output != bytes
                             || dock.dropped != dropped
                         {
                             app.needs_redraw = true;
                         }
                         dock.sessions = sessions;
+                        dock.commands = commands;
                         dock.output = bytes;
                         dock.dropped = dropped;
                     }
@@ -297,10 +395,10 @@ pub(crate) fn poll(app: &mut App) {
                     .last_poll
                     .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
             {
-                match worker
-                    .requests
-                    .try_send(Request::Refresh(dock.selected.clone()))
-                {
+                match worker.requests.try_send(Request::Refresh {
+                    selected: dock.selected.clone(),
+                    session: session_id.clone(),
+                }) {
                     Ok(()) => {
                         dock.refreshing = true;
                         dock.last_poll = Some(Instant::now());
@@ -384,19 +482,19 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             Some(ShellBindingId::TerminalNext | ShellBindingId::TerminalPrevious)
         ) {
             let dock = &mut app.work_surface.terminal;
-            if !dock.sessions.is_empty() {
-                let current = dock
-                    .sessions
+            let tabs = tab_ids(dock);
+            if !tabs.is_empty() {
+                let current = tabs
                     .iter()
-                    .position(|session| Some(&session.id) == dock.selected.as_ref());
+                    .position(|id| Some(id) == dock.selected.as_ref());
                 let index = match (current, action) {
                     (Some(index), Some(ShellBindingId::TerminalPrevious)) => {
-                        (index + dock.sessions.len() - 1) % dock.sessions.len()
+                        (index + tabs.len() - 1) % tabs.len()
                     }
-                    (Some(index), _) => (index + 1) % dock.sessions.len(),
+                    (Some(index), _) => (index + 1) % tabs.len(),
                     (None, _) => 0,
                 };
-                dock.selected = Some(dock.sessions[index].id.clone());
+                dock.selected = Some(tabs[index].clone());
                 dock.output.clear();
                 dock.error = None;
                 dock.size = None;
@@ -427,6 +525,9 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 #[cfg(all(unix, not(target_env = "ohos")))]
 fn input(app: &mut App, bytes: Vec<u8>) {
     let dock = &app.work_surface.terminal;
+    if dock.selected.as_deref().and_then(command_job_id).is_some() {
+        return;
+    }
     if let Some(session) = dock
         .sessions
         .iter()
@@ -441,7 +542,7 @@ fn input(app: &mut App, bytes: Vec<u8>) {
                 policy: policy(app),
             },
         );
-    } else {
+    } else if !dock.sessions.is_empty() {
         app.work_surface.terminal.error = Some(app.tr(MessageId::TerminalDockLost).into_owned());
         app.needs_redraw = true;
     }
@@ -538,7 +639,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::styled(app.tr(MessageId::TerminalDockStarting), muted));
         } else if dock.lost {
             lines.push(Line::styled(app.tr(MessageId::TerminalDockLost), muted));
-        } else if dock.sessions.is_empty() {
+        } else if dock.sessions.is_empty() && dock.commands.is_empty() {
             lines.push(Line::styled(
                 app.tr(MessageId::TerminalDockEmpty)
                     .replace("{new}", binding(ShellBindingId::TerminalNew).footer_chord),
@@ -605,6 +706,49 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                     },
                 ));
             }
+            for job in &dock.commands {
+                let id = command_tab_id(job);
+                let selected = Some(&id) == dock.selected.as_ref();
+                let status = match job.exit_code {
+                    Some(code)
+                        if job.status != codewhale_engine::tools::shell::ShellStatus::Running =>
+                    {
+                        app.tr(MessageId::TerminalDockExited)
+                            .replace("{code}", &code.to_string())
+                    }
+                    _ => app.tr(MessageId::SubagentsStatusRunning).into_owned(),
+                };
+                let command: String = job.command.chars().take(32).collect();
+                let ellipsis = if job.command.chars().count() > 32 {
+                    "…"
+                } else {
+                    ""
+                };
+                let text = format!(
+                    "{}$ {command}{ellipsis} ({status} · {}s)  ",
+                    if selected { "› " } else { "" },
+                    job.elapsed_ms / 1000
+                );
+                let width = unicode_width::UnicodeWidthStr::width(text.as_str())
+                    .min(usize::from(area.right().saturating_sub(column)))
+                    as u16;
+                if width == 0 {
+                    break;
+                }
+                session_tabs.push((
+                    id,
+                    Rect::new(column, area.y.saturating_add(lines.len() as u16), width, 1),
+                ));
+                column = column.saturating_add(width);
+                spans.push(ratatui::text::Span::styled(
+                    text,
+                    if selected && app.work_surface.focused {
+                        style.bg(app.ui_theme.selection_bg)
+                    } else {
+                        style
+                    },
+                ));
+            }
             lines.push(Line::from(spans));
         }
         if let Some(error) = &dock.error {
@@ -622,7 +766,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             ));
         }
         let mut safe = String::new();
-        crate::tui::osc8::strip_ansi_keep_sgr_into(
+        codewhale_tui_kit::osc8::strip_ansi_keep_sgr_into(
             &String::from_utf8_lossy(&dock.output),
             &mut safe,
         );

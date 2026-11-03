@@ -1,12 +1,12 @@
 //! Real-host preservation fixtures, captured before FEAT-026 production edits.
 //! These fixtures stay outside the portable session command closure.
 use super::{CommandResult, execute};
-use crate::config::Config;
-use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::clipboard::ClipboardHandler;
+use codewhale_engine::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
 use codewhale_localization::{Locale, tr};
 use codewhale_models::{ContentBlock, ImageUrlContent, Message, Role, ToolCaller};
+use codewhale_runtime::config::Config;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -71,6 +71,7 @@ fn seed(app: &mut App) {
                     thinking: "hidden reasoning".into(),
                     signature: Some("hidden-signature".into()),
                     state: None,
+                    redacted_data: None,
                 },
                 call("first-call"),
                 result("first-result", Some(false)),
@@ -243,7 +244,7 @@ fn baseline_observations() -> Value {
         !temp.path().join(".codewhale").exists(),
         "missing workflow lookup created state"
     );
-    crate::tools::workflow::structcopy_test_seed_run(
+    codewhale_engine::tools::workflow::structcopy_test_seed_run(
         temp.path(),
         "golden-run",
         "structcopy-baseline-session",
@@ -288,7 +289,7 @@ fn baseline_observations() -> Value {
         "description_en":tr(Locale::En,info.description_id),
         "description_zh_hans":tr(Locale::ZhHans,info.description_id),
         "session_order":super::session_group::SessionCommands.commands().iter().map(|c|c.info().name).collect::<Vec<_>>(),
-        "native_model_tool":crate::core::engine::default_active_native_tool_names().contains(&"structcopy"),
+        "native_model_tool":codewhale_engine::core::engine::default_active_native_tool_names().contains(&"structcopy"),
     }));
     Value::Object(captures)
 }
@@ -373,6 +374,8 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
         trust,
         login,
         work_surface,
+        navigation,
+        voice_input,
     } = bundle.contexts(capabilities).into_parts();
     assert!(
         permissions.is_none()
@@ -382,6 +385,8 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
             && trust.is_none()
             && login.is_none()
             && work_surface.is_none()
+            && navigation.is_none()
+            && voice_input.is_none()
     );
     assert!(presentation.is_some());
     assert!(
@@ -452,7 +457,7 @@ fn structcopy_public_workflow_preserves_payload_across_locales_and_transports() 
     // This successful transport matrix needs a unique tool pair. Duplicate
     // identities are exercised by the separate refusal regressions.
     app.api_messages_mut()[2].content.clear();
-    crate::tools::workflow::structcopy_test_seed_run(
+    codewhale_engine::tools::workflow::structcopy_test_seed_run(
         temp.path(),
         "transport-run",
         "structcopy-baseline-session",

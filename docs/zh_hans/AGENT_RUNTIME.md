@@ -37,9 +37,9 @@
 
 ## 切换规则
 
-如果一个后台（detached）的 `agent` 子级会因一次性的提供商（provider）超时而失败且不重试，而等价的 Runtime worker 会重试并保留账本证据，那么切换就没有完成。应把这视为 Codewhale Runtime 的缺口，而不是正常的 "子智能体行为"。
+后台 `agent` 子级与 Runtime worker 必须保留相同的请求证据和恢复状态。请求可能已经发出后的超时，在两条路径上都属于结果未知，不能授权自动重新发起推理。
 
-兼容性的 `agent` 运行时现在会对提供商响应头、流和超时这类瞬时失败做带退避的重试，之后才把 worker 标记为中断；重试耗尽时会保留检查点并返回一个续接句柄。剩下的收敛工作，是让这套生命周期在进程重启、远程执行和完整的 Runtime 账本调度下保持持久。
+兼容性的 `agent` 运行时仅重试普通限流，或有证据证明请求尚未发出时的瞬时连接故障。响应头超时、流中断或其他结果不明的故障会保留检查点并返回续接句柄，不会自动重新发送推理请求。已报告的用量仍归属于原请求，缺失的用量保持未知。进程重启、远程执行和 Runtime 账本调度仍有各自的持久性要求。
 
 目标规则是：
 
@@ -67,18 +67,15 @@
 
 worker 从 `spawn_depth = 0` 起运行，只要满足 `spawn_depth + 1 ≤ max_spawn_depth` 就可以派生子级，所以预算 `N` 提供 `N` 层嵌套委派。子智能体和 Fleet 选中的 Runtime worker 共用**同一条**轴，其来源是 `codewhale_config`：
 
-- `DEFAULT_SPAWN_DEPTH = 3`：独立子智能体和 Fleet 选中的 Runtime worker 共同的默认预算（这样两者不会漂移成"两个移动靶"）；
-- `MAX_SPAWN_DEPTH_CEILING = 8`：需主动开启的上限，所有配置的 Runtime 值（包括 Fleet 执行配置中的 `max_spawn_depth`）都会被钳制到这个值。
+Runtime 委派默认不设置产品深度上限。操作者显式设置的深度仍约束后代，子级不能扩大权限。0 禁止子级委派，但根 worker 仍可运行。内部 `u32` 表示会拒绝溢出，它不是建议的工作预算。
 
-面向模型的 `agent` schema 有意不包含 `max_depth`。解析器仍然接受 `max_depth`、`maxDepth` 和 `max_spawn_depth`，以兼容已保存的对话记录、ACP/MCP 客户端和内部调用方，并拒绝大于 8 的值。当前由模型发起的调用继承 Runtime 的配置，而不是在工具 schema 里协商递归深度。
+面向模型的 `agent` schema 不提供深度控制。兼容字段 `max_depth`、`maxDepth` 和 `max_spawn_depth` 仍可解析，但模型请求不能用它们给子级设置上限；回执会注明被忽略的字段。Exact Fleet 和保存的 Runtime 权限仍然生效。
 
-Workflow IR 另有一个默认的结构校验上限：最多五层嵌套节点。这个上限约束的是编排文档的形状，既不授予也不消耗 Runtime 的子级委派深度。
-
-根 worker 即使预算为 0 也总会运行；预算限制的是*子级*委派。默认值至少提供三层嵌套。
+Workflow IR 结构与子级委派分开。其 `max_depth` 默认 0（不设上限），正数操作者配置会被遵守。解析器及 VM 的栈、内存边界仍在执行前校验文档。
 
 ## 事件词汇
 
-Runtime 执行账本持久化的是 worker 自己的事件流，而不是另一套模拟出来的分类。兼容性 API 和类型仍以 `Fleet...` 前缀暴露它。`codewhale exec --output-format stream-json` 会输出 `{"type": "content" | "tool_use" | "tool_result" | "sandbox_denied" | "workflow_event" | "session_capture" | "turn_usage" | "metadata" | "done" | "error"}` 形式的行，它们映射到 Runtime 账本的兼容类型 `FleetWorkerEventPayload`（`RunningTool`、`WorkflowEvent`、`Running`、`Completed`、`Failed` 等）。`workflow_event` 在 Workflow 运行期间携带带类型的 run/phase/task/gate 回执，并作为带类型的 `WorkflowEvent` 保留在 Runtime 执行账本中；终态的 `done` 或 `error` 仍由外层 Runtime worker 负责。一套词汇，两个表面。
+Runtime 执行账本持久化的是 worker 自己的事件流，而不是另一套模拟出来的分类。兼容性 API 和类型仍以 `Fleet...` 前缀暴露它。`codewhale exec --output-format stream-json` 会输出 `{"type": "content" | "tool_use" | "tool_result" | "agent_spawned" | "sandbox_denied" | "workflow_event" | "session_capture" | "service_released" | "turn_usage" | "metadata" | "status" | "request_image_window" | "done" | "error"}` 形式的行，它们映射到 Runtime 账本的兼容类型 `FleetWorkerEventPayload`（`RunningTool`、`WorkflowEvent`、`Running`、`Completed`、`Failed` 等）。`workflow_event` 在 Workflow 运行期间携带带类型的 run/phase/task/gate 回执，并作为带类型的 `WorkflowEvent` 保留在 Runtime 执行账本中；终态的 `done` 或 `error` 仍由外层 Runtime worker 负责。一套词汇，两个表面。
 
 `session_capture` 在 exec 运行把自己的对话记录保存为会话时发出一次，并且只在一个位置携带可恢复的 id：
 
@@ -104,6 +101,7 @@ Runtime 执行账本持久化的是 worker 自己的事件流，而不是另一�
 
 - `turn` 是这次 exec 运行内该模型调用的序号，从 1 开始；`input_tokens`、`output_tokens` 和 `duration_ms` 始终存在。
 - 提供商没有报告的可选 token 字段会被**省略**——绝不输出为 null，也绝不用 0 回填。字段名与终态 `metadata` 回执保持一致：`prompt_cache_hit_tokens` 是提供商的缓存读取计数（Anthropic 的 `cache_read_input_tokens`），`prompt_cache_write_tokens` 是缓存创建计数（`cache_creation_input_tokens`）。`reasoning_tokens` 只出现在会报告它的提供商路径上（OpenAI 兼容的 `completion_tokens_details` / Responses 的 `output_tokens_details`；Anthropic 不报告思考 token 计数）。`reasoning_replay_tokens` 是对 DeepSeek V4 交错思考（interleaved-thinking）重放的客户端估算值。
+- `finish_reason` 是该步骤提供商报告的停止原因（例如 `stop`、`tool_calls` 或 `length`），提供商未报告时省略。
 - 当提供商对某次调用完全没有报告用量时，该次调用的整个事件都会被跳过。做延迟/收敛分析时，应当对 `turn_usage` 事件求和，而不是根据墙钟时间去推断每一步的 token；终态 `metadata` 回执仍然携带累计总数。
 
 ## 与 Claude Code 的收敛（#2972）

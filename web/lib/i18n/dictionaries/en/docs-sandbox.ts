@@ -85,7 +85,7 @@ prefer_bwrap = false`,
           codeTerms: true,
         },
         {
-          p: "The first two are enforced only where a sandbox is available — on Linux without bubblewrap, and on Windows, they are settings without an OS wrapper behind them. A repository's own config can make the mode stricter, never looser. For one headless run, pass `--sandbox <mode>` to `codewhale exec`; `--auto` approves tools but never widens the sandbox.",
+          p: "The first two are enforced only where a sandbox is available — on Linux without bubblewrap, and on Windows, they are settings without an OS wrapper behind them. A repository's own config can make the mode stricter, never looser. For one headless run, pass `--sandbox <mode>` before the prompt to `codewhale exec`. By default, `--auto` enables Full Access: tools run without asking, shell commands have no Codewhale sandbox, and trust mode lets file tools write outside the workspace. Any `--sandbox` other than `danger-full-access` (or the equivalent `sandbox_mode` in config) keeps trust mode off. Use `--sandbox workspace-write` for the shell sandbox, where available, and file-tool workspace restrictions; `external-sandbox` relies on your own isolation.",
         },
       ],
     },

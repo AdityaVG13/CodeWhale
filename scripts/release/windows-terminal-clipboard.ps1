@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory)][string]$Evidence
 )
 $ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText([IO.Path]::Combine($Evidence, 'desktop-started.txt'), "startedAt=$([DateTime]::UtcNow.ToString('o'))`npid=$PID`npowershellVersion=$($PSVersionTable.PSVersion)`n")
 Write-Output 'desktop stage: loading automation'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms, System.Drawing
 Add-Type @'

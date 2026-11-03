@@ -7,6 +7,7 @@
 //! The skills mutation manager remains at `/skills manage`; MCP setup is a
 //! read-only suggestions handoff, not an inline installer or credential editor.
 
+use codewhale_engine::mcp::McpServerConfigExt;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -27,9 +28,9 @@ use super::{
     render_underwater_surface, truncate_view_text,
 };
 use crate::tui::app::App;
-use crate::tui::menu_style;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+use codewhale_tui_kit::menu_style;
 
 fn localize(locale: Locale, id: MessageId, replacements: &[(&str, &str)]) -> String {
     let mut value = tr(locale, id).into_owned();
@@ -301,7 +302,7 @@ impl ExtensionsSnapshot {
     pub fn from_app(app: &App) -> Self {
         let mut snapshot = Self {
             mcp_generation: app.mcp_snapshot_generation,
-            mcp_initializing: app.mcp_initializing,
+            mcp_initializing: app.mcp_boot_initializing(),
             ..Self::default()
         };
         snapshot.tabs[ExtensionsTab::Hooks.index()] = hooks_model(app, app.ui_locale);
@@ -333,12 +334,23 @@ impl ExtensionsSnapshot {
     }
 
     fn with_recommended_actions(mut self, app: &App) -> Self {
-        let configured = crate::mcp::load_config_with_workspace_and_plugins(
+        let configured = codewhale_engine::mcp::load_config_with_workspace_and_plugins(
             &app.mcp_config_path,
             &app.workspace,
             app.plugin_registry.as_ref(),
         )
         .ok();
+        let computer_use = self.tabs[ExtensionsTab::Marketplace.index()]
+            .groups
+            .iter()
+            .find(|group| group.id == "codewhale")
+            .and_then(|group| {
+                group
+                    .items
+                    .iter()
+                    .find(|item| item.id == "codewhale:computer-use")
+            })
+            .cloned();
         let Some(group) = self.tabs[ExtensionsTab::Marketplace.index()]
             .groups
             .iter_mut()
@@ -357,25 +369,16 @@ impl ExtensionsSnapshot {
         }
 
         for item in &mut group.items {
-            // The first-party row is not an MCP recommendation: the plugin is
-            // already in the binary, so the row asks the registry what it
-            // wants — trust it, enable it, or open it — through the same
-            // ladder the Plugins tab uses.
             if item.id == "codewhale-computer-use" {
-                item.action = match app
-                    .plugin_registry
-                    .list()
-                    .into_iter()
-                    .find(|plugin| plugin.name() == "computer-use")
-                {
-                    Some(plugin) => {
-                        item.state = plugin_row_state(app.ui_locale, plugin);
-                        Some(plugin_row_action(app.ui_locale, plugin))
-                    }
-                    None => Some(ExtensionAction::Status {
+                if let Some(catalog_item) = &computer_use {
+                    item.state = catalog_item.state.clone();
+                    item.tone = catalog_item.tone;
+                    item.action = catalog_item.action.clone();
+                } else {
+                    item.action = Some(ExtensionAction::Status {
                         label: tr(app.ui_locale, MessageId::PickerActionUnavailable).into_owned(),
-                    }),
-                };
+                    });
+                }
                 continue;
             }
             let recommendation = match item.id.as_str() {
@@ -452,7 +455,7 @@ fn reviewed_product_catalog(locale: Locale) -> Vec<PluginProduct> {
             )
             .into_owned(),
             publisher: "Codewhale".into(),
-            source_reference: "crates/tui/plugins/computer-use".into(),
+            source_reference: "https://github.com/codewhale-hq/codewhale-cu-plugin".into(),
             components: vec![
                 PluginProductComponent {
                     kind: PluginProductComponentKind::Mcp,
@@ -561,7 +564,7 @@ fn hooks_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 tr(locale, MessageId::ExtensionsStateWarning)
             }
             .into_owned(),
-            detail: problem.summary(),
+            detail: codewhale_engine::hooks::config::problem_summary(problem),
             action: Some(ExtensionAction::Command {
                 label: tr(locale, MessageId::ExtensionsActionEdit).into_owned(),
                 command: "/hooks edit".into(),
@@ -617,7 +620,7 @@ fn hooks_model(app: &App, locale: Locale) -> ExtensionsTabModel {
 }
 
 fn inventory_summary(
-    inventory: &crate::plugins::manifest::PluginInventory,
+    inventory: &codewhale_plugins::manifest::PluginInventory,
     locale: Locale,
 ) -> String {
     let mut parts = Vec::new();
@@ -702,7 +705,7 @@ fn localized_plugin_state(locale: Locale, state: &str) -> String {
 /// review`, so turning it on is visibly a two-part step rather than a dead
 /// `disabled` with no explanation — the exact row (`computer-use`) the
 /// founder could not enable.
-fn plugin_row_state(locale: Locale, plugin: &crate::plugins::types::LoadedPlugin) -> String {
+fn plugin_row_state(locale: Locale, plugin: &codewhale_plugins::types::LoadedPlugin) -> String {
     let state = localized_plugin_state(locale, plugin.state_label());
     if plugin.trusted() || plugin.enabled {
         return state;
@@ -745,8 +748,8 @@ fn localized_tier(locale: Locale, tier: &str) -> String {
     tr(locale, id).into_owned()
 }
 
-fn localized_skill_root(locale: Locale, kind: crate::skills::roots::SkillRootKind) -> String {
-    use crate::skills::roots::SkillRootKind;
+fn localized_skill_root(locale: Locale, kind: codewhale_skills::roots::SkillRootKind) -> String {
+    use codewhale_skills::roots::SkillRootKind;
 
     match kind {
         SkillRootKind::CodeWhaleProject => {
@@ -785,12 +788,11 @@ fn localized_skill_root(locale: Locale, kind: crate::skills::roots::SkillRootKin
 /// how the marketplace ends up offering `Enable` for something already active.
 fn plugin_row_action(
     locale: Locale,
-    plugin: &crate::plugins::types::LoadedPlugin,
+    plugin: &codewhale_plugins::types::LoadedPlugin,
 ) -> ExtensionAction {
-    let has_error_diagnostics = plugin
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.level == crate::plugins::types::PluginDiagnosticLevel::Error);
+    let has_error_diagnostics = plugin.diagnostics.iter().any(|diagnostic| {
+        diagnostic.level == codewhale_plugins::types::PluginDiagnosticLevel::Error
+    });
     if has_error_diagnostics {
         ExtensionAction::Command {
             label: tr(locale, MessageId::ExtensionsActionDiagnose).into_owned(),
@@ -836,7 +838,7 @@ fn plugin_row_action(
 /// the affordance without widening what runs unreviewed.
 fn plugin_row_toggle(
     locale: Locale,
-    plugin: &crate::plugins::types::LoadedPlugin,
+    plugin: &codewhale_plugins::types::LoadedPlugin,
 ) -> Option<ExtensionAction> {
     Some(if plugin.enabled {
         ExtensionAction::Command {
@@ -854,11 +856,10 @@ fn plugin_row_toggle(
 }
 
 /// How a plugin row reads, using the same ladder as [`plugin_row_action`].
-fn plugin_row_tone(plugin: &crate::plugins::types::LoadedPlugin) -> ExtensionTone {
-    let has_error_diagnostics = plugin
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.level == crate::plugins::types::PluginDiagnosticLevel::Error);
+fn plugin_row_tone(plugin: &codewhale_plugins::types::LoadedPlugin) -> ExtensionTone {
+    let has_error_diagnostics = plugin.diagnostics.iter().any(|diagnostic| {
+        diagnostic.level == codewhale_plugins::types::PluginDiagnosticLevel::Error
+    });
     if has_error_diagnostics {
         ExtensionTone::Failure
     } else if plugin.active() {
@@ -876,9 +877,9 @@ fn plugins_model(app: &App, locale: Locale) -> ExtensionsTabModel {
     let mut by_scope = [Vec::new(), Vec::new(), Vec::new()];
     for plugin in app.plugin_registry.list() {
         let scope = match plugin.scope {
-            crate::plugins::types::PluginScope::Builtin => 0,
-            crate::plugins::types::PluginScope::User => 1,
-            crate::plugins::types::PluginScope::Workspace => 2,
+            codewhale_plugins::types::PluginScope::Builtin => 0,
+            codewhale_plugins::types::PluginScope::User => 1,
+            codewhale_plugins::types::PluginScope::Workspace => 2,
         };
         let diagnostic_count = plugin.diagnostics.len();
         let action = plugin_row_action(locale, plugin);
@@ -961,7 +962,7 @@ fn plugins_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             tone: ExtensionTone::Failure,
             label: diagnostic.code.to_string(),
             description: diagnostic.message.clone(),
-            state: if diagnostic.level == crate::plugins::types::PluginDiagnosticLevel::Error {
+            state: if diagnostic.level == codewhale_plugins::types::PluginDiagnosticLevel::Error {
                 tr(locale, MessageId::ExtensionsStateInvalid)
             } else {
                 tr(locale, MessageId::ExtensionsStateWarning)
@@ -995,10 +996,10 @@ fn plugins_model(app: &App, locale: Locale) -> ExtensionsTabModel {
 }
 
 fn marketplace_model(app: &App, locale: Locale) -> ExtensionsTabModel {
-    use crate::plugins::marketplace::document::{
+    use codewhale_plugins::marketplace::document::{
         CatalogInstallResolution, resolve_candidate_install,
     };
-    let Some(store) = crate::plugins::marketplace::store::MarketplaceStore::open(
+    let Some(store) = codewhale_plugins::marketplace::store::MarketplaceStore::open(
         app.plugin_registry.state_path(),
     ) else {
         return ExtensionsTabModel {
@@ -1047,7 +1048,7 @@ fn marketplace_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                                     .clone()
                                     .unwrap_or_default(),
                                 state: if plugin.scope
-                                    == crate::plugins::types::PluginScope::Builtin
+                                    == codewhale_plugins::types::PluginScope::Builtin
                                 {
                                     tr(locale, MessageId::ExtensionsStateFirstParty).into_owned()
                                 } else {
@@ -1133,9 +1134,9 @@ fn marketplace_model(app: &App, locale: Locale) -> ExtensionsTabModel {
 }
 
 fn skills_model(app: &App, locale: Locale) -> ExtensionsTabModel {
-    use crate::skills::audit::{ParserState, SkillAuditMode, scan_with_configured};
+    use codewhale_skills::audit::{ParserState, SkillAuditMode, scan_with_configured};
 
-    let home = crate::config::effective_home_dir();
+    let home = codewhale_paths::user_home();
     let audit = scan_with_configured(
         &app.workspace,
         home.as_deref(),
@@ -1163,7 +1164,7 @@ fn skills_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             detail: skill.safe_display_path,
             // Enter opens the skills manager, which is where install, update,
             // remove and trust already live (`views/skills_manager.rs`, 1,000
-            // lines, driving `skills::mutation::SkillMutationRequest`). This
+            // lines, driving `codewhale_skills::mutation::SkillMutationRequest`). This
             // tab used to dead-end on `action: None` — founder live-test:
             // "skills - no way to delete them or edit or anything either" —
             // even though the manager it needed was one command away. Routing
@@ -1207,7 +1208,7 @@ fn mcp_row_is_mutable(owned: Option<&BTreeSet<String>>, name: &str) -> bool {
 }
 
 fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
-    let configured = crate::mcp::load_config_with_workspace_and_plugins(
+    let configured = codewhale_engine::mcp::load_config_with_workspace_and_plugins(
         &app.mcp_config_path,
         &app.workspace,
         app.plugin_registry.as_ref(),
@@ -1221,13 +1222,14 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
     // loading the same config without plugin contributions and taking the
     // difference, rather than parsing the shape of the synthesized name.
     let user_owned: Option<BTreeSet<String>> =
-        crate::mcp::load_config_with_workspace(&app.mcp_config_path, &app.workspace)
+        codewhale_engine::mcp::load_config_with_workspace(&app.mcp_config_path, &app.workspace)
             .ok()
             .map(|config| config.servers.keys().cloned().collect());
     // Where each row lives. A person asked to "say if they should be global
     // or in a certain project"; the panel could not answer because nothing
     // on the row carried its origin. Resolved once here, not per row.
-    let project_owned = crate::mcp::project_server_names(&app.mcp_config_path, &app.workspace);
+    let project_owned =
+        codewhale_engine::mcp::project_server_names(&app.mcp_config_path, &app.workspace);
     let snapshot = app.mcp_snapshot.as_ref();
     // Configured names are the count authority used by the surrounding shell.
     // Snapshot data enriches those exact rows; it must never independently
@@ -1256,7 +1258,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             // — a disabled server offered "reconnect" instead of "enable".
             // When the two disagree, the observation belongs to a config the
             // user already changed, so it is not shown as this row's state.
-            let config_enabled = config.map(crate::mcp::McpServerConfig::is_enabled);
+            let config_enabled = config.map(codewhale_mcp::config::McpServerConfig::is_enabled);
             let stale = observed
                 .zip(config_enabled)
                 .is_some_and(|(server, enabled)| server.enabled != enabled);
@@ -1319,10 +1321,16 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 && !initializing
                 && !stale
                 && observed.is_some_and(|server| !server.started());
-            let oauth_capable = config.is_some_and(crate::mcp::mcp_server_oauth_capable);
+            let oauth_capable = config.is_some_and(codewhale_engine::mcp::mcp_server_oauth_capable);
             let recovery = match observed {
                 Some(server) => server.recovery_kind(oauth_capable),
-                None => crate::mcp::mcp_recovery_kind(enabled, false, false, None, oauth_capable),
+                None => codewhale_engine::mcp::mcp_recovery_kind(
+                    enabled,
+                    false,
+                    false,
+                    None,
+                    oauth_capable,
+                ),
             };
             let action = match (initializing, recovery) {
                 // Still connecting: the state is the whole story.
@@ -1343,13 +1351,13 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     label: state.clone(),
                 },
                 (false, Some(recovery))
-                    if crate::mcp::mcp_name_is_command_safe(&name)
+                    if codewhale_engine::mcp::mcp_name_is_command_safe(&name)
                         || matches!(
                             recovery,
-                            crate::mcp::McpRecoveryKind::Connect
-                                | crate::mcp::McpRecoveryKind::Reconnect
-                                | crate::mcp::McpRecoveryKind::Diagnose
-                                | crate::mcp::McpRecoveryKind::AwsLogin
+                            codewhale_engine::mcp::McpRecoveryKind::Connect
+                                | codewhale_engine::mcp::McpRecoveryKind::Reconnect
+                                | codewhale_engine::mcp::McpRecoveryKind::Diagnose
+                                | codewhale_engine::mcp::McpRecoveryKind::AwsLogin
                         ) =>
                 {
                     ExtensionAction::Command {
@@ -1359,7 +1367,9 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                         // other recovery runs against live state the panel
                         // re-reads when it lands.
                         disposition: match recovery {
-                            crate::mcp::McpRecoveryKind::Reauth => RowActionDisposition::LeavePanel,
+                            codewhale_engine::mcp::McpRecoveryKind::Reauth => {
+                                RowActionDisposition::LeavePanel
+                            }
                             _ => RowActionDisposition::InPlace,
                         },
                     }
@@ -1371,7 +1381,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 },
             };
             let scope = config
-                .and_then(|server| server.reviewed_plugin.as_ref())
+                .and_then(|server| server.reviewed_plugin_source())
                 .map(|source| {
                     localize(
                         locale,
@@ -1390,7 +1400,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     )
                     .into_owned()
                 });
-            let command_safe = crate::mcp::mcp_name_is_command_safe(&name);
+            let command_safe = codewhale_engine::mcp::mcp_name_is_command_safe(&name);
             let mutable = command_safe && mcp_row_is_mutable(user_owned.as_ref(), &name);
             let toggle = mutable.then(|| {
                 if enabled {
@@ -1422,7 +1432,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     (true, false, None) => ExtensionTone::Ready,
                     // A server that reports an error is broken; one that only
                     // wants a login or a reconnect is waiting on a person.
-                    (true, false, Some(crate::mcp::McpRecoveryKind::Diagnose)) => {
+                    (true, false, Some(codewhale_engine::mcp::McpRecoveryKind::Diagnose)) => {
                         ExtensionTone::Failure
                     }
                     (true, false, Some(_)) => ExtensionTone::Attention,
@@ -1431,10 +1441,11 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 // wire key `plugin-25-<plugin>-<server>`. The length-prefixed
                 // form is how the config layer keeps the name unambiguous; it
                 // was never meant to be read by a person.
-                label: crate::mcp::split_qualified_plugin_server_name(&name).map_or_else(
-                    || name.clone(),
-                    |(plugin, server)| format!("{plugin}/{server}"),
-                ),
+                label: codewhale_engine::mcp::split_qualified_plugin_server_name(&name)
+                    .map_or_else(
+                        || name.clone(),
+                        |(plugin, server)| format!("{plugin}/{server}"),
+                    ),
                 description: observed.map_or_else(String::new, |server| {
                     if waiting_for_first_use {
                         return server.transport.clone();
@@ -1993,9 +2004,19 @@ impl ExtensionsView {
                 format!("{} · {}{action} · {}", item.label, item.state, item.detail)
             }
             Some(VisibleEntry::Problem(problem)) => problem.to_string(),
-            Some(VisibleEntry::Empty) | None => {
-                tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
-            }
+            Some(VisibleEntry::Empty) | None => self.empty_message(),
+        }
+    }
+
+    fn empty_message(&self) -> String {
+        if self.query.is_empty() {
+            tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
+        } else {
+            localize(
+                self.locale,
+                MessageId::ExtensionsNoMatches,
+                &[("query", &self.query)],
+            )
         }
     }
 }
@@ -2227,13 +2248,41 @@ impl ModalView for ExtensionsView {
         if body.width == 0 || body.height < 5 {
             return;
         }
+        let spacious = body.height >= 16;
+        let status = if spacious && self.pending_remove.is_none() {
+            self.selected_item().map_or_else(
+                || self.selected_status(),
+                |item| {
+                    format!(
+                        "{} · {}\n{}\n{}",
+                        item.label, item.state, item.description, item.detail
+                    )
+                },
+            )
+        } else {
+            self.selected_status()
+        };
+        let status = Paragraph::new(status)
+            .style(Style::default().fg(if self.pending_remove.is_some() {
+                palette::STATUS_WARNING
+            } else {
+                palette::TEXT_MUTED
+            }))
+            .wrap(Wrap { trim: false });
+        let status_height = if spacious {
+            u16::try_from(status.line_count(body.width))
+                .unwrap_or(u16::MAX)
+                .clamp(3, (body.height / 3).max(3))
+        } else {
+            1
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
-                Constraint::Length(if body.height >= 16 { 3 } else { 1 }),
+                Constraint::Length(status_height),
                 Constraint::Length(1),
             ])
             .split(body);
@@ -2377,15 +2426,7 @@ impl ModalView for ExtensionsView {
                     Some(codewhale_palette::ChromeInk::Failure),
                 )),
                 VisibleEntry::Empty => parts.push((
-                    if self.query.is_empty() {
-                        tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
-                    } else {
-                        localize(
-                            self.locale,
-                            MessageId::ExtensionsNoMatches,
-                            &[("query", &self.query)],
-                        )
-                    },
+                    self.empty_message(),
                     Some(codewhale_palette::ChromeInk::MetadataHint),
                 )),
             }
@@ -2418,27 +2459,7 @@ impl ModalView for ExtensionsView {
             hits.rows.push((row_area, entry_index));
         }
 
-        let status = if rows[3].height > 1 && self.pending_remove.is_none() {
-            self.selected_item().map_or_else(
-                || self.selected_status(),
-                |item| {
-                    format!(
-                        "{} · {}\n{}\n{}",
-                        item.label, item.state, item.description, item.detail
-                    )
-                },
-            )
-        } else {
-            self.selected_status()
-        };
-        Paragraph::new(status)
-            .style(Style::default().fg(if self.pending_remove.is_some() {
-                palette::STATUS_WARNING
-            } else {
-                palette::TEXT_MUTED
-            }))
-            .wrap(Wrap { trim: false })
-            .render(rows[3], buf);
+        status.render(rows[3], buf);
         let mut compact_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
@@ -2534,7 +2555,7 @@ fn sentence_case(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::McpRecoveryKind;
+    use codewhale_engine::mcp::McpRecoveryKind;
 
     #[test]
     fn passive_rows_open_details_without_recovery_or_mutation() {
@@ -2557,8 +2578,8 @@ mod tests {
         connected: bool,
         error: Option<&str>,
         auth_required: bool,
-    ) -> crate::mcp::McpServerSnapshot {
-        crate::mcp::McpServerSnapshot {
+    ) -> codewhale_engine::mcp::McpServerSnapshot {
+        codewhale_engine::mcp::McpServerSnapshot {
             name: name.into(),
             enabled,
             required: false,
@@ -2571,9 +2592,9 @@ mod tests {
             error: error.map(str::to_string),
             auth_required,
             capability_metadata: if connected {
-                crate::mcp::McpServerCapabilityMetadata::LegacyFallback
+                codewhale_engine::mcp::McpServerCapabilityMetadata::LegacyFallback
             } else {
-                crate::mcp::McpServerCapabilityMetadata::NotObserved
+                codewhale_engine::mcp::McpServerCapabilityMetadata::NotObserved
             },
             tools: Vec::new(),
             resources: Vec::new(),
@@ -2590,11 +2611,11 @@ mod tests {
         let _env = crate::test_support::lock_test_env();
         let root = tempfile::tempdir().unwrap();
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
-        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+        let registry = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let mut app = App::new_with_plugin_registry(
             crate::tui::test_support::test_tui_options(root.path()),
-            &crate::config::Config::default(),
+            &codewhale_runtime::config::Config::default(),
             registry,
         );
         app.mcp_config_path = root.path().join("mcp.json");
@@ -2610,7 +2631,7 @@ mod tests {
             }}"#,
         )
         .unwrap();
-        app.mcp_snapshot = Some(crate::mcp::McpManagerSnapshot {
+        app.mcp_snapshot = Some(codewhale_engine::mcp::McpManagerSnapshot {
             config_path: app.mcp_config_path.clone(),
             config_exists: true,
             reload_required: false,
@@ -2719,11 +2740,11 @@ mod tests {
         let _env = crate::test_support::lock_test_env();
         let root = tempfile::tempdir().unwrap();
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
-        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+        let registry = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
             crate::tui::test_support::test_tui_options(root.path()),
-            &crate::config::Config::default(),
+            &codewhale_runtime::config::Config::default(),
             registry,
         );
         let model = mcp_model(&app, Locale::En);
@@ -2844,20 +2865,33 @@ mod tests {
         assert!(mcp_row_is_mutable(None, "anything"));
     }
 
-    /// The founder's report, as a test: `computer-use` ships disabled and
+    /// The founder's report, as a test: `computer-use` is installed disabled and
     /// never reviewed, and the panel said `disabled` while offering no way
     /// to enable it — "computer use is disabled but i can't enable it. tf?".
     /// The row must now say what stands in the way and carry the switch.
     #[test]
-    fn the_shipped_bundle_says_what_it_needs_and_carries_a_switch() {
+    fn an_installed_bundle_says_what_it_needs_and_carries_a_switch() {
         let _env = crate::test_support::lock_test_env();
         let root = tempfile::tempdir().unwrap();
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
-        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+        let plugin_dir = root.path().join("plugins/computer-use");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            root.path().join("plugins"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"computer-use","version":"1.0.0","description":"Locally installed fixture"}"#,
+        )
+        .unwrap();
+        let registry = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
             crate::tui::test_support::test_tui_options(root.path()),
-            &crate::config::Config::default(),
+            &codewhale_runtime::config::Config::default(),
             registry,
         );
         let plugin = app.plugin_registry.get("computer-use").unwrap();
@@ -2869,7 +2903,7 @@ mod tests {
             .iter()
             .flat_map(|group| group.items.iter())
             .find(|row| row.label == "computer-use")
-            .expect("built-in row");
+            .expect("installed row");
 
         // Both halves of the truth, in words a person uses for a switch.
         assert_eq!(row.state, "off · needs review", "state: {}", row.state);
@@ -2908,18 +2942,31 @@ mod tests {
         let _env = crate::test_support::lock_test_env();
         let root = tempfile::tempdir().unwrap();
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
-        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+        let plugin_dir = root.path().join("plugins/computer-use");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            root.path().join("plugins"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"computer-use","version":"1.0.0","description":"Locally installed fixture"}"#,
+        )
+        .unwrap();
+        let registry = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
             crate::tui::test_support::test_tui_options(root.path()),
-            &crate::config::Config::default(),
+            &codewhale_runtime::config::Config::default(),
             registry,
         );
         let mut view = ExtensionsView::new(&app, ExtensionsTab::Plugins);
         assert_eq!(
             view.selected_item().map(|item| item.label.as_str()),
             Some("computer-use"),
-            "the Plugins tab opens on the built-in row"
+            "the Plugins tab opens on the installed row"
         );
         let action = view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(
@@ -2933,15 +2980,28 @@ mod tests {
     }
 
     #[test]
-    fn marketplace_shipped_bundle_uses_local_metadata_and_review_action() {
+    fn marketplace_installed_bundle_uses_local_metadata_and_review_action() {
         let _env = crate::test_support::lock_test_env();
         let root = tempfile::tempdir().unwrap();
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
-        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+        let plugin_dir = root.path().join("plugins/computer-use");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            root.path().join("plugins"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"computer-use","version":"1.0.0","description":"Locally installed fixture"}"#,
+        )
+        .unwrap();
+        let registry = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
             crate::tui::test_support::test_tui_options(root.path()),
-            &crate::config::Config::default(),
+            &codewhale_runtime::config::Config::default(),
             registry,
         );
         let model = marketplace_model(&app, Locale::En);
@@ -2955,27 +3015,24 @@ mod tests {
             .iter()
             .find(|row| row.label == "computer-use")
             .unwrap();
-        let builtin = app.plugin_registry.get("computer-use").unwrap();
+        let installed = app.plugin_registry.get("computer-use").unwrap();
         assert_eq!(
             row.description,
-            builtin
+            installed
                 .manifest
                 .plugin
                 .description
                 .clone()
                 .unwrap_or_default()
         );
-        assert_eq!(
-            row.state,
-            tr(Locale::En, MessageId::ExtensionsStateFirstParty)
-        );
+        assert_eq!(row.state, plugin_row_state(Locale::En, installed));
         // The exact-content review stacks on the panel so the confirmed
         // digest lands on a row that then re-reads its trust state.
         assert!(
             matches!(&row.action, Some(ExtensionAction::Command { command, disposition: RowActionDisposition::InPlace, .. }) if command == "/plugin trust computer-use")
         );
-        assert!(!builtin.trusted());
-        assert!(!builtin.enabled);
+        assert!(!installed.trusted());
+        assert!(!installed.enabled);
         assert!(
             group.items.iter().any(|row| matches!(
                 &row.action,
@@ -2988,9 +3045,14 @@ mod tests {
 
     #[test]
     fn mcp_item_action_for_stale_oauth_is_login() {
-        let recovery =
-            crate::mcp::mcp_recovery_kind(true, true, false, Some("401 Unauthorized"), true)
-                .expect("stale oauth needs recovery");
+        let recovery = codewhale_engine::mcp::mcp_recovery_kind(
+            true,
+            true,
+            false,
+            Some("401 Unauthorized"),
+            true,
+        )
+        .expect("stale oauth needs recovery");
         assert_eq!(recovery, McpRecoveryKind::Reauth);
         assert_eq!(recovery.slash_command("github"), "/mcp login github");
         assert_eq!(tr(Locale::En, recovery.label_key()).as_ref(), "re-auth");
@@ -3002,14 +3064,14 @@ mod tests {
         // lol". Enabled, inspected, connected and erroring on nothing is not
         // a state anything repairs.
         assert_eq!(
-            crate::mcp::mcp_recovery_kind(true, true, true, None, false),
+            codewhale_engine::mcp::mcp_recovery_kind(true, true, true, None, false),
             None
         );
     }
 
     #[test]
     fn mcp_item_action_for_disconnected_server_is_reconnect() {
-        let recovery = crate::mcp::mcp_recovery_kind(true, true, false, None, false)
+        let recovery = codewhale_engine::mcp::mcp_recovery_kind(true, true, false, None, false)
             .expect("a disconnected server needs recovery");
         assert_eq!(recovery, McpRecoveryKind::Reconnect);
         // The row names one server, so the command it runs must name it too:

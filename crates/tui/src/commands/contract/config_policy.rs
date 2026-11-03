@@ -54,7 +54,7 @@ impl CommandPermissionsContext for PermissionsAdapter<'_> {
                 }
             },
             approval_mode: to_command_approval(app.approval_mode),
-            audit_path: crate::audit::audit_log_path(),
+            audit_path: codewhale_runtime::audit::audit_log_path(),
         })
     }
     fn remove_rule(
@@ -78,41 +78,48 @@ impl CommandConfigStatusContext for ConfigStatusAdapter<'_> {
 }
 
 fn project_status(app: &App) -> ConfigStatusView {
-    let config =
-        crate::config::Config::load(app.config_path.clone(), app.config_profile.as_deref()).ok();
-    let catalog = crate::models_dev_live::status();
+    let config = codewhale_plugins::providers::load_config(
+        app.config_path.clone(),
+        app.config_profile.as_deref(),
+    )
+    .ok();
+    let catalog = codewhale_engine::models_dev_live::status();
     let metrics = crate::tui::session_metrics::snapshot_from_app(app);
-    let outputs =
-        crate::tool_output_receipts::tool_output_status(&app.api_messages, &app.session_artifacts);
-    let context_window = crate::route_budget::route_context_window_tokens(
-        app.api_provider,
-        app.effective_model_for_budget(),
-        app.active_route_limits,
+    let outputs = codewhale_runtime::tool_output_receipts::tool_output_status(
+        &app.api_messages,
+        &app.session_artifacts,
     );
-    let context_used = crate::compaction::estimate_input_tokens_conservative(
+    let context_window = app.effective_context_window();
+    let context_used = codewhale_engine::compaction::estimate_input_tokens_conservative(
         &app.api_messages,
         app.system_prompt.as_ref(),
     )
-    .max(crate::utils::estimate_message_chars(&app.api_messages) / 4);
-    let context_source = match app.active_context_window_source {
-        crate::route_runtime::ContextWindowSource::Configured => StatusContextSource::Configured,
-        crate::route_runtime::ContextWindowSource::UserDeclared => {
+    .max(codewhale_util::utils::estimate_message_chars(&app.api_messages) / 4);
+    let context_source = match app.effective_context_window_source() {
+        codewhale_engine::route_runtime::ContextWindowSource::Configured => {
+            StatusContextSource::Configured
+        }
+        codewhale_engine::route_runtime::ContextWindowSource::UserDeclared => {
             StatusContextSource::UserDeclared
         }
-        crate::route_runtime::ContextWindowSource::ConfiguredModel => {
+        codewhale_engine::route_runtime::ContextWindowSource::ConfiguredModel => {
             StatusContextSource::ConfiguredModel
         }
-        crate::route_runtime::ContextWindowSource::ProviderReported => {
+        codewhale_engine::route_runtime::ContextWindowSource::ProviderReported => {
             StatusContextSource::ProviderReported
         }
-        crate::route_runtime::ContextWindowSource::StaticKimiCodeSafeFloor => {
+        codewhale_engine::route_runtime::ContextWindowSource::StaticKimiCodeSafeFloor => {
             StatusContextSource::StaticKimiCodeSafeFloor
         }
-        crate::route_runtime::ContextWindowSource::Catalog => StatusContextSource::Catalog,
-        crate::route_runtime::ContextWindowSource::NameSuffixHint => {
+        codewhale_engine::route_runtime::ContextWindowSource::Catalog => {
+            StatusContextSource::Catalog
+        }
+        codewhale_engine::route_runtime::ContextWindowSource::NameSuffixHint => {
             StatusContextSource::NameSuffixHint
         }
-        crate::route_runtime::ContextWindowSource::Fallback => StatusContextSource::Fallback,
+        codewhale_engine::route_runtime::ContextWindowSource::Fallback => {
+            StatusContextSource::Fallback
+        }
     };
     let window_override = if matches!(
         context_source,
@@ -135,7 +142,7 @@ fn project_status(app: &App) -> ConfigStatusView {
         model: app.model_display_label(),
         reasoning: app.reasoning_effort_display_label(),
         workspace: app.workspace.clone(),
-        home: crate::config::effective_home_dir(),
+        home: codewhale_paths::user_home(),
         project_docs: ["AGENTS.md", "CLAUDE.md"]
             .into_iter()
             .filter(|name| app.workspace.join(name).is_file())
@@ -151,7 +158,7 @@ fn project_status(app: &App) -> ConfigStatusView {
             .as_ref()
             .and_then(|config| model_pin_drift(app, config)),
         fleet_drift: config.as_ref().and_then(|config| fleet_drift(app, config)),
-        snapshot_notice: crate::core::turn::snapshots_disabled_status(
+        snapshot_notice: codewhale_engine::core::turn::snapshots_disabled_status(
             &app.workspace,
             app.current_session_id.as_deref(),
         ),
@@ -161,12 +168,16 @@ fn project_status(app: &App) -> ConfigStatusView {
         window_override,
         catalog: StatusCatalog {
             freshness: match catalog.freshness {
-                crate::models_dev_live::ModelsDevFreshness::Bundled => {
+                codewhale_engine::models_dev_live::ModelsDevFreshness::Bundled => {
                     StatusCatalogFreshness::Bundled
                 }
-                crate::models_dev_live::ModelsDevFreshness::Live => StatusCatalogFreshness::Live,
-                crate::models_dev_live::ModelsDevFreshness::Stale => StatusCatalogFreshness::Stale,
-                crate::models_dev_live::ModelsDevFreshness::Failed => {
+                codewhale_engine::models_dev_live::ModelsDevFreshness::Live => {
+                    StatusCatalogFreshness::Live
+                }
+                codewhale_engine::models_dev_live::ModelsDevFreshness::Stale => {
+                    StatusCatalogFreshness::Stale
+                }
+                codewhale_engine::models_dev_live::ModelsDevFreshness::Failed => {
                     StatusCatalogFreshness::Failed
                 }
             },
@@ -186,6 +197,19 @@ fn project_status(app: &App) -> ConfigStatusView {
         cache_miss_tokens: app.session.displayed_total_cache_miss_tokens(),
         cost: app.session_cost_for_currency(app.cost_currency),
         currency: to_command_currency(app.cost_display_currency(app.cost_currency)),
+        cost_label: match app.cumulative_usage_chip() {
+            chip @ codewhale_engine::route_billing::UsageChip::PricedSubtotal { .. } => {
+                codewhale_engine::route_billing::format_usage_chip(&chip, app.ui_locale)
+            }
+            codewhale_engine::route_billing::UsageChip::Unknown(_) => Some(
+                codewhale_localization::tr(
+                    app.ui_locale,
+                    codewhale_localization::MessageId::CmdCostUnknownValue,
+                )
+                .into_owned(),
+            ),
+            _ => None,
+        },
         metrics,
         ascii_safe: crate::tui::color_compat::ascii_safe_enabled(),
         tool_outputs: outputs,
@@ -193,34 +217,39 @@ fn project_status(app: &App) -> ConfigStatusView {
 }
 
 pub(crate) fn safety(app: &App) -> StatusSafety {
-    let policy = crate::core::authority::sandbox_policy_for_turn(
+    let policy = codewhale_engine::core::authority::sandbox_policy_for_turn(
         app.mode,
         app.approval_mode,
         app.configured_sandbox_mode.as_deref(),
         &app.workspace,
-        crate::core::authority::SandboxNetworkAccess::from_config(app.configured_sandbox_network),
+        codewhale_engine::core::authority::SandboxNetworkAccess::from_config(
+            app.configured_sandbox_network,
+        ),
     );
     let enforced = app.sandbox_backend.is_some();
     match policy {
-        crate::sandbox::SandboxPolicy::ReadOnly => StatusSafety::ReadOnly { enforced },
-        crate::sandbox::SandboxPolicy::WorkspaceWrite { network_access, .. } => {
+        codewhale_sandbox::SandboxPolicy::ReadOnly { .. } => StatusSafety::ReadOnly { enforced },
+        codewhale_sandbox::SandboxPolicy::WorkspaceWrite { network_access, .. } => {
             StatusSafety::WorkspaceWrite {
                 enforced,
                 network_access,
             }
         }
-        crate::sandbox::SandboxPolicy::DangerFullAccess => StatusSafety::FullAccess {
-            no_new_privs: crate::sandbox::process_hardening::no_new_privs_active(),
+        codewhale_sandbox::SandboxPolicy::DangerFullAccess => StatusSafety::FullAccess {
+            no_new_privs: codewhale_sandbox::process_hardening::no_new_privs_active(),
         },
-        crate::sandbox::SandboxPolicy::ExternalSandbox { .. } => StatusSafety::External,
+        codewhale_sandbox::SandboxPolicy::ExternalSandbox { .. } => StatusSafety::External,
     }
 }
 
-pub(crate) fn fleet_drift(app: &App, config: &crate::config::Config) -> Option<StatusFleetDrift> {
-    let selected = crate::fleet::store::selected_fleet(&app.workspace)?;
-    let (fleet, _scope) = crate::fleet::store::load_fleet_at(&selected.path).ok()?;
+pub(crate) fn fleet_drift(
+    app: &App,
+    config: &codewhale_runtime::config::Config,
+) -> Option<StatusFleetDrift> {
+    let selected = codewhale_engine::fleet::store::selected_fleet(&app.workspace)?;
+    let (fleet, _scope) = codewhale_engine::fleet::store::load_fleet_at(&selected.path).ok()?;
     let active = config.active_provider_identity().ok();
-    let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
+    let health = codewhale_engine::provider_readiness::ProviderReadinessSnapshot::default();
     let routes = crate::tui::views::fleet_setup::cross_provider_model_routes(
         config,
         active.as_ref(),
@@ -250,13 +279,18 @@ pub(crate) fn fleet_drift(app: &App, config: &crate::config::Config) -> Option<S
     })
 }
 
-pub(crate) fn model_pin_drift(app: &App, config: &crate::config::Config) -> Option<String> {
+pub(crate) fn model_pin_drift(
+    app: &App,
+    config: &codewhale_runtime::config::Config,
+) -> Option<String> {
     if app.auto_model || app.model.trim().is_empty() {
         return None;
     }
     let provider = app.provider_identity_for_persistence();
-    crate::provider_catalog_live::pin_missing_from_fresh_roster(config, provider, &app.model)
-        .filter(|missing| *missing)?;
+    codewhale_engine::provider_catalog_live::pin_missing_from_fresh_roster(
+        config, provider, &app.model,
+    )
+    .filter(|missing| *missing)?;
     Some(app.model.clone())
 }
 
@@ -453,12 +487,21 @@ fn config_policy_status_retains_notice_after_delivery_and_binds_it_to_session() 
     );
     app.current_session_id = Some("policy-session".into());
     assert!(
-        crate::core::turn::pre_turn_snapshot(&workspace, 1, 1024, None, Some("policy-session"))
-            .is_none()
+        codewhale_engine::core::turn::pre_turn_snapshot(
+            &workspace,
+            1,
+            1024,
+            None,
+            Some("policy-session")
+        )
+        .is_none()
     );
     assert_eq!(
-        crate::core::turn::take_snapshots_disabled_notices(&workspace, Some("policy-session"))
-            .len(),
+        codewhale_engine::core::turn::take_snapshots_disabled_notices(
+            &workspace,
+            Some("policy-session")
+        )
+        .len(),
         1
     );
     let a = project_status(&app).snapshot_notice.unwrap();

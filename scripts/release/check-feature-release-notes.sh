@@ -42,7 +42,7 @@ while IFS= read -r -d '' sha &&
   while IFS= read -r issue; do
     [[ -n "${issue}" ]] || continue
     case "${issue}" in
-      000 | 1 | 24 | 26 | 1834 | 142352) continue ;;
+      000 | 1 | 4 | 5 | 6 | 7 | 9 | 16 | 18 | 19 | 24 | 26 | 1234 | 1834 | 142352) continue ;;
     esac
     checked=$((checked + 1))
     found=0

@@ -25,14 +25,15 @@ use crate::commands::session_export_test_support::{
     assert_only_export_facet_exposed, normalize_export_time,
 };
 use crate::commands::{CommandResult, execute};
-use crate::config::{Config, ProviderKind};
 use crate::test_support::{EnvVarGuard, TestEnvLock};
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::clipboard::ClipboardHandler;
 use crate::tui::command_palette;
 use codewhale_command_contract::CommandDiscovery;
+use codewhale_config::ProviderKind;
 use codewhale_localization::Locale;
 use codewhale_models::{ContentBlock, Message, Role};
+use codewhale_runtime::config::Config;
 
 const EXPORT_NAME: &str = "export";
 const EXPORT_ALIAS: &str = "daochu";
@@ -219,7 +220,7 @@ fn export_is_discoverable_by_name_and_alias_in_palette_and_slash_completion() {
     let entries = command_palette::build_entries(
         Locale::En,
         &skills_dir,
-        crate::skills::SkillDiscoveryMode::Compatible,
+        &Default::default(),
         workspace,
         &mcp_config,
         None,
@@ -535,10 +536,10 @@ fn portable_export_source_has_no_host_dependency() {
     for token in [
         "use crate::",
         "crate::tui",
-        "crate::client",
-        "crate::config",
-        "crate::snapshot",
-        "crate::session_manager",
+        "codewhale_engine::client",
+        "codewhale_runtime::config",
+        "codewhale_snapshot",
+        "codewhale_engine::session_manager",
         "std::fs",
         "std::net",
         "std::process",

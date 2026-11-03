@@ -197,12 +197,19 @@
     "compile": "tsc -p ./",
     "check": "npm run compile",
     "test": "npm run compile && node --test out/test/*.test.js",
-    "package": "vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies",
+    "audit:dependencies": "node scripts/audit-dependencies.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.27",
     "@types/vscode": "1.96.0",
     "@vscode/vsce": "^4.0.0",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "@azure/identity": {
+      "@azure/msal-node": "^7.1.2"
+    },
+    "minimatch": "^11.0.1"
   }
 }

@@ -16,7 +16,6 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::ui_text::{semantic_truncate, text_display_width};
 use crate::tui::{
     app::{App, OnboardingState},
     ocean::COMPLETION_BREATH_MS,
@@ -26,6 +25,7 @@ use codewhale_config::AppMode;
 use codewhale_execpolicy::ApprovalMode;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette::ChromeInk;
+use codewhale_tui_kit::ui_text::{semantic_truncate, text_display_width};
 
 /// Responsive density tier. It changes how much truth is shown, never the
 /// underlying state grammar.
@@ -141,9 +141,9 @@ fn launch_recent_entries(app: &App) -> (Vec<LaunchRecentEntry>, bool) {
         .recent
         .iter()
         .map(|session| {
-            let raw = crate::session_manager::extract_title(&session.title);
+            let raw = codewhale_engine::session_manager::extract_title(&session.title);
             let title = if raw == "Session" || raw.trim().is_empty() {
-                crate::session_manager::truncate_id(&session.id).to_string()
+                codewhale_engine::session_manager::truncate_id(&session.id).to_string()
             } else {
                 raw.to_string()
             };
@@ -373,6 +373,11 @@ pub fn handle_launch_composer_key(app: &mut App, key: KeyEvent) -> LaunchCompose
         KeyCode::Enter
             if crate::tui::composer_ui::composer_submit_chord(key, multiline).is_some() =>
         {
+            if key.modifiers != KeyModifiers::NONE
+                && let Some(pending) = app.flush_paste_burst_before_modified_input_if_enabled()
+            {
+                app.insert_str(&pending);
+            }
             // Explicit home navigation takes precedence over a preserved draft.
             // Only painted rows may own Enter, just as with mouse activation.
             if app.launch.return_to_session
@@ -582,7 +587,7 @@ fn app_has_unfinished_subagents(app: &App) -> bool {
         || app.subagent_cache.iter().any(|agent| {
             matches!(
                 agent.status,
-                crate::tools::subagent::SubAgentStatus::Running
+                codewhale_engine::tools::subagent::SubAgentStatus::Running
             )
         })
 }
@@ -687,7 +692,7 @@ impl ShellPhase {
 
 /// Exhaustive on purpose: a new [`AppMode`] must be handed a Policy ink
 /// deliberately rather than inheriting act's by falling through a wildcard.
-fn header_mode_ink(mode: AppMode) -> ChromeInk {
+pub(crate) fn header_mode_ink(mode: AppMode) -> ChromeInk {
     match mode {
         AppMode::Plan => ChromeInk::PolicyPlan,
         AppMode::Operate => ChromeInk::PolicyOperate,
@@ -695,7 +700,7 @@ fn header_mode_ink(mode: AppMode) -> ChromeInk {
     }
 }
 
-fn header_permission_ink(mode: ApprovalMode) -> ChromeInk {
+pub(crate) fn header_permission_ink(mode: ApprovalMode) -> ChromeInk {
     match mode {
         ApprovalMode::Suggest | ApprovalMode::Never => ChromeInk::PermissionAsk,
         ApprovalMode::Auto => ChromeInk::PermissionAutoReview,
@@ -868,10 +873,11 @@ pub(crate) fn phase_marker_with_activity(
             // spinners. The shared helper also preserves the 400ms
             // "motion is earned" delay and reduced/still fallback.
             let policy = app.motion_policy();
-            let animated = crate::tui::spinner::braille_spinner_frame(app.turn_started_at, false);
+            let animated =
+                codewhale_tui_kit::spinner::braille_spinner_frame(app.turn_started_at, false);
             let earned = app.turn_started_at.is_none_or(|started| {
                 started.elapsed().as_millis()
-                    >= u128::from(crate::tui::spinner::LIVE_MARKER_DELAY_MS)
+                    >= u128::from(codewhale_tui_kit::spinner::LIVE_MARKER_DELAY_MS)
             });
             let frame = policy.spinner_glyph(animated, earned);
             (frame, activity.label(locale))
@@ -880,10 +886,11 @@ pub(crate) fn phase_marker_with_activity(
             // Metered braille tick on the shared live clock — checking, not
             // searching. Reduced motion holds the legible mid frame.
             let policy = app.motion_policy();
-            let animated = crate::tui::spinner::verification_tick_frame(app.turn_started_at, false);
+            let animated =
+                codewhale_tui_kit::spinner::verification_tick_frame(app.turn_started_at, false);
             let earned = app.turn_started_at.is_none_or(|started| {
                 started.elapsed().as_millis()
-                    >= u128::from(crate::tui::spinner::LIVE_MARKER_DELAY_MS)
+                    >= u128::from(codewhale_tui_kit::spinner::LIVE_MARKER_DELAY_MS)
             });
             let frame = policy.spinner_glyph(animated, earned);
             (frame, phase.label(locale))
@@ -894,13 +901,13 @@ pub(crate) fn phase_marker_with_activity(
                 let index = ((elapsed / 140) as usize + 4).min(WORKING_BUBBLE_FRAMES.len() - 1);
                 (WORKING_BUBBLE_FRAMES[index], phase.label(locale))
             }
-            _ => (crate::tui::glyphs::DONE, phase.label(locale)),
+            _ => (codewhale_tui_kit::glyphs::DONE, phase.label(locale)),
         },
-        ShellPhase::Failed => (crate::tui::glyphs::FAILED, phase.label(locale)),
+        ShellPhase::Failed => (codewhale_tui_kit::glyphs::FAILED, phase.label(locale)),
     }
 }
 
-fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
+pub(crate) fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
     match mode {
         AppMode::Agent => tr(locale, MessageId::ChipModeAct),
         AppMode::Plan => tr(locale, MessageId::ChipModePlan),
@@ -916,7 +923,11 @@ fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
 /// earns header columns when it is worth reading — see
 /// [`filesystem_scope_notice`].
 pub(crate) fn permission_label(app: &App) -> Cow<'static, str> {
-    crate::core::authority::permission_label_for(app.ui_locale, app.mode, app.approval_mode)
+    codewhale_engine::core::authority::permission_label_for(
+        app.ui_locale,
+        app.mode,
+        app.approval_mode,
+    )
 }
 
 /// The effective filesystem scope — but only when it says something the
@@ -940,12 +951,14 @@ fn filesystem_scope_notice(app: &App) -> Option<Cow<'static, str>> {
     // Spelled out because the old `fs:` prefix read as an unexplained
     // acronym (user report, 2026-07-23): this chip states which files the
     // session may write.
-    let policy = crate::core::authority::sandbox_policy_for_turn(
+    let policy = codewhale_engine::core::authority::sandbox_policy_for_turn(
         app.mode,
         app.approval_mode,
         app.configured_sandbox_mode.as_deref(),
         &app.workspace,
-        crate::core::authority::SandboxNetworkAccess::from_config(app.configured_sandbox_network),
+        codewhale_engine::core::authority::SandboxNetworkAccess::from_config(
+            app.configured_sandbox_network,
+        ),
     );
     // A policy is an intent; enforcement needs a backend. On default Linux
     // (bubblewrap is opt-in) and on all Windows there is none. Say
@@ -955,14 +968,14 @@ fn filesystem_scope_notice(app: &App) -> Option<Cow<'static, str>> {
     let unenforced = app.sandbox_backend.is_none()
         && !matches!(
             policy,
-            crate::sandbox::SandboxPolicy::DangerFullAccess
-                | crate::sandbox::SandboxPolicy::ExternalSandbox { .. }
+            codewhale_sandbox::SandboxPolicy::DangerFullAccess
+                | codewhale_sandbox::SandboxPolicy::ExternalSandbox { .. }
         );
     match policy {
-        crate::sandbox::SandboxPolicy::ReadOnly if unenforced => {
+        codewhale_sandbox::SandboxPolicy::ReadOnly { .. } if unenforced => {
             Some(Cow::Borrowed("files: read-only (unenforced)"))
         }
-        crate::sandbox::SandboxPolicy::ReadOnly => {
+        codewhale_sandbox::SandboxPolicy::ReadOnly { .. } => {
             (app.mode != AppMode::Plan).then_some(Cow::Borrowed("files: read-only"))
         }
         // `DangerFullAccess` only ever arises from the Bypass posture
@@ -971,11 +984,11 @@ fn filesystem_scope_notice(app: &App) -> Option<Cow<'static, str>> {
         // restating it as `files: full disk` spent columns saying it twice.
         // The scope chip speaks in this posture only when the scope is
         // *narrower* than the name implies (the WorkspaceWrite arm below).
-        crate::sandbox::SandboxPolicy::DangerFullAccess => None,
-        crate::sandbox::SandboxPolicy::ExternalSandbox { .. } => {
+        codewhale_sandbox::SandboxPolicy::DangerFullAccess => None,
+        codewhale_sandbox::SandboxPolicy::ExternalSandbox { .. } => {
             Some(Cow::Borrowed("files: external sandbox"))
         }
-        crate::sandbox::SandboxPolicy::WorkspaceWrite { .. } if unenforced => {
+        codewhale_sandbox::SandboxPolicy::WorkspaceWrite { .. } if unenforced => {
             Some(Cow::Borrowed("files: workspace (unenforced)"))
         }
         // The unremarkable case: writes are confined to the workspace and the
@@ -988,7 +1001,7 @@ fn filesystem_scope_notice(app: &App) -> Option<Cow<'static, str>> {
         // to mean unrestricted disk writes), and that pairing is reachable:
         // Bypass with a configured `workspace-write` is clamped to this policy
         // by `sandbox_policy_for_turn`.
-        crate::sandbox::SandboxPolicy::WorkspaceWrite { .. } => {
+        codewhale_sandbox::SandboxPolicy::WorkspaceWrite { .. } => {
             (app.approval_mode == ApprovalMode::Bypass).then_some(Cow::Borrowed("files: workspace"))
         }
     }
@@ -1193,7 +1206,7 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         &app.workspace,
         app.workspace_context.as_deref(),
     );
-    let workspace = crate::utils::display_path(&app.workspace);
+    let workspace = codewhale_util::utils::display_path(&app.workspace);
     let branch = identity.branch.as_deref().map_or_else(
         || tr(app.ui_locale, MessageId::EmptyStateNoGit),
         |branch| Cow::Owned(branch.to_string()),
@@ -1245,7 +1258,7 @@ pub(crate) fn mcp_remedy_command(app: &App) -> Option<String> {
     use crate::tui::session_boot::{McpServerBootState, PluginBootSummary, SessionBootSurface};
     let boot = SessionBootSurface::from_parts(
         app.mcp_snapshot.as_ref(),
-        app.mcp_initializing,
+        app.mcp_boot_initializing(),
         &app.mcp_connecting,
         app.mcp_configured_count,
         PluginBootSummary::default(),
@@ -1298,7 +1311,7 @@ fn mcp_launch_lines(app: &App, text_width: usize) -> McpLaunchBlock {
     // discard it would be waste.
     let boot = SessionBootSurface::from_parts(
         app.mcp_snapshot.as_ref(),
-        app.mcp_initializing,
+        app.mcp_boot_initializing(),
         &app.mcp_connecting,
         app.mcp_configured_count,
         PluginBootSummary::default(),
@@ -1422,8 +1435,8 @@ fn mcp_problems_row(
     hint: &str,
     lane: usize,
 ) -> Option<String> {
-    use crate::tui::glyphs::{ATTENTION, FAILED};
     use crate::tui::session_boot::ITEM_SEPARATOR;
+    use codewhale_tui_kit::glyphs::{ATTENTION, FAILED};
 
     let group = |glyph: &str, names: &[&str], shown: usize, row: &mut String| {
         if names.is_empty() {
@@ -1478,7 +1491,7 @@ fn fade_lines(lines: &mut [Line<'static>], dissolve: f32, water: Color) {
     for line in lines.iter_mut() {
         for span in line.spans.iter_mut() {
             if let Some(fg) = span.style.fg {
-                span.style.fg = Some(crate::tui::mark::lerp_color(fg, water, dissolve));
+                span.style.fg = Some(codewhale_tui_kit::mark::lerp_color(fg, water, dissolve));
             }
         }
     }
@@ -1492,6 +1505,7 @@ struct LaunchFit {
     context: bool,
     help: bool,
     notice: bool,
+    whats_new: usize,
     /// The "no model connected · run /provider" line (UX-3).
     setup: bool,
     heading: bool,
@@ -1516,6 +1530,7 @@ impl LaunchFit {
             + (self.context as usize)
             + (self.help as usize)
             + (self.notice as usize)
+            + self.whats_new
             + (self.setup as usize)
             + self.blanks * self.gap
             + 1
@@ -1542,6 +1557,7 @@ fn launch_fit(
     recent: usize,
     has_more: bool,
     notice: bool,
+    whats_new: usize,
     mcp: usize,
     setup: bool,
 ) -> LaunchFit {
@@ -1550,6 +1566,7 @@ fn launch_fit(
         context: true,
         help: true,
         notice,
+        whats_new,
         setup,
         heading: recent > 0 || has_more,
         blanks: LAUNCH_SEPARATORS,
@@ -1567,28 +1584,58 @@ fn launch_fit(
             2 => fit.blanks = 0,
             3 => fit.notice = false,
             4 => {
+                while fit.whats_new > 0 && fit.rows() > height {
+                    fit.whats_new -= 1;
+                }
+            }
+            5 => {
                 while fit.mcp > 1 && fit.rows() > height {
                     fit.mcp -= 1;
                 }
             }
-            5 => fit.help = false,
-            6 => fit.context = false,
-            7 => fit.heading = false,
-            8 => fit.brand = false,
-            9 => {
+            6 => fit.help = false,
+            7 => fit.context = false,
+            8 => fit.heading = false,
+            9 => fit.brand = false,
+            10 => {
                 while fit.shown > 0 && fit.rows() > height {
                     fit.shown -= 1;
                     fit.see_all = true;
                 }
             }
-            10 => fit.mcp = 0,
-            11 => fit.see_all = false,
-            12 => fit.setup = false,
+            11 => fit.mcp = 0,
+            12 => fit.see_all = false,
+            13 => fit.setup = false,
             _ => break,
         }
         step += 1;
     }
     fit
+}
+
+fn whats_new_launch_lines(app: &App, text_width: usize) -> Vec<(String, bool)> {
+    let Some(notice) = app.launch.whats_new.as_ref() else {
+        return Vec::new();
+    };
+    if app.launch.return_to_session {
+        return Vec::new();
+    }
+    let headline = notice.headline();
+    let mut lines: Vec<(String, bool)> = if text_display_width(&headline) <= text_width {
+        vec![(headline, false)]
+    } else {
+        let mut rows = crate::tui::onboarding::wrap_words(&notice.updated, text_width);
+        if let Some(counts) = &notice.counts {
+            rows.extend(crate::tui::onboarding::wrap_words(counts, text_width));
+        }
+        rows.into_iter().map(|row| (row, false)).collect()
+    };
+    let notes = [notice.notes_with_command(), notice.notes.clone()]
+        .into_iter()
+        .find(|line| text_display_width(line) <= text_width)
+        .unwrap_or_else(|| notice.url.clone());
+    lines.push((notes, true));
+    lines
 }
 
 pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
@@ -1637,9 +1684,10 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
     // Built before the fit ladder runs: how many rows the block wants is a
     // fact about this workspace's servers, not about the pane.
     let mcp_block = mcp_launch_lines(app, text_width);
+    let whats_new_lines = whats_new_launch_lines(app, text_width);
     // Brand occupies the header only; recent titles retain the whole reading lane.
     // Scale the canonical raster derivative before sacrificing any controls.
-    use crate::tui::mark::MarkSize;
+    use codewhale_tui_kit::mark::MarkSize;
     let mut mark = if crate::tui::color_compat::ascii_safe_enabled() {
         None
     } else if height >= 14 && text_width >= 40 {
@@ -1657,6 +1705,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         entries.len(),
         has_more,
         app.launch.claude_code_detected,
+        whats_new_lines.len(),
         mcp_block.lines.len(),
         no_model_connected,
     );
@@ -1668,6 +1717,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             entries.len(),
             has_more,
             app.launch.claude_code_detected,
+            whats_new_lines.len(),
             mcp_block.lines.len(),
             no_model_connected,
         );
@@ -1701,7 +1751,11 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         text.push(Some(Line::from(spans)));
     }
     if fit.context {
-        let workspace = shorten_workspace(&crate::utils::display_path(&app.workspace), 2);
+        let path = codewhale_util::utils::display_path(&app.workspace);
+        let mut workspace = shorten_workspace(&path, 2);
+        if text_display_width(&workspace) > header_width {
+            workspace = shorten_workspace(&path, 1);
+        }
         let identity = crate::tui::workspace_context::identity_from_context(
             &app.workspace,
             app.workspace_context.as_deref(),
@@ -1723,11 +1777,11 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         for (row, dots) in mark.rows().iter().enumerate() {
             let mut spans = vec![
                 Span::styled(
-                    crate::tui::mark::reveal_row(
+                    codewhale_tui_kit::mark::reveal_row(
                         dots,
                         app.launch
                             .mark_reveal_started_at
-                            .map_or(crate::tui::mark::REVEAL_MS, |started| {
+                            .map_or(codewhale_tui_kit::mark::REVEAL_MS, |started| {
                                 started.elapsed().as_millis()
                             }),
                         app.motion_policy().allows_decorative() && !app.launch.return_to_session,
@@ -1752,6 +1806,17 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         text.push(Some(Line::from(Span::styled(
             semantic_truncate(&line, text_width),
             Style::default().fg(theme.warning),
+        ))));
+    }
+    for (line, muted) in whats_new_lines.iter().take(fit.whats_new) {
+        let ink = if *muted {
+            theme.text_muted
+        } else {
+            theme.text_body
+        };
+        text.push(Some(Line::from(Span::styled(
+            semantic_truncate(line, text_width),
+            Style::default().fg(ink),
         ))));
     }
     // The migration notice, while there is still a question to answer. It
@@ -1829,11 +1894,23 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
                 }
             }
             let label = semantic_truncate(&tr(locale, MessageId::LaunchRecentHeading), text_width);
-            let remaining = text_width.saturating_sub(text_display_width(&label) + 2);
+            let mut remaining = text_width.saturating_sub(text_display_width(&label) + 2);
             let mut spans = vec![Span::styled(
                 label,
                 Style::default().fg(theme.text_soft).bold(),
             )];
+            let resume = tr(locale, MessageId::LaunchRecentResumeHint);
+            if card_rows
+                .iter()
+                .any(|row| matches!(row.id, crate::tui::app::LaunchRowId::Recent(_)))
+                && remaining >= text_display_width(&resume) + 6
+            {
+                remaining = remaining.saturating_sub(text_display_width(&resume) + 2);
+                spans.push(Span::styled(
+                    format!("  {resume}"),
+                    Style::default().fg(theme.text_hint),
+                ));
+            }
             if remaining >= 4 {
                 let rule = if crate::tui::color_compat::ascii_safe_enabled() {
                     "-"
@@ -1893,9 +1970,9 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
     // band to the text lane so selecting a session never colors the margins.
     for (index, (_, row)) in rows.iter().enumerate() {
         let style = if app.launch.menu_selected == Some(index) {
-            Some(crate::tui::menu_style::selected_row_bg_style().bold())
+            Some(codewhale_tui_kit::menu_style::selected_row_bg_style().bold())
         } else if app.launch.hovered_row == Some(index) {
-            Some(crate::tui::menu_style::hovered_row_style())
+            Some(codewhale_tui_kit::menu_style::hovered_row_style())
         } else {
             None
         };
@@ -1927,9 +2004,9 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         let selected = action.is_some_and(|i| app.launch.menu_selected == Some(i));
         let hovered = action.is_some_and(|i| app.launch.hovered_row == Some(i));
         let style = if selected {
-            crate::tui::menu_style::selected_row_style()
+            codewhale_tui_kit::menu_style::selected_row_style()
         } else if hovered {
-            crate::tui::menu_style::hovered_row_style()
+            codewhale_tui_kit::menu_style::hovered_row_style()
         } else {
             Style::default().fg(theme.text_muted)
         };
@@ -2073,7 +2150,9 @@ mod launch_card_tests {
     /// The founder's own shape: many servers, a couple genuinely broken, a
     /// pile sitting unauthenticated, the rest fine.
     fn with_mcp(mut app: App) -> App {
-        use crate::mcp::{McpManagerSnapshot, McpServerCapabilityMetadata, McpServerSnapshot};
+        use codewhale_engine::mcp::{
+            McpManagerSnapshot, McpServerCapabilityMetadata, McpServerSnapshot,
+        };
         let mut servers = Vec::new();
         let mut push = |name: &str, connected: bool, error: Option<&str>, auth: bool| {
             servers.push(McpServerSnapshot {
@@ -2114,7 +2193,7 @@ mod launch_card_tests {
             reload_required: false,
             servers,
         });
-        app.mcp_initializing = false;
+        app.set_mcp_boot_initializing(false);
         app.mcp_connecting = Vec::new();
         app
     }
@@ -2315,8 +2394,8 @@ mod launch_card_tests {
         let problems: Vec<_> = lines
             .iter()
             .filter(|line| {
-                line.contains(crate::tui::glyphs::FAILED)
-                    || line.contains(crate::tui::glyphs::ATTENTION)
+                line.contains(codewhale_tui_kit::glyphs::FAILED)
+                    || line.contains(codewhale_tui_kit::glyphs::ATTENTION)
             })
             .collect();
         assert_eq!(problems.len(), 1, "one problems row: {lines:#?}");
@@ -2333,7 +2412,7 @@ mod launch_card_tests {
     #[test]
     fn a_boot_in_flight_says_connecting_rather_than_connected() {
         let mut app = app_with_recent(&["one"], 1);
-        app.mcp_initializing = true;
+        app.set_mcp_boot_initializing(true);
         app.mcp_configured_count = 23;
         app.mcp_connecting = Vec::new();
         let lines = painted(&app, 120, 30);
@@ -2353,10 +2432,12 @@ mod launch_card_tests {
         for height in 1usize..=16 {
             for recent in 0usize..=5 {
                 for has_more in [false, true] {
-                    for notice in [false, true] {
+                    for (notice, whats_new) in [(false, 0), (true, 0), (false, 3), (true, 2)] {
                         for mcp in 0usize..=4 {
                             for setup in [false, true] {
-                                let fit = launch_fit(height, recent, has_more, notice, mcp, setup);
+                                let fit = launch_fit(
+                                    height, recent, has_more, notice, whats_new, mcp, setup,
+                                );
                                 assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
                                 assert!(fit.shown <= recent);
                                 assert!(fit.mcp <= mcp);
@@ -2404,9 +2485,9 @@ mod launch_card_tests {
         assert!(text.contains("New session"));
         assert!(!text.contains("Recent"));
         assert!(!text.contains("No recent sessions"));
-        assert!(!launch_fit(24, 0, false, false, 0, false).heading);
-        assert!(launch_fit(24, 0, true, false, 0, false).heading);
-        assert!(launch_fit(24, 0, true, false, 0, false).see_all);
+        assert!(!launch_fit(24, 0, false, false, 0, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, 0, false).see_all);
     }
 
     // --- the row reads as one object -----------------------------------
@@ -2616,14 +2697,14 @@ mod launch_card_tests {
                 let text = hovered.lines[y].spans.last().unwrap();
                 assert_eq!(
                     text.style.bg,
-                    crate::tui::menu_style::hovered_row_style().bg
+                    codewhale_tui_kit::menu_style::hovered_row_style().bg
                 );
 
                 app.launch.menu_selected = Some(index);
                 let selected = launch_empty_state(&app, area);
                 assert_eq!(
                     selected.lines[y].spans.last().unwrap().style,
-                    crate::tui::menu_style::selected_row_bg_style().bold()
+                    codewhale_tui_kit::menu_style::selected_row_bg_style().bold()
                 );
                 // Neither the whale nor the leading whitespace changes color.
                 assert_eq!(selected.lines[y].spans[0].style.bg, None);
@@ -2653,7 +2734,7 @@ mod launch_card_tests {
             assert_eq!(summary.style.fg, Some(app.ui_theme.error_fg));
             assert_eq!(
                 summary.style.bg,
-                crate::tui::menu_style::selected_row_bg_style().bg
+                codewhale_tui_kit::menu_style::selected_row_bg_style().bg
             );
         }
     }
@@ -2858,9 +2939,8 @@ pub fn launch_motion_active(app: &App, obscured: bool, ambient_settled: bool) ->
     let water_alive = app.theme_id == codewhale_palette::ThemeId::Underwater && !ambient_settled;
     let revealing = !app.launch.return_to_session
         && !crate::tui::color_compat::ascii_safe_enabled()
-        && app
-            .launch
-            .mark_reveal_started_at
-            .is_some_and(|started| started.elapsed().as_millis() < crate::tui::mark::REVEAL_MS);
+        && app.launch.mark_reveal_started_at.is_some_and(|started| {
+            started.elapsed().as_millis() < codewhale_tui_kit::mark::REVEAL_MS
+        });
     revealing || dissolving || water_alive
 }

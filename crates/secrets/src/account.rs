@@ -17,8 +17,6 @@ use crate::{Secrets, SecretsError};
 pub const DEFAULT_ACCOUNT_API_BASE: &str = "https://api.codewhale.net";
 /// Environment variable that selects the account API origin.
 pub const ACCOUNT_API_BASE_ENV: &str = "CODEWHALE_CLOUD_API_BASE";
-/// OS credential-manager service shared by CLI, TUI, and Runtime API.
-pub const ACCOUNT_KEYRING_SERVICE: &str = "codewhale-cloud";
 /// Current serialized account-session record version.
 pub const ACCOUNT_SESSION_SCHEMA_VERSION: u8 = 1;
 
@@ -130,7 +128,7 @@ pub struct StoredAccountAuth {
     pub schema_version: u8,
     /// Exact canonical API origin that owns this session.
     pub api_base: String,
-    /// Secret account bundle stored inside the credential manager.
+    /// Secret account bundle held in the secret store.
     pub bundle: AccountAuthBundle,
 }
 

@@ -27,6 +27,7 @@ const FILES = ["chrome.ts", "home.ts"];
 // lookup time — so absence is a valid state, never a failure.
 const OPTIONAL_FILES = [
   "features.ts",
+  "enterprise.ts",
   "docs-skills.ts",
   "docs-claude-code.ts",
   "docs-guide.ts",
@@ -41,7 +42,6 @@ const OPTIONAL_FILES = [
   "docs-sandbox.ts",
   "docs-subagents.ts",
   "docs-web.ts",
-  "docs-computers.ts",
   "docs-auth.ts",
   "docs-trust.ts",
   "docs-work.ts",

@@ -42,7 +42,7 @@ fn maps_models_dev_cost_with_bundled_provenance_in_usd() {
 #[test]
 fn malformed_catalog_prices_fail_closed_at_every_projection() {
     for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
-        for field in 0..4 {
+        for field in 0..7 {
             let mut offering = priced(CatalogSource::Bundled);
             offering.provider = "openrouter".to_string();
             offering.wire_model_id = "openai/gpt-5.5".to_string();
@@ -52,6 +52,9 @@ fn malformed_catalog_prices_fail_closed_at_every_projection() {
                 1 => cost.output = Some(invalid),
                 2 => cost.cache_read = Some(invalid),
                 3 => cost.cache_write = Some(invalid),
+                4 => cost.reasoning = Some(invalid),
+                5 => cost.input_audio = Some(invalid),
+                6 => cost.output_audio = Some(invalid),
                 _ => unreachable!(),
             }
             assert!(
@@ -94,7 +97,7 @@ fn absurd_catalog_prices_fail_closed_at_every_projection() {
         f64::MAX,
     ];
     for price in absurd {
-        for field in 0..4 {
+        for field in 0..7 {
             let mut offering = priced(CatalogSource::Bundled);
             let cost = offering.cost.as_mut().expect("cost fixture");
             match field {
@@ -102,6 +105,9 @@ fn absurd_catalog_prices_fail_closed_at_every_projection() {
                 1 => cost.output = Some(price),
                 2 => cost.cache_read = Some(price),
                 3 => cost.cache_write = Some(price),
+                4 => cost.reasoning = Some(price),
+                5 => cost.input_audio = Some(price),
+                6 => cost.output_audio = Some(price),
                 _ => unreachable!(),
             }
             assert!(
@@ -139,14 +145,15 @@ fn absurd_catalog_prices_fail_closed_at_every_projection() {
 }
 
 #[test]
-fn live_source_carries_provider_live_provenance_and_effective_at() {
+fn live_source_carries_provider_live_provenance_and_fetch_time() {
     let src = CatalogSource::Live {
         base_url_fingerprint: "fp".into(),
         fetched_at: 1_700,
     };
     let p = OfferingPricing::from_catalog_offering(&priced(src)).expect("priced");
     assert_eq!(p.provenance, PricingProvenance::ProviderLive);
-    assert_eq!(p.effective_at, Some(1_700));
+    assert_eq!(p.effective_at, None);
+    assert_eq!(p.fetched_at, Some(1_700));
     assert_eq!(p.endpoint_fingerprint.as_deref(), Some("fp"));
 }
 
@@ -246,7 +253,10 @@ fn no_cost_or_empty_cost_object_is_unknown() {
 
     // A cost object present but with no concrete price is still unknown.
     offering.cost = Some(ModelsDevCost::default());
-    assert!(OfferingPricing::from_catalog_offering(&offering).is_none());
+    let withheld =
+        OfferingPricing::from_catalog_offering(&offering).expect("explicit withheld rate");
+    assert!(withheld.rate_withheld);
+    assert_eq!(withheld.estimate_cost(&TokenUsage::default()), None);
 }
 
 #[test]
@@ -258,6 +268,12 @@ fn estimate_cost_sums_priced_classes() {
         output: 500_000,
         cache_read: 2_000_000,
         cache_write: 0,
+
+        reasoning: None,
+        input_audio: None,
+        output_audio: None,
+
+        request_usages: Vec::new(),
     };
     let cost = p.estimate_cost(&usage).expect("priced classes estimate");
     assert!((cost - 0.546).abs() < 1e-9, "got {cost}");
@@ -273,6 +289,12 @@ fn estimate_cost_is_none_when_a_used_class_is_unpriced() {
         output: 0,
         cache_read: 0,
         cache_write: 10,
+
+        reasoning: None,
+        input_audio: None,
+        output_audio: None,
+
+        request_usages: Vec::new(),
     };
     assert!(p.estimate_cost(&usage).is_none());
 }
@@ -303,6 +325,8 @@ fn finite_rates_that_overflow_the_computed_total_fail_closed() {
         provenance: PricingProvenance::ModelsDevBundled,
         effective_at: None,
         endpoint_fingerprint: None,
+
+        ..Default::default()
     };
     let usage = TokenUsage {
         input: u64::MAX,
@@ -362,6 +386,8 @@ fn user_override_pricing_round_trips_and_carries_no_secrets() {
         provenance: PricingProvenance::UserOverride,
         effective_at: None,
         endpoint_fingerprint: None,
+
+        ..Default::default()
     };
     let json = serde_json::to_string_pretty(&pricing).expect("serialize");
     let back: OfferingPricing = serde_json::from_str(&json).expect("round-trip");
@@ -488,6 +514,12 @@ fn unpriced_used_classes_names_exactly_what_makes_an_estimate_fail_closed() {
         output: 1_000_000,
         cache_read: 1_000_000,
         cache_write: 0,
+
+        reasoning: None,
+        input_audio: None,
+        output_audio: None,
+
+        request_usages: Vec::new(),
     };
     assert!(pricing.unpriced_used_classes(&no_write).is_empty());
     assert_eq!(pricing.estimate_cost(&no_write), Some(0.28 + 0.42 + 0.028));
@@ -517,6 +549,12 @@ fn token_class_labels_and_counts_stay_aligned_with_token_usage() {
         output: 2,
         cache_read: 3,
         cache_write: 4,
+
+        reasoning: None,
+        input_audio: None,
+        output_audio: None,
+
+        request_usages: Vec::new(),
     };
     let seen: Vec<(&str, u64)> = TokenClass::ALL
         .into_iter()
@@ -529,6 +567,9 @@ fn token_class_labels_and_counts_stay_aligned_with_token_usage() {
             ("output", 2),
             ("cache_read", 3),
             ("cache_write", 4),
+            ("reasoning", 0),
+            ("input_audio", 0),
+            ("output_audio", 0),
         ]
     );
 }

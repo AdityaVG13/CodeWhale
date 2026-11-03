@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` has twenty-five independently optional facet slots, all
+//! `CommandContexts` has independently optional facet slots, all
 //! constructed here. The diagnostics adapter joins the host bundle in FEAT-029. Important behavior (mode transitions, model
 //! invalidation, cost accounting, skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -27,11 +27,14 @@
 //! helpers remain production-dead until the first slice migrates (FEAT-018+),
 //! so this transitional module keeps a bounded dead-code allow.
 
+use crate::commands::groups::plugins::render::ReviewTextContext;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod config_main;
+mod core_navigation;
+use core_navigation::{NavigationAdapter, VoiceInputAdapter};
 pub(in crate::commands) mod config_policy;
 #[cfg(test)]
 mod config_policy_baseline;
@@ -89,12 +92,12 @@ use codewhale_execpolicy::ApprovalMode;
 
 use crate::commands::groups::plugins::plugin_network_policy;
 
-use crate::dependencies::ExternalTool as _;
-use crate::network_policy::NetworkPolicy;
-use crate::pricing::CostCurrency;
 use crate::tui::app::App;
 use crate::tui::history::HistoryCell;
+use codewhale_config::pricing::CostCurrency;
+use codewhale_dependencies::ExternalTool as _;
 use codewhale_localization::{MessageId, tr};
+use codewhale_net::network_policy::NetworkPolicy;
 
 // ---------------------------------------------------------------------------
 // Pending frontier projection (D4)
@@ -185,6 +188,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_cache_description" => MessageId::CmdCacheDescription,
         "cmd_change_description" => MessageId::CmdChangeDescription,
         "cmd_clear_description" => MessageId::CmdClearDescription,
+        "cmd_color_description" => MessageId::CmdColorDescription,
         "cmd_compact_description" => MessageId::CmdCompactDescription,
         "cmd_config_description" => MessageId::CmdConfigDescription,
         "cmd_connect_description" => MessageId::CmdConnectDescription,
@@ -205,6 +209,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_help_description" => MessageId::CmdHelpDescription,
         "cmd_hf_description" => MessageId::CmdHfDescription,
         "cmd_home_description" => MessageId::CmdHomeDescription,
+        "cmd_overview_description" => MessageId::CmdOverviewDescription,
         "cmd_hooks_description" => MessageId::CmdHooksDescription,
         "cmd_import_claude_description" => MessageId::CmdImportClaudeDescription,
         "cmd_inline_description" => MessageId::CmdInlineDescription,
@@ -269,6 +274,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_tree_description" => MessageId::CmdTreeDescription,
         "cmd_trust_description" => MessageId::CmdTrustDescription,
         "cmd_turn_inspect_description" => MessageId::CmdTurnInspectDescription,
+        "kb_live_transcript" => MessageId::KbLiveTranscript,
         "cmd_undo_description" => MessageId::CmdUndoDescription,
         "cmd_update_description" => MessageId::CmdUpdateDescription,
         "cmd_verbose_description" => MessageId::CmdVerboseDescription,
@@ -294,7 +300,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
 /// return owned values. Command handlers never receive or name `App`.
 struct CommandHost<'a> {
     app: RefCell<&'a mut App>,
-    config: Option<&'a crate::config::Config>,
+    config: Option<&'a codewhale_runtime::config::Config>,
 }
 
 type SharedCommandHost<'a> = Rc<CommandHost<'a>>;
@@ -334,7 +340,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
     fn branch_current_leaf_hint(&self) -> Option<String> {
         let app = self.host.app.borrow();
         let session_id = app.current_session_id.as_deref()?;
-        let manager = crate::session_manager::SessionManager::default_location().ok()?;
+        let manager = codewhale_engine::session_manager::SessionManager::default_location().ok()?;
         let mut session = manager.load_session(session_id).ok()?;
         session.ensure_journal();
         session.journal.as_ref()?.leaf_id.clone()
@@ -350,15 +356,25 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
                 );
             }
         };
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(m) => m,
             Err(e) => return Err(format!("could not open sessions directory: {e}")),
         };
         crate::tui::persistence_actor::flush_before_transition()?;
+        let source = app
+            .session_write_receipt
+            .as_ref()
+            .ok_or_else(|| {
+                "Session source was not admitted; reopen its managed record before branching"
+                    .to_string()
+            })?
+            .capture(codewhale_engine::session_manager::SessionWriteOwner::control())
+            .map_err(|error| error.to_string())?;
         let mut session = match manager.load_session(&session_id) {
             Ok(s) => s,
             Err(e) => return Err(format!("could not load session {session_id}: {e}")),
         };
+        session.write_receipt = Some(source);
         session.ensure_journal();
         let journal_len_before = session
             .journal
@@ -374,17 +390,17 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         }
         match session.journal_branch_to(entry_id) {
             Ok(()) => {
-                if let Err(e) = manager.save_session(&session) {
-                    return Err(format!(
-                        "branch could not be persisted; active conversation unchanged: {e}"
-                    ));
-                }
+                let publication = manager.publish_session(&session).map_err(|error| {
+                    format!("branch could not be persisted; active conversation unchanged: {error}")
+                })?;
+                session.adopt_publication(&publication);
                 app.restore_api_messages(session.messages.clone(), &session);
                 let leaf_display = session
                     .leaf_id
                     .clone()
                     .unwrap_or_else(|| "(none)".to_string());
                 app.clear_history();
+                app.session_turn_outcomes = session.turn_outcomes.clone();
                 app.session_artifacts = session.artifacts.clone();
                 app.session_context_references = session.context_references.clone();
                 app.extend_history(
@@ -415,7 +431,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
     fn tree_body(&self) -> Result<TreeBodyProjection, String> {
         let app = self.host.app.borrow();
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(m) => m,
             Err(e) => return Err(format!("could not open sessions directory: {e}")),
         };
@@ -423,14 +439,14 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             if let Ok(mut session) = manager.load_session(&session_id) {
                 session.ensure_journal();
                 if let Some(journal) = session.journal.as_ref() {
-                    let mut rendered = crate::session_tree::render_tree(journal);
+                    let mut rendered = codewhale_runtime::session_tree::render_tree(journal);
                     match manager.load_journal_archive(&session_id) {
                         Ok(archived) if !archived.is_empty() => {
                             rendered.push_str(&format!(
                                 "{} older off-branch entries are archived in {}/{}.jsonl \
                                  (not drawn); `/branch <id>` restores one.\n",
                                 archived.len(),
-                                crate::session_manager::JOURNAL_ARCHIVE_DIR,
+                                codewhale_engine::session_manager::JOURNAL_ARCHIVE_DIR,
                                 session_id,
                             ));
                         }
@@ -448,11 +464,19 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             let mut rendered =
                 String::from("Active branch (linear — journal will be created on save):\n");
             for (i, msg) in app.api_messages.iter().enumerate() {
+                let meta_index = codewhale_models::turn_classify::turn_metadata_text(msg)
+                    .filter(|_| msg.role == codewhale_models::Role::User)
+                    .map(|(index, _)| index);
                 let snippet: String = msg
                     .content
                     .iter()
-                    .filter_map(|b| match b {
-                        codewhale_models::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    .enumerate()
+                    .filter_map(|(index, b)| match b {
+                        codewhale_models::ContentBlock::Text { text, .. }
+                            if Some(index) != meta_index =>
+                        {
+                            Some(text.as_str())
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -476,7 +500,10 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         explicit_path: Option<String>,
     ) -> Result<SessionSaveReceipt, String> {
         let mut app = self.host.app.borrow_mut();
-        let explicit_save_path = explicit_path.map(PathBuf::from);
+        let explicit_save_path = explicit_path.map(|path| {
+            app.workspace
+                .join(crate::commands::config_main_host::expand_tilde(&path))
+        });
 
         // Explicit save must report contended Work state instead of falling
         // back to the last automatic snapshot. Reuse the canonical snapshot
@@ -484,28 +511,41 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         // title, provider, and window metadata.
         app.work_state_snapshot()
             .map_err(|error| format!("Failed to snapshot Work state: {error}"))?;
-        let manager = crate::session_manager::SessionManager::default_location()
+        let manager = codewhale_engine::session_manager::SessionManager::default_location()
             .map_err(|error| format!("could not open sessions directory: {error}"))?;
+        crate::tui::persistence_actor::flush_before_transition()?;
+        let control_owner = codewhale_engine::session_manager::SessionWriteOwner::control();
+        let control_source = app.session_write_receipt.clone();
         let mut session = crate::tui::ui::build_session_snapshot(&mut app, &manager)?;
-        // Snapshots are journal-only (#6214 T3); this path serializes
-        // directly instead of through `save_session`, so rehydrate the
-        // `messages` projection first — otherwise the file loses history.
+        let work_owner = app.current_session_id.clone();
+        // Snapshots are journal-only (#6214 T3); exports need the legacy
+        // `messages` projection too.
         session.make_storage_compatible();
         let queue_transition =
             crate::tui::ui::prepare_offline_queue_transition(&app, &session.metadata.id)?;
         // C01-09: an explicit path may replace a saved session (a re-save),
         // never an arbitrary file. Whatever exists there must read as one.
-        if let Some(path) = explicit_save_path.as_deref()
-            && path.symlink_metadata().is_ok()
-            && crate::session_manager::SessionManager::load_session_metadata(path).is_err()
-        {
-            return Err(format!(
-                "Refusing to overwrite {}: it is not a saved Codewhale session. Choose a new path, or move that file first.",
-                path.display()
-            ));
+        if let Some(path) = explicit_save_path.as_deref() {
+            match path.symlink_metadata() {
+                Ok(_) => {
+                    if let Err(error) =
+                        codewhale_engine::session_manager::SessionManager::load_session_metadata(
+                            path,
+                        )
+                    {
+                        return Err(format!(
+                            "Refusing to overwrite {}: the existing session could not be inspected ({error}). Choose a new path, or move that file first.",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("Could not inspect {}: {error}", path.display())),
+            }
         }
+        let in_place = explicit_save_path.is_none();
         let save_path = explicit_save_path.unwrap_or_else(|| {
-            let dir = crate::session_manager::default_sessions_dir()
+            let dir = codewhale_engine::session_manager::default_sessions_dir()
                 .unwrap_or_else(|_| app.workspace.clone());
             dir.join(format!("{}.json", session.metadata.id))
         });
@@ -517,28 +557,56 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
         match std::fs::create_dir_all(&sessions_dir) {
             Ok(()) => {
-                let json = match serde_json::to_string_pretty(&session) {
-                    Ok(j) => j,
-                    Err(e) => return Err(format!("Failed to serialize session: {e}")),
+                let managed =
+                    in_place || manager.owns_session_path(&session.metadata.id, &save_path);
+                let result = if managed {
+                    if let Some(source) = control_source {
+                        session.write_receipt = Some(
+                            source
+                                .capture(control_owner)
+                                .map_err(|error| error.to_string())?,
+                        );
+                    } else {
+                        session
+                            .capture_publication(control_owner)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    manager
+                        .publish_session_bounded(session.clone())
+                        .map(|publication| {
+                            session.adopt_publication(&publication);
+                        })
+                } else {
+                    let json = match serde_json::to_string_pretty(&session) {
+                        Ok(json) => json,
+                        Err(error) => return Err(format!("Failed to serialize session: {error}")),
+                    };
+                    codewhale_util::utils::write_atomic(&save_path, json.as_bytes())
                 };
-                match crate::utils::write_atomic(&save_path, json.as_bytes()) {
+                match result {
                     Ok(()) => {
                         crate::tui::ui::install_offline_queue_transition(
                             &mut app,
                             queue_transition,
                         );
-                        app.current_session_id = Some(session.metadata.id.clone());
+                        app.set_current_session_id(Some(session.metadata.id.clone()));
+                        app.session_write_receipt = session.write_receipt.clone();
                         app.current_session_metadata = Some(session.metadata.clone());
                         app.session_title = Some(session.metadata.title.clone());
-                        if let Err(err) = app.publish_pending_work_state() {
+                        if let Err(err) = app.publish_saved_work_state(
+                            work_owner.as_deref(),
+                            session.work_state.as_ref(),
+                        ) {
                             return Err(format!(
                                 "Session saved, but Work views were not published: {err}"
                             ));
                         }
                         Ok(SessionSaveReceipt {
                             display_path: save_path.display().to_string(),
-                            truncated_id: crate::session_manager::truncate_id(&session.metadata.id)
-                                .to_string(),
+                            truncated_id: codewhale_engine::session_manager::truncate_id(
+                                &session.metadata.id,
+                            )
+                            .to_string(),
                         })
                     }
                     Err(e) => Err(format!("Failed to save session: {e}")),
@@ -554,27 +622,53 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             return Err("Nothing to fork. Send or load a message first.".to_string());
         }
 
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(manager) => manager,
             Err(err) => {
                 return Err(format!("could not open sessions directory: {err}"));
             }
         };
 
+        crate::tui::persistence_actor::flush_before_transition()?;
+        let control_owner = codewhale_engine::session_manager::SessionWriteOwner::control();
+        let control_source = app
+            .session_write_receipt
+            .as_ref()
+            .map(|source| source.capture(control_owner.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?;
         let mut parent = crate::tui::ui::build_session_snapshot(&mut app, &manager)?;
-        parent.make_storage_compatible();
-        if let Err(err) = manager.save_session(&parent) {
-            return Err(format!("Failed to save parent session: {err}"));
+        if let Some(source) = control_source {
+            parent.write_receipt = Some(source);
+        } else if parent.write_receipt.is_some() {
+            parent
+                .capture_publication(control_owner)
+                .map_err(|error| error.to_string())?;
         }
 
+        let work_owner = app.current_session_id.clone();
+        parent.make_storage_compatible();
+        let publication = manager
+            .publish_session_bounded(parent.clone())
+            .map_err(|error| format!("Failed to save parent session: {error}"))?;
+        parent.adopt_publication(&publication);
+        app.session_write_receipt = parent.write_receipt.clone();
+
+        let fork_id = uuid::Uuid::new_v4().to_string();
+        let fork_source = manager
+            .expect_absent_session(&fork_id)
+            .map_err(|error| error.to_string())?
+            .capture(codewhale_engine::session_manager::SessionWriteOwner::control())
+            .map_err(|error| error.to_string())?;
         let mut forked = parent.clone();
-        forked.metadata.id = uuid::Uuid::new_v4().to_string();
+        forked.metadata.id = fork_id;
         forked.metadata.created_at = chrono::Utc::now();
         forked.metadata.updated_at = forked.metadata.created_at;
         forked.metadata.archived = false;
         forked.metadata.runtime_store = None;
         forked.approval_receipts.clear();
         forked.window_title = None;
+        forked.composer_color = None;
         forked.metadata.spawn_depth = parent.metadata.spawn_depth.saturating_add(1);
         forked.metadata.mark_forked_from(&parent.metadata);
         if let Some(journal) = forked.journal.as_mut() {
@@ -583,25 +677,32 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         let queue_transition =
             crate::tui::ui::prepare_offline_queue_transition(&app, &forked.metadata.id)?;
 
-        if let Err(err) = manager.save_session(&forked) {
-            return Err(format!("Failed to save forked session: {err}"));
-        }
-        if let Err(err) = app.publish_pending_work_state() {
+        forked.write_receipt = Some(fork_source);
+        let publication = manager
+            .publish_session(&forked)
+            .map_err(|error| format!("Failed to save forked session: {error}"))?;
+        forked.adopt_publication(&publication);
+        if let Err(err) =
+            app.publish_saved_work_state(work_owner.as_deref(), parent.work_state.as_ref())
+        {
             return Err(format!(
-                "Sessions saved, but Work views were not published: {err}"
+                "Parent and fork {} were saved; the active session did not change because Work views were not published: {err}",
+                forked.metadata.id
             ));
         }
 
         crate::tui::ui::install_offline_queue_transition(&mut app, queue_transition);
-        app.current_session_id = Some(forked.metadata.id.clone());
+        app.set_current_session_id(Some(forked.metadata.id.clone()));
         app.current_session_metadata = Some(forked.metadata.clone());
         app.restore_api_messages(forked.messages.clone(), &forked);
         app.session_title = Some(forked.metadata.title.clone());
         // A fork starts as its own session: no inherited tab/window title.
         app.window_title = None;
+        app.composer_color = None;
         let fork_id = forked.metadata.id.clone();
-        let parent_label = crate::session_manager::truncate_id(&parent.metadata.id).to_string();
-        let fork_label = crate::session_manager::truncate_id(&fork_id).to_string();
+        let parent_label =
+            codewhale_engine::session_manager::truncate_id(&parent.metadata.id).to_string();
+        let fork_label = codewhale_engine::session_manager::truncate_id(&fork_id).to_string();
         let mode = to_command_mode(app.mode);
         Ok(SessionForkReceipt {
             parent_label,
@@ -618,8 +719,13 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
     }
 
     fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkFromReceipt, String> {
+        let mut config = self
+            .host
+            .config
+            .ok_or_else(|| "The fork command has no active provider configuration.".to_string())?
+            .clone();
         let mut app = self.host.app.borrow_mut();
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(m) => m,
             Err(err) => {
                 return Err(format!("could not open sessions directory: {err}"));
@@ -639,19 +745,25 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         };
         source_session.ensure_journal();
         let journal = source_session.journal.clone().unwrap_or_else(|| {
-            crate::session_tree::SessionJournal::from_messages(
+            codewhale_runtime::session_tree::SessionJournal::from_messages(
                 source_session.messages.clone(),
                 source_session.metadata.spawn_depth,
             )
         });
+        let fork_id = uuid::Uuid::new_v4().to_string();
+        let fork_source = manager
+            .expect_absent_session(&fork_id)
+            .map_err(|error| error.to_string())?
+            .capture(codewhale_engine::session_manager::SessionWriteOwner::control())
+            .map_err(|error| error.to_string())?;
         let forked_journal = journal.fork_from(None).unwrap_or_else(|_| {
-            crate::session_tree::SessionJournal::with_spawn_depth(
+            codewhale_runtime::session_tree::SessionJournal::with_spawn_depth(
                 source_session.metadata.spawn_depth.saturating_add(1),
             )
         });
         let messages = forked_journal.to_messages();
-        let mut forked = crate::session_manager::create_saved_session_with_id_and_mode(
-            uuid::Uuid::new_v4().to_string(),
+        let mut forked = codewhale_engine::session_manager::create_saved_session_with_id_and_mode(
+            fork_id,
             &messages,
             &source_session.metadata.model,
             &app.workspace,
@@ -678,34 +790,27 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         forked.artifacts = source_session.artifacts.clone();
         forked.work_state = source_session.work_state.clone();
         forked.last_auto_route = source_session.last_auto_route.clone();
-        let queue_transition =
-            crate::tui::ui::prepare_offline_queue_transition(&app, &forked.metadata.id)?;
-        if let Err(err) = manager.save_session(&forked) {
-            return Err(format!("Failed to save forked session: {err}"));
-        }
-        crate::tui::ui::install_offline_queue_transition(&mut app, queue_transition);
-        app.current_session_id = Some(forked.metadata.id.clone());
-        app.current_session_metadata = Some(forked.metadata.clone());
-        app.restore_api_messages(forked.messages.clone(), &forked);
-        app.session_title = Some(forked.metadata.title.clone());
-        // A fork starts as its own session: no inherited tab/window title.
-        app.window_title = None;
+        forked.write_receipt = Some(fork_source);
+        let publication = manager
+            .publish_session(&forked)
+            .map_err(|error| format!("Failed to save forked session: {error}"))?;
+        forked.adopt_publication(&publication);
         let parent_label =
-            crate::session_manager::truncate_id(&source_session.metadata.id).to_string();
-        let fork_label = crate::session_manager::truncate_id(&forked.metadata.id).to_string();
+            codewhale_engine::session_manager::truncate_id(&source_session.metadata.id).to_string();
+        let fork_label =
+            codewhale_engine::session_manager::truncate_id(&forked.metadata.id).to_string();
+        let spawn_depth = forked.metadata.spawn_depth;
+        crate::tui::ui::apply_loaded_session_with_goal(&mut app, &mut config, forked, None)?;
         let mode = to_command_mode(app.mode);
         Ok(SessionForkFromReceipt {
             parent_label,
             fork_label,
-            spawn_depth: forked.metadata.spawn_depth.into(),
+            spawn_depth: spawn_depth.into(),
             sync: SessionSyncPayload {
-                session_id: Some(forked.metadata.id.clone()),
-                messages: forked.messages.clone(),
-                system_prompt: forked
-                    .system_prompt
-                    .as_ref()
-                    .map(|s| codewhale_models::SystemPrompt::Text(s.clone())),
-                model: forked.metadata.model.clone(),
+                session_id: app.current_session_id.clone(),
+                messages: app.api_messages.as_ref().clone(),
+                system_prompt: app.system_prompt.clone(),
+                model: app.model.clone(),
                 workspace: app.workspace.clone(),
                 mode,
             },
@@ -743,16 +848,19 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         app.session_artifacts.clear();
         app.session_context_references.clear();
         app.tool_evidence.clear();
-        app.current_session_id = Some(new_id.clone());
+        app.set_current_session_id(Some(new_id.clone()));
+        crate::tui::ui::expect_fresh_session(&mut app, &new_id)?;
         app.current_session_metadata = None;
-        app.session_title = Some(crate::session_manager::DEFAULT_SESSION_TITLE.to_string());
+        app.session_title =
+            Some(codewhale_engine::session_manager::DEFAULT_SESSION_TITLE.to_string());
         // A new session has no tab/window title override yet; the `title`
         // config default still applies.
         app.window_title = None;
+        app.composer_color = None;
         app.scroll_to_bottom();
         let mode = to_command_mode(app.mode);
         Ok(SessionNewReceipt {
-            truncated_id: crate::session_manager::truncate_id(&new_id).to_string(),
+            truncated_id: codewhale_engine::session_manager::truncate_id(&new_id).to_string(),
             sync: SessionSyncPayload {
                 session_id: Some(new_id),
                 messages: Vec::new(),
@@ -766,11 +874,9 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
     fn load_session(&mut self, path: &str) -> Result<PathBuf, String> {
         let app = self.host.app.borrow();
-        let load_path = if path.contains('/') || path.contains('\\') {
-            PathBuf::from(path)
-        } else {
-            app.workspace.join(path)
-        };
+        let load_path = app
+            .workspace
+            .join(crate::commands::config_main_host::expand_tilde(path));
 
         let content = match std::fs::read_to_string(&load_path) {
             Ok(c) => c,
@@ -779,12 +885,13 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             }
         };
 
-        let _session: crate::session_manager::SavedSession = match serde_json::from_str(&content) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(format!("Failed to parse session file: {e}"));
-            }
-        };
+        let _session: codewhale_engine::session_manager::SavedSession =
+            match serde_json::from_str(&content) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(format!("Failed to parse session file: {e}"));
+                }
+            };
         Ok(load_path)
     }
 
@@ -822,25 +929,28 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
     ) -> Result<SessionArchiveReceipt, String> {
         let verb = if archived { "archive" } else { "unarchive" };
         let mut app = self.host.app.borrow_mut();
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(manager) => manager,
             Err(err) => {
                 return Err(format!("could not open sessions directory: {err}"));
             }
         };
+        crate::tui::persistence_actor::flush_before_transition()?;
         match manager.set_session_archived(
             session_id,
             archived,
-            crate::session_manager::SessionMutator::Owner,
+            codewhale_engine::session_manager::SessionMutator::Owner,
         ) {
             Ok(metadata) => {
+                app.adopt_session_mutation(&metadata);
                 if let Some(cached) = app.current_session_metadata.as_mut()
                     && cached.id == metadata.id
                 {
                     cached.archived = metadata.archived;
                 }
                 Ok(SessionArchiveReceipt {
-                    truncated_id: crate::session_manager::truncate_id(&metadata.id).to_string(),
+                    truncated_id: codewhale_engine::session_manager::truncate_id(&metadata.id)
+                        .to_string(),
                     title: metadata.title,
                 })
             }
@@ -850,7 +960,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
     fn prune_sessions(&mut self, days: u64) -> Result<usize, String> {
         let app = self.host.app.borrow();
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(m) => m,
             Err(err) => {
                 return Err(format!("could not open sessions directory: {err}"));
@@ -911,7 +1021,7 @@ fn hosted_work_url(repo: &str, branch: &str) -> String {
 }
 
 fn read_git_value(workspace: &Path, args: &[&str]) -> Option<String> {
-    let mut command = crate::dependencies::Git::command()?;
+    let mut command = codewhale_dependencies::Git::command()?;
     let output = command.arg("-C").arg(workspace).args(args).output().ok()?;
     if !output.status.success()
         || output.stdout.is_empty()
@@ -932,7 +1042,7 @@ fn valid_branch_name(branch: &str) -> bool {
     if branch.is_empty() || branch.len() > MAX_GIT_VALUE_BYTES {
         return false;
     }
-    let Some(mut command) = crate::dependencies::Git::command() else {
+    let Some(mut command) = codewhale_dependencies::Git::command() else {
         return false;
     };
     command
@@ -1043,8 +1153,8 @@ fn valid_repo_component(value: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Session control adapter (FEAT-024 D4/D5)
 //
-// Sole host owner of concrete control machinery for the six control commands:
-// relay snapshot reads (goal/plan/work/todo/compact-template), rename/title
+// Sole host owner of concrete control machinery for the seven control commands:
+// relay snapshot reads (goal/plan/work/todo/compact-template), rename/title/color
 // persistence (sanitization, checkpoint recovery, live synchronization, save,
 // publication, redraw), resume routing/imports, remote-control state and the
 // synchronous single-attempt browser launch, and hosted-work Git target
@@ -1083,16 +1193,18 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
             Err(_) => PlanProjection::Busy,
         };
         let todos = match app.work_state_snapshot() {
-            Ok(Some(state)) => match crate::todo_snapshot::todo_snapshot_body(&state.todos) {
-                Some(body) => TodoProjection::Body(body),
-                None => TodoProjection::Absent,
-            },
+            Ok(Some(state)) => {
+                match codewhale_engine::todo_snapshot::todo_snapshot_body(&state.todos) {
+                    Some(body) => TodoProjection::Body(body),
+                    None => TodoProjection::Absent,
+                }
+            }
             Ok(None) => TodoProjection::Absent,
             Err(_) => TodoProjection::Unavailable,
         };
         RelayProjection {
-            compact_template: crate::prompts::COMPACT_TEMPLATE.to_string(),
-            handoff_path: crate::prompts::HANDOFF_RELATIVE_PATH.to_string(),
+            compact_template: codewhale_engine::prompts::COMPACT_TEMPLATE.to_string(),
+            handoff_path: codewhale_engine::prompts::HANDOFF_RELATIVE_PATH.to_string(),
             workspace: app.workspace.display().to_string(),
             mode: app.mode.label().to_string(),
             model: app.model_display_label(),
@@ -1126,7 +1238,7 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         if let Some(ws_path) = workspace_relative {
             return Ok(ResumeSource::File(ws_path));
         }
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(m) => m,
             Err(e) => return Err(format!("could not open sessions directory: {e}")),
         };
@@ -1144,13 +1256,15 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
                     .join(format!("{}.json", sess.metadata.id));
                 Ok(ResumeSource::Session {
                     load_path: path.exists().then_some(path),
-                    truncated_id: crate::session_manager::truncate_id(&sess.metadata.id)
+                    truncated_id: codewhale_engine::session_manager::truncate_id(&sess.metadata.id)
                         .to_string(),
                     title: sess.metadata.title,
                 })
             }
             Err(e) => {
-                if let Ok(container) = crate::session_tree::SessionImportContainer::from_json(raw) {
+                if let Ok(container) =
+                    codewhale_runtime::session_tree::SessionImportContainer::from_json(raw)
+                {
                     let mut app = self.host.app.borrow_mut();
                     let receipt = import_session_container(&mut app, container)?;
                     Ok(ResumeSource::Imported(receipt))
@@ -1170,7 +1284,7 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
     }
 
     fn sanitize_session_title(&self, raw_title: &str) -> String {
-        crate::session_manager::sanitize_session_title(raw_title)
+        codewhale_engine::session_manager::sanitize_session_title(raw_title)
     }
 
     fn rename_session(&mut self, new_title: &str) -> Result<SessionTitleReceipt, String> {
@@ -1183,27 +1297,30 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
                 );
             }
         };
-        let manager = match crate::session_manager::SessionManager::default_location() {
+        let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
             Ok(m) => m,
             Err(e) => return Err(format!("Could not open sessions directory: {e}")),
         };
 
-        // Mirrors the baseline `/rename` write path exactly: load (with
-        // first-snapshot recovery), sync live state, snapshot Work state,
-        // carry context/artifacts/route/cost/model/workspace/mode metadata,
-        // persist, then publish. Publication failures keep their post-save
-        // partial-success semantics.
-        let mut session = match manager.load_session(&session_id) {
-            Ok(s) => s,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                match live_session_before_first_snapshot(&manager, &session_id, &app) {
-                    Some(s) => s,
-                    None => return Err(format!("Could not load session: {err}")),
-                }
-            }
-            Err(e) => return Err(format!("Could not load session: {e}")),
-        };
-        session = crate::session_manager::update_session(
+        crate::tui::persistence_actor::flush_before_transition()?;
+        let control_owner = codewhale_engine::session_manager::SessionWriteOwner::control();
+        let control_source = app
+            .session_write_receipt
+            .as_ref()
+            .map(|source| source.capture(control_owner.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let mut session = crate::tui::ui::build_session_snapshot(&mut app, &manager)?;
+        if let Some(source) = control_source {
+            session.write_receipt = Some(source);
+        } else if session.write_receipt.is_some() {
+            session
+                .capture_publication(control_owner)
+                .map_err(|error| error.to_string())?;
+        }
+
+        session.make_storage_compatible();
+        session = codewhale_engine::session_manager::update_session(
             session,
             &app.api_messages,
             u64::from(app.session.total_tokens),
@@ -1228,12 +1345,17 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         session.metadata.mode = Some(app.mode.as_setting().to_string());
         app.sync_cost_to_metadata(&mut session.metadata);
         session.metadata.title = new_title.to_string();
+        session.metadata.title_is_custom = true;
 
-        match manager.save_session(&session) {
-            Ok(_) => {
+        match manager.publish_session(&session) {
+            Ok(publication) => {
+                session.adopt_publication(&publication);
+                app.session_write_receipt = session.write_receipt.clone();
                 app.current_session_metadata = Some(session.metadata.clone());
                 app.session_title = Some(new_title.to_string());
-                if let Err(err) = app.publish_pending_work_state() {
+                if let Err(err) =
+                    app.publish_saved_work_state(Some(&session_id), session.work_state.as_ref())
+                {
                     return Err(format!(
                         "Session renamed, but Work views were not published: {err}"
                     ));
@@ -1271,6 +1393,15 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         persist_window_title(&mut app, None)
     }
 
+    fn composer_color(&self) -> Option<String> {
+        self.host.app.borrow().composer_color.clone()
+    }
+
+    fn set_composer_color(&mut self, color: Option<String>) -> Result<(), String> {
+        let mut app = self.host.app.borrow_mut();
+        persist_composer_color(&mut app, color)
+    }
+
     fn remote_status(&self) -> String {
         self.host.app.borrow().remote_control.status_line()
     }
@@ -1291,7 +1422,7 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         };
         // Synchronous single attempt through the authoritative URL-opening
         // helper; never retried and never deferred to an external-URL action.
-        let launched = crate::utils::open_url(&url).is_ok();
+        let launched = codewhale_runtime::browser::open_url(&url).is_ok();
         map_browser_open_result(url, launched)
     }
 
@@ -1322,7 +1453,33 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
 /// Manager resolution intentionally precedes active-session lookup, matching
 /// the original `/title` error precedence for both set and clear operations.
 fn persist_window_title(app: &mut App, title: Option<String>) -> Result<(), String> {
-    let manager = match crate::session_manager::SessionManager::default_location() {
+    persist_session_display(
+        app,
+        "title",
+        "Window title",
+        |session| session.window_title.clone_from(&title),
+        |app| app.window_title = title.clone(),
+    )
+}
+
+fn persist_composer_color(app: &mut App, color: Option<String>) -> Result<(), String> {
+    persist_session_display(
+        app,
+        "composer color",
+        "Composer color",
+        |session| session.composer_color.clone_from(&color),
+        |app| app.composer_color = color.clone(),
+    )
+}
+
+fn persist_session_display(
+    app: &mut App,
+    setting: &str,
+    saved: &str,
+    stage: impl FnOnce(&mut codewhale_engine::session_manager::SavedSession),
+    commit: impl FnOnce(&mut App),
+) -> Result<(), String> {
+    let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
         Ok(manager) => manager,
         Err(error) => return Err(format!("Could not open sessions directory: {error}")),
     };
@@ -1332,17 +1489,25 @@ fn persist_window_title(app: &mut App, title: Option<String>) -> Result<(), Stri
             return Err("No active session. Send a message first to start a session.".to_string());
         }
     };
-    let mut session = match manager.load_session(&session_id) {
-        Ok(session) => session,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match live_session_before_first_snapshot(&manager, &session_id, app) {
-                Some(session) => session,
-                None => return Err(format!("Could not load session: {error}")),
-            }
-        }
-        Err(error) => return Err(format!("Could not load session: {error}")),
-    };
-    session = crate::session_manager::update_session(
+    crate::tui::persistence_actor::flush_before_transition()?;
+    let control_owner = codewhale_engine::session_manager::SessionWriteOwner::control();
+    let control_source = app
+        .session_write_receipt
+        .as_ref()
+        .map(|source| source.capture(control_owner.clone()))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let mut session = crate::tui::ui::build_session_snapshot(app, &manager)?;
+    if let Some(source) = control_source {
+        session.write_receipt = Some(source);
+    } else if session.write_receipt.is_some() {
+        session
+            .capture_publication(control_owner)
+            .map_err(|error| error.to_string())?;
+    }
+
+    session.make_storage_compatible();
+    session = codewhale_engine::session_manager::update_session(
         session,
         &app.api_messages,
         u64::from(app.session.total_tokens),
@@ -1352,7 +1517,7 @@ fn persist_window_title(app: &mut App, title: Option<String>) -> Result<(), Stri
         Ok(state) => state,
         Err(error) => {
             return Err(format!(
-                "Could not snapshot Work state before setting title: {error}"
+                "Could not snapshot Work state before setting {setting}: {error}"
             ));
         }
     };
@@ -1366,17 +1531,22 @@ fn persist_window_title(app: &mut App, title: Option<String>) -> Result<(), Stri
     session.metadata.workspace.clone_from(&app.workspace);
     session.metadata.mode = Some(app.mode.as_setting().to_string());
     app.sync_cost_to_metadata(&mut session.metadata);
-    session.window_title.clone_from(&title);
+    stage(&mut session);
 
-    match manager.save_session(&session) {
-        Ok(_) => {
-            app.window_title = title;
+    match manager.publish_session_preserving_lifecycle(&session) {
+        Ok(publication) => {
+            session.adopt_publication(&publication);
+            app.session_write_receipt = session.write_receipt.clone();
+            app.current_session_metadata = Some(session.metadata.clone());
+            commit(app);
             // The render loop syncs the resolved prefix into the terminal
             // title; force a frame so the change lands immediately.
             app.needs_redraw = true;
-            if let Err(error) = app.publish_pending_work_state() {
+            if let Err(error) =
+                app.publish_saved_work_state(Some(&session_id), session.work_state.as_ref())
+            {
                 return Err(format!(
-                    "Window title saved, but Work views were not published: {error}"
+                    "{saved} saved, but Work views were not published: {error}"
                 ));
             }
             Ok(())
@@ -1396,7 +1566,9 @@ fn map_browser_open_result(url: String, launched: bool) -> RemoteOpenOutcome {
     }
 }
 
-fn plan_snapshot_to_sections(snapshot: &crate::tools::plan::PlanSnapshot) -> PlanSections {
+fn plan_snapshot_to_sections(
+    snapshot: &codewhale_engine::tools::plan::PlanSnapshot,
+) -> PlanSections {
     PlanSections {
         title: snapshot.title.clone(),
         objective: snapshot.objective.clone(),
@@ -1414,38 +1586,18 @@ fn plan_snapshot_to_sections(snapshot: &crate::tools::plan::PlanSnapshot) -> Pla
             .iter()
             .map(|item| PlanStep {
                 status: match &item.status {
-                    crate::tools::plan::StepStatus::Pending => PlanStepStatus::Pending,
-                    crate::tools::plan::StepStatus::InProgress => PlanStepStatus::InProgress,
-                    crate::tools::plan::StepStatus::Completed => PlanStepStatus::Completed,
+                    codewhale_engine::tools::plan::StepStatus::Pending => PlanStepStatus::Pending,
+                    codewhale_engine::tools::plan::StepStatus::InProgress => {
+                        PlanStepStatus::InProgress
+                    }
+                    codewhale_engine::tools::plan::StepStatus::Completed => {
+                        PlanStepStatus::Completed
+                    }
                 },
                 text: item.step.clone(),
             })
             .collect(),
     }
-}
-
-/// Recover the session document for a live turn that has not completed (and
-/// therefore persisted) its first snapshot yet (#5430). Mirrors the legacy
-/// `/rename`/`/title` recovery exactly.
-fn live_session_before_first_snapshot(
-    manager: &crate::session_manager::SessionManager,
-    session_id: &str,
-    app: &App,
-) -> Option<crate::session_manager::SavedSession> {
-    if let Ok(Some(checkpoint)) = manager.load_session_checkpoint(session_id) {
-        return Some(checkpoint);
-    }
-    Some(
-        crate::session_manager::create_saved_session_with_id_and_mode(
-            session_id.to_string(),
-            &app.api_messages,
-            &app.model_selection_for_persistence(),
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.as_setting()),
-        ),
-    )
 }
 
 /// `/resume <file>` import: read, parse a container or plain saved session,
@@ -1460,10 +1612,14 @@ fn import_foreign_file(app: &mut App, path: &Path) -> Result<ResumeImportReceipt
             ));
         }
     };
-    if let Ok(container) = crate::session_tree::SessionImportContainer::from_json(&content) {
+    if let Ok(container) =
+        codewhale_runtime::session_tree::SessionImportContainer::from_json(&content)
+    {
         return import_session_container(app, container);
     }
-    if let Ok(foreign) = serde_json::from_str::<crate::session_manager::SavedSession>(&content) {
+    if let Ok(foreign) =
+        serde_json::from_str::<codewhale_engine::session_manager::SavedSession>(&content)
+    {
         let container = foreign.export_container("foreign");
         return import_session_container(app, container);
     }
@@ -1477,19 +1633,20 @@ fn import_foreign_file(app: &mut App, path: &Path) -> Result<ResumeImportReceipt
 /// select it in a fresh picker, and return the portable receipt.
 fn import_session_container(
     app: &mut App,
-    container: crate::session_tree::SessionImportContainer,
+    container: codewhale_runtime::session_tree::SessionImportContainer,
 ) -> Result<ResumeImportReceipt, String> {
-    let manager = match crate::session_manager::SessionManager::default_location() {
+    let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
         Ok(m) => m,
         Err(e) => return Err(format!("could not open sessions directory: {e}")),
     };
     let model = app.model.clone();
     let workspace = app.workspace.clone();
-    let mut imported =
-        match crate::session_manager::SavedSession::import_foreign(container, workspace, model) {
-            Ok(s) => s,
-            Err(e) => return Err(format!("foreign import failed: {e}")),
-        };
+    let mut imported = match codewhale_engine::session_manager::SavedSession::import_foreign(
+        container, workspace, model,
+    ) {
+        Ok(s) => s,
+        Err(e) => return Err(format!("foreign import failed: {e}")),
+    };
     // The import takes this window's model, so it takes this window's route
     // too. Left at the record default it named a different provider, and
     // opening the imported session sent its whole history there.
@@ -1502,12 +1659,23 @@ fn import_session_container(
         .set_model_provider_route(&provider, provider_id.as_deref());
     let new_id = imported.metadata.id.clone();
     let queue_transition = crate::tui::ui::prepare_offline_queue_transition(app, &new_id)?;
-    if let Err(e) = manager.save_session(&imported) {
-        return Err(format!("imported session could not be saved: {e}"));
-    }
+    imported.write_receipt = Some(
+        manager
+            .expect_absent_session(&new_id)
+            .map_err(|error| error.to_string())?,
+    );
+    imported
+        .capture_publication(codewhale_engine::session_manager::SessionWriteOwner::control())
+        .map_err(|error| error.to_string())?;
+    let publication = manager
+        .publish_session(&imported)
+        .map_err(|error| format!("imported session could not be saved: {error}"))?;
+    imported.adopt_publication(&publication);
     crate::tui::ui::install_offline_queue_transition(app, queue_transition);
-    app.current_session_id = Some(new_id.clone());
+    app.set_current_session_id(Some(new_id.clone()));
     app.current_session_metadata = Some(imported.metadata.clone());
+    app.window_title.clone_from(&imported.window_title);
+    app.composer_color.clone_from(&imported.composer_color);
     app.restore_api_messages(imported.messages.clone(), &imported);
     let picker = crate::tui::session_picker::SessionPickerView::new_selecting(
         &app.workspace,
@@ -1517,7 +1685,7 @@ fn import_session_container(
     .with_current_session(app.current_session_id.as_deref());
     app.view_stack.push(picker);
     Ok(ResumeImportReceipt {
-        truncated_id: crate::session_manager::truncate_id(&new_id).to_string(),
+        truncated_id: codewhale_engine::session_manager::truncate_id(&new_id).to_string(),
         entry_count: imported
             .journal
             .as_ref()
@@ -1626,7 +1794,7 @@ fn export_metadata(app: &App) -> ExportMetadata {
     let session_label = app
         .current_session_id
         .as_deref()
-        .map(crate::session_manager::truncate_id)
+        .map(codewhale_engine::session_manager::truncate_id)
         .unwrap_or("unsaved")
         .to_string();
     let workspace_name = app
@@ -1659,14 +1827,23 @@ fn project_transcript(app: &App) -> TranscriptProjection {
 }
 
 fn project_message(message: &Message) -> ExportMessage {
+    let meta_index = codewhale_models::turn_classify::turn_metadata_text(message)
+        .filter(|_| message.role == codewhale_models::Role::User)
+        .map(|(index, _)| index);
     ExportMessage {
         role: message.role.as_str().to_string(),
         // Exact enum identity, not a string comparison: `Role::Unrecognized("user")`
         // must not be treated as a user turn (baseline parity, F6).
         is_user_role: message.role == codewhale_models::Role::User,
-        blocks: message.content.iter().map(project_block).collect(),
+        blocks: message
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != meta_index)
+            .map(|(_, block)| project_block(block))
+            .collect(),
         prompt_snippet: first_text_block(message)
-            .and_then(crate::core::turn::snapshot_label_prompt_snippet),
+            .and_then(codewhale_engine::core::turn::snapshot_label_prompt_snippet),
     }
 }
 
@@ -1719,7 +1896,7 @@ fn project_block(block: &ContentBlock) -> ExportBlock {
             is_error: is_error.unwrap_or(false),
             structured: content_blocks.as_deref().map(|blocks| {
                 serde_json::Value::Array(
-                    crate::image_attach::safe_tool_result_content_blocks(Some(blocks))
+                    codewhale_engine::image_attach::safe_tool_result_content_blocks(Some(blocks))
                         .unwrap_or_default(),
                 )
             }),
@@ -1792,12 +1969,12 @@ fn project_history_cell(cell: &HistoryCell) -> HistoryEntry {
     }
 }
 
-fn error_severity_role(severity: crate::error_taxonomy::ErrorSeverity) -> &'static str {
+fn error_severity_role(severity: codewhale_error_taxonomy::ErrorSeverity) -> &'static str {
     match severity {
-        crate::error_taxonomy::ErrorSeverity::Info => "info",
-        crate::error_taxonomy::ErrorSeverity::Warning => "warning",
-        crate::error_taxonomy::ErrorSeverity::Error => "error",
-        crate::error_taxonomy::ErrorSeverity::Critical => "critical error",
+        codewhale_error_taxonomy::ErrorSeverity::Info => "info",
+        codewhale_error_taxonomy::ErrorSeverity::Warning => "warning",
+        codewhale_error_taxonomy::ErrorSeverity::Error => "error",
+        codewhale_error_taxonomy::ErrorSeverity::Critical => "critical error",
     }
 }
 
@@ -1819,7 +1996,7 @@ fn flatten_history_lines(lines: Vec<ratatui::text::Line<'static>>) -> String {
 /// Read the workspace snapshot repository read-only and project its state
 /// (D8): only an existing repo is opened, never created.
 fn project_restore_points(workspace: &Path) -> RestorePointProjection {
-    match crate::snapshot::SnapshotRepo::open_existing(workspace) {
+    match codewhale_snapshot::SnapshotRepo::open_existing(workspace) {
         Ok(None) => RestorePointProjection::None,
         Err(err) => RestorePointProjection::Unreadable {
             reason: err.to_string(),
@@ -1835,8 +2012,8 @@ fn project_restore_points(workspace: &Path) -> RestorePointProjection {
     }
 }
 
-fn project_restore_snapshot(snapshot: &crate::snapshot::Snapshot) -> RestoreSnapshot {
-    let parsed = crate::core::turn::parse_snapshot_label(&snapshot.label);
+fn project_restore_snapshot(snapshot: &codewhale_snapshot::Snapshot) -> RestoreSnapshot {
+    let parsed = codewhale_engine::core::turn::parse_snapshot_label(&snapshot.label);
     RestoreSnapshot {
         id: snapshot.id.as_str().to_string(),
         label: snapshot.label.clone(),
@@ -1956,13 +2133,16 @@ pub(crate) struct CostAdapter<'a> {
     host: SharedCommandHost<'a>,
 }
 
-fn command_cost_estimate(amount: f64, currency: CommandCurrency) -> crate::pricing::CostEstimate {
+fn command_cost_estimate(
+    amount: f64,
+    currency: CommandCurrency,
+) -> codewhale_engine::pricing::CostEstimate {
     match currency {
-        CommandCurrency::Usd => crate::pricing::CostEstimate {
+        CommandCurrency::Usd => codewhale_engine::pricing::CostEstimate {
             usd: amount,
             cny: 0.0,
         },
-        CommandCurrency::Cny => crate::pricing::CostEstimate {
+        CommandCurrency::Cny => codewhale_engine::pricing::CostEstimate {
             usd: 0.0,
             cny: amount,
         },
@@ -2129,7 +2309,7 @@ impl CommandSkillsContext for SkillsAdapter<'_> {
     }
 }
 
-/// Workspace path and bounded serialized work-state snapshot.
+/// Workspace observations and confined anchor operations.
 pub(crate) struct WorkspaceAdapter<'a> {
     host: SharedCommandHost<'a>,
 }
@@ -2139,9 +2319,47 @@ impl CommandWorkspaceContext for WorkspaceAdapter<'_> {
         self.host.app.borrow().workspace.clone()
     }
 
+    fn effective_home_dir(&self) -> Option<PathBuf> {
+        codewhale_paths::user_home()
+    }
+
+    fn inspect_workspace_target(
+        &self,
+        candidate: &Path,
+    ) -> codewhale_command_contract::navigation::WorkspaceTarget {
+        use codewhale_command_contract::navigation::WorkspaceTarget;
+        if !candidate.exists() {
+            WorkspaceTarget::Missing
+        } else if !candidate.is_dir() {
+            WorkspaceTarget::NotDirectory
+        } else {
+            WorkspaceTarget::Directory {
+                canonical_or_candidate: candidate
+                    .canonicalize()
+                    .unwrap_or_else(|_| candidate.to_path_buf()),
+            }
+        }
+    }
+
+    fn read_anchor_document(&self) -> Result<Option<String>, String> {
+        core_navigation::read_anchor_document(&self.workspace())
+    }
+
+    fn append_anchor_bytes(
+        &mut self,
+        parts: &[&[u8]],
+    ) -> Result<PathBuf, codewhale_command_contract::navigation::AnchorWriteError> {
+        core_navigation::append_anchor_bytes(&self.workspace(), parts)
+    }
+
+    fn replace_anchor_document(&mut self, bytes: &[u8]) -> Result<(), String> {
+        core_navigation::replace_anchor_document(&self.workspace(), bytes)
+    }
+
     fn work_state_snapshot(&self) -> Result<Option<String>, String> {
         self.host.app.borrow().work_state_snapshot().map(|state| {
-            state.and_then(|state| crate::todo_snapshot::todo_snapshot_body(&state.todos))
+            state
+                .and_then(|state| codewhale_engine::todo_snapshot::todo_snapshot_body(&state.todos))
         })
     }
 
@@ -2151,7 +2369,7 @@ impl CommandWorkspaceContext for WorkspaceAdapter<'_> {
             return Ok("No active operations or to-do items.".to_string());
         };
         match work.capture(app.current_session_id.as_deref()) {
-            Ok(snapshot) => Ok(crate::work_graph::format_operation_digest(
+            Ok(snapshot) => Ok(codewhale_engine::work_graph::format_operation_digest(
                 snapshot.as_ref(),
             )),
             Err(error) => Err(format!(
@@ -2180,6 +2398,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| diagnostics_messages::resolve(key))
             .or_else(|| config_policy_messages::resolve(key))
             .or_else(|| config_messages::resolve(key))
+            .or_else(|| core_navigation::resolve_message(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -2187,6 +2406,10 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
         let template = tr(locale, message_id);
         apply_named_replacements(&template, replacements)
             .ok_or_else(|| "invalid translation replacement contract".to_string())
+    }
+
+    fn language_name(&self) -> &'static str {
+        self.host.app.borrow().ui_locale.translation_target_name()
     }
 }
 
@@ -2211,6 +2434,9 @@ pub(crate) fn key_to_session_message_id(key: &str) -> Option<MessageId> {
         "cmd_remote_env_unavailable" => MessageId::CmdRemoteEnvUnavailable,
         "cmd_remote_env_source_custody_policy" => MessageId::CmdRemoteEnvSourceCustodyPolicy,
         "cmd_remote_env_browser_label" => MessageId::CmdRemoteEnvBrowserLabel,
+        "cmd_color_set" => MessageId::CmdColorSet,
+        "cmd_color_reset" => MessageId::CmdColorReset,
+        "cmd_color_unknown" => MessageId::CmdColorUnknown,
         _ => return None,
     })
 }
@@ -2388,7 +2614,7 @@ impl CommandMediaContext for MediaAdapter<'_> {
             );
         };
         if kind == "image"
-            && let Err(error) = crate::image_attach::attach_image_from_path(&path)
+            && let Err(error) = codewhale_engine::image_attach::attach_image_from_path(&path)
         {
             return Err(error.to_string());
         }
@@ -2425,13 +2651,15 @@ pub(crate) struct MemoryAdapter<'a> {
 
 /// Derive the authoritative native-memory store from the resolved user-memory
 /// file path, mirroring the pre-migration `/memory` handler exactly.
-fn native_store_from_memory_path(memory_path: &Path) -> crate::native_memory::NativeMemoryStore {
-    crate::native_memory::NativeMemoryStore::from_memory_anchor(memory_path)
+fn native_store_from_memory_path(
+    memory_path: &Path,
+) -> codewhale_runtime::native_memory::NativeMemoryStore {
+    codewhale_runtime::native_memory::NativeMemoryStore::from_memory_anchor(memory_path)
 }
 
 /// Convert a TUI-owned native hit into the portable contract hit. Only the
 /// semantic fields the handler consumes for rendering cross the boundary (D2).
-fn portable_hit(hit: crate::native_memory::MemoryHit) -> MemoryHit {
+fn portable_hit(hit: codewhale_runtime::native_memory::MemoryHit) -> MemoryHit {
     MemoryHit {
         source: hit.source,
         line_start: hit.line_start,
@@ -2467,7 +2695,7 @@ impl CommandMemoryContext for MemoryAdapter<'_> {
     }
 
     fn workspace_id(&self, workspace: &Path) -> Result<String, String> {
-        match crate::native_memory::NativeMemoryStore::workspace_id(workspace) {
+        match codewhale_runtime::native_memory::NativeMemoryStore::workspace_id(workspace) {
             Ok(Some(id)) => Ok(id),
             Ok(None) => {
                 Err("workspace memory requires a git repository with an origin".to_string())
@@ -2498,9 +2726,11 @@ impl CommandMemoryContext for MemoryAdapter<'_> {
         let app = self.host.app.borrow();
         let store = native_store_from_memory_path(&app.memory_path);
         let (scope, workspace_id) = match target {
-            MemoryRememberTarget::Global => (crate::native_memory::MemoryScope::Global, None),
+            MemoryRememberTarget::Global => {
+                (codewhale_runtime::native_memory::MemoryScope::Global, None)
+            }
             MemoryRememberTarget::Workspace { workspace_id } => (
-                crate::native_memory::MemoryScope::Workspace,
+                codewhale_runtime::native_memory::MemoryScope::Workspace,
                 Some(workspace_id),
             ),
         };
@@ -2563,9 +2793,10 @@ impl CommandMemoryContext for MemoryAdapter<'_> {
         let store = native_store_from_memory_path(&app.memory_path);
         let result = match scope {
             MemoryDeleteScope::All => store.delete_all(None, None),
-            MemoryDeleteScope::Global => {
-                store.delete_all(Some(crate::native_memory::MemoryScope::Global), None)
-            }
+            MemoryDeleteScope::Global => store.delete_all(
+                Some(codewhale_runtime::native_memory::MemoryScope::Global),
+                None,
+            ),
         };
         result.map(|()| MemoryDelete).map_err(|err| err.to_string())
     }
@@ -2573,10 +2804,10 @@ impl CommandMemoryContext for MemoryAdapter<'_> {
     fn delete_workspace(&self, workspace: &Path) -> Result<MemoryDelete, String> {
         let app = self.host.app.borrow();
         let store = native_store_from_memory_path(&app.memory_path);
-        match crate::native_memory::NativeMemoryStore::workspace_id(workspace) {
+        match codewhale_runtime::native_memory::NativeMemoryStore::workspace_id(workspace) {
             Ok(Some(id)) => store
                 .delete_all(
-                    Some(crate::native_memory::MemoryScope::Workspace),
+                    Some(codewhale_runtime::native_memory::MemoryScope::Workspace),
                     Some(&id),
                 )
                 .map(|()| MemoryDelete)
@@ -2605,24 +2836,26 @@ pub(crate) struct ProjectAdapter<'a> {
 }
 
 /// Map the TUI-owned goal status onto the portable project status.
-fn portable_goal_status(status: crate::tools::goal::GoalStatus) -> ProjectGoalStatus {
+fn portable_goal_status(status: codewhale_engine::tools::goal::GoalStatus) -> ProjectGoalStatus {
     match status {
-        crate::tools::goal::GoalStatus::Active => ProjectGoalStatus::Active,
-        crate::tools::goal::GoalStatus::Paused => ProjectGoalStatus::Paused,
-        crate::tools::goal::GoalStatus::Complete => ProjectGoalStatus::Complete,
-        crate::tools::goal::GoalStatus::Blocked => ProjectGoalStatus::Blocked,
+        codewhale_engine::tools::goal::GoalStatus::Active => ProjectGoalStatus::Active,
+        codewhale_engine::tools::goal::GoalStatus::Paused => ProjectGoalStatus::Paused,
+        codewhale_engine::tools::goal::GoalStatus::Complete => ProjectGoalStatus::Complete,
+        codewhale_engine::tools::goal::GoalStatus::Blocked => ProjectGoalStatus::Blocked,
     }
 }
 
 /// Map the durable session goal status onto the portable project status.
 fn portable_session_goal_status(
-    status: crate::session_manager::SessionGoalStatus,
+    status: codewhale_engine::session_manager::SessionGoalStatus,
 ) -> ProjectGoalStatus {
     match status {
-        crate::session_manager::SessionGoalStatus::Active => ProjectGoalStatus::Active,
-        crate::session_manager::SessionGoalStatus::Paused => ProjectGoalStatus::Paused,
-        crate::session_manager::SessionGoalStatus::Complete => ProjectGoalStatus::Complete,
-        crate::session_manager::SessionGoalStatus::Blocked => ProjectGoalStatus::Blocked,
+        codewhale_engine::session_manager::SessionGoalStatus::Active => ProjectGoalStatus::Active,
+        codewhale_engine::session_manager::SessionGoalStatus::Paused => ProjectGoalStatus::Paused,
+        codewhale_engine::session_manager::SessionGoalStatus::Complete => {
+            ProjectGoalStatus::Complete
+        }
+        codewhale_engine::session_manager::SessionGoalStatus::Blocked => ProjectGoalStatus::Blocked,
     }
 }
 
@@ -2675,8 +2908,8 @@ impl CommandProjectContext for ProjectAdapter<'_> {
 
 /// The single new skills-specific host adapter.
 ///
-/// Owns every concrete skills touch: `App` skill state, `crate::skills`
-/// discovery/mutation/install/recommend services, `crate::plugins` authority
+/// Owns every concrete skills touch: `App` skill state, `codewhale_skills`
+/// discovery/mutation/install/recommend services, `codewhale_plugins` authority
 /// verification, `SnapshotRepo`, config/network policy, and the async bridge
 /// (`tokio::task::block_in_place`). Portable handlers never name these
 /// subsystems (D3); every method returns portable contract values or safe
@@ -2704,30 +2937,36 @@ where
 /// network-gated install rather than a silent crash. Mirrors
 /// `groups/skills/skills.rs::installer_settings`.
 fn installer_settings() -> (NetworkPolicy, u64, String) {
-    let cfg = crate::config::Config::load(None, None).unwrap_or_default();
+    let cfg = codewhale_plugins::providers::load_config(None, None).unwrap_or_default();
     let network = cfg
         .network
         .clone()
-        .map(|policy| policy.into_runtime())
+        .map(codewhale_net::network_policy::NetworkPolicy::from)
         .unwrap_or_default();
     let skills_cfg = cfg.skills.as_ref();
     let max_size = skills_cfg
         .and_then(|s| s.max_install_size_bytes)
-        .unwrap_or(crate::skills::install::DEFAULT_MAX_SIZE_BYTES);
+        .unwrap_or(codewhale_skill_install::install::DEFAULT_MAX_SIZE_BYTES);
     let registry_url = skills_cfg
         .and_then(|s| s.registry_url.clone())
-        .unwrap_or_else(|| crate::skills::install::DEFAULT_REGISTRY_URL.to_string());
+        .unwrap_or_else(|| codewhale_skill_install::install::DEFAULT_REGISTRY_URL.to_string());
     (network, max_size, registry_url)
 }
 
 /// Resolve the cache destination before loading settings or entering the network bridge.
 fn sync_registry_to_cache(cache_dir: Option<PathBuf>) -> Result<SkillSyncOutcome, String> {
-    use crate::skills::install::{SkillSyncOutcome as TuiSyncOutcome, SyncResult};
+    use codewhale_skill_install::install::{SkillSyncOutcome as TuiSyncOutcome, SyncResult};
     let cache_dir =
         cache_dir.ok_or_else(|| "global skill mutations require a home directory".to_string())?;
     let (network, max_size, registry_url) = installer_settings();
     let result = run_async(async move {
-        crate::skills::install::sync_registry(&network, &registry_url, &cache_dir, max_size).await
+        codewhale_skill_install::install::sync_registry(
+            &network,
+            &registry_url,
+            &cache_dir,
+            max_size,
+        )
+        .await
     });
     match result {
         Ok(SyncResult::RegistryDenied(host)) => Ok(SkillSyncOutcome::RegistryDenied(host)),
@@ -2836,21 +3075,21 @@ fn format_registry_error(prefix: &str, err: &anyhow::Error) -> String {
 }
 
 /// Discover the enabled visible skills for the current App state.
-fn discover_visible(app: &App) -> crate::skills::SkillRegistry {
-    crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
+fn discover_visible(app: &App) -> codewhale_skills::SkillRegistry {
+    codewhale_skills::discover_for_workspace(
         &app.workspace,
-        &app.skills_dir,
-        app.skills_discovery_mode,
+        Some(&app.skills_dir),
+        &app.skills_config,
         Some(app.extension_plugin_view().as_ref()),
     )
     .into_enabled()
 }
 
 /// Map a TUI skill to its portable projection entry.
-fn portable_skill_entry(skill: &crate::skills::Skill) -> SkillEntry {
+fn portable_skill_entry(skill: &codewhale_skills::Skill, app: &App) -> SkillEntry {
     let source = match &skill.source {
-        crate::skills::SkillSource::Native => SkillSourceKind::Native,
-        crate::skills::SkillSource::Plugin {
+        codewhale_skills::SkillSource::Native => SkillSourceKind::Native,
+        codewhale_skills::SkillSource::Plugin {
             plugin_id,
             plugin_name,
             ..
@@ -2860,16 +3099,29 @@ fn portable_skill_entry(skill: &crate::skills::Skill) -> SkillEntry {
         },
     };
     let path = match &skill.source {
-        crate::skills::SkillSource::Native => Some(skill.path.display().to_string()),
-        crate::skills::SkillSource::Plugin { .. } => None,
+        codewhale_skills::SkillSource::Native => Some(skill.path.display().to_string()),
+        codewhale_skills::SkillSource::Plugin { .. } => None,
     };
-    let bundled_tier = crate::skills::bundled_skill_tier(&skill.name).map(|tier| match tier {
-        crate::skills::BundledSkillTier::CoreAgentic => SkillBundledTier::CoreAgentic,
-        crate::skills::BundledSkillTier::FormatTooling => SkillBundledTier::FormatTooling,
+    let bundled_tier = codewhale_skills::bundled_skill_tier(&skill.name).map(|tier| match tier {
+        codewhale_skills::BundledSkillTier::CoreAgentic => SkillBundledTier::CoreAgentic,
+        codewhale_skills::BundledSkillTier::FormatTooling => SkillBundledTier::FormatTooling,
     });
     SkillEntry {
         name: skill.name.clone(),
-        description: skill.description.clone(),
+        description: skill
+            .description_for_locale(app.ui_locale.tag())
+            .to_string(),
+        index_note: codewhale_skills::description_index_cap_if_shortened(
+            skill.description_for_locale(app.ui_locale.tag()),
+            &app.skills_config,
+        )
+        .map(|cap| {
+            codewhale_localization::tr(
+                app.ui_locale,
+                codewhale_localization::MessageId::SkillsIndexDescriptionLimit,
+            )
+            .replace("{limit}", &cap.to_string())
+        }),
         source,
         path,
         bundled_tier,
@@ -2878,9 +3130,9 @@ fn portable_skill_entry(skill: &crate::skills::Skill) -> SkillEntry {
 
 /// Map a TUI mutation receipt to its portable receipt.
 fn portable_mutation_receipt(
-    receipt: &crate::skills::mutation::SkillMutationReceipt,
+    receipt: &codewhale_skills::mutation::SkillMutationReceipt,
 ) -> SkillMutationReceipt {
-    use crate::skills::mutation::SkillMutationOutcome as TuiOutcome;
+    use codewhale_skills::mutation::SkillMutationOutcome as TuiOutcome;
     let outcome = match &receipt.outcome {
         TuiOutcome::Installed => SkillMutationOutcome::Installed,
         TuiOutcome::Updated => SkillMutationOutcome::Updated,
@@ -2902,8 +3154,8 @@ fn portable_mutation_receipt(
 /// Map a portable target scope to the TUI scope.
 fn portable_scope(
     scope: Option<SkillTargetScope>,
-) -> Option<crate::skills::mutation::SkillTargetScope> {
-    use crate::skills::mutation::SkillTargetScope as TuiScope;
+) -> Option<codewhale_skills::mutation::SkillTargetScope> {
+    use codewhale_skills::mutation::SkillTargetScope as TuiScope;
     scope.map(|s| match s {
         SkillTargetScope::Project => TuiScope::Project,
         SkillTargetScope::Global => TuiScope::Global,
@@ -2912,7 +3164,7 @@ fn portable_scope(
 
 /// Map a curated registry document to portable entries.
 fn portable_registry_entries(
-    doc: &crate::skills::install::RegistryDocument,
+    doc: &codewhale_skill_install::install::RegistryDocument,
 ) -> Vec<RemoteSkillEntry> {
     doc.skills
         .iter()
@@ -2946,26 +3198,33 @@ fn network_denied_message(host: &str) -> String {
 impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     fn skill_registry_projection(&self) -> SkillRegistryProjection {
         let app = self.host.app.borrow();
-        let mode = app.skills_discovery_mode;
-        let dirs = crate::skills::skill_directories_for_workspace_and_dir(
+        let mode = codewhale_skills::SkillDiscoveryMode::from_config(&app.skills_config);
+        let dirs = codewhale_skills::skill_directories_for_workspace_and_dir(
             &app.workspace,
             &app.skills_dir,
             mode,
         );
         let registry = discover_visible(&app);
         let mode_label = match mode {
-            crate::skills::SkillDiscoveryMode::Compatible => "compatible",
-            crate::skills::SkillDiscoveryMode::CompatibleWithFlatWorkspace => {
+            codewhale_skills::SkillDiscoveryMode::Compatible => "compatible",
+            codewhale_skills::SkillDiscoveryMode::CompatibleWithFlatWorkspace => {
                 "compatible (flat workspace enabled)"
             }
-            crate::skills::SkillDiscoveryMode::CodeWhaleOnly => "codewhale-only",
+            codewhale_skills::SkillDiscoveryMode::CodeWhaleOnly => "codewhale-only",
         };
         SkillRegistryProjection {
             workspace: app.workspace.display().to_string(),
             skills_dir: app.skills_dir.display().to_string(),
             mode_label: mode_label.to_string(),
+            bundled_status: codewhale_skills::bundled_skills_status(&app.skills_config, &registry)
+                .map(|status| status.inspection())
+                .unwrap_or_default(),
             dirs: dirs.iter().map(|dir| dir.display().to_string()).collect(),
-            entries: registry.list().iter().map(portable_skill_entry).collect(),
+            entries: registry
+                .list()
+                .iter()
+                .map(|skill| portable_skill_entry(skill, &app))
+                .collect(),
             warnings: registry.warnings().to_vec(),
             total: registry.len(),
         }
@@ -3028,15 +3287,15 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         scope: Option<SkillTargetScope>,
         spec: &str,
     ) -> Result<SkillMutationReceipt, String> {
-        use crate::skills::mutation::{MutationContext, SkillMutationRequest};
-        let source = match crate::skills::install::InstallSource::parse(spec) {
+        use codewhale_skills::mutation::{MutationContext, SkillMutationRequest};
+        let source = match codewhale_skill_install::install::InstallSource::parse(spec) {
             Ok(source) => source,
             Err(err) => return Err(format!("Invalid install source: {err}")),
         };
         let target =
-            portable_scope(scope).unwrap_or(crate::skills::mutation::SkillTargetScope::Global);
+            portable_scope(scope).unwrap_or(codewhale_skills::mutation::SkillTargetScope::Global);
         let workspace = self.host.app.borrow().workspace.clone();
-        let home = crate::config::effective_home_dir();
+        let home = codewhale_paths::user_home();
         let (network, max_size, registry_url) = installer_settings();
         let outcome = run_async(async move {
             let ctx = MutationContext {
@@ -3047,7 +3306,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                 max_size,
                 registry_url: &registry_url,
             };
-            crate::skills::mutation::execute(
+            codewhale_skills::mutation::execute(
                 SkillMutationRequest::InstallRemote { source, target },
                 &ctx,
             )
@@ -3064,9 +3323,9 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         scope: Option<SkillTargetScope>,
         name: &str,
     ) -> Result<SkillMutationReceipt, String> {
-        use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+        use codewhale_skills::mutation::{MutationContext, SkillMutationRequest};
         let workspace = self.host.app.borrow().workspace.clone();
-        let home = crate::config::effective_home_dir();
+        let home = codewhale_paths::user_home();
         let (network, max_size, registry_url) = installer_settings();
         let owned_name = name.to_string();
         let scope = portable_scope(scope);
@@ -3079,7 +3338,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                 max_size,
                 registry_url: &registry_url,
             };
-            crate::skills::mutation::execute(
+            codewhale_skills::mutation::execute(
                 SkillMutationRequest::UpdateByName {
                     name: owned_name,
                     scope,
@@ -3100,9 +3359,9 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         scope: Option<SkillTargetScope>,
         name: &str,
     ) -> Result<SkillMutationReceipt, String> {
-        use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+        use codewhale_skills::mutation::{MutationContext, SkillMutationRequest};
         let workspace = self.host.app.borrow().workspace.clone();
-        let home = crate::config::effective_home_dir();
+        let home = codewhale_paths::user_home();
         let (network, max_size, registry_url) = installer_settings();
         let ctx = MutationContext {
             workspace: &workspace,
@@ -3112,7 +3371,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
             max_size,
             registry_url: &registry_url,
         };
-        match crate::skills::mutation::execute_sync(
+        match codewhale_skills::mutation::execute_sync(
             SkillMutationRequest::RemoveByName {
                 name: name.to_string(),
                 scope: portable_scope(scope),
@@ -3130,9 +3389,9 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         scope: Option<SkillTargetScope>,
         name: &str,
     ) -> Result<SkillMutationReceipt, String> {
-        use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+        use codewhale_skills::mutation::{MutationContext, SkillMutationRequest};
         let workspace = self.host.app.borrow().workspace.clone();
-        let home = crate::config::effective_home_dir();
+        let home = codewhale_paths::user_home();
         let (network, max_size, registry_url) = installer_settings();
         let ctx = MutationContext {
             workspace: &workspace,
@@ -3142,7 +3401,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
             max_size,
             registry_url: &registry_url,
         };
-        match crate::skills::mutation::execute_sync(
+        match codewhale_skills::mutation::execute_sync(
             SkillMutationRequest::TrustByName {
                 name: name.to_string(),
                 scope: portable_scope(scope),
@@ -3158,18 +3417,18 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     fn fetch_remote_registry(&mut self) -> Result<RemoteRegistryOutcome, String> {
         let (network, _max_size, registry_url) = installer_settings();
         let registry = run_async(async move {
-            crate::skills::install::fetch_registry(&network, &registry_url).await
+            codewhale_skill_install::install::fetch_registry(&network, &registry_url).await
         });
         match registry {
-            Ok(crate::skills::install::RegistryFetchResult::Loaded(doc)) => {
+            Ok(codewhale_skill_install::install::RegistryFetchResult::Loaded(doc)) => {
                 Ok(RemoteRegistryOutcome::Loaded {
                     entries: portable_registry_entries(&doc),
                 })
             }
-            Ok(crate::skills::install::RegistryFetchResult::NeedsApproval(host)) => {
+            Ok(codewhale_skill_install::install::RegistryFetchResult::NeedsApproval(host)) => {
                 Ok(RemoteRegistryOutcome::NeedsApproval(host))
             }
-            Ok(crate::skills::install::RegistryFetchResult::Denied(host)) => {
+            Ok(codewhale_skill_install::install::RegistryFetchResult::Denied(host)) => {
                 Ok(RemoteRegistryOutcome::Denied(host))
             }
             Err(err) => Err(format_registry_error("Failed to fetch registry", &err)),
@@ -3179,12 +3438,12 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     fn recommend_skills(&mut self, task: &str) -> Result<Vec<SkillRecommendation>, String> {
         let (network, _max_size, registry_url) = installer_settings();
         let registry = run_async(async move {
-            crate::skills::install::fetch_registry(&network, &registry_url).await
+            codewhale_skill_install::install::fetch_registry(&network, &registry_url).await
         });
         match registry {
-            Ok(crate::skills::install::RegistryFetchResult::Loaded(doc)) => {
+            Ok(codewhale_skill_install::install::RegistryFetchResult::Loaded(doc)) => {
                 let recommendations =
-                    crate::skills::recommend::recommend_remote_skills(task, &doc, 3);
+                    codewhale_skill_install::recommend::recommend_remote_skills(task, &doc, 3);
                 Ok(recommendations
                     .into_iter()
                     .map(|recommendation| SkillRecommendation {
@@ -3194,10 +3453,10 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                     })
                     .collect())
             }
-            Ok(crate::skills::install::RegistryFetchResult::NeedsApproval(host)) => {
+            Ok(codewhale_skill_install::install::RegistryFetchResult::NeedsApproval(host)) => {
                 Err(needs_approval_message(&host))
             }
-            Ok(crate::skills::install::RegistryFetchResult::Denied(host)) => {
+            Ok(codewhale_skill_install::install::RegistryFetchResult::Denied(host)) => {
                 Err(network_denied_message(&host))
             }
             Err(err) => Err(format_registry_error("Failed to fetch registry", &err)),
@@ -3205,18 +3464,18 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     }
 
     fn sync_registry(&mut self) -> Result<SkillSyncOutcome, String> {
-        sync_registry_to_cache(crate::skills::install::default_cache_skills_dir())
+        sync_registry_to_cache(codewhale_skill_install::install::default_cache_skills_dir())
     }
 
     fn run_review(&mut self) -> Result<ReviewOutcome, String> {
         let skills_dir = self.host.app.borrow().skills_dir.clone();
-        let registry = crate::skills::SkillRegistry::discover(&skills_dir).into_enabled();
+        let registry = codewhale_skills::SkillRegistry::discover(&skills_dir).into_enabled();
         let mut warnings: Vec<String> = registry.warnings().to_vec();
         let mut skill = registry.get("review").cloned();
 
-        let global_dir = crate::skills::default_skills_dir();
+        let global_dir = codewhale_skills::default_skills_dir();
         if skill.is_none() && global_dir != skills_dir {
-            let registry = crate::skills::SkillRegistry::discover(&global_dir).into_enabled();
+            let registry = codewhale_skills::SkillRegistry::discover(&global_dir).into_enabled();
             if warnings.is_empty() {
                 warnings = registry.warnings().to_vec();
             } else if !registry.warnings().is_empty() {
@@ -3259,7 +3518,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
 
     fn snapshot_list(&mut self, limit: usize) -> Result<Vec<SnapshotEntry>, String> {
         let workspace = self.host.app.borrow().workspace.clone();
-        let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {
+        let repo = match codewhale_snapshot::SnapshotRepo::open_or_init(&workspace) {
             Ok(repo) => repo,
             Err(err) => {
                 return Err(format!(
@@ -3291,7 +3550,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         let workspace = self.host.app.borrow().workspace.clone();
         let id = id.to_owned();
         let restore = move || {
-            let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {
+            let repo = match codewhale_snapshot::SnapshotRepo::open_or_init(&workspace) {
                 Ok(repo) => repo,
                 Err(err) => {
                     return Err(format!(
@@ -3300,7 +3559,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                     ));
                 }
             };
-            let id = crate::snapshot::SnapshotId::parse(&id)
+            let id = codewhale_snapshot::SnapshotId::parse(&id)
                 .map_err(|err| format!("Restore failed: {err}"))?;
             repo.restore(&id)
                 .map_err(|err| format!("Restore failed: {err}"))
@@ -3354,11 +3613,15 @@ pub(crate) struct PluginAdapter<'a> {
 }
 
 /// Convert a TUI-owned diagnostic to the portable contract diagnostic.
-fn portable_diagnostic(diagnostic: &crate::plugins::types::PluginDiagnostic) -> PluginDiagnostic {
+fn portable_diagnostic(
+    diagnostic: &codewhale_plugins::types::PluginDiagnostic,
+) -> PluginDiagnostic {
     PluginDiagnostic {
         level: match diagnostic.level {
-            crate::plugins::types::PluginDiagnosticLevel::Warning => PluginDiagnosticLevel::Warning,
-            crate::plugins::types::PluginDiagnosticLevel::Error => PluginDiagnosticLevel::Error,
+            codewhale_plugins::types::PluginDiagnosticLevel::Warning => {
+                PluginDiagnosticLevel::Warning
+            }
+            codewhale_plugins::types::PluginDiagnosticLevel::Error => PluginDiagnosticLevel::Error,
         },
         code: diagnostic.code.to_string(),
         message: diagnostic.message.clone(),
@@ -3368,12 +3631,14 @@ fn portable_diagnostic(diagnostic: &crate::plugins::types::PluginDiagnostic) -> 
 
 /// Convert a TUI marketplace diagnostic into the portable contract diagnostic.
 fn portable_marketplace_diagnostic(
-    diagnostic: &crate::plugins::marketplace::types::MarketplaceDiagnostic,
+    diagnostic: &codewhale_plugins::marketplace::types::MarketplaceDiagnostic,
 ) -> PluginDiagnostic {
     PluginDiagnostic {
         level: match diagnostic.level {
-            crate::plugins::types::PluginDiagnosticLevel::Warning => PluginDiagnosticLevel::Warning,
-            crate::plugins::types::PluginDiagnosticLevel::Error => PluginDiagnosticLevel::Error,
+            codewhale_plugins::types::PluginDiagnosticLevel::Warning => {
+                PluginDiagnosticLevel::Warning
+            }
+            codewhale_plugins::types::PluginDiagnosticLevel::Error => PluginDiagnosticLevel::Error,
         },
         code: diagnostic.code.clone(),
         message: diagnostic.message.clone(),
@@ -3382,7 +3647,7 @@ fn portable_marketplace_diagnostic(
 }
 
 /// Convert a TUI-owned loaded plugin into the portable list summary.
-fn portable_summary(plugin: &crate::plugins::types::LoadedPlugin) -> PluginSummary {
+fn portable_summary(plugin: &codewhale_plugins::types::LoadedPlugin) -> PluginSummary {
     PluginSummary {
         name: plugin.name().to_string(),
         id: plugin.id.as_str().to_string(),
@@ -3398,7 +3663,10 @@ fn portable_summary(plugin: &crate::plugins::types::LoadedPlugin) -> PluginSumma
 }
 
 /// Convert one TUI MCP server config into the portable review detail.
-fn portable_mcp_server(name: &str, server: &crate::mcp::McpServerConfig) -> PluginMcpServerDetail {
+fn portable_mcp_server(
+    name: &str,
+    server: &codewhale_mcp::config::McpServerConfig,
+) -> PluginMcpServerDetail {
     let transport = if server.url.is_some() {
         PluginMcpTransport::Http
     } else if server.command.is_some() {
@@ -3439,7 +3707,7 @@ fn portable_mcp_server(name: &str, server: &crate::mcp::McpServerConfig) -> Plug
 }
 
 /// Convert a TUI-owned loaded plugin into the portable full detail.
-fn portable_detail(plugin: &crate::plugins::types::LoadedPlugin) -> PluginDetail {
+fn portable_detail(plugin: &codewhale_plugins::types::LoadedPlugin) -> PluginDetail {
     let mcp_servers = plugin
         .manifest
         .mcp_servers
@@ -3497,23 +3765,25 @@ fn portable_detail(plugin: &crate::plugins::types::LoadedPlugin) -> PluginDetail
 
 /// Convert a TUI mutation receipt into the portable contract receipt.
 fn portable_plugin_mutation_receipt(
-    receipt: &crate::plugins::mutation::PluginMutationReceipt,
+    receipt: &codewhale_plugins::mutation::PluginMutationReceipt,
 ) -> PluginMutationReceipt {
     let outcome = match &receipt.outcome {
-        crate::plugins::mutation::PluginMutationOutcome::Installed => {
+        codewhale_plugins::mutation::PluginMutationOutcome::Installed => {
             PluginMutationOutcome::Installed
         }
-        crate::plugins::mutation::PluginMutationOutcome::Updated => PluginMutationOutcome::Updated,
-        crate::plugins::mutation::PluginMutationOutcome::NoChange => {
+        codewhale_plugins::mutation::PluginMutationOutcome::Updated => {
+            PluginMutationOutcome::Updated
+        }
+        codewhale_plugins::mutation::PluginMutationOutcome::NoChange => {
             PluginMutationOutcome::NoChange
         }
-        crate::plugins::mutation::PluginMutationOutcome::Uninstalled => {
+        codewhale_plugins::mutation::PluginMutationOutcome::Uninstalled => {
             PluginMutationOutcome::Uninstalled
         }
-        crate::plugins::mutation::PluginMutationOutcome::NeedsApproval(host) => {
+        codewhale_plugins::mutation::PluginMutationOutcome::NeedsApproval(host) => {
             PluginMutationOutcome::NeedsApproval(host.clone())
         }
-        crate::plugins::mutation::PluginMutationOutcome::NetworkDenied(host) => {
+        codewhale_plugins::mutation::PluginMutationOutcome::NetworkDenied(host) => {
             PluginMutationOutcome::NetworkDenied(host.clone())
         }
     };
@@ -3528,7 +3798,7 @@ fn portable_plugin_mutation_receipt(
 
 /// Convert a TUI export receipt into the portable contract receipt.
 fn portable_export_receipt(
-    receipt: &crate::plugins::export::PluginExportReceipt,
+    receipt: &codewhale_plugins::export::PluginExportReceipt,
 ) -> PluginExportReceipt {
     PluginExportReceipt {
         exported_name: receipt.exported_name.clone(),
@@ -3543,15 +3813,15 @@ fn portable_export_receipt(
 /// Convert one TUI legacy tool entry into the portable value.
 fn portable_legacy_tool(
     path: &Path,
-    metadata: &crate::tools::plugin::PluginMetadata,
+    metadata: &codewhale_engine::tools::plugin::PluginMetadata,
 ) -> PluginLegacyTool {
     PluginLegacyTool {
         name: metadata.name.clone(),
         description: metadata.description.clone(),
         approval: match metadata.approval {
-            crate::tools::spec::ApprovalRequirement::Auto => "auto",
-            crate::tools::spec::ApprovalRequirement::Suggest => "suggest",
-            crate::tools::spec::ApprovalRequirement::Required => "required",
+            codewhale_engine::tools::spec::ApprovalRequirement::Auto => "auto",
+            codewhale_engine::tools::spec::ApprovalRequirement::Suggest => "suggest",
+            codewhale_engine::tools::spec::ApprovalRequirement::Required => "required",
         }
         .to_string(),
         input_schema: Some(
@@ -3563,11 +3833,11 @@ fn portable_legacy_tool(
 
 /// Convert one TUI marketplace candidate into the portable value.
 fn portable_marketplace_candidate(
-    entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
-    candidate: &crate::plugins::marketplace::types::MarketplaceCandidate,
-    registry: &crate::plugins::PluginRegistry,
+    entry: &codewhale_plugins::marketplace::store::StoredMarketplaceCatalog,
+    candidate: &codewhale_plugins::marketplace::types::MarketplaceCandidate,
+    registry: &codewhale_plugins::PluginRegistry,
 ) -> PluginMarketplaceCandidate {
-    use crate::plugins::marketplace::document::{
+    use codewhale_plugins::marketplace::document::{
         CatalogInstallResolution, resolve_candidate_install,
     };
     let install_plan = match resolve_candidate_install(entry, candidate, registry) {
@@ -3617,8 +3887,8 @@ fn portable_marketplace_candidate(
 
 /// Convert one stored TUI marketplace catalog (with its source path).
 fn portable_marketplace_catalog_with_source(
-    entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
-    registry: &crate::plugins::PluginRegistry,
+    entry: &codewhale_plugins::marketplace::store::StoredMarketplaceCatalog,
+    registry: &codewhale_plugins::PluginRegistry,
 ) -> PluginMarketplaceCatalog {
     let catalog = &entry.catalog;
     PluginMarketplaceCatalog {
@@ -3656,7 +3926,7 @@ fn scan_managed_plugins_portable(
     use std::path::PathBuf;
 
     const MAX_MANAGED_CHILDREN: usize = 128;
-    const KIMI_PLUGIN_JSON_NAME: &str = crate::plugins::agent_plugin::KIMI_PLUGIN_JSON_NAME;
+    const KIMI_PLUGIN_JSON_NAME: &str = codewhale_plugins::agent_plugin::KIMI_PLUGIN_JSON_NAME;
 
     struct Candidate {
         name: String,
@@ -3678,21 +3948,22 @@ fn scan_managed_plugins_portable(
                 error
             )
         })?;
-        if crate::plugins::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+        if codewhale_util::path_identity::metadata_is_link_or_reparse(&metadata)
+            || !metadata.is_file()
+        {
             return Err(format!(
                 "Kimi manifest must be a regular file at {}",
                 canonical_path.display()
             ));
         }
-        let validated = crate::plugins::manifest::PluginManifest::validate_from_path(
-            &manifest_path,
-        )
-        .map_err(|error| {
-            format!(
-                "Kimi manifest invalid at {}: {error}",
-                canonical_path.display()
-            )
-        })?;
+        let validated =
+            codewhale_plugins::manifest::PluginManifest::validate_from_path(&manifest_path)
+                .map_err(|error| {
+                    format!(
+                        "Kimi manifest invalid at {}: {error}",
+                        canonical_path.display()
+                    )
+                })?;
         let name = validated.manifest.plugin.name.clone();
         if canonical_path.file_name().and_then(|part| part.to_str()) != Some(name.as_str()) {
             return Err(format!(
@@ -3715,7 +3986,7 @@ fn scan_managed_plugins_portable(
 
     let home = match home_override {
         Some(home) => home.to_path_buf(),
-        None => crate::config::effective_home_dir().ok_or_else(|| {
+        None => codewhale_paths::user_home().ok_or_else(|| {
             tr(
                 codewhale_localization::Locale::En,
                 codewhale_localization::MessageId::PluginKimiHomeMissing,
@@ -3735,8 +4006,11 @@ fn scan_managed_plugins_portable(
             });
         }
         Err(error) => {
-            let root_text = escape_review_text(&configured_root.display().to_string());
-            let error_text = escape_review_text(&error.to_string());
+            let root_text = escape_review_text(
+                &configured_root.display().to_string(),
+                ReviewTextContext::Prose,
+            );
+            let error_text = escape_review_text(&error.to_string(), ReviewTextContext::Prose);
             return Err(tr(
                 codewhale_localization::Locale::En,
                 codewhale_localization::MessageId::PluginKimiRootInspectFailed,
@@ -3745,8 +4019,11 @@ fn scan_managed_plugins_portable(
             .replace("{error}", &error_text));
         }
     };
-    if crate::plugins::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
-        let root_text = escape_review_text(&configured_root.display().to_string());
+    if codewhale_util::path_identity::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        let root_text = escape_review_text(
+            &configured_root.display().to_string(),
+            ReviewTextContext::Prose,
+        );
         return Err(tr(
             codewhale_localization::Locale::En,
             codewhale_localization::MessageId::PluginKimiRootMustBeDirectory,
@@ -3754,8 +4031,11 @@ fn scan_managed_plugins_portable(
         .replace("{root}", &root_text));
     }
     let canonical_root = configured_root.canonicalize().map_err(|error| {
-        let root_text = escape_review_text(&configured_root.display().to_string());
-        let error_text = escape_review_text(&error.to_string());
+        let root_text = escape_review_text(
+            &configured_root.display().to_string(),
+            ReviewTextContext::Prose,
+        );
+        let error_text = escape_review_text(&error.to_string(), ReviewTextContext::Prose);
         tr(
             codewhale_localization::Locale::En,
             codewhale_localization::MessageId::PluginKimiRootCanonicalizeFailed,
@@ -3765,8 +4045,11 @@ fn scan_managed_plugins_portable(
     })?;
     let mut entries = fs::read_dir(&canonical_root)
         .map_err(|error| {
-            let root_text = escape_review_text(&canonical_root.display().to_string());
-            let error_text = escape_review_text(&error.to_string());
+            let root_text = escape_review_text(
+                &canonical_root.display().to_string(),
+                ReviewTextContext::Prose,
+            );
+            let error_text = escape_review_text(&error.to_string(), ReviewTextContext::Prose);
             tr(
                 codewhale_localization::Locale::En,
                 codewhale_localization::MessageId::PluginKimiRootListFailed,
@@ -3776,7 +4059,7 @@ fn scan_managed_plugins_portable(
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
-            let error_text = escape_review_text(&error.to_string());
+            let error_text = escape_review_text(&error.to_string(), ReviewTextContext::Prose);
             tr(
                 codewhale_localization::Locale::En,
                 codewhale_localization::MessageId::PluginKimiEntryReadFailed,
@@ -3800,8 +4083,9 @@ fn scan_managed_plugins_portable(
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                let path_text = escape_review_text(&path.display().to_string());
-                let error_text = escape_review_text(&error.to_string());
+                let path_text =
+                    escape_review_text(&path.display().to_string(), ReviewTextContext::Prose);
+                let error_text = escape_review_text(&error.to_string(), ReviewTextContext::Prose);
                 rejected.push(
                     tr(
                         codewhale_localization::Locale::En,
@@ -3813,8 +4097,8 @@ fn scan_managed_plugins_portable(
                 continue;
             }
         };
-        if crate::plugins::metadata_is_link_or_reparse(&metadata) {
-            let path_text = escape_review_path(&path);
+        if codewhale_util::path_identity::metadata_is_link_or_reparse(&metadata) {
+            let path_text = escape_review_path(&path, ReviewTextContext::Prose);
             rejected.push(
                 tr(
                     codewhale_localization::Locale::En,
@@ -3830,8 +4114,12 @@ fn scan_managed_plugins_portable(
         let canonical_path = match path.canonicalize() {
             Ok(path) if path.parent() == Some(canonical_root.as_path()) => path,
             Ok(canonical_path) => {
-                let path_text = escape_review_text(&path.display().to_string());
-                let canonical_text = escape_review_text(&canonical_path.display().to_string());
+                let path_text =
+                    escape_review_text(&path.display().to_string(), ReviewTextContext::Prose);
+                let canonical_text = escape_review_text(
+                    &canonical_path.display().to_string(),
+                    ReviewTextContext::Prose,
+                );
                 rejected.push(
                     tr(
                         codewhale_localization::Locale::En,
@@ -3843,8 +4131,9 @@ fn scan_managed_plugins_portable(
                 continue;
             }
             Err(error) => {
-                let path_text = escape_review_text(&path.display().to_string());
-                let error_text = escape_review_text(&error.to_string());
+                let path_text =
+                    escape_review_text(&path.display().to_string(), ReviewTextContext::Prose);
+                let error_text = escape_review_text(&error.to_string(), ReviewTextContext::Prose);
                 rejected.push(
                     tr(
                         codewhale_localization::Locale::En,
@@ -3882,13 +4171,13 @@ fn scan_managed_plugins_portable(
 }
 
 /// Escape review text exactly like the plugin render helpers (FEAT-020 D2).
-fn escape_review_text(value: &str) -> String {
-    crate::commands::groups::plugins::render::escape_review_text(value)
+fn escape_review_text(value: &str, context: ReviewTextContext) -> String {
+    crate::commands::groups::plugins::render::escape_review_text(value, context)
 }
 
 /// Escape a review path exactly like the plugin render helpers (FEAT-020 D2).
-fn escape_review_path(path: &Path) -> String {
-    crate::commands::groups::plugins::render::escape_review_path(path)
+fn escape_review_path(path: &Path, context: ReviewTextContext) -> String {
+    crate::commands::groups::plugins::render::escape_review_path(path, context)
 }
 
 impl CommandPluginContext for PluginAdapter<'_> {
@@ -3945,8 +4234,11 @@ impl CommandPluginContext for PluginAdapter<'_> {
     fn reload_nudge(&mut self) -> Option<String> {
         let mut app = self.host.app.borrow_mut();
         let registry = app.plugin_registry.clone();
-        crate::plugins::plugin_reload_nudge(registry.as_ref(), &mut app.plugin_reload_nudge_stamp)
-            .map(str::to_string)
+        codewhale_plugins::plugin_reload_nudge(
+            registry.as_ref(),
+            &mut app.plugin_reload_nudge_stamp,
+        )
+        .map(str::to_string)
     }
 
     fn state_path(&self) -> Option<PathBuf> {
@@ -3964,26 +4256,26 @@ impl CommandPluginContext for PluginAdapter<'_> {
             return Err("Usage: /plugin suggest <task of at least 3 characters>".to_string());
         }
         let app = self.host.app.borrow();
-        let marketplace = crate::plugins::recommend::load_marketplace_candidates(
+        let marketplace = codewhale_plugins::recommend::load_marketplace_candidates(
             app.plugin_registry.state_path(),
         );
-        let recommendations = crate::plugins::recommend::recommend_plugins_for_task(
+        let recommendations = codewhale_plugins::recommend::recommend_plugins_for_task(
             task,
             app.plugin_registry.as_ref(),
             &marketplace,
-            crate::plugins::recommend::RecommendOptions::default(),
+            codewhale_plugins::recommend::RecommendOptions::default(),
         );
         Ok(recommendations
             .into_iter()
             .map(|recommendation| {
                 let description = match &recommendation.source {
-                    crate::plugins::recommend::PluginMatchSource::Installed { id } => app
+                    codewhale_plugins::recommend::PluginMatchSource::Installed { id } => app
                         .plugin_registry
                         .get(id)
                         .and_then(|plugin| plugin.manifest.plugin.description.clone())
                         .filter(|description| !description.trim().is_empty())
                         .unwrap_or_else(|| "No description provided.".to_string()),
-                    crate::plugins::recommend::PluginMatchSource::Marketplace { catalog_id } => {
+                    codewhale_plugins::recommend::PluginMatchSource::Marketplace { catalog_id } => {
                         marketplace
                             .iter()
                             .find(|candidate| {
@@ -3996,12 +4288,12 @@ impl CommandPluginContext for PluginAdapter<'_> {
                     }
                 };
                 let state_label = match &recommendation.source {
-                    crate::plugins::recommend::PluginMatchSource::Installed { id } => app
+                    codewhale_plugins::recommend::PluginMatchSource::Installed { id } => app
                         .plugin_registry
                         .get(id)
                         .map(|plugin| plugin.state_label().to_string())
                         .unwrap_or_else(|| "installed".to_string()),
-                    crate::plugins::recommend::PluginMatchSource::Marketplace { .. } => {
+                    codewhale_plugins::recommend::PluginMatchSource::Marketplace { .. } => {
                         "not installed".to_string()
                     }
                 };
@@ -4021,7 +4313,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
             let app = self.host.app.borrow();
             app.plugin_registry
                 .get(selector)
-                .map(crate::plugins::types::LoadedPlugin::review_token)
+                .map(codewhale_plugins::types::LoadedPlugin::review_token)
                 .ok_or_else(|| format!("no plugin named {selector}"))?
         };
         if token != expected {
@@ -4085,8 +4377,8 @@ impl CommandPluginContext for PluginAdapter<'_> {
         source: &str,
         expected_content_hash: Option<&str>,
     ) -> Result<PluginMutationReceipt, String> {
-        use crate::plugins::install::PluginInstallSource;
-        use crate::plugins::mutation::{
+        use codewhale_plugins::install::PluginInstallSource;
+        use codewhale_plugins::mutation::{
             PluginMutationContext, PluginMutationOutcome, PluginMutationRequest,
         };
 
@@ -4104,7 +4396,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
         let outcome = run_async(async move {
             let ctx = PluginMutationContext {
                 network: &network,
-                max_size: crate::plugins::install::DEFAULT_MAX_SIZE_BYTES,
+                max_size: codewhale_plugins::install::DEFAULT_MAX_SIZE_BYTES,
             };
             let request = match expected_for_request {
                 Some(expected_content_hash) => PluginMutationRequest::InstallExact {
@@ -4115,7 +4407,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
                     source: plugin_source,
                 },
             };
-            crate::plugins::mutation::execute(request, &ctx, registry).await
+            codewhale_plugins::mutation::execute(request, &ctx, registry).await
         });
         match outcome {
             Ok(receipt) => {
@@ -4133,7 +4425,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
     }
 
     fn update(&mut self, selector: &str) -> Result<PluginMutationReceipt, String> {
-        use crate::plugins::mutation::{
+        use codewhale_plugins::mutation::{
             PluginMutationContext, PluginMutationOutcome, PluginMutationRequest,
         };
         let network = plugin_network_policy();
@@ -4143,9 +4435,9 @@ impl CommandPluginContext for PluginAdapter<'_> {
         let outcome = run_async(async move {
             let ctx = PluginMutationContext {
                 network: &network,
-                max_size: crate::plugins::install::DEFAULT_MAX_SIZE_BYTES,
+                max_size: codewhale_plugins::install::DEFAULT_MAX_SIZE_BYTES,
             };
-            crate::plugins::mutation::execute(
+            codewhale_plugins::mutation::execute(
                 PluginMutationRequest::Update {
                     selector: selector_owned,
                 },
@@ -4169,7 +4461,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
     }
 
     fn uninstall(&mut self, selector: &str) -> Result<PluginMutationReceipt, String> {
-        use crate::plugins::mutation::{
+        use codewhale_plugins::mutation::{
             PluginMutationContext, PluginMutationOutcome, PluginMutationRequest,
         };
         let network = plugin_network_policy();
@@ -4179,9 +4471,9 @@ impl CommandPluginContext for PluginAdapter<'_> {
         let outcome = run_async(async move {
             let ctx = PluginMutationContext {
                 network: &network,
-                max_size: crate::plugins::install::DEFAULT_MAX_SIZE_BYTES,
+                max_size: codewhale_plugins::install::DEFAULT_MAX_SIZE_BYTES,
             };
-            crate::plugins::mutation::execute(
+            codewhale_plugins::mutation::execute(
                 PluginMutationRequest::Uninstall {
                     selector: selector_owned,
                 },
@@ -4209,8 +4501,9 @@ impl CommandPluginContext for PluginAdapter<'_> {
     fn uninstall_path(&mut self, name: &str, plugins_dir: &Path) -> Result<(), String> {
         // File-level rollback removal for a bundle whose content hash
         // mismatched; no registry resolution, rediscovery, or skill side
-        // effects (FEAT-020 D1 — the `crate::plugins` call stays host-side).
-        crate::plugins::install::uninstall(name, plugins_dir).map_err(|error| format!("{error:#}"))
+        // effects (FEAT-020 D1 — the `codewhale_plugins` call stays host-side).
+        codewhale_plugins::install::uninstall(name, plugins_dir)
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn export(&self, selector: &str, target: &Path) -> Result<PluginExportReceipt, String> {
@@ -4232,7 +4525,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
         } else {
             app.workspace.join(target)
         };
-        crate::plugins::export::export_plugin_bundle(&plugin, &target, &existing_names)
+        codewhale_plugins::export::export_plugin_bundle(&plugin, &target, &existing_names)
             .map(|receipt| portable_export_receipt(&receipt))
             .map_err(|error| format!("Export of `{}` failed: {}", plugin.name(), error))
     }
@@ -4249,7 +4542,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
         if !dir.exists() {
             return Ok(None);
         }
-        let discovered = crate::tools::plugin::scan_plugin_dir(&dir);
+        let discovered = codewhale_engine::tools::plugin::scan_plugin_dir(&dir);
         let diagnostics = discovered
             .iter()
             .filter(|(_, metadata)| metadata.auto_approval_ignored)
@@ -4259,7 +4552,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
                 message: format!(
                     "script tool '{}': {}",
                     metadata.name,
-                    crate::tools::plugin::AUTO_APPROVAL_UNSUPPORTED
+                    codewhale_engine::tools::plugin::AUTO_APPROVAL_UNSUPPORTED
                 ),
                 path: Some(path.clone()),
             })
@@ -4288,7 +4581,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
             let canonical = package
                 .canonicalize()
                 .map_err(|_| format!("DSH package not found at {}", package.display()))?;
-            let (conversion, content_hash) = crate::plugins::install::preview_dsh(&canonical)
+            let (conversion, content_hash) = codewhale_plugins::install::preview_dsh(&canonical)
                 .map_err(|error| format!("{error:#}"))?;
             Ok(codewhale_command_contract::facets::PluginDshPreview {
                 package_path: canonical,
@@ -4343,8 +4636,8 @@ impl CommandPluginContext for PluginAdapter<'_> {
         canonical_path: &Path,
         expected_content_hash: &str,
     ) -> Result<PluginMutationReceipt, String> {
-        use crate::plugins::install::PluginInstallSource;
-        use crate::plugins::mutation::{
+        use codewhale_plugins::install::PluginInstallSource;
+        use codewhale_plugins::mutation::{
             PluginMutationContext, PluginMutationOutcome, PluginMutationRequest,
         };
         let network = plugin_network_policy();
@@ -4355,9 +4648,9 @@ impl CommandPluginContext for PluginAdapter<'_> {
         let outcome = run_async(async move {
             let ctx = PluginMutationContext {
                 network: &network,
-                max_size: crate::plugins::install::DEFAULT_MAX_SIZE_BYTES,
+                max_size: codewhale_plugins::install::DEFAULT_MAX_SIZE_BYTES,
             };
-            crate::plugins::mutation::execute(
+            codewhale_plugins::mutation::execute(
                 PluginMutationRequest::InstallExact {
                     source: PluginInstallSource::LocalPath(path),
                     expected_content_hash,
@@ -4383,7 +4676,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
 
     fn marketplace_state(&self) -> Result<PluginMarketplaceState, String> {
         let app = self.host.app.borrow();
-        let store = crate::plugins::marketplace::store::MarketplaceStore::open(
+        let store = codewhale_plugins::marketplace::store::MarketplaceStore::open(
             app.plugin_registry.state_path(),
         )
         .ok_or_else(|| {
@@ -4408,7 +4701,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
         path: &Path,
     ) -> Result<PluginMarketplaceAddReceipt, String> {
         let app = self.host.app.borrow();
-        let store = crate::plugins::marketplace::store::MarketplaceStore::open(
+        let store = codewhale_plugins::marketplace::store::MarketplaceStore::open(
             app.plugin_registry.state_path(),
         )
         .ok_or_else(|| {
@@ -4416,7 +4709,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
                 .to_string()
         })?;
         let raw_path = path.to_string_lossy();
-        let loaded = crate::plugins::marketplace::document::load_catalog_document(
+        let loaded = codewhale_plugins::marketplace::document::load_catalog_document(
             name,
             &app.workspace,
             &raw_path,
@@ -4436,7 +4729,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
 
     fn marketplace_remove(&mut self, name: &str) -> Result<bool, String> {
         let app = self.host.app.borrow();
-        let store = crate::plugins::marketplace::store::MarketplaceStore::open(
+        let store = codewhale_plugins::marketplace::store::MarketplaceStore::open(
             app.plugin_registry.state_path(),
         )
         .ok_or_else(|| {
@@ -4452,7 +4745,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
         candidate: &str,
     ) -> Result<PluginMutationReceipt, String> {
         let app = self.host.app.borrow();
-        let store = crate::plugins::marketplace::store::MarketplaceStore::open(
+        let store = codewhale_plugins::marketplace::store::MarketplaceStore::open(
             app.plugin_registry.state_path(),
         )
         .ok_or_else(|| {
@@ -4460,30 +4753,30 @@ impl CommandPluginContext for PluginAdapter<'_> {
                 .to_string()
         })?;
         let state = store.load()?;
-        let catalog_text = escape_review_text(catalog);
-        let candidate_text = escape_review_text(candidate);
+        let catalog_text = escape_review_text(catalog, ReviewTextContext::InlineCode);
+        let candidate_text = escape_review_text(candidate, ReviewTextContext::InlineCode);
         let entry = state.get(catalog).cloned().ok_or_else(|| {
             format!("No marketplace named `{catalog_text}`. Use /plugin marketplace list.")
         })?;
         let candidate_entry = entry.catalog.candidate_by_name(candidate).ok_or_else(|| {
             format!("No candidate `{candidate_text}` in marketplace `{catalog_text}`.")
         })?;
-        let spec = match crate::plugins::marketplace::document::resolve_candidate_install(
+        let spec = match codewhale_plugins::marketplace::document::resolve_candidate_install(
             &entry,
             candidate_entry,
             &app.plugin_registry,
         ) {
-            crate::plugins::marketplace::document::CatalogInstallResolution::Supported {
+            codewhale_plugins::marketplace::document::CatalogInstallResolution::Supported {
                 spec,
                 ..
             } => spec,
-            crate::plugins::marketplace::document::CatalogInstallResolution::AlreadyPresent {
+            codewhale_plugins::marketplace::document::CatalogInstallResolution::AlreadyPresent {
                 plugin,
                 reason,
             } => {
                 // Installing a bundle Codewhale ships succeeds as a no-op
                 // (B5); any other occupied name stays a refusal.
-                if plugin.scope == crate::plugins::types::PluginScope::Builtin {
+                if plugin.scope == codewhale_plugins::types::PluginScope::Builtin {
                     return Ok(PluginMutationReceipt {
                         name: plugin.id.as_str().to_string(),
                         path: None,
@@ -4493,9 +4786,9 @@ impl CommandPluginContext for PluginAdapter<'_> {
                             codewhale_command_contract::facets::PluginMutationOutcome::NoChange,
                     });
                 }
-                return Err(escape_review_text(&reason));
+                return Err(escape_review_text(&reason, ReviewTextContext::Prose));
             }
-            crate::plugins::marketplace::document::CatalogInstallResolution::Unsupported {
+            codewhale_plugins::marketplace::document::CatalogInstallResolution::Unsupported {
                 reason,
             } => {
                 let localized = key_to_plugin_message_id(&reason)
@@ -4503,15 +4796,15 @@ impl CommandPluginContext for PluginAdapter<'_> {
                     .unwrap_or(reason);
                 return Err(format!(
                     "Candidate `{candidate_text}` cannot be installed by Codewhale: {}",
-                    escape_review_text(&localized)
+                    escape_review_text(&localized, ReviewTextContext::Prose)
                 ));
             }
-            crate::plugins::marketplace::document::CatalogInstallResolution::HasErrors {
+            codewhale_plugins::marketplace::document::CatalogInstallResolution::HasErrors {
                 diagnostics,
             } => {
                 return Err(format!(
                     "Candidate `{candidate_text}` has parse errors and cannot be installed:\n{}",
-                    escape_review_text(&diagnostics)
+                    escape_review_text(&diagnostics, ReviewTextContext::Prose)
                 ));
             }
         };
@@ -4524,12 +4817,13 @@ impl CommandPluginContext for PluginAdapter<'_> {
     ) -> Result<codewhale_command_contract::facets::PluginSuggestionDismissals, String> {
         // Stored lowercase by the CTA, but a hand-edited settings file may not
         // be; fold here so the list matches what suggestions actually skip.
-        let persisted: std::collections::BTreeSet<String> = crate::settings::Settings::load()
-            .map_err(|err| format!("could not read saved plugin dismissals: {err}"))?
-            .dismissed_plugin_suggestions
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
+        let persisted: std::collections::BTreeSet<String> =
+            codewhale_runtime::settings::Settings::load()
+                .map_err(|err| format!("could not read saved plugin dismissals: {err}"))?
+                .dismissed_plugin_suggestions
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect();
         let app = self.host.app.borrow();
         let session = app
             .plugin_cta
@@ -4550,7 +4844,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
         let matches =
             |candidate: &String| name.is_none_or(|target| candidate.eq_ignore_ascii_case(target));
         let mut cleared = std::collections::BTreeSet::new();
-        crate::settings::Settings::transact_opt(|settings| {
+        codewhale_runtime::settings::Settings::transact_opt(|settings| {
             let before = settings.dismissed_plugin_suggestions.len();
             settings.dismissed_plugin_suggestions.retain(|candidate| {
                 let reset = matches(candidate);
@@ -4621,6 +4915,8 @@ pub(crate) struct CommandContextBundle<'a> {
     trust: TrustAdapter<'a>,
     login: LoginAdapter<'a>,
     work_surface: WorkSurfaceAdapter<'a>,
+    navigation: NavigationAdapter<'a>,
+    voice_input: VoiceInputAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4717,6 +5013,12 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::WORK_SURFACE) {
             contexts = contexts.with_work_surface(&mut self.work_surface);
         }
+        if capabilities.contains(CommandCapabilities::NAVIGATION) {
+            contexts = contexts.with_navigation(&mut self.navigation);
+        }
+        if capabilities.contains(CommandCapabilities::VOICE_INPUT) {
+            contexts = contexts.with_voice_input(&mut self.voice_input);
+        }
         contexts
     }
 
@@ -4752,7 +5054,9 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::PET)
             .union(CommandCapabilities::TRUST)
             .union(CommandCapabilities::LOGIN)
-            .union(CommandCapabilities::WORK_SURFACE);
+            .union(CommandCapabilities::WORK_SURFACE)
+            .union(CommandCapabilities::NAVIGATION)
+            .union(CommandCapabilities::VOICE_INPUT);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4767,7 +5071,7 @@ impl App {
 
     pub(crate) fn command_contexts_with_config<'a>(
         &'a mut self,
-        config: Option<&'a crate::config::Config>,
+        config: Option<&'a codewhale_runtime::config::Config>,
     ) -> CommandContextBundle<'a> {
         let host = Rc::new(CommandHost {
             app: RefCell::new(self),
@@ -4803,7 +5107,9 @@ impl App {
             pet: PetAdapter { host: host.clone() },
             trust: TrustAdapter { host: host.clone() },
             login: LoginAdapter { host: host.clone() },
-            work_surface: WorkSurfaceAdapter { host },
+            work_surface: WorkSurfaceAdapter { host: host.clone() },
+            navigation: NavigationAdapter { host: host.clone() },
+            voice_input: VoiceInputAdapter { host },
         }
     }
 }
@@ -4939,6 +5245,7 @@ mod tests {
             display: "q".to_string(),
             skill_instruction: None,
             skill_provenance: None,
+            extension_command: None,
             history_echoed: false,
         });
         {
@@ -4964,7 +5271,7 @@ mod tests {
     fn model_adapter_delegates_selection_and_route_invalidation_to_app() {
         let mut app = test_app();
         app.last_effective_model = Some("stale-model".to_string());
-        let config = crate::config::Config::default();
+        let config = codewhale_runtime::config::Config::default();
         {
             let mut bundle = app.command_contexts_with_config(Some(&config));
             let mut parts = bundle.parts();
@@ -4983,10 +5290,10 @@ mod tests {
 
     #[test]
     fn model_adapter_admits_cross_provider_and_case_distinct_custom_routes_from_borrowed_config() {
-        use crate::config::{Config, ProviderConfig, ProvidersConfig};
-        let config = Config {
-            provider: Some("openai".to_string()),
-            providers: Some(ProvidersConfig {
+        use codewhale_runtime::config::{Config, ProviderConfig, ProvidersConfig};
+        let config = {
+            let __cw_config_init_0_0 = Some("openai".to_string());
+            let __cw_config_init_0_1 = Some(ProvidersConfig {
                 custom: [
                     ("CustomA".to_string(), "http://127.0.0.1:4111/v1"),
                     ("customa".to_string(), "http://127.0.0.1:4222/v1"),
@@ -5004,8 +5311,11 @@ mod tests {
                 })
                 .collect(),
                 ..Default::default()
-            }),
-            ..Config::default()
+            });
+            let mut __cw_config_init_0_value: Config = Config::default();
+            __cw_config_init_0_value.provider = __cw_config_init_0_0;
+            __cw_config_init_0_value.providers = __cw_config_init_0_1;
+            __cw_config_init_0_value
         };
         let mut app = test_app();
         app.set_provider_identity_record(config.active_provider_identity().unwrap());
@@ -5179,7 +5489,8 @@ mod tests {
             .provider()
             .display_name()
             .to_string();
-        let expected_support = crate::config::provider_has_balance_api(harness.app.api_provider);
+        let expected_support =
+            codewhale_runtime::config::provider_has_balance_api(harness.app.api_provider);
         let mut bundle = harness.app.command_contexts();
         let mut parts = bundle
             .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
@@ -5210,11 +5521,11 @@ mod tests {
             crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
         let app = &mut harness.app;
         app.session.cost_priced_turns = 1;
-        app.accrue_session_cost_estimate(crate::pricing::CostEstimate {
+        app.accrue_session_cost_estimate(codewhale_engine::pricing::CostEstimate {
             usd: 0.05,
             cny: 0.0,
         });
-        app.accrue_subagent_cost_estimate(crate::pricing::CostEstimate {
+        app.accrue_subagent_cost_estimate(codewhale_engine::pricing::CostEstimate {
             usd: 0.02,
             cny: 0.0,
         });
@@ -5235,7 +5546,7 @@ mod tests {
             recorded_at: std::time::Instant::now(),
         });
         let expected_total =
-            app.displayed_session_cost_for_currency(crate::pricing::CostCurrency::Usd);
+            app.displayed_session_cost_for_currency(codewhale_config::pricing::CostCurrency::Usd);
         let mut bundle = app.command_contexts();
         let mut parts = bundle
             .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
@@ -5305,11 +5616,12 @@ mod tests {
     fn diagnostics_adapter_retains_full_tool_snapshot_schema() {
         let mut harness =
             crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
-        let snapshot = crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
-            "turn-1",
-            2,
-            Some(&[]),
-        );
+        let snapshot =
+            codewhale_engine::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
+                "turn-1",
+                2,
+                Some(&[]),
+            );
         harness.app.session.last_tool_request_snapshot = Some(snapshot.clone());
         let mut bundle = harness.app.command_contexts();
         let mut parts = bundle
@@ -5347,7 +5659,7 @@ mod tests {
         harness.app.session.last_tool_catalog = Some(vec![tool.clone()]);
         let original_context = crate::context_report::build_prompt_context(&harness.app);
         let original_snapshot =
-            crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
+            codewhale_engine::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
                 "turn",
                 3,
                 Some(&[tool]),
@@ -5854,7 +6166,7 @@ mod tests {
     fn project_adapter_goal_projection_preserves_visible_and_effective_state() {
         let mut app = test_app();
         app.goal.objective = Some("Ship FEAT-021".to_string());
-        app.goal.status = crate::tools::goal::GoalStatus::Active;
+        app.goal.status = codewhale_engine::tools::goal::GoalStatus::Active;
         app.goal.time_used_seconds = 42;
         app.goal.token_budget = Some(50_000);
         app.goal.tokens_used = 1_000;
@@ -5892,19 +6204,19 @@ mod tests {
             .push_back(crate::tui::app::PendingGoalControl {
                 goal_id: None,
                 intent: crate::tui::app::GoalControlIntent::SetStatus {
-                    status: crate::tools::goal::GoalStatus::Paused,
+                    status: codewhale_engine::tools::goal::GoalStatus::Paused,
                     clear: false,
                 },
                 dispatched: false,
             });
-        app.last_known_goal_state = Some(crate::session_manager::SessionGoalState {
+        app.last_known_goal_state = Some(codewhale_engine::session_manager::SessionGoalState {
             schema_version: 1,
             goal_id: None,
             last_gap_fingerprint: None,
             repeated_gap_count: 0,
             last_gap_pass: None,
             objective: "Durable objective".to_string(),
-            status: crate::session_manager::SessionGoalStatus::Paused,
+            status: codewhale_engine::session_manager::SessionGoalStatus::Paused,
             token_budget: None,
             tokens_used: 0,
             time_used_seconds: 0,
@@ -6403,7 +6715,7 @@ mod tests {
                     assert_eq!(found_dir, skills_dir.display().to_string());
                     assert_eq!(
                         global_dir,
-                        crate::skills::default_skills_dir().display().to_string()
+                        codewhale_skills::default_skills_dir().display().to_string()
                     );
                     assert!(warnings.is_empty());
                 }
@@ -6420,7 +6732,7 @@ mod tests {
             let _home = scoped_home(&tmp);
             let skills_dir = tmp.path().join("skills");
             let file = tmp.path().join("a.txt");
-            let repo = crate::snapshot::SnapshotRepo::open_or_init(tmp.path()).unwrap();
+            let repo = codewhale_snapshot::SnapshotRepo::open_or_init(tmp.path()).unwrap();
             std::fs::write(&file, b"v1").unwrap();
             repo.snapshot("pre-turn:1").unwrap();
             std::fs::write(&file, b"v2").unwrap();
@@ -6493,7 +6805,7 @@ mod tests {
 
     #[test]
     fn portable_scope_maps_both_scopes_and_none() {
-        use crate::skills::mutation::SkillTargetScope as TuiScope;
+        use codewhale_skills::mutation::SkillTargetScope as TuiScope;
         assert_eq!(
             portable_scope(Some(SkillTargetScope::Project)),
             Some(TuiScope::Project)
@@ -6507,11 +6819,11 @@ mod tests {
 
     #[test]
     fn portable_mutation_receipt_maps_distinct_outcomes() {
-        use crate::skills::audit::SkillActionKind;
-        use crate::skills::mutation::{
+        use codewhale_skills::audit::SkillActionKind;
+        use codewhale_skills::mutation::{
             SkillMutationOutcome as TuiOutcome, SkillMutationReceipt as TuiReceipt,
         };
-        use crate::skills::roots::SkillScope;
+        use codewhale_skills::roots::SkillScope;
         let make = |outcome: TuiOutcome| TuiReceipt {
             action: SkillActionKind::Install,
             name: "demo".to_string(),
@@ -6590,16 +6902,16 @@ mod tests {
         // Discover only the demo bundle: the host's real `~/.codewhale/plugins`
         // and materialized builtin plugins must not leak diagnostics into this
         // assertion (they did on a shared CI agent).
-        let plugin_config = crate::plugins::discovery::DiscoveryConfig {
+        let plugin_config = codewhale_plugins::discovery::DiscoveryConfig {
             workspace: tmp.path().to_path_buf(),
             user_plugins_dir: tmp.path().join("user-plugins"),
             workspace_plugins_dir: tmp.path().join(".codewhale/plugins"),
             builtin_plugin_dirs: Vec::new(),
             state_path: tmp.path().join("user-plugins/state.json"),
         };
-        let discovery = crate::plugins::PluginDiscoveryContext::from_config_and_environment(
+        let discovery = codewhale_plugins::PluginDiscoveryContext::from_config_and_environment(
             &plugin_config,
-            crate::plugins::HostEnvironment::capture(),
+            codewhale_plugins::HostEnvironment::capture(),
         );
         app.plugin_registry = discovery.registry_for_workspace(tmp.path());
         let mut bundle = app.command_contexts();
@@ -6641,7 +6953,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plugin_adapter_dsh_preview_runs_from_live_runtime() {
         let _home = crate::test_support::SealedHome::new();
-        if crate::extension_host::tests::node_for_tests(
+        if codewhale_engine::extension_host::test_support::node_for_tests(
             "plugin_adapter_dsh_preview_runs_from_live_runtime",
         )
         .is_none()
@@ -6651,8 +6963,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = plugin_test_app(&tmp);
         let before = app.plugin_registry.len();
-        let package = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/extension_host/raw-agent-presets/source");
+        let package = codewhale_engine::extension_host::test_support::fixtures_dir()
+            .join("raw-agent-presets/source");
         let mut bundle = app.command_contexts();
         let mut parts = bundle.contexts(CommandCapabilities::PLUGIN).into_parts();
         let plugin = parts.plugin.as_deref_mut().unwrap();
@@ -6677,16 +6989,16 @@ mod tests {
         // Discover only the demo bundle: the host's real `~/.codewhale/plugins`
         // and materialized builtin plugins must not leak diagnostics into this
         // assertion (they did on a shared CI agent).
-        let plugin_config = crate::plugins::discovery::DiscoveryConfig {
+        let plugin_config = codewhale_plugins::discovery::DiscoveryConfig {
             workspace: tmp.path().to_path_buf(),
             user_plugins_dir: tmp.path().join("user-plugins"),
             workspace_plugins_dir: tmp.path().join(".codewhale/plugins"),
             builtin_plugin_dirs: Vec::new(),
             state_path: tmp.path().join("user-plugins/state.json"),
         };
-        let discovery = crate::plugins::PluginDiscoveryContext::from_config_and_environment(
+        let discovery = codewhale_plugins::PluginDiscoveryContext::from_config_and_environment(
             &plugin_config,
-            crate::plugins::HostEnvironment::capture(),
+            codewhale_plugins::HostEnvironment::capture(),
         );
         app.plugin_registry = discovery.registry_for_workspace(tmp.path());
         // Capture the review token before borrowing the mutable facet.
@@ -6771,7 +7083,7 @@ mod tests {
 
     fn lifecycle_test_app(tmpdir: &TempDir) -> App {
         let options = crate::tui::test_support::test_tui_options(tmpdir.path());
-        App::new(options, &crate::config::Config::default())
+        App::new(options, &codewhale_runtime::config::Config::default())
     }
 
     /// Point CODEWHALE_HOME at `tmp/home` with a pre-created sessions directory so
@@ -6866,7 +7178,8 @@ mod tests {
             .expect("fork switches session");
         assert_ne!(child_id, parent_id);
 
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
         let parent = manager.load_session(&parent_id).expect("parent loadable");
         let child = manager.load_session(&child_id).expect("child loadable");
         assert_eq!(parent.messages.len(), 1, "parent history preserved");
@@ -6896,26 +7209,36 @@ mod tests {
             .clone()
             .expect("save sets session id");
         let source_len = {
-            let manager = crate::session_manager::SessionManager::default_location().unwrap();
+            let manager =
+                codewhale_engine::session_manager::SessionManager::default_location().unwrap();
             manager
                 .load_session(&parent_id)
                 .expect("saved parent")
                 .messages
                 .len()
         };
+        app.add_message(HistoryCell::System {
+            content: "another conversation".to_string(),
+        });
+        let config = codewhale_runtime::config::Config::default();
         {
-            let mut bundle = app.command_contexts();
+            let mut bundle = app.command_contexts_with_config(Some(&config));
             let mut parts = bundle.parts();
             let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
             let forked = facet.fork_from(&parent_id).expect("explicit fork ok");
             assert_eq!(forked.spawn_depth, 1);
             assert_eq!(
                 forked.parent_label,
-                crate::session_manager::truncate_id(&parent_id)
+                codewhale_engine::session_manager::truncate_id(&parent_id)
             );
             assert_eq!(forked.sync.messages.len(), 1);
         }
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        assert!(matches!(
+            app.history.as_slice(),
+            [HistoryCell::User { content }] if content == "parent turn"
+        ));
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
         let reloaded = manager
             .load_session(&parent_id)
             .expect("source still loadable");
@@ -7048,7 +7371,7 @@ mod tests {
             let receipt = facet.set_archived(&archived_id, true).expect("archive ok");
             assert_eq!(
                 receipt.truncated_id,
-                crate::session_manager::truncate_id(&archived_id)
+                codewhale_engine::session_manager::truncate_id(&archived_id)
             );
             assert!(!receipt.title.is_empty());
             let restored = facet.set_archived(&archived_id, false).expect("restore ok");
@@ -7061,7 +7384,8 @@ mod tests {
             before_kind,
             "picker pushed a view"
         );
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
         assert!(
             manager.load_session(&archived_id).is_ok(),
             "active session survives pruning"
@@ -7153,8 +7477,9 @@ mod tests {
     }
 
     fn save_control_session(tmpdir: &TempDir, id: &str) {
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
-        let mut session = crate::session_manager::create_saved_session_with_mode(
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
+        let mut session = codewhale_engine::session_manager::create_saved_session_with_mode(
             &[],
             "deepseek-v4-pro",
             tmpdir.path(),
@@ -7193,11 +7518,11 @@ mod tests {
             assert_eq!(projection.goal_token_budget, Some(42_000));
             assert_eq!(
                 projection.compact_template.trim(),
-                crate::prompts::COMPACT_TEMPLATE.trim()
+                codewhale_engine::prompts::COMPACT_TEMPLATE.trim()
             );
             assert_eq!(
                 projection.handoff_path,
-                crate::prompts::HANDOFF_RELATIVE_PATH
+                codewhale_engine::prompts::HANDOFF_RELATIVE_PATH
             );
             assert!(matches!(projection.todos, TodoProjection::Absent));
             assert!(matches!(projection.plan, PlanProjection::Absent));
@@ -7224,13 +7549,13 @@ mod tests {
         {
             let plan_state = app.plan_state.clone();
             let mut plan = plan_state.try_lock().unwrap();
-            plan.update(crate::tools::plan::UpdatePlanArgs {
+            plan.update(codewhale_engine::tools::plan::UpdatePlanArgs {
                 title: Some("Relay Plan".to_string()),
-                plan: vec![crate::tools::plan::PlanItemArg {
+                plan: vec![codewhale_engine::tools::plan::PlanItemArg {
                     step: "port the control slice".to_string(),
-                    status: crate::tools::plan::StepStatus::InProgress,
+                    status: codewhale_engine::tools::plan::StepStatus::InProgress,
                 }],
-                ..crate::tools::plan::UpdatePlanArgs::default()
+                ..codewhale_engine::tools::plan::UpdatePlanArgs::default()
             });
         }
         {
@@ -7318,6 +7643,7 @@ mod tests {
         save_control_session(&tmpdir, "rename-1");
         let mut app = control_test_app(&tmpdir);
         app.current_session_id = Some("rename-1".to_string());
+        app.capture_session_fixture_source();
 
         let receipt = {
             let mut bundle = app.command_contexts();
@@ -7327,7 +7653,8 @@ mod tests {
         };
         assert_eq!(receipt.title, "Brand New Title");
         assert_eq!(app.session_title.as_deref(), Some("Brand New Title"));
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
         let reloaded = manager.load_session("rename-1").unwrap();
         assert_eq!(reloaded.metadata.title, "Brand New Title");
 
@@ -7348,8 +7675,9 @@ mod tests {
         let tmpdir = TempDir::new().unwrap();
         let _lock = crate::test_support::lock_test_env();
         let _home = control_home_guard(&tmpdir);
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
-        let mut checkpoint = crate::session_manager::create_saved_session_with_mode(
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
+        let mut checkpoint = codewhale_engine::session_manager::create_saved_session_with_mode(
             &[],
             "deepseek-v4-pro",
             tmpdir.path(),
@@ -7362,6 +7690,7 @@ mod tests {
 
         let mut app = control_test_app(&tmpdir);
         app.current_session_id = Some("midturn-1".to_string());
+        app.capture_session_fixture_source();
         app.api_messages = std::sync::Arc::new(vec![user_message("first turn still streaming")]);
 
         let receipt = {
@@ -7401,6 +7730,7 @@ mod tests {
         save_control_session(&tmpdir, "title-1");
         let mut app = control_test_app(&tmpdir);
         app.current_session_id = Some("title-1".to_string());
+        app.capture_session_fixture_source();
 
         // No session window title and no config default -> unset, no source.
         let report = {
@@ -7427,7 +7757,8 @@ mod tests {
             app.session_title, None,
             "/title never changes the session name"
         );
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
         let reloaded = manager.load_session("title-1").unwrap();
         assert_eq!(reloaded.window_title.as_deref(), Some("parallel-task"));
         assert_eq!(reloaded.metadata.title, "Control Session");
@@ -7562,8 +7893,9 @@ mod tests {
 
         // A real export container round-trips through import and mutates the
         // active session atomically.
-        let manager = crate::session_manager::SessionManager::default_location().unwrap();
-        let mut source = crate::session_manager::create_saved_session_with_mode(
+        let manager =
+            codewhale_engine::session_manager::SessionManager::default_location().unwrap();
+        let mut source = codewhale_engine::session_manager::create_saved_session_with_mode(
             &[],
             "deepseek-v4-pro",
             tmpdir.path(),
@@ -7580,8 +7912,8 @@ mod tests {
 
         // This window is on a non-default route; the import must bind to it.
         app.set_provider_identity_record(
-            crate::config::Config::default()
-                .resolve_provider_identity(crate::config::ProviderKind::Openai.as_str())
+            codewhale_runtime::config::Config::default()
+                .resolve_provider_identity(codewhale_config::ProviderKind::Openai.as_str())
                 .expect("captured fixture provider"),
         );
         let receipt = {

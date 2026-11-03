@@ -4,19 +4,19 @@
 //! cards (AUTOMATION-VISIBILITY-SPEC §2.2). Deletion uses the shared pager
 //! review control; query responses (list/show) retain their text receipts.
 
-use crate::automation_manager::{
-    AutomationRecord, AutomationRunRecord, AutomationRunStatus, AutomationStatus,
-    SharedAutomationManager, run_now_shared,
-};
-use crate::task_manager::SharedTaskManager;
 use crate::tui::app::{App, AutomationAction};
 use crate::tui::automation_panel::{SettledOutcome, SettledRun};
 use crate::tui::history::{AutomationCell, AutomationCellKind, HistoryCell};
+use codewhale_engine::automation_manager::{
+    AutomationRecord, AutomationRunRecord, AutomationRunStatus, AutomationStatus,
+    SharedAutomationManager, run_now_shared,
+};
+use codewhale_engine::task_manager::SharedTaskManager;
 use codewhale_localization::{Locale, MessageId, tr};
 
 pub(super) async fn handle_action(
     app: &mut App,
-    config: &crate::config::Config,
+    config: &codewhale_runtime::config::Config,
     action: AutomationAction,
     task_manager: &SharedTaskManager,
 ) {
@@ -276,7 +276,7 @@ fn deletion_token(
 ) -> Result<String, serde_json::Error> {
     let mut canonical_runs = runs.iter().collect::<Vec<_>>();
     canonical_runs.sort_by(|left, right| left.id.cmp(&right.id));
-    serde_json::to_vec(&(record, canonical_runs)).map(crate::hashing::sha256_hex)
+    serde_json::to_vec(&(record, canonical_runs)).map(codewhale_runtime::hashing::sha256_hex)
 }
 
 fn action_failed(
@@ -359,7 +359,7 @@ fn format_detail(
         field(
             locale,
             MessageId::AutomationCwdLabel,
-            &display_text(&crate::utils::display_path(cwd)),
+            &display_text(&codewhale_util::utils::display_path(cwd)),
         )
     }));
     if let Some(mode) = record.mode.as_deref() {
@@ -436,7 +436,7 @@ fn field(locale: Locale, label: MessageId, value: &str) -> String {
 
 fn display_text(value: &str) -> String {
     let mut visible = String::with_capacity(value.len());
-    crate::tui::osc8::strip_ansi_into(value, &mut visible);
+    codewhale_tui_kit::osc8::strip_ansi_into(value, &mut visible);
     codewhale_config::persistence::redact_secrets(&visible)
 }
 
@@ -585,18 +585,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::automation_manager::{
+    use chrono::Utc;
+    use codewhale_engine::automation_manager::{
         AutomationDeliveryMode, AutomationManager, CreateAutomationRequest,
     };
-    use chrono::Utc;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
     fn record(status: AutomationStatus) -> AutomationRecord {
         let now = Utc::now();
         AutomationRecord {
+            destination_thread_id: None,
             schema_version: 1,
-            execution_scope: Some(crate::task_manager::test_execution_scope("test")),
+            execution_scope: Some(codewhale_engine::task_manager::test_execution_scope("test")),
             id: "auto_1".to_string(),
             name: "Nightly checks".to_string(),
             prompt: "Run checks".to_string(),
@@ -863,6 +864,7 @@ mod tests {
         let manager = AutomationManager::open_for_test(temp.path().to_path_buf()).expect("manager");
         let automation = manager
             .create_automation(CreateAutomationRequest {
+                destination_thread_id: None,
                 name: "Nightly checks".to_string(),
                 prompt: "Run checks".to_string(),
                 rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
@@ -912,6 +914,7 @@ mod tests {
         let manager = AutomationManager::open_for_test(temp.path().to_path_buf()).expect("manager");
         let automation = manager
             .create_automation(CreateAutomationRequest {
+                destination_thread_id: None,
                 name: "Nightly checks".to_string(),
                 prompt: "Run checks".to_string(),
                 rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),

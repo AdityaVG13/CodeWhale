@@ -6,7 +6,7 @@
 use super::*;
 
 pub(crate) struct OfflineQueueTransition {
-    lease: Arc<crate::session_manager::OfflineQueueLease>,
+    lease: Arc<codewhale_engine::session_manager::OfflineQueueLease>,
     restored: Option<OfflineQueueState>,
 }
 
@@ -19,7 +19,7 @@ pub(crate) struct OfflineQueueTransition {
 pub(crate) fn surface_session_load_failure(app: &mut App, message: String) {
     app.add_message(crate::tui::history::HistoryCell::Error {
         message: message.clone(),
-        severity: crate::error_taxonomy::ErrorSeverity::Error,
+        severity: codewhale_error_taxonomy::ErrorSeverity::Error,
     });
     app.status_message = Some(message);
 }
@@ -63,7 +63,8 @@ pub(crate) fn install_offline_queue_transition(
         app.clear_input();
     }
     app.queued_messages.clear();
-    app.current_session_id = Some(transition.lease.session_id().to_string());
+    app.held_restored_queue = 0;
+    app.set_current_session_id(Some(transition.lease.session_id().to_string()));
     app.offline_queue_lease = Some(transition.lease);
     transition
         .restored
@@ -83,12 +84,105 @@ pub(crate) fn offline_queue_projection(
     (app.queued_messages.clone(), draft)
 }
 
+#[derive(Clone)]
+pub(crate) struct SavedWorkProjection {
+    pub(super) owner: Option<String>,
+    pub(super) state: Option<codewhale_engine::session_manager::SessionWorkState>,
+}
+
+pub(crate) fn saved_work_projection(app: &App, session: &SavedSession) -> SavedWorkProjection {
+    SavedWorkProjection {
+        owner: app.current_session_id.clone(),
+        state: session.work_state.clone(),
+    }
+}
+
+pub(crate) async fn publish_saved_work_projection(
+    app: &mut App,
+    projection: &SavedWorkProjection,
+) -> Result<bool, String> {
+    let Some(work) = app.runtime_services.work.clone() else {
+        return Ok(false);
+    };
+    let published = work
+        .publish_pending_matching(
+            projection.owner.as_deref(),
+            projection
+                .state
+                .as_ref()
+                .and_then(|state| state.graph.as_ref()),
+        )
+        .await?;
+    if !published && work.has_pending_publish() {
+        return Err("a newer Work update remains pending".to_string());
+    }
+    Ok(published)
+}
+
+#[cfg(test)]
 pub(crate) async fn publish_pending_work_projection(app: &mut App) -> Result<bool, String> {
     let Some(work) = app.runtime_services.work.clone() else {
         return Ok(false);
     };
-    let published = work.publish_pending().await?;
-    Ok(published)
+    work.publish_pending().await
+}
+
+pub(crate) fn prepare_session_publication(
+    app: &mut App,
+    request: &mut PersistRequest,
+) -> Result<(), String> {
+    if app.dispatch_in_flight {
+        return Err("session publication is waiting for native dispatch admission".to_string());
+    }
+    let session = match request {
+        PersistRequest::SaveCheckpoint { session }
+        | PersistRequest::AcknowledgedCheckpoint { session, .. }
+        | PersistRequest::SessionSnapshot(session)
+        | PersistRequest::CompletedCommit { session } => session,
+        _ => return Ok(()),
+    };
+    let owner = app
+        .session_write_owner
+        .clone()
+        .ok_or_else(|| "session publication lacks an admitted native owner".to_string())?;
+    let receipt = session
+        .capture_publication(owner)
+        .map_err(|error| error.to_string())?;
+    if app
+        .current_session_id
+        .as_deref()
+        .is_none_or(|id| id == session.metadata.id)
+    {
+        app.session_write_receipt = Some(receipt);
+    }
+    Ok(())
+}
+
+pub(crate) fn try_persist_session(app: &mut App, mut request: PersistRequest) -> bool {
+    if let Err(error) = prepare_session_publication(app, &mut request) {
+        tracing::warn!(%error, "session publication could not capture its native source");
+        let session_id = match &request {
+            PersistRequest::SaveCheckpoint { session }
+            | PersistRequest::AcknowledgedCheckpoint { session, .. }
+            | PersistRequest::SessionSnapshot(session)
+            | PersistRequest::CompletedCommit { session } => Some(session.metadata.id.as_str()),
+            _ => None,
+        };
+        super::event_loop::surface_session_save_failure(app, session_id, &error);
+        return false;
+    }
+    persistence_actor::try_persist(request)
+}
+
+pub(crate) fn expect_fresh_session(app: &mut App, id: &str) -> Result<(), String> {
+    let manager = SessionManager::default_location().map_err(|error| error.to_string())?;
+    app.session_write_receipt = Some(
+        manager
+            .expect_absent_session(id)
+            .map_err(|error| error.to_string())?,
+    );
+    app.session_write_owner = Some(codewhale_engine::session_manager::SessionWriteOwner::control());
+    Ok(())
 }
 
 pub(crate) async fn persist_pending_work_checkpoint(app: &mut App) -> Result<bool, String> {
@@ -101,32 +195,35 @@ pub(crate) async fn persist_pending_work_checkpoint(app: &mut App) -> Result<boo
     let manager = SessionManager::default_location()
         .map_err(|err| format!("could not open sessions directory: {err}"))?;
     let session = build_session_snapshot(app, &manager)?;
+    let projection = saved_work_projection(app, &session);
     if app.current_session_id.is_none() {
-        app.current_session_id = Some(session.metadata.id.clone());
+        app.set_current_session_id(Some(session.metadata.id.clone()));
     }
-    if !persistence_actor::try_persist(PersistRequest::SaveCheckpoint { session }) {
+    if !try_persist_session(app, PersistRequest::SaveCheckpoint { session }) {
         return Err("persistence actor is unavailable".to_string());
     }
-    publish_pending_work_projection(app).await
+    publish_saved_work_projection(app, &projection).await
 }
 
 pub(crate) fn persist_with_pending_work_boundary(
     app: &mut App,
-    request: PersistRequest,
+    mut request: PersistRequest,
+    projection: &SavedWorkProjection,
 ) -> Result<(), String> {
+    prepare_session_publication(app, &mut request)?;
     let has_pending = app
         .runtime_services
         .work
         .as_ref()
         .is_some_and(|work| work.has_pending_publish());
     if !has_pending {
-        persistence_actor::persist(request);
-        return Ok(());
+        return persistence_actor::persist_checked(request);
     }
     if !persistence_actor::try_persist(request) {
         return Err("persistence actor is unavailable".to_string());
     }
-    app.publish_pending_work_state().map(|_| ())
+    app.publish_saved_work_state(projection.owner.as_deref(), projection.state.as_ref())
+        .map(|_| ())
 }
 
 pub(crate) fn restore_matching_offline_queue_state(
@@ -143,6 +240,7 @@ pub(crate) fn restore_matching_offline_queue_state(
         .into_iter()
         .map(queued_session_to_ui)
         .collect();
+    app.held_restored_queue = app.queued_messages.len();
     if let Some(draft) = state.draft.map(queued_session_to_ui) {
         app.input.clone_from(&draft.display);
         app.cursor_position = app.input.chars().count();
@@ -157,22 +255,27 @@ pub(crate) fn restore_matching_offline_queue_state(
     true
 }
 
-/// A Running sub-agent older than every child's wall budget cannot still be
-/// doing bounded work: its terminal event was lost or its task is wedged
-/// (#6184 H2). The default child wall budget plus generous grace.
-pub(crate) const SUBAGENT_SUSPECT_AFTER: Duration =
-    crate::tools::subagent::DEFAULT_CHILD_WALL_TIME.saturating_add(Duration::from_secs(5 * 60));
-
-/// Running sub-agents that are past their bound: shown as suspect, and never a
-/// veto on turn recovery. A prior-session row still marked Running cannot be
-/// live in this process at all.
+/// Running rows that never veto recovery: a prior-session row has no live
+/// actor in this process, and a current child silent beyond its heartbeat
+/// bound (at least `TOOL_HANG_WATCHDOG_TIMEOUT`) may have lost its terminal event (#6184).
+/// Elapsed time alone does not establish that a current child is stalled.
 pub(crate) fn suspect_running_agents(app: &App, now: Instant) -> Vec<String> {
     app.subagent_cache
         .iter()
         .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
-        .filter(|agent| match agent.started_at {
-            Some(started) => now.saturating_duration_since(started) > SUBAGENT_SUSPECT_AFTER,
-            None => agent.from_prior_session,
+        .filter(|agent| {
+            agent.from_prior_session
+                || app
+                    .agent_progress_meta
+                    .get(&agent.agent_id)
+                    .and_then(|meta| meta.last_progress_at)
+                    .or(agent.started_at)
+                    .is_some_and(|at| {
+                        now.saturating_duration_since(at)
+                            > TOOL_HANG_WATCHDOG_TIMEOUT.max(Duration::from_millis(
+                                agent.heartbeat_timeout_ms.unwrap_or(0),
+                            ))
+                    })
         })
         .map(|agent| agent.agent_id.clone())
         .collect()
@@ -208,25 +311,23 @@ fn record_ui_stall(app: &App, phase: &str, since_progress: Duration, bound: Dura
     let suspects = suspect_running_agents(app, Instant::now());
     let detail = (!suspects.is_empty()).then(|| {
         format!(
-            "sub-agent(s) past their bound, treated as suspect: {}",
+            "sub-agent(s) from a prior session or with no progress for 10m, treated as suspect: {}",
             suspects.join(", ")
         )
     });
-    crate::core::engine::turn_heartbeat::report_stall(
-        &crate::core::engine::turn_heartbeat::StallReport {
-            source: "ui",
-            phase: phase.to_string(),
-            detail,
-            turn_id: app.runtime_turn_id.clone(),
-            provider_request: app
-                .active_turn
-                .as_ref()
-                .and_then(|turn| turn.route.as_ref())
-                .map(|route| format!("{} / {}", route.provider_identity, route.model)),
-            since_progress,
-            bound: Some(bound),
-        },
-    );
+    codewhale_runtime::stall_report::report_stall(&codewhale_runtime::stall_report::StallReport {
+        source: "ui",
+        phase: phase.to_string(),
+        detail,
+        turn_id: app.runtime_turn_id.clone(),
+        provider_request: app
+            .active_turn
+            .as_ref()
+            .and_then(|turn| turn.route.as_ref())
+            .map(|route| format!("{} / {}", route.provider_identity, route.model)),
+        since_progress,
+        bound: Some(bound),
+    });
 }
 
 /// The UI watchdog, supervised by the engine heartbeat (#6184). Suspect
@@ -244,7 +345,7 @@ fn record_ui_stall(app: &App, phase: &str, since_progress: Duration, bound: Dura
 pub(crate) fn reconcile_turn_liveness_supervised(
     app: &mut App,
     now: Instant,
-    heartbeat: &crate::core::engine::turn_heartbeat::HeartbeatSnapshot,
+    heartbeat: &codewhale_engine::core::engine::turn_heartbeat::HeartbeatSnapshot,
     engine: &EngineHandle,
 ) -> bool {
     let turn_in_progress = matches!(app.runtime_turn_status.as_deref(), Some("in_progress"));
@@ -258,7 +359,7 @@ pub(crate) fn reconcile_turn_liveness_supervised(
     let has_live_agents = live_running_agent_count(app, now) > 0;
     let recovered = reconcile_turn_liveness_with(app, now, has_live_agents, Some(heartbeat));
     if recovered && turn_in_progress && app.runtime_turn_status.is_none() {
-        engine.cancel_with_reason(crate::core::engine::CancelReason::Stalled);
+        engine.cancel_with_reason(codewhale_engine::core::engine::CancelReason::Stalled);
         app.suppress_stream_events_until_turn_complete = true;
     }
     recovered
@@ -278,7 +379,7 @@ pub(crate) fn reconcile_turn_liveness_with(
     app: &mut App,
     now: Instant,
     has_running_agents: bool,
-    heartbeat: Option<&crate::core::engine::turn_heartbeat::HeartbeatSnapshot>,
+    heartbeat: Option<&codewhale_engine::core::engine::turn_heartbeat::HeartbeatSnapshot>,
 ) -> bool {
     // The engine is inside a wait it bounds itself and has not reported as
     // overdue (a quiet model, a live stream). Its watchdog owns that bound;
@@ -418,41 +519,77 @@ pub(crate) fn reconcile_turn_liveness_with(
 /// losing the entire in-progress turn.
 pub(crate) fn persist_recovery_snapshot(app: &mut App) {
     if let Ok(manager) = SessionManager::default_location()
-        && let Ok(session) = build_session_snapshot(app, &manager)
+        && let Ok(mut session) = build_session_snapshot(app, &manager)
     {
-        if app.current_session_id.is_none() {
-            app.current_session_id = Some(session.metadata.id.clone());
-        }
-        if let Err(err) =
-            persist_with_pending_work_boundary(app, PersistRequest::SaveCheckpoint { session })
+        if let Some(turn) = app.active_turn.as_ref()
+            && app.runtime_turn_id.as_deref() == Some(turn.turn_id.as_str())
+            && !app.suppress_stream_events_until_turn_complete
+            && app
+                .api_messages
+                .last()
+                .is_some_and(|message| message.role == codewhale_models::Role::User)
+            && let Some(HistoryCell::Assistant {
+                content,
+                streaming: true,
+            }) = app
+                .streaming_message_index
+                .and_then(|index| app.history.get(index))
+            && !content.is_empty()
+            && let Some(journal) = session.journal.as_mut()
         {
+            session.leaf_id = Some(journal.append_message(Message::interrupted_assistant(content)));
+            session.metadata.message_count += 1;
+        }
+        let projection = saved_work_projection(app, &session);
+        if app.current_session_id.is_none() {
+            app.set_current_session_id(Some(session.metadata.id.clone()));
+        }
+        if let Err(err) = persist_with_pending_work_boundary(
+            app,
+            PersistRequest::SaveCheckpoint { session },
+            &projection,
+        ) {
             app.status_message = Some(format!(
-                "To-do list update pending: recovery snapshot could not be queued ({err})"
+                "To-do list update pending while saving recovery snapshot ({err})"
             ));
         }
     }
 }
 
 pub(crate) fn persist_full_reset_snapshot(app: &mut App) {
-    if let Ok(manager) = SessionManager::default_location()
-        && let Ok(session) = build_session_snapshot(app, &manager)
-    {
-        app.current_session_id = Some(session.metadata.id.clone());
-        if let Err(err) =
-            persist_with_pending_work_boundary(app, PersistRequest::SessionSnapshot(session))
-        {
-            app.status_message = Some(format!(
-                "To-do list update pending: reset snapshot could not be queued ({err})"
-            ));
+    let session = SessionManager::default_location()
+        .map_err(|err| err.to_string())
+        .and_then(|manager| build_session_snapshot(app, &manager));
+    let session = match session {
+        Ok(session) => session,
+        Err(err) => {
+            let id = app
+                .current_session_id
+                .as_deref()
+                .map(codewhale_engine::session_manager::truncate_id)
+                .unwrap_or("—");
+            let message = app
+                .tr(MessageId::SessionSaveFailed)
+                .replace("{id}", id)
+                .replace("{error}", &err);
+            app.add_message(crate::tui::history::HistoryCell::Error {
+                message: message.clone(),
+                severity: codewhale_error_taxonomy::ErrorSeverity::Error,
+            });
+            app.status_message = Some(message);
+            return;
         }
-    }
-    // `/clear` and `/new` are explicit boundaries. Never let an older
-    // in-flight checkpoint resurrect the session the user just discarded,
-    // even if the replacement snapshot could not be constructed.
-    // `build_session_snapshot` reuses `current_session_id`, so this id is the
-    // discarded session's id whether or not the snapshot above succeeded.
-    if let Some(session_id) = app.current_session_id.clone() {
-        persistence_actor::persist(PersistRequest::ClearCheckpoint { session_id });
+    };
+    let projection = saved_work_projection(app, &session);
+    app.set_current_session_id(Some(session.metadata.id.clone()));
+    if let Err(err) = persist_with_pending_work_boundary(
+        app,
+        PersistRequest::CompletedCommit { session },
+        &projection,
+    ) {
+        app.status_message = Some(format!(
+            "To-do list update pending while saving reset snapshot ({err})"
+        ));
     }
 }
 
@@ -604,7 +741,7 @@ pub(crate) fn recover_engine_event_disconnect(app: &mut App) -> bool {
     app.add_message(HistoryCell::Error {
         message: "Engine stopped before completing the turn. Check ~/.codewhale/crashes and retry."
             .to_string(),
-        severity: crate::error_taxonomy::ErrorSeverity::Error,
+        severity: codewhale_error_taxonomy::ErrorSeverity::Error,
     });
     app.push_status_toast(
         "Engine stopped before completing the turn.",
@@ -614,14 +751,36 @@ pub(crate) fn recover_engine_event_disconnect(app: &mut App) -> bool {
     true
 }
 
-pub(crate) fn capture_turn_started_metadata(app: &mut App, event: &EngineEvent) {
+pub(crate) fn capture_turn_started_metadata(app: &mut App, event: &EngineEvent) -> bool {
     match event {
         EngineEvent::TurnStarted {
+            previous_source,
             turn_id,
             created_at,
             route,
-            submission_id: _,
+            submission_id,
         } => {
+            let source = codewhale_engine::core::ops::SessionSnapshotSource::turn(
+                turn_id.clone(),
+                submission_id.clone(),
+            );
+            let admitted = match app.session_write_owner.as_ref() {
+                Some(codewhale_engine::session_manager::SessionWriteOwner::Submission(id)) => {
+                    submission_id.as_ref() == Some(id)
+                }
+                Some(owner) => {
+                    owner.matches_source(&source)
+                        || previous_source
+                            .as_ref()
+                            .is_some_and(|previous| owner.matches_source(previous))
+                }
+                None => true,
+            };
+            if !admitted {
+                return false;
+            }
+            app.session_write_owner =
+                Some(codewhale_engine::session_manager::SessionWriteOwner::Engine(source));
             app.ocean_completion_started_at = None;
             let auto_route_receipt = if route.as_ref().is_some_and(|route| route.auto_model) {
                 app.pending_auto_route_receipt.take()
@@ -653,14 +812,18 @@ pub(crate) fn capture_turn_started_metadata(app: &mut App, event: &EngineEvent) 
         // already taken at `TurnStarted` are preserved — this event narrows the
         // route, it never re-opens an authority decision.
         EngineEvent::RouteDispatched { turn_id, route } => {
+            let newer_submission = matches!(
+                app.session_write_owner.as_ref(),
+                Some(codewhale_engine::session_manager::SessionWriteOwner::Submission(_))
+            );
             if let Some(active) = app
                 .active_turn
                 .as_mut()
                 .filter(|active| active.turn_id == *turn_id)
             {
-                if route.auto_model && active.auto_route_receipt.is_none() {
+                if !newer_submission && route.auto_model && active.auto_route_receipt.is_none() {
                     active.auto_route_receipt = app.pending_auto_route_receipt.take();
-                } else if !route.auto_model {
+                } else if !newer_submission && !route.auto_model {
                     app.pending_auto_route_receipt = None;
                     active.auto_route_receipt = None;
                 }
@@ -671,8 +834,28 @@ pub(crate) fn capture_turn_started_metadata(app: &mut App, event: &EngineEvent) 
                 active.route = Some(route.clone());
             }
         }
+        EngineEvent::CompactionStarted {
+            id,
+            previous_source,
+            auto: false,
+            ..
+        } => {
+            let source = codewhale_engine::core::ops::SessionSnapshotSource::compaction(id.clone());
+            let admitted = app.session_write_owner.as_ref().is_none_or(|owner| {
+                owner.matches_source(&source)
+                    || previous_source
+                        .as_ref()
+                        .is_some_and(|previous| owner.matches_source(previous))
+            });
+            if !admitted {
+                return false;
+            }
+            app.session_write_owner =
+                Some(codewhale_engine::session_manager::SessionWriteOwner::Engine(source));
+        }
         _ => {}
     }
+    true
 }
 
 pub(crate) fn record_turn_activity(app: &mut App, event: &EngineEvent, now: Instant) {
@@ -692,6 +875,21 @@ pub(crate) fn persist_offline_queue_state(app: &App) {
         .as_ref()
         .filter(|lease| app.current_session_id.as_deref() == Some(lease.session_id()))
     else {
+        let lease_owner = app
+            .offline_queue_lease
+            .as_ref()
+            .map(|lease| lease.session_id());
+        if lease_owner.is_some() || !app.queued_messages.is_empty() || app.queued_draft.is_some() {
+            tracing::warn!(
+                target: "persistence",
+                what = "offline-queue",
+                session_id = app.current_session_id.as_deref().unwrap_or("none"),
+                lease_owner = lease_owner.unwrap_or("none"),
+                queued = app.queued_messages.len(),
+                draft = app.queued_draft.is_some(),
+                "offline queue not persisted: this window holds no queue lease for the current session",
+            );
+        }
         return;
     };
     if app.queued_messages.is_empty() && app.queued_draft.is_none() {
@@ -701,9 +899,23 @@ pub(crate) fn persist_offline_queue_state(app: &App) {
         return;
     }
     let (messages, draft) = offline_queue_projection(app);
+    let converted = messages
+        .iter()
+        .map(queued_ui_to_session)
+        .collect::<Result<Vec<_>>>();
+    let draft = draft.as_ref().map(queued_ui_to_session).transpose();
+    let (messages, draft) = match converted
+        .and_then(|messages| draft.map(|draft| (messages, draft)))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(target: "persistence", %error, "offline queue serialization refused");
+            return;
+        }
+    };
     let state = OfflineQueueState {
-        messages: messages.iter().map(queued_ui_to_session).collect(),
-        draft: draft.as_ref().map(queued_ui_to_session),
+        messages,
+        draft,
         ..OfflineQueueState::default()
     };
     persistence_actor::persist(PersistRequest::OfflineQueue {
@@ -713,9 +925,16 @@ pub(crate) fn persist_offline_queue_state(app: &App) {
 }
 
 pub(crate) fn restore_queued_message(app: &mut App, index: Option<usize>, message: QueuedMessage) {
+    if message.extension_command.is_some() {
+        app.restore_unsent_message(message);
+        return;
+    }
     if let Some(index) = index
         && index <= app.queued_messages.len()
     {
+        if index < app.held_restored_queue {
+            app.held_restored_queue += 1;
+        }
         app.queued_messages.insert(index, message);
     } else {
         app.queue_message(message);
@@ -727,6 +946,10 @@ pub(crate) fn restore_queued_or_draft_message(
     recovery: DispatchRecovery,
     message: QueuedMessage,
 ) {
+    if message.extension_command.is_some() {
+        app.restore_unsent_message(message);
+        return;
+    }
     match recovery {
         DispatchRecovery::Draft => {
             app.input.clone_from(&message.display);
@@ -813,7 +1036,7 @@ pub(crate) fn resume_launch_session(app: &mut App, session_id: &str) -> commands
         );
         commands::CommandResult::ok()
     };
-    let manager = match crate::session_manager::SessionManager::default_location() {
+    let manager = match codewhale_engine::session_manager::SessionManager::default_location() {
         Ok(manager) => manager,
         Err(err) => return failed(app, &err.to_string()),
     };
@@ -865,8 +1088,13 @@ pub(crate) fn begin_launch_session(
     if let Some(workspace) = workspace {
         app.workspace = workspace;
     }
-    app.current_session_id = Some(session_id.clone());
+    app.set_current_session_id(Some(session_id.clone()));
+    if let Err(error) = expect_fresh_session(app, &session_id) {
+        return commands::CommandResult::error(error);
+    }
     app.current_session_metadata = None;
+    app.window_title = None;
+    app.composer_color = None;
     app.session_title = Some(app.tr(MessageId::SessionsNewSessionTitle).into_owned());
     app.launch.dismiss();
     app.launch.status = None;
@@ -914,12 +1142,11 @@ pub(crate) async fn switch_workspace(
     apply_workspace_runtime_state(app, config, workspace.clone());
     sync_runtime_workspace_state(task_manager, workspace.clone()).await;
 
-    let _ = engine_handle.send(Op::Shutdown).await;
-    let engine_config = build_engine_config(app, config);
-    *engine_handle = spawn_tui_engine(engine_config, config);
+    replace_tui_engine(app, config, engine_handle).await;
     if !app.api_messages.is_empty() {
         let _ = engine_handle
             .send(Op::SyncSession {
+                control: app.session_sync_control(),
                 session_id: app.current_session_id.clone(),
                 messages: app.api_messages.as_ref().clone(),
                 system_prompt: app.system_prompt.clone(),
@@ -948,6 +1175,11 @@ pub(crate) async fn switch_workspace(
 /// default's key or print its help page. A returning user whose saved route
 /// lost its key also gets the one command that saves it.
 pub(crate) fn keep_unsent_message_for_connect(app: &mut App, message: QueuedMessage, error: &str) {
+    if message.extension_command.is_some() {
+        app.restore_unsent_message(message);
+        app.status_message = Some(error.to_string());
+        return;
+    }
     tracing::warn!(
         error = %error,
         "user message not sent: no usable credential; restored to composer"
@@ -1021,6 +1253,11 @@ pub(crate) fn restore_failed_immediate_submit(
     message: QueuedMessage,
     error: &anyhow::Error,
 ) {
+    if message.extension_command.is_some() {
+        app.restore_unsent_message(message);
+        app.status_message = Some(error.to_string());
+        return;
+    }
     tracing::warn!(
         error = %error,
         "immediate user message dispatch failed; restored composer"
@@ -1046,8 +1283,10 @@ pub(crate) fn restore_failed_immediate_submit(
 /// bindings are replaced with the recommended set.
 pub(crate) fn restore_hotbar_defaults(app: &mut App, config: &mut Config) {
     let defaults = codewhale_config::default_hotbar_bindings_toml();
-    match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &defaults)
-    {
+    match codewhale_runtime::config_persistence::persist_hotbar_bindings(
+        app.config_path.as_deref(),
+        &defaults,
+    ) {
         Ok(path) => {
             config.hotbar = Some(defaults);
             app.status_message = Some(format!(
@@ -1163,7 +1402,7 @@ pub(crate) fn mirror_saved_api_key_in_config(
     }
     let pin_kimi_code_base_url = provider == ProviderKind::Moonshot
         && config.provider_config_for(identity).is_some_and(|entry| {
-            crate::config::provider_config_uses_kimi_imported_token(entry)
+            codewhale_runtime::config::provider_config_uses_kimi_imported_token(entry)
                 && entry
                     .base_url
                     .as_deref()
@@ -1178,7 +1417,8 @@ pub(crate) fn mirror_saved_api_key_in_config(
         .provider_config_for_mut(&auth_owner)
         .map_err(|error| error.to_string())?;
     if pin_kimi_code_base_url {
-        entry.base_url = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
+        entry.base_url =
+            Some(codewhale_config::descriptors::defaults::DEFAULT_KIMI_CODE_BASE_URL.to_string());
     }
     entry.auth_mode = Some("api_key".to_string());
     entry.api_key = Some(api_key);
@@ -1208,10 +1448,10 @@ pub(crate) fn restore_loaded_session_provider(
     let provider = identity.provider;
     config.scope_to_provider_identity(&identity)?;
     app.set_provider_identity_record(identity.clone());
-    app.billing_presentation = crate::route_billing::for_route(config, &identity);
+    app.billing_presentation = codewhale_engine::route_billing::for_route(config, &identity);
     app.max_subagents = config
         .max_subagents_for_provider(&identity)
-        .clamp(1, crate::config::MAX_SUBAGENTS);
+        .clamp(1, codewhale_runtime::config::MAX_SUBAGENTS);
     app.provider_chain = (identity.key.as_str() == provider.as_str()
         && provider != ProviderKind::Antigravity)
         .then(|| codewhale_config::ProviderChain::new(provider, &config.fallback_providers))
@@ -1222,16 +1462,21 @@ pub(crate) fn restore_loaded_session_provider(
         let requested = app
             .reasoning_effort_preference
             .unwrap_or(app.reasoning_effort);
-        app.reasoning_effort =
-            requested.normalize_for_route(provider, &config.active_route_base_url(), &app.model);
+        app.reasoning_effort = requested.normalize_for_route_identity(
+            provider,
+            identity.key.as_str(),
+            &config.active_route_base_url(),
+            &app.model,
+        );
     }
     app.set_active_context_window_override(config, &identity);
     app.active_route_limits = app.context_window_override_limits();
     app.active_route_base_url = config.active_route_base_url();
+    app.active_context_window = app.configured_context_window_for(&app.model);
     app.active_context_window_source = app
         .configured_context_window_for(&app.model)
         .map(|resolution| resolution.source)
-        .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
+        .unwrap_or(codewhale_engine::route_runtime::ContextWindowSource::Fallback);
     Ok(())
 }
 
@@ -1253,14 +1498,15 @@ pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
     if app.auto_model {
         app.active_route_limits = app.context_window_override_limits();
         app.active_route_base_url = config.active_route_base_url();
+        app.active_context_window = app.configured_context_window_for(&app.model);
         app.active_context_window_source = app
             .configured_context_window_for(&app.model)
             .map(|resolution| resolution.source)
-            .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
+            .unwrap_or(codewhale_engine::route_runtime::ContextWindowSource::Fallback);
         return;
     }
 
-    match crate::route_runtime::resolve_runtime_route_for_identity(
+    match codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
         config,
         &identity,
         Some(&app.model),
@@ -1269,16 +1515,17 @@ pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
             app.set_active_route_resolution(
                 resolution.candidate.endpoint().base_url.clone(),
                 resolution.candidate.limits(),
-                resolution.context_window.source,
+                resolution.context_window,
             );
         }
         Err(_) => {
             app.active_route_limits = app.context_window_override_limits();
             app.active_route_base_url = config.active_route_base_url();
+            app.active_context_window = app.configured_context_window_for(&app.model);
             app.active_context_window_source = app
                 .configured_context_window_for(&app.model)
                 .map(|resolution| resolution.source)
-                .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
+                .unwrap_or(codewhale_engine::route_runtime::ContextWindowSource::Fallback);
         }
     }
 }
@@ -1294,10 +1541,11 @@ pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
 ///
 /// Never leaks raw prompt text — the result is always a concise label.
 pub(crate) fn derive_session_title(messages: &[Message]) -> Option<String> {
-    let text = crate::session_manager::conversation_title_prompt(messages)?;
+    let text = codewhale_engine::session_manager::conversation_title_prompt(messages)?;
 
-    let first_line =
-        crate::session_manager::sanitize_session_title(text.lines().next().unwrap_or("").trim());
+    let first_line = codewhale_engine::session_manager::sanitize_session_title(
+        text.lines().next().unwrap_or("").trim(),
+    );
     let first_line = first_line.trim();
     if first_line.is_empty() {
         return None;
@@ -1349,7 +1597,7 @@ mod derived_title_tests {
 
     #[test]
     fn live_title_uses_the_same_user_prompt_after_runtime_handoffs() {
-        let handoff = crate::runtime_handoff::operate_contract_runtime_message();
+        let handoff = codewhale_engine::runtime_handoff::operate_contract_runtime_message();
         assert_eq!(derive_session_title(std::slice::from_ref(&handoff)), None);
         let messages = [handoff, user("/goal Fix the diagnostic display")];
         assert_eq!(
@@ -1357,7 +1605,7 @@ mod derived_title_tests {
             Some("/goal Fix")
         );
         assert_eq!(
-            crate::session_manager::conversation_title_prompt(&messages),
+            codewhale_engine::session_manager::conversation_title_prompt(&messages),
             Some("/goal Fix the diagnostic display")
         );
     }
@@ -1377,13 +1625,15 @@ mod stall_outbox_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let outbox_path = dir.path().join("outbox.jsonl");
 
-        let config = Config {
-            lifecycle_outbox: Some(codewhale_config::LifecycleOutboxToml {
+        let config = {
+            let __cw_config_init_0_0 = Some(codewhale_config::LifecycleOutboxToml {
                 path: Some(outbox_path.clone()),
                 webhook_url: None,
                 webhook_token: None,
-            }),
-            ..Default::default()
+            });
+            let mut __cw_config_init_0_value: Config = Default::default();
+            __cw_config_init_0_value.lifecycle_outbox = __cw_config_init_0_0;
+            __cw_config_init_0_value
         };
         let options = TuiOptions {
             start_in_agent_mode: true,

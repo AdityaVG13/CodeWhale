@@ -252,7 +252,18 @@ fn state_path_for_write(workspace: &Path) -> Result<PathBuf> {
     };
     reject_linked_state_path(&root, &path)?;
     reject_linked_state_path(&root, &journal_path(&path))?;
+    reject_linked_state_path(&root, &write_lock_path(&path)?)?;
     Ok(path)
+}
+
+fn write_lock_path(state_path: &Path) -> Result<PathBuf> {
+    let file_name = state_path.file_name().ok_or_else(|| {
+        anyhow!(
+            "continual harness state has no file name: {}",
+            state_path.display()
+        )
+    })?;
+    Ok(state_path.with_file_name(format!("{}.lock", file_name.to_string_lossy())))
 }
 
 /// Harness writes carry model-authored text. Refuse them when the state
@@ -356,13 +367,7 @@ fn with_write_lock<T>(state_path: &Path, operation: impl FnOnce() -> Result<T>) 
     })?;
     fs::create_dir_all(parent)
         .with_context(|| format!("create continual harness directory {}", parent.display()))?;
-    let file_name = state_path.file_name().ok_or_else(|| {
-        anyhow!(
-            "continual harness state has no file name: {}",
-            state_path.display()
-        )
-    })?;
-    let lock_path = parent.join(format!("{}.lock", file_name.to_string_lossy()));
+    let lock_path = write_lock_path(state_path)?;
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)

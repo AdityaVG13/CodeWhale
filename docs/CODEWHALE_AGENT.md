@@ -22,7 +22,7 @@ configured and authenticated MCP server or API integration.
 ## Rules that make it one identity
 
 - Every surface is I/O around the single `Engine::run_turn`
-  (`crates/tui/src/core/engine/turn_loop.rs`). No surface gets its own
+  (`crates/engine/src/core/engine/turn_loop.rs`). No surface gets its own
   engine or turn loop.
 - Every surface authenticates to the same Codewhale membership
   (`codewhale login` account session). Membership gates cloud agents;
@@ -51,9 +51,11 @@ quiet hours + digest, automation output routable
 to any paired channel, one pairing code bound inside the authenticated
 app, unbind revokes instantly.
 
-WeChat note: personal-WeChat automation is **not supported** —
-reverse-engineered protocols get users banned. Official 公众号/服务号 APIs
-are the only acceptable path and are still under assessment.
+WeChat note: personal WeChat is supported only through Tencent's official
+ClawBot (iLink) channel, never through unofficial account automation. The
+open-source `integrations/weixin-bridge` uses it with a local
+`codewhale serve --http`, and it stops when Tencent's risk control objects.
+Official Account (公众号/服务号) APIs are not used.
 
 ## Pointer
 

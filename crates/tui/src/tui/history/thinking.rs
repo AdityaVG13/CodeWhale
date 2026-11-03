@@ -3,9 +3,9 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::markdown_render;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+use codewhale_tui_kit::markdown_render;
 
 /// Reasoning header opener. Replaces the spinner glyph on thinking cells —
 /// reasoning is a slow exhale, not a tool spin.
@@ -116,6 +116,7 @@ pub(crate) fn render_thinking_with_analysis(
         highlight,
         Locale::En,
         THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
+        markdown_render::detected_palette_mode(),
     )
 }
 
@@ -130,6 +131,7 @@ pub(crate) fn render_thinking_with_preview_limit(
     highlight: bool,
     locale: Locale,
     completed_preview_lines: usize,
+    palette_mode: palette::PaletteMode,
 ) -> (Vec<Line<'static>>, bool) {
     let state = thinking_visual_state(streaming, duration_secs);
     let style = thinking_style();
@@ -146,7 +148,7 @@ pub(crate) fn render_thinking_with_preview_limit(
 
     let label = if streaming {
         format!("{}…", tr(locale, MessageId::WhaleStateThinking))
-    } else if let Some(duration) = duration_secs {
+    } else if let Some(duration) = duration_secs.filter(|duration| *duration >= 1.0) {
         tr(locale, MessageId::TranscriptThoughtFor).replace(
             "{duration}",
             &codewhale_command_contract::elapsed::format_elapsed_ms((duration * 1000.0) as u64),
@@ -173,11 +175,20 @@ pub(crate) fn render_thinking_with_preview_limit(
             streaming,
             body_style,
             completed_preview_lines,
+            palette_mode,
         )
     } else if content.trim().is_empty() {
         (Vec::new(), false)
     } else {
-        let body = markdown_render::render_markdown(content, content_width, body_style);
+        let body: Vec<Line<'static>> = markdown_render::render_markdown_tagged_with_palette(
+            content,
+            content_width,
+            body_style,
+            palette_mode,
+        )
+        .into_iter()
+        .map(|line| line.line)
+        .collect();
         // The collapse affordance mirrors the collapsed preview's "more than
         // the preview would show" test, derived from this single render
         // instead of rendering the preview too: streaming content outgrows
@@ -233,6 +244,7 @@ fn collapsed_thinking_body(
     streaming: bool,
     style: Style,
     completed_preview_lines: usize,
+    palette_mode: palette::PaletteMode,
 ) -> (Vec<Line<'static>>, bool) {
     if !streaming && completed_preview_lines == 0 {
         return (Vec::new(), !content.trim().is_empty());
@@ -271,7 +283,15 @@ fn collapsed_thinking_body(
     let mut lines = if render_source.trim().is_empty() {
         Vec::new()
     } else {
-        markdown_render::render_markdown(render_source, width.saturating_sub(3).max(1), style)
+        markdown_render::render_markdown_tagged_with_palette(
+            render_source,
+            width.saturating_sub(3).max(1),
+            style,
+            palette_mode,
+        )
+        .into_iter()
+        .map(|line| line.line)
+        .collect()
     };
     let truncated = lines.len() > limit;
     if truncated {
@@ -302,21 +322,26 @@ fn streaming_preview_tail_source(body: &str, min_source_lines: usize) -> &str {
     // (byte offset, whether the boundary above this line is inside an open
     // fence). One entry per line; cheap next to the render it bounds.
     let mut lines: Vec<(usize, bool)> = Vec::new();
-    let mut open_fence_len: Option<usize> = None;
+    let mut open_fence: Option<(char, usize)> = None;
     let mut offset = 0usize;
     for piece in body.split_inclusive('\n') {
         let raw_line = piece
             .strip_suffix('\n')
             .map_or(piece, |line| line.strip_suffix('\r').unwrap_or(line));
-        lines.push((offset, open_fence_len.is_some()));
+        lines.push((offset, open_fence.is_some()));
         let trimmed = raw_line.trim_start();
-        let fence_len = trimmed.chars().take_while(|c| *c == '`').count();
+        let fence_char = if trimmed.starts_with('~') { '~' } else { '`' };
+        let fence_len = trimmed.chars().take_while(|c| *c == fence_char).count();
         if fence_len >= 3 {
-            match open_fence_len {
-                Some(open) if fence_len >= open && trimmed[fence_len..].trim().is_empty() => {
-                    open_fence_len = None;
+            match open_fence {
+                Some((open_char, open_len))
+                    if fence_char == open_char
+                        && fence_len >= open_len
+                        && trimmed[fence_len..].trim().is_empty() =>
+                {
+                    open_fence = None;
                 }
-                None => open_fence_len = Some(fence_len),
+                None => open_fence = Some((fence_char, fence_len)),
                 Some(_) => {}
             }
         }
@@ -479,6 +504,7 @@ mod tests {
             false,
             Locale::En,
             THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
+            palette::PaletteMode::Dark,
         );
         assert!(expandable, "a long streaming body must offer expand");
         // header (including the affordance) + three preview rows
@@ -509,6 +535,7 @@ mod tests {
             false,
             Locale::En,
             THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
+            palette::PaletteMode::Dark,
         );
         // Code rows carry the two-space code prefix after the rail; if the
         // tail slice started inside the open fence they would render as
@@ -540,6 +567,7 @@ mod tests {
             false,
             Locale::En,
             THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
+            palette::PaletteMode::Dark,
         );
         assert_eq!(
             markdown_render::parse_invocation_count(),

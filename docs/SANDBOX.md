@@ -21,10 +21,10 @@ run before execution reaches this boundary.
 | No OS wrapper | Windows | Current implementation | `none` |
 | OpenSandbox-compatible service | Any supported host | `sandbox_backend = "opensandbox"` | External execution path |
 
-The repository contains a seccomp implementation module plus a future Windows
-helper contract. They are not wired into child-command launch, so Codewhale
-does not advertise them as active sandboxes. Source-only sandbox code is not
-evidence that a command was restricted.
+The repository also contains a future Windows helper contract. It is not
+wired into child-command launch, so Codewhale does not advertise it as an
+active sandbox. Source-only sandbox code is not evidence that a command was
+restricted.
 
 ## macOS: Seatbelt
 
@@ -37,7 +37,12 @@ The profile can provide:
 - broad filesystem reads;
 - writes limited by the selected policy, including the workspace and specific
   runtime/cache paths needed by supported tools;
-- network access only when the policy enables it.
+- network access only when the policy enables it. A `read-only` policy with
+  network (the agent `read_only: true` shell mode) gets outbound IPv4 and the
+  system DNS resolver only. IPv6 and the host's own addresses, loopback
+  included, are denied, except the port of a local proxy named in
+  `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, and other local sockets stay
+  denied.
 
 If the probe fails or `sandbox-exec` is unavailable, Codewhale reports no OS
 sandbox and launches the command without a Seatbelt wrapper. It does not set a
@@ -93,8 +98,11 @@ paths, and `/` are not promoted to writable mounts.
 For `read-only`, there are no writable binds, so the working directory remains
 inside the read-only root view. `--unshare-all` isolates the network namespace
 by default. Codewhale adds `--share-net` only when the policy's
-`network_access` is true. `danger-full-access` and `external-sandbox` bypass the
-local wrapper entirely.
+`network_access` is true. The agent `read_only: true` shell mode turns it on
+only in Full Access (see [Subagents](SUBAGENTS.md)); it then shares the host
+network namespace, including loopback and abstract unix sockets, like a
+networked `workspace-write` shell. Bubblewrap does not filter either.
+`danger-full-access` and `external-sandbox` bypass the local wrapper entirely.
 
 If the user opts out, or `/usr/bin/bwrap` is missing, non-executable, or
 cannot actually confine a child, Codewhale reports `none` and launches the
@@ -168,6 +176,11 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 
 - `read-only` and `workspace-write` are enforced by Seatbelt or bubblewrap only
   when that wrapper is selected and available.
+- The configured value can only narrow the sandbox the permission mode
+  picks: Full Access (`yolo`) runs without the wrapper, Ask and Auto-Review
+  use `workspace-write`, and Plan uses `read-only`. A configured
+  `danger-full-access` or `external-sandbox` therefore takes effect only in
+  Full Access; it never loosens Ask or Auto-Review.
 - `danger-full-access` deliberately bypasses the local OS wrapper. On Linux it
   also skips the `PR_SET_NO_NEW_PRIVS` process-hardening flag at startup so
   `sudo`/setuid workflows keep running (#5723); see the process-hardening
@@ -224,9 +237,9 @@ Denial attribution is intentionally conservative:
 
 ## Implementation references
 
-- `crates/tui/src/sandbox/mod.rs` — truthful selection and public capability markers
-- `crates/tui/src/sandbox/seatbelt.rs` — macOS wrapper and availability probe
-- `crates/tui/src/sandbox/bwrap.rs` — Linux wrapper and functional availability probe
-- `crates/tui/src/sandbox/process_hardening.rs` — Linux parent-process hardening
-- `crates/tui/src/sandbox/backend.rs` — external backend selection
-- `crates/tui/src/tools/diagnostics.rs` — machine-readable diagnostics
+- `crates/sandbox/src/lib.rs` — truthful selection and public capability markers
+- `crates/sandbox/src/seatbelt.rs` — macOS wrapper and availability probe
+- `crates/sandbox/src/bwrap.rs` — Linux wrapper and functional availability probe
+- `crates/sandbox/src/process_hardening.rs` — Linux parent-process hardening
+- `crates/sandbox/src/backend.rs` — external backend selection
+- `crates/engine/src/tools/diagnostics.rs` — machine-readable diagnostics

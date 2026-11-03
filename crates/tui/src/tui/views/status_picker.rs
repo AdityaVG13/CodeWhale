@@ -10,7 +10,7 @@
 //! segments ([`crate::tui::ui::frame::info_segments`]) and the posture bar's
 //! mode chip. Between 0.9.12 and that fix the list was persisted and never
 //! read, so the checklist was decoration — a new variant belongs in
-//! `crates/tui/src/config.rs` only once something paints it.
+//! `crates/runtime/src/config.rs` only once something paints it.
 
 use std::cell::RefCell;
 
@@ -23,14 +23,15 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
 
-use crate::config::{ProviderKind, StatusItem};
-use crate::tui::menu_style;
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer, render_modal_surface,
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, action_footer_lines,
+    centered_modal_area, render_modal_footer, render_modal_surface, render_panel_scroll_rail,
 };
+use codewhale_config::ProviderKind;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+use codewhale_runtime::config::StatusItem;
+use codewhale_tui_kit::menu_style;
 use unicode_width::UnicodeWidthStr;
 
 /// Picker state. We hold both the user's working selection AND the original
@@ -87,13 +88,13 @@ impl StatusPickerView {
             .collect()
     }
 
-    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// Apply one [`list_nav`](codewhale_tui_kit::list_nav) motion (#6290), returning
     /// whether it was consumed. Vertical motions wrap at the ends for
     /// Prev/Next and clamp for paging and Home/End; the horizontal axis does
     /// not exist on this single-column checklist. The checklist fits on one
     /// screen, so a page is the whole list.
-    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
-        let Some(next) = crate::tui::list_nav::apply(
+    fn apply_motion(&mut self, motion: codewhale_tui_kit::list_nav::Motion) -> bool {
+        let Some(next) = codewhale_tui_kit::list_nav::apply(
             self.cursor,
             self.rows.len(),
             self.rows.len().max(1),
@@ -146,7 +147,7 @@ impl ModalView for StatusPickerView {
         // Movement keys come from the shared vocabulary (#6290): `j`/`k`,
         // Home/End and the page keys mean here what they mean on every other
         // list. This match owns only the checklist's own verbs.
-        if let Some(motion) = crate::tui::list_nav::motion(&key)
+        if let Some(motion) = codewhale_tui_kit::list_nav::motion(&key)
             && self.apply_motion(motion)
         {
             return ViewAction::None;
@@ -182,10 +183,10 @@ impl ModalView for StatusPickerView {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.apply_motion(crate::tui::list_nav::Motion::Prev);
+                self.apply_motion(codewhale_tui_kit::list_nav::Motion::Prev);
             }
             MouseEventKind::ScrollDown => {
-                self.apply_motion(crate::tui::list_nav::Motion::Next);
+                self.apply_motion(codewhale_tui_kit::list_nav::Motion::Next);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let clicked = self.row_hitboxes.borrow().iter().find_map(|(index, rect)| {
@@ -204,12 +205,31 @@ impl ModalView for StatusPickerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        // Two header lines + one row per StatusItem + the wrapping action
-        // footer that now lives inside the body (one row more than the old
-        // border footer). centered_modal_area clamps this to the frame and
-        // lets the scroll offset absorb any remaining overflow.
-        let needed_height = (self.rows.len() as u16).saturating_add(5);
-        let popup_area = centered_modal_area(area, 64, needed_height, 40, 8);
+        let hints = [
+            ActionHint::new(
+                "Space",
+                tr(self.locale, MessageId::StatusPickerActionToggle),
+            ),
+            ActionHint::new("a", tr(self.locale, MessageId::StatusPickerActionAll)),
+            ActionHint::new("n", tr(self.locale, MessageId::StatusPickerActionNone)),
+            ActionHint::new("Enter", tr(self.locale, MessageId::StatusPickerActionSave)),
+            ActionHint::new("Esc", tr(self.locale, MessageId::StatusPickerActionCancel)),
+        ];
+        // Two header lines + one row per StatusItem + the action footer rows
+        // as they wrap at the popup's inner width, plus the border rows, and
+        // the padding rows above and below when the whole list fits.
+        // centered_modal_area clamps this to the frame and lets the scroll
+        // offset absorb any remaining overflow.
+        let popup_width = centered_modal_area(area, 64, 8, 40, 8).width;
+        let footer_rows = action_footer_lines(&hints, popup_width.saturating_sub(4))
+            .len()
+            .max(1) as u16;
+        let unpadded_height = (self.rows.len() as u16)
+            .saturating_add(4)
+            .saturating_add(footer_rows);
+        let pad = u16::from(unpadded_height.saturating_add(2) <= area.height.saturating_sub(2));
+        let popup_area =
+            centered_modal_area(area, 64, unpadded_height.saturating_add(2 * pad), 40, 8);
 
         render_modal_surface(area, popup_area, buf);
 
@@ -223,29 +243,19 @@ impl ModalView for StatusPickerView {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
             .style(Style::default().bg(palette::WHALE_BG))
-            .padding(Padding::uniform(1));
+            .padding(Padding::new(1, 1, pad, pad));
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
-        let content = render_modal_footer(
-            inner,
-            buf,
-            &[
-                ActionHint::new(
-                    "Space",
-                    tr(self.locale, MessageId::StatusPickerActionToggle),
-                ),
-                ActionHint::new("a", tr(self.locale, MessageId::StatusPickerActionAll)),
-                ActionHint::new("n", tr(self.locale, MessageId::StatusPickerActionNone)),
-                ActionHint::new("Enter", tr(self.locale, MessageId::StatusPickerActionSave)),
-                ActionHint::new("Esc", tr(self.locale, MessageId::StatusPickerActionCancel)),
-            ],
-        );
+        let content = render_modal_footer(inner, buf, &hints);
 
         self.row_hitboxes.borrow_mut().clear();
         let visible_rows = content.height.saturating_sub(2) as usize;
         let row_start = visible_row_start(self.rows.len(), self.cursor, visible_rows);
+        let row_width = content
+            .width
+            .saturating_sub(u16::from(visible_rows < self.rows.len()));
 
         let mut lines: Vec<Line> = Vec::with_capacity(visible_rows + 2);
         lines.push(Line::from(Span::styled(
@@ -266,7 +276,7 @@ impl ModalView for StatusPickerView {
                 Rect::new(
                     content.x,
                     content.y + 2 + (idx - row_start) as u16,
-                    content.width,
+                    row_width,
                     1,
                 ),
             ));
@@ -286,21 +296,22 @@ impl ModalView for StatusPickerView {
             } else {
                 Style::default().fg(palette::TEXT_DIM)
             };
-            let pointer = crate::tui::glyphs::selection_marker(is_cursor);
+            let pointer = codewhale_tui_kit::glyphs::selection_marker(is_cursor);
 
             if is_cursor {
                 let selected_style = menu_style::selected_row_style();
-                let line = status_row_text(pointer, mark, item, content.width as usize);
+                let line =
+                    status_row_text(pointer, mark, item, self.locale, usize::from(row_width));
                 lines.push(Line::from(Span::styled(line, selected_style)));
             } else {
                 let label = item.label();
-                let hint = item.hint();
+                let hint = item.hint(self.locale);
                 let prefix = format!(" {pointer} {mark} {label}  (");
-                let truncated_hint = crate::tui::ui_text::semantic_truncate_between_affixes(
+                let truncated_hint = codewhale_tui_kit::ui_text::semantic_truncate_between_affixes(
                     &prefix,
-                    hint,
+                    hint.as_ref(),
                     ")",
-                    usize::from(content.width),
+                    usize::from(row_width),
                 );
                 lines.push(Line::from(vec![
                     Span::styled(format!(" {pointer} "), row_style),
@@ -314,6 +325,18 @@ impl ModalView for StatusPickerView {
         }
 
         Paragraph::new(lines).render(content, buf);
+        render_panel_scroll_rail(
+            Rect {
+                y: content.y.saturating_add(2),
+                height: content.height.saturating_sub(2),
+                ..content
+            },
+            buf,
+            self.rows.len(),
+            row_start,
+            visible_rows,
+            true,
+        );
     }
 }
 
@@ -328,10 +351,20 @@ fn visible_row_start(total_rows: usize, cursor: usize, visible_rows: usize) -> u
         .min(max_start)
 }
 
-fn status_row_text(pointer: &str, mark: &str, item: &StatusItem, width: usize) -> String {
+fn status_row_text(
+    pointer: &str,
+    mark: &str,
+    item: &StatusItem,
+    locale: Locale,
+    width: usize,
+) -> String {
     let prefix = format!(" {pointer} {mark} {}  (", item.label());
-    let mut text =
-        crate::tui::ui_text::semantic_truncate_with_affixes(&prefix, item.hint(), ")", width);
+    let mut text = codewhale_tui_kit::ui_text::semantic_truncate_with_affixes(
+        &prefix,
+        item.hint(locale).as_ref(),
+        ")",
+        width,
+    );
     let current_width = text.width();
     if current_width < width {
         text.push_str(&" ".repeat(width - current_width));
@@ -494,14 +527,14 @@ mod tests {
 
     #[test]
     fn selected_row_text_fills_available_width() {
-        let text = status_row_text("▸", "[ ]", &StatusItem::Cache, 40);
+        let text = status_row_text("▸", "[ ]", &StatusItem::Cache, Locale::En, 40);
         assert_eq!(text.width(), 40);
         assert!(text.starts_with(" ▸ [ ] Prompt cache hit rate"));
     }
 
     #[test]
     fn selected_row_text_semantically_truncates_hint_at_narrow_width() {
-        let text = status_row_text("▸", "[ ]", &StatusItem::Cache, 44);
+        let text = status_row_text("▸", "[ ]", &StatusItem::Cache, Locale::En, 44);
         assert_eq!(text.width(), 44);
         // Cut at a word boundary, never mid-word.
         assert!(text.contains("% of…"), "{text:?}");

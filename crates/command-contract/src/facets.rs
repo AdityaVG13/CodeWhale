@@ -107,9 +107,17 @@ pub trait CommandSkillsContext {
     fn refresh_skill_cache(&mut self);
 }
 
-/// Workspace path and a bounded serialized work-state snapshot.
+/// Workspace path, bounded work-state observations and confined anchor storage.
 pub trait CommandWorkspaceContext {
     fn workspace(&self) -> PathBuf;
+    fn effective_home_dir(&self) -> Option<PathBuf>;
+    fn inspect_workspace_target(&self, candidate: &Path) -> crate::navigation::WorkspaceTarget;
+    fn read_anchor_document(&self) -> Result<Option<String>, String>;
+    fn append_anchor_bytes(
+        &mut self,
+        parts: &[&[u8]],
+    ) -> Result<PathBuf, crate::navigation::AnchorWriteError>;
+    fn replace_anchor_document(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn work_state_snapshot(&self) -> Result<Option<String>, String>;
     /// Session-aware canonical operation digest. Returns the final user-facing
     /// digest text or a safe explicit error; never a serialized snapshot.
@@ -128,6 +136,10 @@ pub trait CommandWorkspaceContext {
 pub trait CommandPresentationContext {
     /// Resolve a stable message key with its named replacements.
     fn translate(&self, key: &str, replacements: &[(&str, &str)]) -> Result<String, String>;
+
+    fn language_name(&self) -> &'static str {
+        "English"
+    }
 }
 
 /// Portable receipt for a successful atomic media attachment (FEAT-018 D4).
@@ -1031,7 +1043,7 @@ pub enum SkillSourceKind {
 /// Curated product tier for bundled (shipped) skills.
 ///
 /// The canonical name→tier classification stays in the TUI host
-/// (`crate::skills::system::bundled_skill_tier`); the portable projection
+/// (`codewhale_skills::bundled_skill_tier`); the portable projection
 /// carries the resolved tier so the handler can render the curated listing
 /// without duplicating the canonical bundle list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,6 +1071,7 @@ impl SkillBundledTier {
 /// exact-minimum).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillEntry {
+    pub index_note: Option<String>,
     pub name: String,
     pub description: String,
     pub source: SkillSourceKind,
@@ -1078,6 +1091,7 @@ pub struct SkillRegistryProjection {
     pub workspace: String,
     pub skills_dir: String,
     pub mode_label: String,
+    pub bundled_status: Vec<String>,
     pub dirs: Vec<String>,
     pub entries: Vec<SkillEntry>,
     pub warnings: Vec<String>,
@@ -1229,7 +1243,7 @@ pub struct CommandApprovalState {
 /// registry + sync (`/skills --remote|sync|suggest`), review (`/review`),
 /// and snapshot list/restore plus approval state (`/restore`). The host
 /// adapter is the only place that touches `App`, `crate::plugins`,
-/// `SnapshotRepo`, `crate::skills` services, config/network policy, and the
+/// `SnapshotRepo`, `codewhale_skills` services, config/network policy, and the
 /// async runtime bridge. The shared FEAT-015 `CommandSkillsContext` is never
 /// widened; active-skill reads use that facet, mutations flow through the
 /// delegates here (D2). All results are contract-owned portable values;
@@ -1471,8 +1485,8 @@ pub trait CommandSessionLifecycleContext {
 // FEAT-024: session control slice (D2-D7).
 //
 // One independently optional session-control authority covering exactly the
-// host work the six control commands (`/relay`, `/rename`, `/resume`, `/rc`,
-// `/remote-env`, `/title`) consume. `CommandSessionContext` and
+// host work the seven control commands (`/relay`, `/rename`, `/resume`, `/rc`,
+// `/remote-env`, `/title`, `/color`) consume. `CommandSessionContext` and
 // `CommandSessionLifecycleContext` are deliberately not widened: control
 // authority exists only on this facet, and every delegate is an atomic host
 // operation or a semantic projection so handlers keep byte-identical
@@ -1661,7 +1675,7 @@ pub struct HostedWorkTarget {
 /// Control authority for the session command slice (FEAT-024 D2/D5).
 ///
 /// Operation-granular synchronous delegates over the exact minimum host work
-/// the six control commands consume. Delegates reproduce the baseline
+/// the seven control commands consume. Delegates reproduce the baseline
 /// check/mutation order (transition gate before resume I/O, save before
 /// publication, single-attempt browser launch) and return portable receipts/
 /// projections or the exact host-error text the baseline surfaces. No
@@ -1719,6 +1733,10 @@ pub trait CommandSessionControlContext {
     /// `/title off|clear|none`: clear the session window title with the same
     /// baseline persistence/redraw semantics.
     fn clear_window_title(&mut self) -> Result<(), String>;
+
+    fn composer_color(&self) -> Option<String>;
+
+    fn set_composer_color(&mut self, color: Option<String>) -> Result<(), String>;
 
     /// `/rc status`: current remote-control status line.
     fn remote_status(&self) -> String;

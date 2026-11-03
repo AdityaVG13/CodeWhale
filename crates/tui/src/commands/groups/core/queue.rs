@@ -123,6 +123,7 @@ fn clear_queue(app: &mut App) -> CommandResult {
     let queued = app.queued_message_count();
     let had_draft = app.queued_draft.take().is_some();
     app.queued_messages.clear();
+    app.held_restored_queue = 0;
     if queued == 0 && !had_draft {
         return CommandResult::message(tr(locale, MessageId::CmdQueueAlreadyEmpty));
     }
@@ -158,8 +159,8 @@ fn truncate_preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::tui::app::{App, QueuedMessage, TuiOptions};
+    use codewhale_runtime::config::Config;
     use tempfile::TempDir;
 
     fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {

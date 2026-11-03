@@ -32,18 +32,22 @@ export interface RepoFacts {
   defaultModel: string | null;
   nodeEngines: string | null;
   toolCount: number | null;
+  contributorCount: number;
   license: string | null;
   latestPublishedRelease: PublishedReleaseFact | null;
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-10-10T12:21:52.760Z",
+  "generatedAt": "2026-11-03T04:49:30.137Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
   "version": "0.10.2",
   "crates": [
+    "account-cli",
     "agent",
+    "agent-contract",
     "app-server",
+    "app-server-protocol",
     "build-support",
     "cli",
     "cloud-facts",
@@ -51,24 +55,38 @@ export const FACTS: RepoFacts = {
     "commands",
     "config",
     "core",
+    "dependencies",
+    "engine",
+    "error-taxonomy",
     "execpolicy",
     "hooks",
     "lane",
     "localization",
+    "lsp",
     "mcp",
     "memory",
     "models",
+    "net",
+    "notify",
     "palette",
     "paths",
+    "plugins",
     "protocol",
     "release",
+    "repl",
     "runtime",
+    "sandbox",
     "sanitize",
     "secrets",
+    "skill-install",
+    "skills",
+    "snapshot",
     "state",
     "telemetry",
     "tools",
     "tui",
+    "tui-kit",
+    "util",
     "workflow",
     "workflow-js"
   ],
@@ -330,6 +348,118 @@ export const FACTS: RepoFacts = {
   ],
   "models": [
     {
+      "id": "claude-fable-5-1",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "claude-opus-5-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "provider": "Google",
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
+      "reasoning": false,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gemini-4-argon",
+      "provider": "Google",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gpt-6-luna",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gpt-6-sol",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "mimo-v2.6-flash",
+      "provider": "Xiaomi MiMo",
+      "contextWindow": 1048576,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "mimo-v2.6-pro",
+      "provider": "Xiaomi MiMo",
+      "contextWindow": 1048576,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "muse-spark-1.3",
+      "provider": "Meta",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "muse-spark-1.3-contributor",
+      "provider": "Meta",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
+      "id": "muse-wonder-1.0",
+      "provider": "Meta",
+      "contextWindow": 1048576,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-10-17"
+    },
+    {
       "id": "grok-4.7",
       "provider": "xAI",
       "contextWindow": 500000,
@@ -554,14 +684,6 @@ export const FACTS: RepoFacts = {
       "addedAt": "2026-08-02"
     },
     {
-      "id": "qwen3.8-max-preview",
-      "provider": "Qwen",
-      "contextWindow": 1000000,
-      "maxOutput": 131072,
-      "reasoning": true,
-      "addedAt": "2026-08-02"
-    },
-    {
       "id": "kimi-for-coding-highspeed",
       "provider": "Moonshot/Kimi",
       "contextWindow": 262144,
@@ -742,7 +864,7 @@ export const FACTS: RepoFacts = {
       "provider": "Anthropic",
       "contextWindow": 200000,
       "maxOutput": 64000,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-06-14"
     },
     {
@@ -956,12 +1078,13 @@ export const FACTS: RepoFacts = {
   ],
   "defaultModel": "deepseek-flash",
   "nodeEngines": ">=18",
-  "toolCount": 79,
+  "toolCount": 81,
+  "contributorCount": 393,
   "license": "MIT",
   "latestPublishedRelease": {
-    "tag": "v0.10.1",
-    "version": "0.10.1",
-    "publishedAt": "2026-10-08T01:47:44Z",
-    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.1"
+    "tag": "v0.10.2",
+    "version": "0.10.2",
+    "publishedAt": "2026-10-24T17:31:14Z",
+    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.2"
   }
 };

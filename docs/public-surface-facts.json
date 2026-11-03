@@ -22,24 +22,24 @@
   "sourceCandidate": {
     "version": "0.10.2",
     "providerCount": 50,
-    "toolCount": 79,
+    "toolCount": 81,
     "sandboxBackends": [
       "seatbelt (macOS, when available)",
       "bubblewrap (Linux, default when installed and working)"
     ],
     "sources": [
       "Cargo.toml",
-      "crates/tui/src/config.rs",
-      "crates/tui/src/sandbox/mod.rs",
+      "crates/runtime/src/config.rs",
+      "crates/sandbox/src/lib.rs",
       "web/scripts/derive-facts.mjs"
     ],
     "providerCountDefinition": "Website descriptor identities in this source snapshot, excluding Custom and retired identities; includes protocol/plan variants. Not a count of distinct vendors, ProviderKind identities, live catalogs, or providers in any published release."
   },
   "latestPublishedRelease": {
-    "tag": "v0.10.1",
-    "version": "0.10.1",
-    "publishedAt": "2026-10-08T01:47:44Z",
-    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.1",
+    "tag": "v0.10.2",
+    "version": "0.10.2",
+    "publishedAt": "2026-10-24T17:31:14Z",
+    "url": "https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.10.2",
     "sources": [
       "web/data/latest-published-release.json"
     ]
@@ -95,7 +95,7 @@
     "sources": [
       "docs/MODES.md",
       "docs/KEYBINDINGS.md",
-      "crates/tui/src/settings.rs"
+      "crates/runtime/src/settings.rs"
     ]
   },
   "toolSurface": {
@@ -104,14 +104,14 @@
       "write",
       "edit",
       "file_search",
+      "grep_files",
       "bash",
-      "agent",
-      "workflow",
       "todo_write",
+      "task_shell_wait",
+      "load_skill",
       "create_goal",
-      "get_goal",
-      "update_goal",
-      "load_skill"
+      "context_archive_get",
+      "context_archive_search"
     ],
     "schemas": {
       "read": [
@@ -157,9 +157,9 @@
     "sources": [
       "docs/TOOL_SURFACE.md",
       "docs/RUNTIME_SIMPLIFICATION_DESIGN.md",
-      "crates/tui/src/core/engine/tool_catalog.rs",
-      "crates/tui/src/tools/registry.rs",
-      "crates/tui/src/config/subagent_limits.rs"
+      "crates/engine/src/core/engine/tool_catalog.rs",
+      "crates/engine/src/tools/registry.rs",
+      "crates/runtime/src/config/subagent_limits.rs"
     ]
   },
   "surfaces": {
@@ -195,7 +195,7 @@
       "docs/SANDBOX.md",
       "docs/RUNTIME_API.md",
       "docs/WEB.md",
-      "crates/tui/src/audit.rs",
+      "crates/runtime/src/audit.rs",
       "web/app/[locale]/faq/page.tsx",
       "web/app/[locale]/install/page.tsx"
     ]
@@ -227,7 +227,9 @@
       "docs/CONTRIBUTORS.md",
       "web/lib/release-credits.ts"
     ],
-    "requiredCandidateCredits": ["@BX166"]
+    "requiredCandidateCredits": [
+      "@BX166"
+    ]
   },
   "screenshot": {
     "readme": "web/public/codewhale-tui-0102-demo.png",

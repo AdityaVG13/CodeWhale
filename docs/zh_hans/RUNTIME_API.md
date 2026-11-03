@@ -4,8 +4,10 @@
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
 > 2026-10-06 补齐设备令牌意图、逐调用变更、技能详情、持久配置与账号宪章契约。
 > 2026-10-11 补齐工作区信任契约：`workspace_trusted` 与 `POST /v1/workspace/trust`。
+> 2026-10-23 补齐完整 API 入口、兼容执行限制与 ACP MCP 拒绝边界。
+> 2026-11-02 补齐控制帧大小、写入背压、ACP 拒绝恢复与当前 HTTP 监听器边界。
 
-`codewhale app-server` 是本地运行时的规范 API 与控制面。本地 SDK、移动端/远程控制客户端
+`codewhale app-server --http` 是本地运行时的规范 API 与控制面。本地 SDK、移动端/远程控制客户端
 以及编辑器集成都与它对话，而不是去抓取终端输出。它提供完整的 HTTP/SSE 运行时
 API（`/v1/*`）、基于 stdio 的 JSON-RPC 控制传输，以及面向手机的移动端页面。
 `codewhale doctor --json` 提供机器可读的健康状态，`codewhale serve --acp` 则通过 stdio
@@ -13,7 +15,8 @@ API（`/v1/*`）、基于 stdio 的 JSON-RPC 控制传输，以及面向手机�
 
 `codewhale serve --http` / `serve --mobile` 仍作为 `codewhale app-server --http` /
 `--mobile` 的**兼容别名**存在；两者启动的是同一个服务器。新的集成应当以
-`app-server` 为目标。
+`app-server --http` 为目标。`--stdio` 和 `--socket` 提供兼容控制接口。
+当前裸 `app-server` 的 HTTP 监听器通过同一个 Runtime owner 提供兼容路由和完整 `/v1/*` 路由。
 
 `codewhale exec` 是另一条一次性的无头 worker 路径（stream-json、fleet worker 子进程、
 CI 原语）。它不属于本 API，但共享同一个运行时、提供商/模型解析、权限配置
@@ -51,9 +54,9 @@ local supervisor / SDK / automation harness
 | `codewhale web [--port 7878]` | 在 `127.0.0.1:7878` 上的 HTTP/SSE + 内嵌客户端 | 一等公民的仅回环浏览器客户端；打开默认浏览器 |
 | `codewhale app-server --http` | 在 `127.0.0.1:7878` 上的 HTTP/SSE | 完整的 `/v1/*` 运行时 API（规范入口） |
 | `codewhale app-server --mobile` | 回环上的 HTTP/SSE + `/mobile` | 运行时 API + 本地移动端控制页 |
-| `codewhale app-server --stdio` | 基于 stdio 的 JSON-RPC 2.0 | 本地 SDK / 控制探针（不监听端口） |
+| `codewhale app-server --stdio` | 基于 stdio 的 JSON-RPC 2.0 | 兼容控制与显式禁用工具的回合；宿主仍可能绑定内部 Runtime 桥接使用的私有回环监听器。 |
 | `codewhale app-server --socket [--socket-path P]` | 基于权限为 `0600` 的 Unix 域套接字（macOS/Linux）或仅限所有者的命名管道（Windows）的 JSON-RPC 2.0 | 桌面守护进程：多客户端、内核对端身份校验、`daemon/attach` 认领握手。Windows 原生应用验收仍待完成。 |
-| `codewhale app-server` | 在 `127.0.0.1:8787` 上的 HTTP | 旧式进程内 app-server（`/healthz`、`/thread`、`/app`、`/prompt`）；后台作业请用运行时 API 的 `GET /v1/jobs`；`/prompt` 与 `/thread` 消息会通过运行时桥执行真实回合。它没有直接的 `/tool` 路由：工具只在 Engine 回合内部、在 Engine 的工具目录与审批姿态下运行。这个旧式服务器不呈现审批：它的桥只转发文本增量和回合的完成，并且没有决策路由，所以一个受审批门控的调用会一直等不到答复。受审批门控的工作请通过运行时 API 驱动（`/v1/threads/*` 事件与 `POST /v1/approvals/{approval_id}`） |
+| `codewhale app-server` | 在 `127.0.0.1:8787` 上的 HTTP | 兼容 `/healthz`、`/thread`、`/app`、`/prompt`，并提供完整 `/v1/*` 路由。兼容回合请求必须显式带 `allowed_tools: []`；这些路由在回合开始前拒绝交互执行。新集成请用 `app-server --http`。 |
 | `codewhale serve --http` / `--mobile` | 与 `app-server --http`/`--mobile` 相同的服务器 | 兼容别名 |
 
 `app-server --http` 与 `--mobile` 启动的是历史上经由 `serve --http` 访问的同一个
@@ -111,7 +114,7 @@ Drive 保留现有 Runtime/控制权限，但不能铸造、列举或撤销设�
 
 ### 工作区文件与会话工件
 
-原生客户端（GPUI 桌面的 Files 与 Preview 模块）通过三条需认证的路由浏览并编辑
+原生客户端通过三条需认证的路由浏览并编辑
 服务器配置的工作区。它们直接读写工作区；没有第二套文件存储、缓存或索引，
 也没有路径覆盖：工作区根目录是唯一的根目录。
 
@@ -337,22 +340,42 @@ printf '%s\n' \
   | codewhale app-server --stdio
 ```
 
+本地控制与 ACP 帧的编码正文最多为 8 MiB，不计换行分隔符。序列化在达到上限时停止，
+不会先写入超限帧。正文、换行与 flush 共用 30 秒背压期限；owner 附着、请求转发和前端
+就绪通知保留更紧的 5 秒期限。部分写入、flush 失败或超时会结束当前流，不能再追加另一条
+响应或自动重放请求。兼容 stdio 响应、事件与中继 stdout 也使用该写入期限。
+
 `capabilities` 返回已声明的方法族（`thread/*`、`app/*`、
 `prompt/*`）以及完整的方法清单；`thread/capabilities`、
 `app/capabilities` 与 `prompt/capabilities` 则按族缩小范围。方法集合由
-`crates/app-server/src/lib.rs` 中的一个漂移测试钉住，因此 SDK 与本地集成客户端
+`crates/app-server/src/tests.rs` 中的一个漂移测试钉住，因此 SDK 与本地集成客户端
 可以依赖它不会悄悄变化。
+
+### 兼容执行限制
+
+HTTP 兼容路由、stdio 和 socket 均声明 `interactive_execution: false`、`goal_execution: false`、
+`tool_free_turns: true` 与 `full_api_entrypoint: "codewhale app-server --http"`。
+客户端必须先确认 `tool_free_turns: true`，才能依赖空工具列表；旧兼容服务器可能忽略该字段。
+`thread/message`、`thread/request` 的 message、`prompt/run`、`prompt/request`
+以及 HTTP `/prompt`、`/thread` 的 message 必须显式提供 `allowed_tools: []`。
+省略、null 或非空列表返回 `interactive_execution_unsupported`，不会创建 Runtime
+线程或启动回合；错误类型的值也会被拒绝。桥在实际回合请求中继续传递空工具列表，
+只转发助手文本和最终状态；意外的审批或澄清请求会报错并中断该回合。
+工具客户端须迁移到带 bearer 认证的完整 HTTP/SSE API。
+JSON-RPC 返回 `-32602` 和 `data.error: "interactive_execution_unsupported"`；
+HTTP 返回 400，`error.code` 为 `invalid_request`，同一详情位于 `error.data`。
+兼容 `thread/goal/set` 以及 `ThreadRequest::GoalSet` 也在修改目标前拒绝，
+因为设为活动目标会启动后台工作。读取、清除现有目标仍可用；开始目标请用完整 HTTP API。
+
+`@codewhale/runtime-sdk` 当前只封装 Fleet 和线程事件读取，未封装线程创建、
+回合开始/引导/中断、审批、澄清或模型发现。完整集成请使用
+[SDK 指南中的认证 HTTP 示例](../../npm/runtime-sdk/README.md#full-engine-api)。
 
 ### 守护进程套接字：`codewhale app-server --socket`
 
-桌面外壳（DESKTOP-APP-BRIEF §2）通过 unix 域套接字连接到一个长期存活的守护进程。
+此套接字传输在长期存活的守护进程上暴露兼容控制。
 其线上协议就是 `--stdio` 传输本身——同样的换行分隔 JSON-RPC 2.0 方法，由同一份代码
 分发——只是在前面加了一次握手。
-
-> 注（2026-09-14）：上面提到的 Tauri 桌面外壳在 2026-09-14 的产品客户端切换中正在退役，
-> 而 DESKTOP-APP-BRIEF 这个引用是一个悬空指针（本仓库中不存在该 brief）。私有
-> `codehwhale-gpui` 仓库中的 GPUI 客户端是这套 HTTP 运行时 API 的继任守护进程消费方；
-> 这里描述的套接字协议没有变化。
 
 **端点。** 若给了 `--socket-path` 就用它；否则若设置了 `CODEWHALE_HOME` 则用
 `$CODEWHALE_HOME/run/daemon.sock`（显式指定 home 即是一条隔离边界）；否则用
@@ -482,6 +505,10 @@ owner 存储中的原始操作；响应丢失或来源历史后来增长不会�
 它不会从可能已变化的来源重新构造原始意图。尚未准备好的目标保持待决；
 变化或无法验证的目标拒绝完成。使用同一个键重复恢复会观察到同一个已提交结果。
 
+新的历史操作预留会保存原始文档和检查点的观察值。尚未提交的恢复必须匹配完整的
+预备文档及该操作自己的发布代次，且原始检查点保持不变。旧预留没有该原始观察值时，
+仍保持待决或拒绝恢复；读取当前文件不能补造过去的写入依据。
+
 选定工作区来自已确认的 owner 或明确获准的请求。历史和旧回执不能提供权限、
 凭据、端点或另一个 owner。绑定存储缺失、变化、繁忙或不兼容时明确失败。
 规范目标缺失不会启动一个空的替代会话。
@@ -525,12 +552,10 @@ owner 存储中的原始操作；响应丢失或来源历史后来增长不会�
 POST /v1/user-input/{thread_id}/{request_id}
 ```
 
-app-server 控制传输无法接受该回复。
-带 `SubmitUserInput` 的 `app/request` 会返回 `ok: false` 与
-`error: "user_input_reply_unsupported"`。这是该传输的固有性质，
-不是遗漏：当一个回合正在流式传输时，stdio 循环只执行
-`thread/interrupt`，其他请求一律排队，所以从那里发出的答复会
-等待那个正在等它的回合本身。
+兼容控制传输无法接受该回复。`app/request` 的 `SubmitUserInput` 返回
+`ok: false` 与 `error: "user_input_reply_unsupported"`。兼容回合要求空工具列表，
+交互执行在准入时拒绝，因此受支持的回合不会静默等待无法提交的答案。
+这是 Codewhale 当前实现的限制。
 
 ## SDK 契约
 
@@ -587,9 +612,20 @@ Core 回合、事件时间线、审批等待器和完整 Engine 会话快照。
 编辑器接口支持 `initialize`、`session/new`、`session/list`、`session/load`
 （含持久 ID 前缀）、`session/prompt`、`session/cancel`、模型发现/选择，
 以及声明的模式/模型配置选项。新会话先持久化裸 UUID 和空检查点，不调用提供商。
+`session/load` 在响应前以 `session/update` 通知重放已保存的对话：用户与智能体
+文本，以及每个工具调用及其最终状态。重放的工具结果与实时流一样脱敏：
+`request_user_input` 的回答显示为 `User input submitted`，已配置的凭据被遮蔽。
+推理内容和图片不会重放。
 连接最多保留64个空闲绑定；淘汰绑定不删除持久会话。恢复复用已有线程绑定。
 完整历史、工具调用/结果配对、签名、媒体和部分执行回执通过 HTTP 同用的检查点
 守卫与会话写入租约保存。ACP 展示文本可以缩短，持久历史仍是完整 Core 快照。
+
+Codewhale 0.10.2 的 ACP v1 支持不完整。`session/new` 和 `session/load`
+会在创建、恢复或返回缓存会话之前拒绝非空 `mcpServers`，返回 `-32602`。
+该字段可省略或为 `[]`；null 与其他非数组值无效。验证不会执行所提供的命令。
+[ACP v1 要求 stdio MCP 支持](https://agentclientprotocol.com/protocol/v1/session-setup#mcp-servers)；HTTP/SSE 能力为 false 并不代表完整合规。
+需要 MCP 的集成请用完整 Runtime API。下列工具限制来自 Codewhale host profile，
+不是 ACP 协议本身的限制。
 
 受信任的本地 ACP profile 将 Core 收窄到文件/搜索/git/patch，以及获准的前台
 shell 工具。Shell 同时要求编辑器声明 terminal 支持、操作者允许 `allow_shell`；
@@ -597,7 +633,8 @@ shell 工具。Shell 同时要求编辑器声明 terminal 支持、操作者允�
 后台 shell、解释器、子智能体或 RLM 生命周期。内置工具覆盖会移除整个兼容别名族。
 最终派发再次校验 profile；伪造别名、hook 改写或目录中缺失的工具不能绕过限制。
 Full Access 下 Plan 仍只读。Full Access 与普通审批姿态是服务端拥有的只读选项，
-编辑器不能放宽。Core 的类型化规则、严格 hooks、仓库约束、Headless Auto-Review
+编辑器不能放宽。`approval_policy = "never"` 不是 ACP 审批姿态，服务端会拒绝
+以该配置启动，而不是把它当作 Ask 提供。Core 的类型化规则、严格 hooks、仓库约束、Headless Auto-Review
 与硬性下限仍生效；工作区写入不享受免审批例外，需要 guardian 的裁决会明确拒绝。
 
 工具首先显示 `pending`；只有 Core 到达最终派发才显示 `in_progress`。
@@ -614,10 +651,21 @@ owner 关闭或无法产生终态的存储故障会明确报错，不会重新�
 `max_turn_requests`；Core 失败仍是错误。单次提示词最多50个模型步骤（更小的配置
 上限仍有效），并复用 Core 的有界最终报告响应；此 profile 不派发自主目标续跑。
 
-ACP 当前声明一个独占的规范 Runtime owner。其他进程已持有该存储时，启动拒绝；
-会话绑定另一 Runtime 存储时也拒绝。经过身份校验的跨进程 owner 附着尚未完成验证，
-ACP 不把活跃会话复制到随机存储。它也不向编辑器提供全部 `/v1/*` 引导、任务或
-控制方法；完整运行时 API 请使用 `codewhale app-server --http`。
+超大或非 UTF-8 的 ACP 输入帧产生一条有界 `-32700` 错误。超大帧必须丢弃到真正的换行后，
+才能接纳下一条请求；取消不会丢失这个丢弃状态。独立 ACP 与正常 Runtime owner 的认证访客
+都遵守该规则。其他输入 I/O 错误、owner 响应校验失败与兼容控制帧错误会结束流。
+超大 ACP 响应变为有界 `-32603` 错误；原 ID 本身也使错误超限时返回 null ID。
+超大通知在写入前拒绝，并走现有操作清理，不会把截断内容报告为成功。
+
+没有进程持有 Runtime 存储时，ACP 声明自己独占的规范 Runtime owner。已有非 ACP
+的 Runtime 宿主持有该存储时（桌面应用、`codewhale app-server --http` 或
+`codewhale serve --http`），ACP 通过其本地控制套接字以经过身份校验的访客身份
+附着到该 owner，并用 owner 的存储服务编辑器。该 owner 退出时，ACP 进程以说明
+该退出的错误结束；待决操作的结果可能不确定，且不会重放。存储已由另一个 ACP
+服务端持有时，第二个 `codewhale serve --acp` 在启动时拒绝，第一个继续服务。
+会话绑定另一 Runtime 存储时也拒绝；ACP 不把活跃会话复制到随机存储。它也不向
+编辑器提供全部 `/v1/*` 引导、任务或控制方法；完整运行时 API 请使用
+`codewhale app-server --http`。
 
 
 ## 能力端点：`codewhale doctor --json`
@@ -774,12 +822,12 @@ codewhale serve --mobile [...] [--insecure]
 攻击者有严格比这个竞争更简单的本地途径。
 Web 请求需要会话 cookie 加上一个限定于源（origin）的请求证明；
 流使用一张新的一次性票据。初始重定向把证明放在 fragment 中，客户端将其移除并
-保存到限定于源的 `sessionStorage`。重新加载或在第二个标签页中打开时，
-当 `Sec-Fetch-Site` 为 `same-origin` 或 `none`（直接导航）时，
-经过认证的 `GET /` 还会把证明嵌入一个 meta 标签。该页面使用 `no-store`、
-禁止被嵌入框架，也不授予任何跨源读取权限。这让新标签页无需复用 bootstrap URL
-即可恢复，包括存储不可用的情况。不支持 Fetch Metadata 的客户端只能复用 fragment
-或它已存储的证明；恢复不会延长服务器会话，也不会替换已过期的 cookie。
+保存到限定于源的 `sessionStorage`；只要浏览器允许会话存储，重新加载该标签页
+仍可继续使用。服务器从不把证明写进页面：会话 cookie 只限定主机而不限定端口，
+另一个回环端口上的监听者可能收到它，因此仅凭 cookie 不能取回证明。通过手动输入
+地址打开的新标签页没有证明；请使用原来的标签页、复制该标签页，或重新启动
+`codewhale web` 获取新的一次性会话。该页面使用 `no-store`、禁止被嵌入框架，
+也不授予任何跨源读取权限。任何操作都不会延长服务器会话，也不会替换已过期的 cookie。
 跨源的 Fetch Metadata 或不匹配的 Origin 会在 web API 请求上被拒绝。显式的
 bearer 与 Runtime 令牌 header 客户端保持其既有行为。暂时性的流票据失败会以
 有上限的退避重试；HTTP 401/403 会停止票据重试，直到打开新的会话。
@@ -843,7 +891,10 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 - `DELETE /v1/sessions/{id}`
 - `POST /v1/sessions/{id}/resume-thread` 返回已经持有整个已保存会话的打开线程
   （`200`）；没有这样的线程时，从该会话播种一个新线程（`201`），包括会话在那个
-  线程打开它之后又有增长的情况。
+  线程打开它之后又有增长的情况。请求体未给出 `mode` 时，新线程沿用
+  已保存的模式；不是 Runtime 模式的已保存模式（例如 `exec`）以 `agent` 恢复。
+  新线程保存的工具结果与实时回执一样脱敏：`request_user_input` 的回答记为
+  `User input submitted`，已配置的凭据被遮蔽。`GET /v1/sessions/{id}` 仍返回未脱敏的内容。
 - `GET /v1/sessions/{id}/artifacts` 与 `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
   （参见上文的工作区文件与会话工件；运行时回合的溢出通过
   `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}` 读取）
@@ -858,7 +909,7 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 给出含义相同的响应，并且 `search` 与 TUI 会话选择器及任务面板（workbar）
 中的 Sessions 列表使用的是同一个模糊匹配（标题、id、
 工作区——先子串，再子序列）。三个表面运行同一套投影
-（`crates/tui/src/session_projection.rs`），因此列表在
+（`crates/engine/src/session_projection.rs`），因此列表在
 终端与仪表盘之间不可能有差异。
 
 `GET /v1/sessions/summary` 返回的行与
@@ -869,6 +920,19 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 元数据不存储最后一条消息，而为了合成一条而读取每个转录
 会让列表视图变成无界读取。完整转录
 预览位于 TUI 会话选择器中，它只读取所选的那一个会话。
+
+元数据检查最多读取每份常规会话文件的16 MiB。目录和生命周期路由超限时返回
+`413`，错误代码为 `session_metadata_too_large`，来源保持不变。存在无法读取的记录时，
+目录返回错误而不是不完整的成功列表；终端选择器保留可读行并报告检查警告。
+此限制针对元数据检查，不代表完整转录加载的上限。
+
+保存文档或检查点的原生写入依据在准备快照或排队之前捕获。归档、修剪、替换或消费
+检查点之前，现有会话写入接纳范围内的两份物理记录都必须仍匹配；变化时拒绝并保留
+恢复记录。可选序列化元数据 `publication_id` 只标识发布代次，不授予写入权限。
+来源未知的检查点需要显式且持有写入接纳的恢复、挂接或提升，自动完成才可消费它。
+Runtime 前缀恢复验证与后续写入所需的完整文档条件保持独立。
+可选用量存储损坏时，不完整覆盖仍然可见，合法的恢复数据可在不带发布回执的情况下
+读取。已确认删除或原始记录变化时仍拒绝；这种读取结果不能授权保存。
 
 `PATCH /v1/sessions/{id}` 重命名并/或归档一个已保存会话，并返回一个
 形态与线程 patch 回执相同的生命周期回执：
@@ -920,6 +984,8 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 - `PATCH /v1/threads/{id}`（请求体形态见下文）
 - `POST /v1/threads/{id}/resume`
 - `POST /v1/threads/{id}/fork`
+- `POST /v1/threads/{id}/read` — 记录客户端已显示到的最新条目
+  （请求体 `{"item_id": "<item id>"}`；见下文“已读标记”）
 - `GET /v1/threads/{id}/receipt` — 线程做了什么，每个动作一条
   （只读；形态见 [RECEIPTS.md](../RECEIPTS.md)）
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — 同上，针对一个回合；
@@ -973,6 +1039,9 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 }
 ```
 
+每行还带有来自线程已读标记的 `last_read_item_id` 与 `unread`（见下文
+“已读标记”）。从未被任何客户端标记为已读的线程，两者都为 `null`。
+
 `branch` 在请求时从线程工作区解析得到，当工作区不是 Git 仓库或
 分支无法读取时可能为 `null`。
 `head` 是该工作区当前可得的短 Git commit。
@@ -989,6 +1058,27 @@ fork 还可能包含 `backtrack_depth_from_tail` 与 `dropped_turn_id`，而
 在 v0.8.40 中，线程列表与摘要响应仍是扁平的，因此需要
 图的客户端应当从事件重建它，而不是假定列表顺序就是
 一棵完整的树。
+
+### 已读标记
+
+`POST /v1/threads/{id}/read` 携带 `{"item_id": "<item id>"}`，记录客户端已把对话
+显示到该条目为止，顺序与 `GET /v1/threads/{id}` 返回条目的顺序一致（先按回合，再按
+条目开始时间）。客户端在用户打开或阅读对话时，发送它渲染出的最新条目的 id。该条目
+必须属于此线程：未知线程返回 `404`，未知条目或属于其他线程的条目返回 `400`。响应是
+线程记录，其中 `last_read` 包含 `item_id`、`last_in_turn`（标记时该条目是否为其所在
+回合的最后一个条目）与 `watermark_item_id`（那一刻该回合已记录的最后一个条目）。
+
+标记已读不会改动其他任何东西：`updated_at`、列表顺序和线程事件流都保持不变，所以打开
+对话永远不会把它移到列表顶部，也不会让它重新变成未读。标记只会向前移动：标记一个位于
+当前标记之前的条目时，标记保持不变，因此显示旧快照的窗口无法把已读对话变回未读。fork
+出的线程不带标记。
+
+`GET /v1/threads/summary` 根据标记推导 `unread`：被标记的条目仍是最新条目时为
+`false`，一旦出现任何更新的条目即为 `true`，线程从未被标记时为 `null`（旧版 Runtime
+没有标记，因此升级后不会把所有已有对话都报告为未读；对这些线程，客户端保留自己的
+回退逻辑）。“新消息”分隔线应放在 `last_read_item_id` 所指条目之后。已知限制：
+`unread` 跟随每个回合在运行时记录的条目，所以一个已开始但尚未记录任何条目的回合，在
+记录条目之前不计入；回合结束后才添加到该回合的通知（例如权限变更）也不计入。
 
 `GET /v1/threads/running` 是进行中工作的核算表面
 （#6180）：至少有一个排队或进行中回合的线程，每个都带有
@@ -1029,6 +1119,8 @@ fork 还可能包含 `backtrack_depth_from_tail` 与 `dropped_turn_id`，而
 }
 ```
 
+`system_prompt` 的修改从下一个回合开始生效：已加载的引擎会被卸载，并用新的提示词根据线程历史重建。与修改 `workspace` 一样，线程有正在运行的回合时会拒绝该修改。
+
 `model_provider` 切换该线程未来回合所用的提供商。它
 接受内置种类（`deepseek`、`xai`、...）或已配置的路由名，与
 `/provider` 一样。`model_provider_id` 指名一个精确的 `[providers.<id>]` 表，
@@ -1049,7 +1141,7 @@ fork 还可能包含 `backtrack_depth_from_tail` 与 `dropped_turn_id`，而
 - `GET /v1/threads/{id}/turns/{turn_id}/artifacts` - 回合产出了什么：类型化引用加上工作区 delta 状态。参见 [回合工件](#回合工件)。
 - `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}?offset=&limit=&revision=` - 从工作区、post-turn 快照或会话工件目录读取一个引用。
 - `POST /v1/threads/{id}/compact`（手动压缩）
-- `POST /v1/threads/{id}/undo` - 以去掉最后 N 个回合的方式 fork 线程（`{"depth": N}`，默认 0 = 仅最后一个回合）；返回 fork 出的线程以及 `original_user_text`，以便 GUI 预填输入框
+- `POST /v1/threads/{id}/undo` - 以去掉最后 N 个回合的方式 fork 线程（`{"depth": N}`，默认 0 = 仅最后一个回合）；返回 fork 出的线程以及 `original_user_text`，以便 GUI 预填输入框。改用 `{"turn_id": "turn_…"}` 时，指明要去掉的用户回合及其之后的所有回合，并优先于 `depth`；Runtime 在线程的恢复保护下解析它，因此其他客户端同时追加的回合不会移动切点。该回合不是此线程的用户回合时返回 `400`
 - `POST /v1/threads/{id}/fork-at-turn` - 在一个具名用户回合处 fork（`{"turn_id": "turn_…"}`，即 `GET /v1/threads/{id}` 报告的那个）。该 fork *保留*那个回合及其之前的每个回合，丢弃其后的回合；因此指名最后一个回合会保留整个对话。回执与 `/undo` 相同（`thread`、`original_user_text`、`original_user_images`），携带*第一个被丢弃*的用户回合的提示词——即接下来被问的是什么，即使中间夹着一个无提示词回合（如一次手动 `/compact`）——这样客户端可以把它放回输入区供编辑。源线程、它的会话文档与工作区都不受影响，也没有文件回滚：fork 是一个兄弟对话，而回退工作区会把随之留下的分支一起回退。客户端应当指名回合，而不是计算 `depth`——它们渲染的转录与这里裁剪的回合列表不是同一个列表（引导、仅图片提示词与注入的交接各自只位于一侧），一个差一的客户端计数会在回答 `201` 的同时 fork 错前缀。当该回合不是该线程的用户回合时返回 `400`。
 - `POST /v1/threads/{id}/patch-undo` - 回滚被丢弃回合改动过的文件，随后做同样的 fork（`{"depth": N}`）；除 fork 出的线程外还返回 `patch_result`（`files_restored`、`summary`、`snapshot_label`）。所有权、信任、准入与中止规则，以及拒绝时的 `error.code` 取值，参见 [工作区恢复端点](#工作区恢复端点)。
 - `POST /v1/threads/{id}/file-revert` - 从线程拥有的一个恢复点中恢复恰好一个文件（`{"path", "snapshot_id", "expected_hash"}`）；永不 fork 对话。参见 [工作区恢复端点](#工作区恢复端点)。
@@ -1178,17 +1270,27 @@ Runtime 会移除它。客户端回显它所得到的值，不得自行构造、
 意味着该能力当前并非待决——它不是关于该审批如何被解决的证据；
 那要看 `approval.decided`。
 
-提供商的原始调用 ID 另行以 `tool_call_id` 出现在
+Engine 的工具执行 ID 另行以 `tool_call_id` 出现在
 `pending_approvals[]` 与审批事件上。它是用于把提示词
 挂到它所门控的工具行上的关联符，绝不会被当作决策接受。
 每个线程详情中的 `pending_approvals[]` 条目是
-`{ "id", "turn_id", "tool_name", "description", "intent_summary"?, "tool_call_id"?, "summary"? }`，
-其中 `id` 就是上文那个能力。`summary`（也出现在 `approval.required` 上）是
+`{ "id", "turn_id", "tool_name", "input"?, "description", "intent_summary"?, "tool_call_id"?, "summary"? }`，
+其中 `id` 就是上文那个能力。`input` 保存已捕获的工具输入。缺少 `input`
+表示没有可用的已捕获值；显式的 JSON `null` 则保留为已捕获的值。
+在经过身份验证的规范线程接口上，`approval.required` 事件携带同一份已捕获输入。
+`summary`（也出现在 `approval.required` 上）是
 对该受门控调用的一行描述，只由工具名与其参数构建，
 绝不来自模型文本（“Search the web for 'espresso'”、
 “Write notes/espresso.md”）；工作区内的路径为工作区相对路径。
 客户端应先展示它，并把原始参数留在其后。对任务与自动化的创建/更新，
 `summary` 还会写出所请求的信任模式、shell、自动批准、模式和工作区。
+对 shell 命令、任务门禁、shell 输入或校验器，若其 `curl`/`wget` 请求体携带凭据文件
+或名称表明是机密的变量，或读取由这两者或 `env`/`printenv` 送入的 stdin，`summary` 显示为
+``Upload credentials (`…`) with `…` ``；内置安全闸会拦住该调用，
+会话授权或已保存的 allow 规则都无法应答它。超过 64 KiB 或 4,096 个词、且文本中任意位置
+含有 `curl` 或 `wget` 的 shell 命令、shell 输入或校验器，以及嵌套过深而无法读取的调用，
+同样会被拦住，`summary` 保持普通内容。含有隐藏 Unicode 字符的 shell 命令
+会在创建任何审批之前被拒绝。
 
 在 `allow` 上带上 `"remember": true` 会为该工具及其参数类别记录一份**会话授权**
 （审批分组键：对简单的已知命令（例如 `git status`，其选项都是 `-s` 或 `--porcelain`
@@ -1207,8 +1309,10 @@ Runtime 会移除它。客户端回显它所得到的值，不得自行构造、
 撤销其中一个（发出 `approval.grant_revoked`）；下一次匹配的调用
 会再次提示。归档或删除线程会结束它的所有授权
 （归档会为每个授权发出 `approval.grant_revoked`；取消归档不会
-恢复它们）。授权在 Runtime 进程内是内存态：重启
-就会忘掉它们，而一个强制的（不可绕过的）提示永不会被授权回答。
+恢复它们）。授权保存在 Runtime 数据目录（`approval_grants.json`）。
+Runtime 重启后，线程的授权保持暂停，匹配的调用会再次提示，直到经过认证的客户端
+恢复该线程。无法读取的授权存储不含任何授权，因此每次调用都会提示。一个强制的
+（不可绕过的）提示永不会被授权回答。
 
 **用户输入**
 - `POST /v1/user-input/{thread_id}/{input_id}`，请求体
@@ -1577,9 +1681,9 @@ token 但成本为 `0.0`。于 v0.8.10 加入（#564）。
 }
 ```
 
-### 原生客户端路由（GPUI 桌面）
+### 原生客户端路由
 
-这些族在同一套 bearer 令牌传输上为 GPUI 桌面客户端服务。它们复用运行时既有的权威——
+这些族在同一套 bearer 令牌传输上为原生客户端服务。它们复用运行时既有的权威——
 引擎的 shell 管理器、持久线程存储、工作区限制层、
 配置的凭据管道——并不增加第二套运行时、会话存储、
 调度器或凭据存储。
@@ -2099,6 +2203,50 @@ Runtime 的提供商或模型默认值。
 并且永不解析密钥、环境变量值或认证命令。它是一个
 类别，永不是一个值、一个路径或一个环境变量名。
 
+### `POST /v1/providers/orcarouter/connect` —— 无终端的浏览器登录
+
+```json
+// 响应
+{ "attemptId": "0f3c…", "authorizeUrl": "https://www.orcarouter.ai/auth?…",
+  "expiresIn": 900 }
+```
+
+为没有终端的客户端运行与 `codewhale auth orcarouter` 相同的 OrcaRouter
+OAuth 2.0 + PKCE 登录。Engine 绑定自己的回环回调
+（`http://127.0.0.1:<port>/callback`），返回授权页 URL，并在后台最多等待
+`expiresIn` 秒。客户端在系统浏览器（绝不是内嵌视图）中打开 `authorizeUrl`
+并轮询该次尝试。浏览器回调后，Engine 交换授权码，拒绝授予 scope 不是 `api`
+的 key，经与 CLI 相同的入口保存 key，再像 `PUT /v1/providers/{id}/key` 一样把
+凭据标记同步到运行中的配置。它不会切换当前提供商；请用
+`POST /v1/providers/{id}/switch`。
+
+回调监听在 Engine 所在的计算机上，因此客户端只应在 Engine 与浏览器位于同一台
+计算机时提供此路由。新的 `POST` 会取消上一次尝试，且只能读取当前尝试。拒绝情况：
+id 不是 `orcarouter` 为 `400`；该路由凭据不可写为 `409`（理由与
+`credentialWritableReason` 相同）；无法绑定回调为 `500`。`GET /v1/providers`
+会在支持此路由的条目上标注 `"browserConnect": true`；否则以及在没有此路由的
+Engine 上不出现该字段。
+
+### `GET /v1/providers/orcarouter/connect/{attemptId}` 与 `DELETE …` —— 状态与取消
+
+```json
+{ "attemptId": "0f3c…", "status": "failed", "reason": "key_not_saved" }
+```
+
+`status` 为 `waiting`、`connected`、`declined`（用户在浏览器中拒绝）、
+`expired`（未按时回调）、`cancelled` 或 `failed`。`failed` 附带 `reason`：
+`authorization_error`（浏览器带回其他错误）、`callback_failed`、
+`not_writable`（交换前该路由凭据已不可写；未创建 key）、`exchange_failed`、
+`scope_refused` 或 `key_not_saved`。出现 `scope_refused` 或 `key_not_saved`
+时，OrcaRouter 已创建了一个 Codewhale 未保存的 key，用户应在 OrcaRouter 的
+Authorized Apps 中撤销它。`exchange_failed` 也可能发生在 OrcaRouter 已创建
+key 但响应丢失之后。
+
+`DELETE` 取消仍在等待浏览器的尝试。交换一旦开始，key 可能已经存在，因此该尝试
+会继续，并报告 `connected`，或带 `key_not_saved` 的 `failed`；此时 `DELETE`
+返回当前状态。未知或已被取代的 `attemptId` 为 `404`。只有 `POST` 响应携带授权页
+URL；任何状态、错误或日志都不携带它、key、授权码或 verifier。
+
 ### `POST /v1/providers/{id}/switch`
 
 ```json
@@ -2285,13 +2433,35 @@ Fleet 流（`/v1/fleet/runs/{run_id}/events`）保留自己的结束帧，
 请读条目的状态，或等待那个事件。
 
 常见事件名：`thread.started`、`thread.forked`、`turn.started`、
-`turn.lifecycle`、`turn.steered`、`turn.steer_dropped`、`turn.interrupt_requested`、
+`turn.lifecycle`、`turn.usage`、`turn.steered`、`turn.steer_dropped`、`turn.interrupt_requested`、
 `turn.completed`、`turn.artifacts`、`item.started`、`item.delta`、`item.completed`、
 `item.failed`、`item.interrupted`、`approval.required`、`approval.decided`、
 `approval.timeout`、`user_input.required`、`user_input.answered`、
 `user_input.canceled`、`tool_call.requested`、`tool_call.resolved`、
 `tool_call.timeout`、`tool_call.canceled`、`sandbox.denied`、
-`turn.workspace_snapshot`、`runtime.store_failure`。
+`turn.workspace_snapshot`、`turn.provider_request`、`runtime.store_failure`。
+
+`turn.usage` 是**一次模型调用**的回执：父回合的模型调用报告用量时发出，
+而不是每个回合一次。它的 `payload` 携带该次调用的 `usage`，
+`duration_ms` / `first_token_ms` / `request_ms` 计时，`maxOutputTokens` 额度，
+`billed_prompt_tokens`（提供商实际计费的提示大小：发生重试时取最后一次
+请求的输入，否则取本次调用的输入数）、以及 `cost` —— 该次调用按它实际派发的
+路由定价，形如 `{usd, cny, usd_priced, cny_priced}`。
+
+当该路由无法为这次调用用到的所有 token 类别定价时，`cost` 为 `null`；
+客户端不得把它读成“免费”。某币种的 `*_priced` 为 false 时，该币种未定价。
+这些回执覆盖父回合的模型调用；子代理和压缩用量通过其他路径到达。
+因此，逐调用价格之和只是部分估算，不是整个回合的完整账单。
+
+`turn.completed` 的 `payload.turn.usage` 携带回合的权威累计 token 用量，
+包括路由到其他工作的用量；它替换运行中的 token 计数，但不提供权威的
+上一回合费用。`GET /v1/threads/{id}/usage` 的线程总量仍是记账依据。
+移动页面在回合结束后保留已观察到的已定价调用估算，并标记为部分估算，
+并在新回合开始时重置读数。重放的日志序号只计数一次。
+`billed_prompt_tokens` 供 API 客户端使用；移动页头显示 token 用量和部分费用。
+
+`turn.provider_request` 携带请求诊断观察，不增加计费用量；详见
+[每次请求的缓存回执](CACHE.md#每次请求的回执)。
 
 `runtime.store_failure` 是运行时报告操作者自己磁盘状态的故障：会话运行时
 存储下的一个线程、回合或条目记录无法被读取、解析或写入。负载携带 `operation`
@@ -2317,7 +2487,7 @@ Fleet 流（`/v1/fleet/runs/{run_id}/events`）保留自己的结束帧，
 不同的标识符。`approval_id` 是 **审批** 一节所述、由 Runtime 铸造的一次性能力
 ——也是 `POST /v1/approvals/{id}` 唯一接受的値
 ——而 `approval.required` 还会把它重复在旧式的 `id` 字段中，供较旧
-客户端使用。`tool_call_id` 是提供商的原始工具调用 ID，仅为
+客户端使用。`tool_call_id` 是 Engine 的工具执行 ID，仅为
 关联而存在。自动解决的提示（线程 `auto_approve`，以及从不
 打开模态的 Auto-Review 姿态）也会铸造一个 `approval_id`，因此
 该字段在每条路径上只有一种含义；那些 ID 不注册等待者，对
@@ -2532,7 +2702,7 @@ cargo test -p codewhale-protocol --test parity_protocol --locked
 CI 在每次推送到 `main` 时以及发布标签上都会运行它。
 
 app-server 的 stdio 控制表面有自己的漂移防护——所声明的
-`capabilities` 方法集合被钉在 `crates/app-server/src/lib.rs`：
+`capabilities` 方法集合被钉在 `crates/app-server/src/tests.rs`：
 
 ```bash
 cargo test -p codewhale-app-server capabilities

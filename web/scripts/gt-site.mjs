@@ -46,7 +46,6 @@ const STEMS = {
   "docs-sandbox": { exportName: "docsSandbox", typeName: "DocsSandboxDict" },
   "docs-subagents": { exportName: "docsSubagents", typeName: "DocsSubagentsDict" },
   "docs-web": { exportName: "docsWeb", typeName: "DocsWebDict" },
-  "docs-computers": { exportName: "docsComputers", typeName: "DocsComputersDict" },
   "docs-auth": { exportName: "docsAuth", typeName: "DocsAuthDict" },
   "docs-trust": { exportName: "docsTrust", typeName: "DocsTrustDict" },
   states: { exportName: "states", typeName: "StatesDict" },
@@ -335,7 +334,7 @@ function usage() {
   import     gt-catalog → website dictionary TS only (no TUI writes)
   translate  fail-closed without GT_API_KEY + GT_PROJECT_ID
 
-Never wraps inference. Never edits crates/tui/src/prompts/text.rs.`);
+Never wraps inference. Never edits crates/engine/src/prompts/text.rs.`);
 }
 
 const command = process.argv[2] ?? "check";

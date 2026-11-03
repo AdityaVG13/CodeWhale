@@ -35,19 +35,20 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap},
 };
 
-use crate::client::system_one::DecisionRouterRoute;
-use crate::config::{AutoConfig, AutoRouterConfig, Config, ProviderKind};
-use crate::model_inventory::ModelInventory;
-use crate::model_routing::{AutoRouteSelection, provider_router_candidates};
 use crate::tui::app::{App, StatusToastLevel};
 use crate::tui::history::HistoryCell;
-use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent,
     centered_modal_area, render_modal_footer, render_modal_surface,
 };
+use codewhale_config::ProviderKind;
+use codewhale_engine::client::system_one::DecisionRouterRoute;
+use codewhale_engine::model_inventory::ModelInventory;
+use codewhale_engine::model_routing::{AutoRouteSelection, provider_router_candidates};
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+use codewhale_runtime::config::{AutoConfig, AutoRouterConfig, Config};
+use codewhale_tui_kit::menu_style;
 
 /// Pinned OpenRouter id for Jev; `~typesafe/jev-latest` is also accepted.
 pub(crate) const JEV_OPENROUTER_MODEL: &str = "typesafe/jev-1.13";
@@ -162,7 +163,7 @@ pub(crate) fn preset_router_config(
                 provider: Some(route.as_str().to_string()),
                 model: Some(model.to_string()),
                 timeout_secs: Some(JEV_TIMEOUT_SECS),
-                min_confidence: Some(crate::config::DEFAULT_AUTO_ROUTER_MIN_CONFIDENCE),
+                min_confidence: Some(codewhale_runtime::config::DEFAULT_AUTO_ROUTER_MIN_CONFIDENCE),
                 ..Default::default()
             }))
         }
@@ -212,7 +213,7 @@ pub(crate) fn persist_auto_router(
     config_path: Option<&Path>,
     router: Option<&AutoRouterConfig>,
 ) -> anyhow::Result<PathBuf> {
-    use crate::config_persistence::{
+    use codewhale_runtime::config_persistence::{
         config_toml_path, mutate_config_document, set_document_value, unset_document_value,
     };
     let path = config_toml_path(config_path)?;
@@ -249,7 +250,7 @@ pub(crate) fn persist_auto_router(
 pub(crate) async fn handle_router_request(
     app: &mut App,
     config: &mut Config,
-    task_manager: &crate::task_manager::TaskManager,
+    task_manager: &codewhale_engine::task_manager::TaskManager,
     request: RouterRequest,
 ) {
     match request {
@@ -303,15 +304,15 @@ async fn test_preset(app: &mut App, config: &Config, preset: RouterPreset) {
                 .router = Some(router.clone());
             let mut lines = vec![router_summary(router, locale)];
             // Captured before the call, like any background provider request.
-            let cost_scope = crate::cost_status::scope_token();
-            match crate::model_routing::test_auto_router(&candidate).await {
+            let cost_scope = codewhale_engine::cost_status::scope_token();
+            match codewhale_engine::model_routing::test_auto_router(&candidate).await {
                 Ok((selection, latency_ms)) => {
                     // The test call is real spend: settle it into session
                     // cost exactly as a turn's routing call is settled.
-                    crate::cost_status::report_runtime_usage_batch(
+                    codewhale_engine::cost_status::report_runtime_usage_batch(
                         cost_scope,
                         None,
-                        &crate::cost_status::RuntimeUsageBatch {
+                        &codewhale_engine::cost_status::RuntimeUsageBatch {
                             decisions: Vec::new(),
                             records: selection.routed_usage.clone(),
                             drop_records: selection.routed_usage_drop_records.clone(),
@@ -340,7 +341,7 @@ async fn test_preset(app: &mut App, config: &Config, preset: RouterPreset) {
 async fn save_preset(
     app: &mut App,
     config: &mut Config,
-    task_manager: &crate::task_manager::TaskManager,
+    task_manager: &codewhale_engine::task_manager::TaskManager,
     preset: RouterPreset,
 ) {
     let locale = app.ui_locale;
@@ -389,13 +390,13 @@ async fn save_preset(
                 app.add_message(HistoryCell::Error {
                     message: tr(locale, MessageId::RouterRuntimeNotReloaded)
                         .replace("{error}", &error.to_string()),
-                    severity: crate::error_taxonomy::ErrorSeverity::Warning,
+                    severity: codewhale_error_taxonomy::ErrorSeverity::Warning,
                 });
             }
         }
         Err(error) => app.add_message(HistoryCell::Error {
             message: tr(locale, MessageId::RouterNotSaved).replace("{error}", &error.to_string()),
-            severity: crate::error_taxonomy::ErrorSeverity::Error,
+            severity: codewhale_error_taxonomy::ErrorSeverity::Error,
         }),
     }
 }
@@ -425,7 +426,10 @@ fn describe_test_selection(
     let percent = |bp: u16| format!("{}%", (u32::from(bp) + 50) / 100);
     let mut lines = vec![
         tr(locale, MessageId::RouterTestWouldRoute)
-            .replace("{request}", crate::model_routing::ROUTER_TEST_REQUEST)
+            .replace(
+                "{request}",
+                codewhale_engine::model_routing::ROUTER_TEST_REQUEST,
+            )
             .replace(
                 "{provider}",
                 selection
@@ -489,7 +493,7 @@ fn custom_router_help(config: &Config, locale: Locale) -> String {
 [auto.router]\n\
 kind = \"chat\"            # or \"decision\" for Jev\n\
 provider = \"deepseek\"    # decision: \"openrouter\" or \"typesafe\"\n\
-model = \"deepseek-v4-flash\"\n\
+model = \"deepseek-flash\"\n\
 thinking = \"off\"         # chat routers only\n\
 timeout_secs = 4\n\
 # min_confidence = 0.5     # decision routers only\n\n\
@@ -650,9 +654,13 @@ impl ModalView for RouterSetupView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         if matches!(self.mode, Mode::Pick)
-            && let Some(motion) = crate::tui::list_nav::motion(&key)
-            && let Some(next) =
-                crate::tui::list_nav::apply(self.cursor, self.rows.len(), self.rows.len(), motion)
+            && let Some(motion) = codewhale_tui_kit::list_nav::motion(&key)
+            && let Some(next) = codewhale_tui_kit::list_nav::apply(
+                self.cursor,
+                self.rows.len(),
+                self.rows.len(),
+                motion,
+            )
         {
             self.cursor = next;
             return ViewAction::None;
@@ -759,7 +767,7 @@ impl ModalView for RouterSetupView {
                     .min(self.rows.len().saturating_sub(visible));
                 if header > 0 {
                     lines.push(Line::from(Span::styled(
-                        crate::tui::ui_text::semantic_truncate(&self.current, width),
+                        codewhale_tui_kit::ui_text::semantic_truncate(&self.current, width),
                         muted,
                     )));
                 }
@@ -775,12 +783,12 @@ impl ModalView for RouterSetupView {
                     } else {
                         muted
                     };
-                    let pointer = crate::tui::glyphs::selection_marker(is_cursor);
+                    let pointer = codewhale_tui_kit::glyphs::selection_marker(is_cursor);
                     let row_y = content
                         .y
                         .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
                     lines.push(Line::from(Span::styled(
-                        crate::tui::ui_text::semantic_truncate(
+                        codewhale_tui_kit::ui_text::semantic_truncate(
                             &format!("{pointer} {}", row.label),
                             width,
                         ),
@@ -790,7 +798,7 @@ impl ModalView for RouterSetupView {
                         lines.push(Line::from(Span::styled(
                             format!(
                                 "    {}",
-                                crate::tui::ui_text::semantic_truncate(
+                                codewhale_tui_kit::ui_text::semantic_truncate(
                                     &row.hint,
                                     width.saturating_sub(4)
                                 )
@@ -829,21 +837,25 @@ mod tests {
     }
 
     fn deepseek_with_openrouter_key(openrouter_key: bool) -> Config {
-        Config {
-            provider: Some("deepseek".to_string()),
-            default_text_model: Some("deepseek-v4-pro".to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                deepseek: crate::config::ProviderConfig {
+        {
+            let __cw_config_init_0_0 = Some("deepseek".to_string());
+            let __cw_config_init_0_1 = Some("deepseek-v4-pro".to_string());
+            let __cw_config_init_0_2 = Some(codewhale_runtime::config::ProvidersConfig {
+                deepseek: codewhale_runtime::config::ProviderConfig {
                     api_key: Some("ds-test-key".to_string()),
                     ..Default::default()
                 },
-                openrouter: crate::config::ProviderConfig {
+                openrouter: codewhale_runtime::config::ProviderConfig {
                     api_key: openrouter_key.then(|| "or-test-key".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
-            }),
-            ..Default::default()
+            });
+            let mut __cw_config_init_0_value: Config = Default::default();
+            __cw_config_init_0_value.provider = __cw_config_init_0_0;
+            __cw_config_init_0_value.default_text_model = __cw_config_init_0_1;
+            __cw_config_init_0_value.providers = __cw_config_init_0_2;
+            __cw_config_init_0_value
         }
     }
 
@@ -885,7 +897,7 @@ mod tests {
             .expect("fast writes a table");
         assert_eq!(fast.kind.as_deref(), Some("chat"));
         assert_eq!(fast.provider.as_deref(), Some("deepseek"));
-        assert_eq!(fast.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(fast.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(fast.thinking.as_deref(), Some("off"));
 
         assert!(matches!(

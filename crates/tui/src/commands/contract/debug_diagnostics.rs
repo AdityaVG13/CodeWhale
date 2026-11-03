@@ -12,14 +12,15 @@ use codewhale_command_contract::facets::*;
 use codewhale_models::{MessageRequest, SystemPrompt, Usage};
 
 use super::SharedCommandHost;
-use crate::client::{
+use crate::context_report::project_source_map as source_map;
+use crate::tui::app::App;
+use codewhale_config::pricing::CostCurrency;
+use codewhale_engine::client::{
     CacheWarmupKey, PromptInspection, PromptLayerStability, inspect_prompt_for_request,
 };
-use crate::config::provider_has_balance_api;
-use crate::context_report::project_source_map as source_map;
-use crate::pricing::{CostCurrency, token_usage_for_pricing};
-use crate::tool_inspection::project_snapshot as tool_snapshot;
-use crate::tui::app::App;
+use codewhale_engine::pricing::token_usage_for_pricing;
+use codewhale_engine::tool_inspection::project_snapshot as tool_snapshot;
+use codewhale_runtime::config::provider_has_balance_api;
 
 pub(super) struct DebugDiagnosticsAdapter<'a> {
     pub(super) host: SharedCommandHost<'a>,
@@ -58,12 +59,8 @@ impl CommandDebugDiagnosticsContext for DebugDiagnosticsAdapter<'_> {
 
     fn token_projection(&self) -> DebugTokenProjection {
         let app = self.host.app.borrow();
-        let window = crate::route_budget::route_context_window_tokens(
-            app.api_provider,
-            app.effective_model_for_budget(),
-            app.active_route_limits,
-        );
-        let estimated = crate::compaction::estimate_input_tokens_conservative(
+        let window = app.effective_context_window();
+        let estimated = codewhale_engine::compaction::estimate_input_tokens_conservative(
             &app.api_messages,
             app.system_prompt.as_ref(),
         );
@@ -105,6 +102,11 @@ impl CommandDebugDiagnosticsContext for DebugDiagnosticsAdapter<'_> {
                     reasoning_tokens: rec.reasoning_tokens,
                     reasoning_replay_tokens: rec.reasoning_replay_tokens,
                     server_tool_use: None,
+
+                    input_audio_tokens: None,
+                    output_audio_tokens: None,
+
+                    request_usages: Vec::new(),
                 });
                 DebugCacheTurn {
                     provider: rec.provider.map(|provider| provider.as_str().to_string()),
@@ -247,7 +249,12 @@ pub(crate) fn observe_cache_for_app(
         metadata: None,
         thinking: None,
         reasoning_effort: app
-            .reasoning_effort_api_value_for_replay(target.provider, replay_base_url, &target.model)
+            .reasoning_effort_api_value_for_replay(
+                target.provider,
+                &target.provider_identity,
+                replay_base_url,
+                &target.model,
+            )
             .map(str::to_string),
         stream: Some(true),
         temperature: None,
@@ -462,7 +469,9 @@ fn prompt_inspection(inspection: PromptInspection) -> DebugPromptInspection {
 }
 
 fn host_inspection(inspection: DebugPromptInspection) -> PromptInspection {
-    use crate::client::{PromptLayerInspection, ToolResultInspection, TurnMetaInspection};
+    use codewhale_engine::client::{
+        PromptLayerInspection, ToolResultInspection, TurnMetaInspection,
+    };
     PromptInspection {
         base_static_prefix_hash: inspection.base_static_prefix_hash,
         full_request_prefix_hash: inspection.full_request_prefix_hash,

@@ -11,24 +11,26 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{ApprovalPolicyControl, Config, ProviderKind};
-use crate::features::{FEATURES, Stage};
-use crate::settings::Settings;
-use crate::tools::UserInputResponse;
-use crate::tools::subagent::{
-    FleetRole, SubAgentAssignment, SubAgentResult, SubAgentStatus, localized_whale_display_names,
-};
 use crate::tui::app::App;
 use crate::tui::approval::{ElevationOption, ReviewDecision};
 use crate::tui::focus_texture::FocusTextureMode;
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
-use crate::tui::menu_style;
 use crate::tui::tideline::{SettingApplySemantics, SettingAuthority, SettingFact, UiSnapshot};
 use crate::tui::widgets::agent_card::AgentLifecycle;
+use codewhale_agent_contract::role::FleetRole;
+use codewhale_config::ProviderKind;
+use codewhale_engine::tools::UserInputResponse;
+use codewhale_engine::tools::subagent::{
+    SubAgentAssignment, SubAgentResult, SubAgentStatus, localized_whale_display_names,
+};
 use codewhale_localization::{
     Locale, MessageId, configured_locale_is_partial_pack, normalize_configured_locale, tr, tr_key,
 };
 use codewhale_palette as palette;
+use codewhale_runtime::config::{ApprovalPolicyControl, Config};
+use codewhale_runtime::features::{FEATURES, Stage};
+use codewhale_runtime::settings::Settings;
+use codewhale_tui_kit::menu_style;
 
 pub mod automations;
 pub mod extensions;
@@ -122,7 +124,11 @@ pub(crate) fn render_modal_surface(area: Rect, popup_area: Rect, buf: &mut Buffe
 
     Clear.render(popup_area, buf);
     Block::default()
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .render(popup_area, buf);
 }
 
@@ -146,13 +152,17 @@ pub(crate) fn render_underwater_surface(
     };
     Clear.render(area, buf);
     Block::default()
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .render(area, buf);
     // Ratatui clips long block titles at the border edge without signalling
     // that anything is missing. Reserve the corner cells and semantic-ellipsis
     // the title so compact terminals still read as intentional instruments.
     let title_width = usize::from(surface.width.saturating_sub(4));
-    let title = crate::tui::ui_text::semantic_truncate(&title.into(), title_width);
+    let title = codewhale_tui_kit::ui_text::semantic_truncate(&title.into(), title_width);
     let block = Block::default()
         .title(Line::from(Span::styled(
             format!(" {title} "),
@@ -162,7 +172,11 @@ pub(crate) fn render_underwater_surface(
         )))
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .padding(Padding::new(1, 1, u16::from(area.height >= 24), 0));
     let inner = block.inner(surface);
     block.render(surface, buf);
@@ -760,9 +774,10 @@ pub enum ViewEvent {
     },
     SessionSelected {
         session_id: String,
+        workspace: std::path::PathBuf,
     },
     SessionRenamed {
-        metadata: Box<crate::session_manager::SessionMetadata>,
+        metadata: Box<codewhale_engine::session_manager::SessionMetadata>,
     },
     /// A session's archive flag was flipped (#2934 / #4397).
     ///
@@ -771,7 +786,7 @@ pub enum ViewEvent {
     /// archive, which is exactly the kind of small lie that erodes trust in
     /// every other receipt.
     SessionArchived {
-        metadata: Box<crate::session_manager::SessionMetadata>,
+        metadata: Box<codewhale_engine::session_manager::SessionMetadata>,
     },
     SessionDeleted {
         session_id: String,
@@ -786,10 +801,10 @@ pub enum ViewEvent {
     /// status message.
     ModelPickerApplied {
         model: String,
-        identity: Option<crate::config::ProviderIdentity>,
-        effort: crate::reasoning_preference::ReasoningEffort,
+        identity: Option<codewhale_runtime::config::ProviderIdentity>,
+        effort: codewhale_engine::reasoning_preference::ReasoningEffort,
         previous_model: String,
-        previous_effort: crate::reasoning_preference::ReasoningEffort,
+        previous_effort: codewhale_engine::reasoning_preference::ReasoningEffort,
         save_as_startup_default: bool,
     },
     /// Emitted by the `/model` picker on Esc so the next open can restore
@@ -808,13 +823,13 @@ pub enum ViewEvent {
     /// Re-resolve readiness + rebuild catalog rows for the open model picker.
     ModelPickerRefresh,
     ModelPickerTogglePin {
-        provider: crate::config::ProviderKind,
+        provider: codewhale_config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
     },
     ModelPickerMovePin {
-        provider: crate::config::ProviderKind,
+        provider: codewhale_config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
@@ -823,7 +838,7 @@ pub enum ViewEvent {
     /// `⇧F` in the picker: add the row's exact route to the team (the
     /// selected saved team), or remove it when it is already there (design §10 F1).
     ModelPickerToggleFleet {
-        provider: crate::config::ProviderKind,
+        provider: codewhale_config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
@@ -836,10 +851,10 @@ pub enum ViewEvent {
     },
     FleetProfileRoutePicked {
         editor_id: uuid::Uuid,
-        provider: crate::config::ProviderKind,
+        provider: codewhale_config::ProviderKind,
         provider_id: Option<String>,
         model: String,
-        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+        reasoning: Option<codewhale_engine::reasoning_preference::ReasoningEffort>,
     },
     FleetProfileRouteCommitRequested {
         editor_id: uuid::Uuid,
@@ -859,14 +874,14 @@ pub enum ViewEvent {
     FleetRoutePicked {
         target: crate::tui::views::fleet_detail::FleetRouteTarget,
         editor_id: uuid::Uuid,
-        provider: crate::config::ProviderKind,
+        provider: codewhale_config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
-        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+        reasoning: Option<codewhale_engine::reasoning_preference::ReasoningEffort>,
     },
     ModelPickerNeedsAuth {
-        identity: crate::config::ProviderIdentity,
+        identity: codewhale_runtime::config::ProviderIdentity,
         model: String,
         reason: String,
     },
@@ -891,14 +906,14 @@ pub enum ViewEvent {
     /// that already has credentials — the handler should perform the same
     /// switch as `AppAction::SwitchProvider`.
     ProviderPickerApplied {
-        identity: crate::config::ProviderIdentity,
+        identity: codewhale_runtime::config::ProviderIdentity,
     },
     /// Emitted by the `/provider` picker after the user types an API key
     /// inline for a provider that lacked one. The handler validates the key
     /// live; on success it reopens the guided flow at the model-pick stage
     /// without persisting yet (#3875).
     ProviderPickerApiKeySubmitted {
-        identity: crate::config::ProviderIdentity,
+        identity: codewhale_runtime::config::ProviderIdentity,
         api_key: String,
         /// Endpoint chosen in the wizard's billing-route stage, applied to the
         /// verification config only — nothing is written until confirm (#4526).
@@ -908,7 +923,7 @@ pub enum ViewEvent {
     /// accepted provider + model. The handler persists the key (and model)
     /// via the comment-preserving config path, then performs the switch.
     ProviderPickerSetupConfirmed {
-        identity: crate::config::ProviderIdentity,
+        identity: codewhale_runtime::config::ProviderIdentity,
         api_key: String,
         model: String,
         context_window: Option<u32>,
@@ -940,24 +955,24 @@ pub enum ViewEvent {
     /// Emitted only after the picker showed owner, exact path, and the full
     /// read-only side-effect contract and the user explicitly confirmed it.
     ProviderPickerExternalConsentConfirmed {
-        provider: crate::config::ProviderKind,
+        provider: codewhale_config::ProviderKind,
         consent_provider: codewhale_config::ProviderKind,
         source: codewhale_config::ExternalCredentialSource,
         path: std::path::PathBuf,
     },
     /// One-step revocation from a provider row that currently has consent.
     ProviderPickerExternalConsentRevoked {
-        provider: crate::config::ProviderKind,
+        provider: codewhale_config::ProviderKind,
     },
     /// Emitted by the `/provider` picker (the `M` action) to jump straight to
     /// the `/model` picker pre-filtered to the highlighted provider (#3083).
     ProviderPickerOpenModels {
-        identity: crate::config::ProviderIdentity,
+        identity: codewhale_runtime::config::ProviderIdentity,
     },
     /// Emitted by `/provider` `T`: probe `/models` and refresh readiness
     /// without treating a 2xx as model-ready (#5350).
     ProviderPickerTestConnection {
-        identity: crate::config::ProviderIdentity,
+        identity: codewhale_runtime::config::ProviderIdentity,
         /// Restore Catalog vs Configured after the probe. Must not force
         /// the all-providers catalog if the user was on configured-only.
         catalog_view: bool,
@@ -971,7 +986,7 @@ pub enum ViewEvent {
     /// updates `app.status_items` immediately and persists on `final_save`
     /// so the footer animates without a write per keystroke.
     StatusItemsUpdated {
-        items: Vec<crate::config::StatusItem>,
+        items: Vec<codewhale_runtime::config::StatusItem>,
         final_save: bool,
     },
     /// Emitted by the `/hotbar` setup wizard when the user saves the draft
@@ -1048,7 +1063,7 @@ pub enum ViewEvent {
     /// The Fleet list view asks the host to open a saved Fleet's detail view.
     FleetListOpenDetailRequested {
         name: String,
-        scope: crate::fleet::store::FleetScope,
+        scope: codewhale_engine::fleet::store::FleetScope,
     },
     /// A Fleet store mutation happened (select/save/delete/rename/copy).
     /// The message is the exact receipt; the host refreshes roster state.
@@ -1060,8 +1075,8 @@ pub enum ViewEvent {
     /// renders TOML deterministically from the validated draft and persists it
     /// atomically in the explicitly selected project or personal scope.
     FleetProfileDraftCommitRequested {
-        draft: Box<crate::fleet::profile::FleetProfileDraft>,
-        scope: crate::fleet::profile::FleetProfileScope,
+        draft: Box<codewhale_engine::fleet::profile::FleetProfileDraft>,
+        scope: codewhale_engine::fleet::profile::FleetProfileScope,
     },
     /// Emitted by the Fleet setup Model step when the user selects a route that
     /// has structurally valid external-consent credentials but is not the
@@ -1145,7 +1160,7 @@ pub enum ViewEvent {
     /// import / update / remove / trust action. The host runs the mutation
     /// controller and rebuilds the open manager view.
     SkillMutationRequested {
-        request: crate::skills::mutation::SkillMutationRequest,
+        request: codewhale_skills::mutation::SkillMutationRequest,
     },
     /// Toggle owned-only vs compatible audit scan inside the skills manager.
     SkillsManagerToggleCompatible,
@@ -1185,6 +1200,10 @@ pub enum ViewAction {
 
 pub trait ModalView: std::any::Any {
     fn kind(&self) -> ModalKind;
+    fn set_locale(&mut self, _locale: Locale) {}
+    fn input_context_id(&self) -> usize {
+        0
+    }
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction;
     /// Returns `true` if the modal consumed the paste; `false` to let the
     /// host route the text elsewhere (e.g. drop it because a modal is open,
@@ -1243,6 +1262,7 @@ pub trait ModalView: std::any::Any {
 
 #[derive(Default)]
 pub struct ViewStack {
+    locale: Option<Locale>,
     views: Vec<Box<dyn ModalView>>,
     /// Focus-context texture prototype mode (#4823). `Off` by default, which
     /// keeps the render output byte-identical to the pre-prototype path.
@@ -1250,10 +1270,10 @@ pub struct ViewStack {
     /// Theme snapshot for the texture pass, set alongside the mode each
     /// frame. `None` (e.g. tests that never opt in) disables the texture.
     focus_texture_theme: Option<codewhale_palette::UiTheme>,
-    /// When the view now on top became the top view — pushed, or revealed
-    /// by closing or removing the views above it. A key observed before
+    /// When the input context on top became visible — pushed, advanced, or
+    /// revealed by closing or removing the views above it. A key observed before
     /// this instant was typed at something else and must never answer an
-    /// approval or elevation card that only then became visible (approvals M2).
+    /// approval, elevation or question prompt that only then became visible.
     top_since: Option<std::time::Instant>,
 }
 
@@ -1265,26 +1285,40 @@ pub struct ViewTick {
     pub redraw: bool,
 }
 
+/// Whether this view is the approval card for exactly `gate` (the projected
+/// approval id). Used by the web mirror to dismiss the matching card — never
+/// an unrelated approval that happens to be on top.
+fn view_is_approval_for_gate(view: &dyn ModalView, gate: &str) -> bool {
+    view.kind() == ModalKind::Approval
+        && view
+            .approval_request_id()
+            .is_some_and(|tool_id| crate::remote_control::projected_approval_id(tool_id) == gate)
+}
+
 impl ViewStack {
     pub fn new() -> Self {
         Self {
             views: Vec::new(),
+            locale: None,
             focus_texture: FocusTextureMode::Off,
             focus_texture_theme: None,
             top_since: None,
         }
     }
 
-    /// Identity of the top view, for noticing when a different view becomes
-    /// the top one.
-    fn top_identity(&self) -> Option<*const ()> {
-        self.views
-            .last()
-            .map(|view| std::ptr::from_ref::<dyn ModalView>(view.as_ref()).cast::<()>())
+    /// Identity of the top view and input context, for noticing when a
+    /// different view or question becomes the top one.
+    fn top_identity(&self) -> Option<(*const (), usize)> {
+        self.views.last().map(|view| {
+            (
+                std::ptr::from_ref::<dyn ModalView>(view.as_ref()).cast::<()>(),
+                view.input_context_id(),
+            )
+        })
     }
 
     /// Restamp `top_since` when the top view changed since `before`.
-    fn note_top_change(&mut self, before: Option<*const ()>) {
+    fn note_top_change(&mut self, before: Option<(*const (), usize)>) {
         if self.top_identity() != before {
             self.top_since = Some(std::time::Instant::now());
         }
@@ -1298,12 +1332,33 @@ impl ViewStack {
         self.focus_texture_theme = Some(theme);
     }
 
+    pub fn set_locale(&mut self, locale: Locale) {
+        if self.locale == Some(locale) {
+            return;
+        }
+        self.locale = Some(locale);
+        for view in &mut self.views {
+            view.set_locale(locale);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.views.is_empty()
     }
 
     pub fn top_kind(&self) -> Option<ModalKind> {
         self.views.last().map(|view| view.kind())
+    }
+
+    pub(crate) fn remove_owned_evidence_pagers(&mut self) {
+        let top = self.top_identity();
+        self.views.retain_mut(|view| {
+            !view
+                .as_any_mut()
+                .downcast_mut::<crate::tui::pager::PagerView>()
+                .is_some_and(|pager| pager.has_owned_evidence())
+        });
+        self.note_top_change(top);
     }
 
     /// Remove the approval card deciding exactly `gate` at any depth, not
@@ -1314,7 +1369,7 @@ impl ViewStack {
         let before = self.views.len();
         let top = self.top_identity();
         self.views
-            .retain(|view| !crate::remote_control::view_is_approval_for_gate(view.as_ref(), gate));
+            .retain(|view| !view_is_approval_for_gate(view.as_ref(), gate));
         self.note_top_change(top);
         self.views.len() != before
     }
@@ -1376,13 +1431,14 @@ impl ViewStack {
     }
 
     /// Whether a key observed at `observed_at` predates the moment the
-    /// approval or elevation card on top became visible — raised, or revealed
-    /// by closing the card above it — i.e. it was typed ahead and must not
-    /// answer that card. Two quick answers cannot confirm the card beneath.
+    /// approval, elevation or question prompt on top became visible — raised,
+    /// advanced, or revealed by closing the card above it — i.e. it was typed
+    /// ahead and must not answer that prompt. Two quick answers cannot confirm
+    /// the next prompt.
     pub fn key_predates_top_approval(&self, observed_at: std::time::Instant) -> bool {
         matches!(
             self.top_kind(),
-            Some(ModalKind::Approval | ModalKind::Elevation)
+            Some(ModalKind::Approval | ModalKind::Elevation | ModalKind::UserInput)
         ) && self
             .top_since
             .is_some_and(|top_since| observed_at < top_since)
@@ -1407,7 +1463,10 @@ impl ViewStack {
         self.views.last().map(|view| view.occupied_region(area))
     }
 
-    pub fn push<V: ModalView + 'static>(&mut self, view: V) {
+    pub fn push<V: ModalView + 'static>(&mut self, mut view: V) {
+        if let Some(locale) = self.locale {
+            view.set_locale(locale);
+        }
         let kind = view.kind();
         let top = self.top_identity();
         self.views.push(Box::new(view));
@@ -1418,7 +1477,10 @@ impl ViewStack {
     /// Push an already-boxed view back onto the stack. Used by call sites
     /// that pop a view, mutate it externally, and need to restore it without
     /// the generic `push` re-boxing dance.
-    pub fn push_boxed(&mut self, view: Box<dyn ModalView>) {
+    pub fn push_boxed(&mut self, mut view: Box<dyn ModalView>) {
+        if let Some(locale) = self.locale {
+            view.set_locale(locale);
+        }
         let kind = view.kind();
         let top = self.top_identity();
         self.views.push(view);
@@ -1463,7 +1525,7 @@ impl ViewStack {
         // is unchanged.
         for view in &self.views {
             let region = view.occupied_region(area);
-            crate::tui::osc8::overlay_frame_links(region, Vec::new());
+            codewhale_tui_kit::osc8::overlay_frame_links(region, Vec::new());
             render_modal_backdrop(region, buf);
             view.render(area, buf);
         }
@@ -1478,11 +1540,13 @@ impl ViewStack {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<ViewEvent> {
+        let top = self.top_identity();
         let action = self
             .views
             .last_mut()
             .map(|view| view.handle_key(key))
             .unwrap_or(ViewAction::None);
+        self.note_top_change(top);
         self.apply_action(action)
     }
 
@@ -1968,8 +2032,7 @@ enum ConfigSection {
     Experimental,
 }
 
-/// The seven Tideline settings categories in rail order
-/// (`docs/design/tideline-redesign.html`, "Settings categories").
+/// The seven settings categories in rail order.
 ///
 /// A category is a projection over the existing [`ConfigRow`] store: rows keep
 /// their fine-grained [`ConfigSection`]; the category follows the section
@@ -2226,12 +2289,14 @@ impl ConfigView {
             }
             Err(error) => (Settings::default(), Some(error.to_string())),
         };
-        let (config, config_error) =
-            match Config::load(app.config_path.clone(), app.config_profile.as_deref()) {
-                Ok(config) => (config, None),
-                Err(error) => (Config::default(), Some(error.to_string())),
-            };
-        let motion_override = crate::settings::detect_low_motion_override();
+        let (config, config_error) = match codewhale_plugins::providers::load_config(
+            app.config_path.clone(),
+            app.config_profile.as_deref(),
+        ) {
+            Ok(config) => (config, None),
+            Err(error) => (Config::default(), Some(error.to_string())),
+        };
+        let motion_override = codewhale_runtime::settings::detect_low_motion_override();
         let motion_facts = |facts: ConfigRowFacts| match motion_override {
             Some(source) => facts.overridden(source.is_environment(), source.label()),
             None => facts,
@@ -2350,12 +2415,8 @@ impl ConfigView {
                 key: "effective_context_window".to_string(),
                 value: format!(
                     "{} tokens · {}",
-                    crate::route_budget::route_context_window_tokens(
-                        app.api_provider,
-                        app.effective_model_for_budget(),
-                        app.active_route_limits,
-                    ),
-                    app.active_context_window_source.display_label()
+                    app.effective_context_window(),
+                    app.effective_context_window_source().display_label()
                 ),
                 editable: false,
                 scope: ConfigScope::Session,
@@ -2382,7 +2443,7 @@ impl ConfigView {
                 value: settings.reasoning_effort.as_deref().map_or_else(
                     || tr(app.ui_locale, MessageId::ConfigDefaultReasoning).to_string(),
                     |value| {
-                        crate::reasoning_preference::ReasoningEffort::from_setting_for_provider(
+                        codewhale_engine::reasoning_preference::ReasoningEffort::from_setting_for_provider(
                             value,
                             app.api_provider,
                         )
@@ -2413,7 +2474,7 @@ impl ConfigView {
             shell_row,
             ConfigRow {
                 key: "telemetry".to_string(),
-                value: crate::telemetry_notice::saved_preference_enabled(&config).to_string(),
+                value: codewhale_engine::telemetry_notice::saved_preference_enabled(&config).to_string(),
                 editable: true,
                 scope: ConfigScope::Saved,
                 // Telemetry is a trust decision, not a network knob.
@@ -3317,7 +3378,7 @@ impl ConfigView {
             .iter()
             .position(|idx| *idx == self.selected)
             .unwrap_or(0);
-        let next = crate::tui::list_nav::wrap_index(current, matches.len(), delta);
+        let next = codewhale_tui_kit::list_nav::wrap_index(current, matches.len(), delta);
 
         self.selected = matches[next];
         self.clear_hover();
@@ -3701,9 +3762,10 @@ impl ConfigView {
             && row.scope == ConfigScope::Saved
             && let Some(effective_currency) = effective
         {
-            let saved_cost_currency = crate::pricing::CostCurrency::from_setting(&row.value);
+            let saved_cost_currency =
+                codewhale_config::pricing::CostCurrency::from_setting(&row.value);
             let effective_cost_currency =
-                crate::pricing::CostCurrency::from_setting(effective_currency);
+                codewhale_config::pricing::CostCurrency::from_setting(effective_currency);
             if saved_cost_currency != effective_cost_currency {
                 return format!(
                     "{}{}",
@@ -3766,8 +3828,8 @@ fn config_base_url_row_value(app: &App) -> String {
 
 fn cost_currency_config_value(app: &App) -> String {
     match app.cost_currency {
-        crate::pricing::CostCurrency::Usd => "usd",
-        crate::pricing::CostCurrency::Cny => "cny",
+        codewhale_config::pricing::CostCurrency::Usd => "usd",
+        codewhale_config::pricing::CostCurrency::Cny => "cny",
     }
     .to_string()
 }
@@ -4367,6 +4429,7 @@ impl ModalView for ConfigView {
 
         let inner =
             render_underwater_surface(area, buf, self.tr(MessageId::ConfigModalTitle).to_string());
+        let mut choice_rail = None;
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
             *self.last_choice_hitboxes.borrow_mut() = Vec::new();
             *self.last_editor_controls.borrow_mut() = Vec::new();
@@ -4463,17 +4526,32 @@ impl ModalView for ConfigView {
                     .min(max_start);
                 let end = (start + visible_options).min(choices.len());
                 let mut hitboxes = Vec::new();
+                let scrolls = visible_options < choices.len();
+                if scrolls {
+                    choice_rail = Some((
+                        Rect {
+                            x: inner.x,
+                            y: inner.y.saturating_add(lines.len() as u16),
+                            width: inner.width,
+                            height: u16::try_from(visible_options).unwrap_or(u16::MAX),
+                        },
+                        choices.len(),
+                        start,
+                        visible_options,
+                    ));
+                }
+                let label_width = usize::from(inner.width).saturating_sub(8 + usize::from(scrolls));
 
                 for (choice_idx, choice) in choices.iter().enumerate().take(end).skip(start) {
                     let selected = choice_idx == edit.selected_choice;
-                    let marker = crate::tui::glyphs::selection_marker(selected);
+                    let marker = codewhale_tui_kit::glyphs::selection_marker(selected);
                     let label = config_choice_label(self.locale, &edit.key, choice);
                     let line_y = inner.y.saturating_add(lines.len() as u16);
                     hitboxes.push((
                         Rect {
                             x: inner.x,
                             y: line_y,
-                            width: inner.width,
+                            width: inner.width.saturating_sub(u16::from(scrolls)),
                             height: 1,
                         },
                         choice_idx,
@@ -4481,14 +4559,14 @@ impl ModalView for ConfigView {
                     let mut line = Line::from(format!(
                         "  {marker} {:>2}. {}",
                         choice_idx + 1,
-                        truncate_view_text(&label, usize::from(inner.width).saturating_sub(8))
+                        truncate_view_text(&label, label_width)
                     ));
                     line.style = if selected {
                         menu_style::selected_row_style()
                     } else if self.hovered_choice == Some(choice_idx) {
                         Style::default()
                             .fg(palette::TEXT_PRIMARY)
-                            .patch(crate::tui::menu_style::hovered_row_style())
+                            .patch(codewhale_tui_kit::menu_style::hovered_row_style())
                     } else {
                         Style::default().fg(palette::TEXT_PRIMARY)
                     };
@@ -4501,7 +4579,7 @@ impl ModalView for ConfigView {
                         < usize::from(inner.height)
                 {
                     lines.push(Line::from(Span::styled(
-                        crate::tui::ui_text::semantic_truncate(
+                        codewhale_tui_kit::ui_text::semantic_truncate(
                             selected_detail.as_ref(),
                             usize::from(inner.width),
                         ),
@@ -4547,6 +4625,9 @@ impl ModalView for ConfigView {
             .style(Style::default().fg(palette::TEXT_PRIMARY))
             .scroll((0, 0))
             .render(body, buf);
+        if let Some((rail, total, offset, visible)) = choice_rail {
+            render_panel_scroll_rail(rail, buf, total, offset, visible, true);
+        }
         if content.height > 0 {
             self.render_editor_controls(
                 Rect {
@@ -4563,7 +4644,7 @@ impl ModalView for ConfigView {
 impl ConfigView {
     /// Paint `[ Apply ]  [ Cancel ]` and record their exact hitboxes.
     fn render_editor_controls(&self, row: Rect, buf: &mut Buffer) {
-        use crate::tui::ui_text::text_display_width;
+        use codewhale_tui_kit::ui_text::text_display_width;
 
         let mut controls = Vec::new();
         let mut x = row.x;
@@ -4586,7 +4667,7 @@ impl ConfigView {
                     Style::default()
                         .fg(palette::TEXT_PRIMARY)
                         .add_modifier(Modifier::BOLD)
-                        .patch(crate::tui::menu_style::hovered_row_style())
+                        .patch(codewhale_tui_kit::menu_style::hovered_row_style())
                 } else {
                     Style::default()
                         .fg(palette::TEXT_PRIMARY)
@@ -4807,7 +4888,7 @@ pub(crate) fn render_settings_category_strip(
     hovered: Option<ConfigCategory>,
     hovered_nav: Option<NavStep>,
 ) -> CategoryStripHitboxes {
-    use crate::tui::ui_text::{text_display_width, truncate_line_to_width};
+    use codewhale_tui_kit::ui_text::{text_display_width, truncate_line_to_width};
 
     let mut hitboxes = CategoryStripHitboxes::default();
     if area.width < 4 || area.height == 0 {
@@ -4877,7 +4958,7 @@ pub(crate) fn render_settings_category_strip(
         let prev_style = if hovered_nav == Some(NavStep::Previous) {
             style
                 .marker
-                .patch(crate::tui::menu_style::hovered_row_style())
+                .patch(codewhale_tui_kit::menu_style::hovered_row_style())
         } else {
             style.marker
         };
@@ -4908,7 +4989,7 @@ pub(crate) fn render_settings_category_strip(
         } else if hovered == Some(category) {
             style
                 .normal
-                .patch(crate::tui::menu_style::hovered_row_style())
+                .patch(codewhale_tui_kit::menu_style::hovered_row_style())
         } else {
             style.normal
         };
@@ -4929,7 +5010,7 @@ pub(crate) fn render_settings_category_strip(
         let next_style = if hovered_nav == Some(NavStep::Next) {
             style
                 .marker
-                .patch(crate::tui::menu_style::hovered_row_style())
+                .patch(codewhale_tui_kit::menu_style::hovered_row_style())
         } else {
             style.marker
         };
@@ -5062,7 +5143,7 @@ impl ConfigView {
     /// The detail pane: label and key, then the typed facts for the row's
     /// kind, then the description and the activation copy.
     fn setting_detail_lines(&self, row: &ConfigRow, width: usize) -> Vec<Line<'static>> {
-        use crate::tui::ui_text::semantic_truncate;
+        use codewhale_tui_kit::ui_text::semantic_truncate;
 
         let label = config_label_for_key_for_locale(self.locale, &row.key);
         let kind = self.editor_kind(row);
@@ -5300,25 +5381,27 @@ impl ConfigView {
         let context_percent = self.snapshot.context_budget.as_ref().map_or(0, |budget| {
             u8::try_from(budget.percent_basis_points / 100).unwrap_or(100)
         });
-        let mode = value_of("default_mode").unwrap_or_else(|| "agent".to_string());
-        let mode_ink = match mode.as_str() {
-            "plan" => palette::ChromeInk::PolicyPlan,
-            "operate" => palette::ChromeInk::PolicyOperate,
-            _ => palette::ChromeInk::PolicyAct,
-        };
-        let permission = value_of("approval_mode")
+        let mode = value_of("default_mode").map_or(codewhale_config::AppMode::Agent, |value| {
+            codewhale_config::AppMode::from_setting(&value)
+        });
+        let approval = value_of("approval_mode")
             .or_else(|| value_of("permission_posture"))
-            .unwrap_or_else(|| "ask".to_string());
-        let permission_ink = match permission.as_str() {
-            "auto-review" => palette::ChromeInk::PermissionAutoReview,
-            "full-access" => palette::ChromeInk::PermissionFullAccess,
-            _ => palette::ChromeInk::PermissionAsk,
-        };
+            .and_then(|value| codewhale_execpolicy::ApprovalMode::from_config_value(&value))
+            .unwrap_or(codewhale_execpolicy::ApprovalMode::Suggest);
+        let mode_label = crate::tui::underwater::mode_label(self.locale, mode);
+        let permission =
+            codewhale_engine::core::authority::permission_label_for(self.locale, mode, approval);
         let footer = crate::tui::phase_strip::TidelineFooter::new(
             &theme,
-            (permission.as_str(), permission_ink),
+            (
+                permission.as_ref(),
+                crate::tui::underwater::header_permission_ink(approval),
+            ),
         )
-        .mode_chip(Some((mode.as_str(), mode_ink)))
+        .mode_chip(Some((
+            mode_label.as_ref(),
+            crate::tui::underwater::header_mode_ink(mode),
+        )))
         .context_percent(context_percent);
         crate::tui::phase_strip::render_tideline_footer(
             Rect {
@@ -5709,7 +5792,10 @@ impl ConfigView {
                 String::new()
             };
             let band = vec![Line::from(Span::styled(
-                crate::tui::ui_text::semantic_truncate(&bottom_text, usize::from(inner.width)),
+                codewhale_tui_kit::ui_text::semantic_truncate(
+                    &bottom_text,
+                    usize::from(inner.width),
+                ),
                 Style::default().fg(palette::TEXT_MUTED),
             ))];
             // With a detail pane the lanes are already on screen; without one
@@ -5732,7 +5818,7 @@ impl ConfigView {
                     ..bottom
                 };
                 Paragraph::new(Line::from(Span::styled(
-                    crate::tui::ui_text::semantic_truncate(
+                    codewhale_tui_kit::ui_text::semantic_truncate(
                         &self.setting_detail_summary(row),
                         usize::from(inner.width).saturating_mul(usize::from(folded.height)),
                     ),
@@ -5858,7 +5944,7 @@ pub(crate) fn subagent_view_agents(
             HistoryCell::SubAgent(SubAgentCell::Delegate(card))
                 if seen.insert(card.agent_id.clone()) =>
             {
-                let agent_type = FleetRole::from_str(&card.agent_type).unwrap_or(FleetRole::Worker);
+                let agent_type = FleetRole::parse(&card.agent_type).unwrap_or(FleetRole::Worker);
                 let mut row = live_subagent_result(
                     &card.agent_id,
                     agent_type,
@@ -5957,8 +6043,9 @@ fn lifecycle_to_subagent_status(status: AgentLifecycle, reason: Option<&str>) ->
 /// row label and whale state show instead of the coarse `Running`.
 fn lifecycle_worker_status(
     status: AgentLifecycle,
-) -> Option<crate::tools::subagent::AgentWorkerStatus> {
-    (status == AgentLifecycle::Pending).then_some(crate::tools::subagent::AgentWorkerStatus::Queued)
+) -> Option<codewhale_engine::tools::subagent::AgentWorkerStatus> {
+    (status == AgentLifecycle::Pending)
+        .then_some(codewhale_engine::tools::subagent::AgentWorkerStatus::Queued)
 }
 
 fn live_subagent_result(
@@ -6746,14 +6833,15 @@ fn format_agent_type(locale: Locale, agent_type: &FleetRole) -> Cow<'static, str
 fn format_agent_status(
     locale: Locale,
     status: &SubAgentStatus,
-    worker_status: Option<crate::tools::subagent::AgentWorkerStatus>,
+    worker_status: Option<codewhale_engine::tools::subagent::AgentWorkerStatus>,
 ) -> (Cow<'static, str>, ratatui::style::Style, Option<&str>) {
     use ratatui::style::Style;
 
     match status {
         // A worker that has not started yet waits; it is not running.
         SubAgentStatus::Running
-            if worker_status == Some(crate::tools::subagent::AgentWorkerStatus::Queued) =>
+            if worker_status
+                == Some(codewhale_engine::tools::subagent::AgentWorkerStatus::Queued) =>
         {
             (
                 tr(locale, MessageId::AutomationRunStatusQueued),
@@ -6816,8 +6904,8 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
 }
 
 fn fit_config_column(text: &str, width: usize) -> String {
-    let mut fitted = crate::tui::ui_text::truncate_line_to_width(text, width);
-    let padding = width.saturating_sub(crate::tui::ui_text::text_display_width(&fitted));
+    let mut fitted = codewhale_tui_kit::ui_text::truncate_line_to_width(text, width);
+    let padding = width.saturating_sub(codewhale_tui_kit::ui_text::text_display_width(&fitted));
     fitted.push_str(&" ".repeat(padding));
     fitted
 }
@@ -6833,15 +6921,16 @@ mod tests {
         config_label_for_key_for_locale, render_modal_footer_with_gutter,
         render_underwater_surface, subagent_view_agents, truncate_view_text,
     };
-    use crate::config::Config;
-    use crate::settings::Settings;
-    use crate::tools::subagent::{FleetRole, SubAgentAssignment, SubAgentResult, SubAgentStatus};
     use crate::tui::app::{App, TuiOptions};
     use crate::tui::history::{HistoryCell, SubAgentCell};
     use crate::tui::views::{CommandPaletteAction, SubAgentsView};
     use crate::tui::widgets::agent_card::{AgentLifecycle, FanoutCard};
+    use codewhale_agent_contract::role::FleetRole;
+    use codewhale_engine::tools::subagent::{SubAgentAssignment, SubAgentResult, SubAgentStatus};
     use codewhale_localization::{Locale, MessageId, tr, tr_key};
     use codewhale_palette as palette;
+    use codewhale_runtime::config::Config;
+    use codewhale_runtime::settings::Settings;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -7470,13 +7559,18 @@ mod tests {
             ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
-        app.api_provider = crate::config::ProviderKind::Deepseek;
+        app.api_provider = codewhale_config::ProviderKind::Deepseek;
         app
     }
 
     fn cost_currency_row_for_settings(
         settings_toml: &str,
-    ) -> (String, String, crate::pricing::CostCurrency, Locale) {
+    ) -> (
+        String,
+        String,
+        codewhale_config::pricing::CostCurrency,
+        Locale,
+    ) {
         let _guard = ConfigSettingsEnvGuard::new(settings_toml);
         let app = create_test_app();
         let view = ConfigView::new_for_app(&app);
@@ -7674,14 +7768,16 @@ mod tests {
         assert_eq!(progress_only[0].nickname.as_deref(), Some("Agent 1"));
 
         let mut manager = manager_agent("agent_live", SubAgentStatus::Running);
-        manager.nickname = Some(crate::tools::subagent::whale_name_for_id_in_locale(
-            "agent_live",
-            "ja",
-        ));
+        manager.nickname = Some(
+            codewhale_engine::tools::subagent::whale_name_for_id_in_locale("agent_live", "ja"),
+        );
         let manager_backed = subagent_view_agents(&app, &[manager]);
         assert_eq!(
             manager_backed[0].nickname.as_deref(),
-            Some(crate::tools::subagent::whale_name_for_id_in_locale("agent_live", "en").as_str())
+            Some(
+                codewhale_engine::tools::subagent::whale_name_for_id_in_locale("agent_live", "en")
+                    .as_str()
+            )
         );
     }
 
@@ -7700,8 +7796,11 @@ mod tests {
         assert_eq!(
             agents[1].nickname.as_deref(),
             Some(
-                crate::tools::subagent::whale_name_for_id_in_locale("agent_plain_lane", "en")
-                    .as_str()
+                codewhale_engine::tools::subagent::whale_name_for_id_in_locale(
+                    "agent_plain_lane",
+                    "en"
+                )
+                .as_str()
             )
         );
     }
@@ -8094,7 +8193,7 @@ consent_version = 1
         let _path = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &ambient_path);
         let mut app = create_test_app();
         app.config_path = Some(config_path);
-        crate::external_credentials::reset_side_effect_trap();
+        codewhale_runtime::external_credentials::reset_side_effect_trap();
         let view = ConfigView::new_for_app(&app);
         let row = view
             .rows
@@ -8122,7 +8221,7 @@ consent_version = 1
                 .contains("external-revoke --provider openai-codex")
         );
         assert_eq!(
-            crate::external_credentials::complete_side_effect_trap_counts(),
+            codewhale_runtime::external_credentials::complete_side_effect_trap_counts(),
             (0, 0, 0, 0, 0)
         );
     }
@@ -8258,7 +8357,7 @@ api_key_env = "ACME_API_KEY"
         .expect("custom provider config");
         let mut app = create_test_app();
         app.config_path = Some(config_path);
-        app.set_provider_identity(crate::config::ProviderKind::Custom, "acme_ai");
+        app.set_provider_identity(codewhale_config::ProviderKind::Custom, "acme_ai");
         let mut view = ConfigView::new_for_app(&app);
         view.focus_key("provider");
 
@@ -8312,8 +8411,8 @@ api_key_env = "ACME_API_KEY"
     fn config_view_zai_model_row_has_no_derived_rows() {
         let _guard = ConfigSettingsEnvGuard::new("");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ProviderKind::Zai;
-        app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
+        app.api_provider = codewhale_config::ProviderKind::Zai;
+        app.model = codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_2_MODEL.to_string();
 
         let view = ConfigView::new_for_app(&app);
         let active = view
@@ -8355,9 +8454,10 @@ api_key_env = "ACME_API_KEY"
         let mut app = create_test_app();
         app.config_path = Some(config_path.clone());
         // Live session route, exactly as a /provider switch would leave it.
-        app.api_provider = crate::config::ProviderKind::Zai;
+        app.api_provider = codewhale_config::ProviderKind::Zai;
         app.model = "GLM-5.3".to_string();
-        app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL.to_string();
 
         let view = ConfigView::new_for_app(&app);
 
@@ -8390,7 +8490,10 @@ api_key_env = "ACME_API_KEY"
             .iter()
             .find(|row| row.key == "provider_url")
             .expect("endpoint row for the live Z.ai route");
-        assert_eq!(url_row.value, crate::config::DEFAULT_ZAI_BASE_URL);
+        assert_eq!(
+            url_row.value,
+            codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL
+        );
         assert!(!view.rows.iter().any(|row| row.key == "base_url"));
     }
 
@@ -8399,11 +8502,11 @@ api_key_env = "ACME_API_KEY"
         let _guard = ConfigSettingsEnvGuard::new("");
         let mut app = create_test_app();
         for provider in [
-            crate::config::ProviderKind::Zai,
-            crate::config::ProviderKind::Xai,
-            crate::config::ProviderKind::Openrouter,
-            crate::config::ProviderKind::Ollama,
-            crate::config::ProviderKind::Deepseek,
+            codewhale_config::ProviderKind::Zai,
+            codewhale_config::ProviderKind::Xai,
+            codewhale_config::ProviderKind::Openrouter,
+            codewhale_config::ProviderKind::Ollama,
+            codewhale_config::ProviderKind::Deepseek,
         ] {
             app.api_provider = provider;
             let view = ConfigView::new_for_app(&app);
@@ -8421,7 +8524,7 @@ api_key_env = "ACME_API_KEY"
         // the canonical config selection writer.
         let _guard = ConfigSettingsEnvGuard::new("default_model = \"deepseek-v4-pro\"\n");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ProviderKind::Zai;
+        app.api_provider = codewhale_config::ProviderKind::Zai;
 
         let view = ConfigView::new_for_app(&app);
         assert!(
@@ -8444,7 +8547,7 @@ api_key_env = "ACME_API_KEY"
     fn config_view_settings_rows_land_in_truthful_sections() {
         let _guard = ConfigSettingsEnvGuard::new("default_model = \"deepseek-v4-pro\"\n");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ProviderKind::Zai;
+        app.api_provider = codewhale_config::ProviderKind::Zai;
         let view = ConfigView::new_for_app(&app);
 
         let section_of = |key: &str| {
@@ -8659,8 +8762,9 @@ base_url = "https://api.xiaomimimo.com/v1"
         .unwrap();
 
         let mut app = create_test_app();
-        app.api_provider = crate::config::ProviderKind::XiaomiMimo;
-        app.active_route_base_url = crate::config::DEFAULT_XIAOMI_MIMO_BASE_URL.to_string();
+        app.api_provider = codewhale_config::ProviderKind::XiaomiMimo;
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_XIAOMI_MIMO_BASE_URL.to_string();
         app.ui_locale = Locale::Es419;
         app.config_path = Some(config_path.clone());
         let mut view = ConfigView::new_for_app(&app);
@@ -8672,7 +8776,10 @@ base_url = "https://api.xiaomimimo.com/v1"
             .expect("provider_url row missing");
         // The endpoint row reflects the live route identity (the default when
         // nothing overrides it), not a config-file re-read, and is a receipt.
-        assert_eq!(row.value, crate::config::DEFAULT_XIAOMI_MIMO_BASE_URL);
+        assert_eq!(
+            row.value,
+            codewhale_config::descriptors::defaults::DEFAULT_XIAOMI_MIMO_BASE_URL
+        );
         assert!(!row.editable);
         assert!(!view.rows.iter().any(|row| row.key == "base_url"));
 
@@ -8697,7 +8804,10 @@ base_url = "https://api.xiaomimimo.com/v1"
         let _guard = ConfigSettingsEnvGuard::new("locale = \"zh-Hans\"\ncost_currency = \"usd\"\n");
         let app = create_test_app();
         assert_eq!(app.ui_locale, Locale::ZhHans);
-        assert_eq!(app.cost_currency, crate::pricing::CostCurrency::Cny);
+        assert_eq!(
+            app.cost_currency,
+            codewhale_config::pricing::CostCurrency::Cny
+        );
 
         let view = ConfigView::new_for_app(&app);
         let row = view
@@ -8720,7 +8830,10 @@ base_url = "https://api.xiaomimimo.com/v1"
                 ));
 
             assert_eq!(locale, Locale::ZhHans);
-            assert_eq!(effective_currency, crate::pricing::CostCurrency::Cny);
+            assert_eq!(
+                effective_currency,
+                codewhale_config::pricing::CostCurrency::Cny
+            );
             assert_eq!(saved_value, alias);
             assert_eq!(display_value, alias);
         }
@@ -8732,7 +8845,10 @@ base_url = "https://api.xiaomimimo.com/v1"
             cost_currency_row_for_settings("locale = \"zh-Hans\"\ncost_currency = \"cny\"\n");
 
         assert_eq!(locale, Locale::ZhHans);
-        assert_eq!(effective_currency, crate::pricing::CostCurrency::Cny);
+        assert_eq!(
+            effective_currency,
+            codewhale_config::pricing::CostCurrency::Cny
+        );
         assert_eq!(saved_value, "cny");
         assert_eq!(display_value, "cny");
     }
@@ -8743,7 +8859,10 @@ base_url = "https://api.xiaomimimo.com/v1"
             cost_currency_row_for_settings("locale = \"en\"\ncost_currency = \"cny\"\n");
 
         assert_eq!(locale, Locale::En);
-        assert_eq!(effective_currency, crate::pricing::CostCurrency::Cny);
+        assert_eq!(
+            effective_currency,
+            codewhale_config::pricing::CostCurrency::Cny
+        );
         assert_eq!(saved_value, "cny");
         assert_eq!(display_value, "cny");
     }
@@ -8873,18 +8992,18 @@ base_url = "https://api.xiaomimimo.com/v1"
         std::fs::write(&path, "[notifications]\nquiet = false\nsound = \"off\"\n").unwrap();
         let mut app = create_test_app();
         app.config_path = Some(path.clone());
-        let mut config = Config::load(Some(path), None).unwrap();
+        let mut config = codewhale_plugins::providers::load_config(Some(path), None).unwrap();
         crate::tui::ui::apply_notification_update(
             &mut app,
             &mut config,
-            crate::config::NotificationConfigUpdate::Quiet(true),
+            codewhale_config::notifications::NotificationConfigUpdate::Quiet(true),
         )
         .unwrap();
         crate::tui::ui::apply_notification_update(
             &mut app,
             &mut config,
-            crate::config::NotificationConfigUpdate::Sound(Some(
-                crate::config::CompletionSound::Whale,
+            codewhale_config::notifications::NotificationConfigUpdate::Sound(Some(
+                codewhale_config::notifications::CompletionSound::Whale,
             )),
         )
         .unwrap();
@@ -9076,12 +9195,15 @@ base_url = "https://api.xiaomimimo.com/v1"
                 let temp = tempfile::tempdir().unwrap();
                 let path = temp.path().join("config.toml");
                 for sample in samples {
-                    let edit =
-                        crate::config::NotificationConfigUpdate::parse(setting, &sample).unwrap();
+                    let edit = codewhale_config::notifications::NotificationConfigUpdate::parse(
+                        setting, &sample,
+                    )
+                    .unwrap();
                     edit.persist(&path).unwrap();
-                    let loaded = Config::load(Some(path.clone()), None)
-                        .unwrap()
-                        .notifications_config();
+                    let loaded =
+                        codewhale_plugins::providers::load_config(Some(path.clone()), None)
+                            .unwrap()
+                            .notifications_config();
                     assert_eq!(
                         loaded.display(setting),
                         edit.display(),
@@ -9154,36 +9276,47 @@ base_url = "https://api.xiaomimimo.com/v1"
     /// no kind, no provenance layer, and no resolver home.
     #[test]
     fn every_persisted_settings_field_is_declared_in_the_schema() {
-        use crate::settings::PinnedModel;
+        use codewhale_runtime::settings::PinnedModel;
 
         // Options serialize as absent when None; force them present so the
         // table below names every key settings.toml can hold.
-        let settings = Settings {
-            background_color: Some("#1a1b26".to_string()),
-            default_provider: Some("deepseek".to_string()),
-            default_model: Some("deepseek-v4-pro".to_string()),
-            reasoning_effort: Some("medium".to_string()),
-            permission_posture: Some("ask".to_string()),
-            sandbox_mode: Some("read-only".to_string()),
-            provider_models: Some(std::collections::HashMap::from([(
+        let settings = {
+            let __cw_config_init_0_0 = Some("#1a1b26".to_string());
+            let __cw_config_init_0_1 = Some("deepseek".to_string());
+            let __cw_config_init_0_2 = Some("deepseek-v4-pro".to_string());
+            let __cw_config_init_0_3 = Some("medium".to_string());
+            let __cw_config_init_0_4 = Some("ask".to_string());
+            let __cw_config_init_0_5 = Some("read-only".to_string());
+            let __cw_config_init_0_6 = Some(std::collections::HashMap::from([(
                 "deepseek".to_string(),
                 "deepseek-v4-pro".to_string(),
-            )])),
-            enabled_models: Some(std::collections::HashMap::from([(
+            )]));
+            let __cw_config_init_0_7 = Some(std::collections::HashMap::from([(
                 "deepseek".to_string(),
                 vec!["deepseek-v4-pro".to_string()],
-            )])),
-            pinned_models: vec![PinnedModel {
+            )]));
+            let __cw_config_init_0_8 = vec![PinnedModel {
                 provider: "deepseek".to_string(),
                 model: "deepseek-v4-pro".to_string(),
                 label: None,
-            }],
-            behavioral_tip_impressions: std::collections::BTreeMap::from([(
-                "probe".to_string(),
-                1u8,
-            )]),
-            footer_hint_uses: std::collections::BTreeMap::from([("probe".to_string(), 1u8)]),
-            ..Settings::default()
+            }];
+            let __cw_config_init_0_9 =
+                std::collections::BTreeMap::from([("probe".to_string(), 1u8)]);
+            let __cw_config_init_0_10 =
+                std::collections::BTreeMap::from([("probe".to_string(), 1u8)]);
+            let mut __cw_config_init_0_value: Settings = Settings::default();
+            __cw_config_init_0_value.background_color = __cw_config_init_0_0;
+            __cw_config_init_0_value.default_provider = __cw_config_init_0_1;
+            __cw_config_init_0_value.default_model = __cw_config_init_0_2;
+            __cw_config_init_0_value.reasoning_effort = __cw_config_init_0_3;
+            __cw_config_init_0_value.permission_posture = __cw_config_init_0_4;
+            __cw_config_init_0_value.sandbox_mode = __cw_config_init_0_5;
+            __cw_config_init_0_value.provider_models = __cw_config_init_0_6;
+            __cw_config_init_0_value.enabled_models = __cw_config_init_0_7;
+            __cw_config_init_0_value.pinned_models = __cw_config_init_0_8;
+            __cw_config_init_0_value.behavioral_tip_impressions = __cw_config_init_0_9;
+            __cw_config_init_0_value.footer_hint_uses = __cw_config_init_0_10;
+            __cw_config_init_0_value
         };
         let table = toml::Value::try_from(&settings)
             .expect("settings serialize")
@@ -9311,8 +9444,8 @@ context_window = 262144
         .expect("config");
         let _config_path =
             crate::test_support::EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-        let config =
-            Config::load(Some(config_path.clone()), None).expect("captured fixture config");
+        let config = codewhale_plugins::providers::load_config(Some(config_path.clone()), None)
+            .expect("captured fixture config");
         let options = TuiOptions {
             config_path: Some(config_path),
             ..crate::tui::test_support::test_tui_options(temp.path())
@@ -9331,7 +9464,8 @@ context_window = 262144
             context_tokens: Some(262_144),
             ..Default::default()
         });
-        app.active_context_window_source = crate::route_runtime::ContextWindowSource::Configured;
+        app.active_context_window_source =
+            codewhale_engine::route_runtime::ContextWindowSource::Configured;
 
         let view = ConfigView::new_for_app(&app);
         let configured = view
@@ -9386,11 +9520,15 @@ context_window = 131072
 "#,
         )
         .expect("saved custom provider");
-        let saved = Config::load(Some(saved_path.clone()), None).expect("saved custom config");
+        let saved = codewhale_plugins::providers::load_config(Some(saved_path.clone()), None)
+            .expect("saved custom config");
         let saved_identity = saved
             .active_provider_identity()
             .expect("saved admitted custom identity");
-        assert_eq!(saved_identity.provider, crate::config::ProviderKind::Custom);
+        assert_eq!(
+            saved_identity.provider,
+            codewhale_config::ProviderKind::Custom
+        );
         assert_eq!(saved_identity.key.as_str(), "custom-current");
         assert_eq!(
             saved.context_window_for_provider_config(&saved_identity),
@@ -9425,7 +9563,7 @@ context_window = 131072
             .expect("foreign admitted provider identity");
         assert_eq!(
             foreign_identity.provider,
-            crate::config::ProviderKind::Custom
+            codewhale_config::ProviderKind::Custom
         );
         assert_eq!(foreign_identity.provider, app.api_provider);
         assert_eq!(foreign_identity.key.as_str(), "custom-other");
@@ -9444,7 +9582,7 @@ context_window = 131072
     fn config_view_displays_saved_codex_reasoning_effort_label() {
         let _guard = ConfigSettingsEnvGuard::new("reasoning_effort = \"max\"\n");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ProviderKind::OpenaiCodex;
+        app.api_provider = codewhale_config::ProviderKind::OpenaiCodex;
 
         let view = ConfigView::new_for_app(&app);
         let row = view
@@ -9850,7 +9988,7 @@ context_window = 131072
 
     #[test]
     fn a_pending_worker_row_reads_queued_not_running() {
-        use crate::tools::subagent::AgentWorkerStatus;
+        use codewhale_engine::tools::subagent::AgentWorkerStatus;
         assert_eq!(
             super::lifecycle_worker_status(AgentLifecycle::Pending),
             Some(AgentWorkerStatus::Queued)
@@ -11858,7 +11996,7 @@ context_window = 131072
         // No rendered row may overflow the available columns.
         for (idx, row) in rows.iter().enumerate() {
             assert!(
-                crate::tui::ui_text::text_display_width(row) <= usize::from(area.width),
+                codewhale_tui_kit::ui_text::text_display_width(row) <= usize::from(area.width),
                 "line {idx} overflows: {row:?}"
             );
         }
@@ -11988,7 +12126,7 @@ context_window = 131072
     #[test]
     fn view_stack_masks_links_behind_opaque_modals() {
         let area = Rect::new(0, 0, 24, 8);
-        crate::tui::osc8::set_frame_links(vec![crate::tui::osc8::LinkRegion {
+        codewhale_tui_kit::osc8::set_frame_links(vec![codewhale_tui_kit::osc8::LinkRegion {
             row: 3,
             col_start: 2,
             col_end: 18,
@@ -11997,7 +12135,7 @@ context_window = 131072
         let mut stack = ViewStack::new();
         stack.push(BareModal);
         stack.render(area, &mut Buffer::empty(area));
-        assert!(crate::tui::osc8::take_frame_links().is_empty());
+        assert!(codewhale_tui_kit::osc8::take_frame_links().is_empty());
     }
 
     fn buffer_text(buf: &Buffer, area: Rect) -> String {

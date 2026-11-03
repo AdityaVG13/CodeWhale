@@ -25,7 +25,9 @@
 //! A route can publish a total context window, an output ceiling, and a
 //! separate input ceiling. [`ContextBudget::new_with_input_limit`] intersects
 //! all three without treating one as a substitute for another: the output
-//! reservation is the exact route-effective wire request, the total-window
+//! reservation is the route-effective wire request (a quarter of the window, at
+//! most 64K and never more than that request, on a route that shares one window
+//! between input and output), the total-window
 //! arithmetic remains saturating, and a concrete input limit clamps the final
 //! spendable ceiling and compaction trigger.
 
@@ -274,7 +276,7 @@ fn clamp_output_cap(window_tokens: u64, configured_output_cap: u64) -> u64 {
 }
 
 /// Window usage as a percentage in `0.0..=100.0`. Zero window -> `0.0`.
-fn usage_percent(window_tokens: u64, input_tokens: u64) -> f64 {
+pub fn usage_percent(window_tokens: u64, input_tokens: u64) -> f64 {
     if window_tokens == 0 {
         return 0.0;
     }

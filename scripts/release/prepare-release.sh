@@ -7,7 +7,7 @@
 # codewhale-* dependency pins), npm/codewhale/package.json (version +
 # codewhaleBinaryVersion), npm/runtime-sdk/package.json, the VS Code extension
 # package and lock, the root npm lock workspace records, the remote-smoke default
-# tag, README*.md install-tag examples when present, the public fact matrix's
+# tag, README.md and docs/i18n/README*.md install-tag examples when present, the public fact matrix's
 # source-candidate version, Cargo.lock, crates/tui/CHANGELOG.md (via
 # sync-changelog.sh), web/lib/facts.generated.ts (via derive-facts.mjs), and
 # the two version-stamped contract fixtures
@@ -29,6 +29,7 @@ fi
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo}"
+readmes=(README.md docs/i18n/README.*.md)
 
 # Release preparation spans generated files and two package managers. Preserve
 # the exact starting bytes so any validation, generator, or downstream gate
@@ -44,6 +45,9 @@ transaction_missing="${transaction_dir}/missing"
 transaction_paths=(
   Cargo.toml
   Cargo.lock
+  vendor/codewhale-ratatui/Cargo.toml
+  vendor/codewhale-ratatui/Cargo.lock
+  pet/tui/Cargo.lock
   package-lock.json
   npm/codewhale/package.json
   npm/runtime-sdk/package.json
@@ -52,13 +56,10 @@ transaction_paths=(
   scripts/remote-smoke/setup-vm.sh
   docs/public-surface-facts.json
   docs/INSTALL.md
-  README.md
-  README.zh-CN.md
-  README.ja-JP.md
-  README.vi.md
-  README.ko-KR.md
+  "${readmes[@]}"
   crates/tui/CHANGELOG.md
   web/lib/facts.generated.ts
+  web/data/agent-docs.generated.json
   crates/config/src/route/providers-export.golden.json
   crates/tui/src/commands/contract/fixtures/config_policy/status.json
 )
@@ -102,18 +103,12 @@ fi
 if [[ "${old}" != "${new}" ]]; then
   echo "Bumping ${old} -> ${new}"
 
-  OLD_VERSION="${old}" NEW_VERSION="${new}" python3 - <<'PY'
+  OLD_VERSION="${old}" NEW_VERSION="${new}" python3 - "${readmes[@]}" <<'PY'
 import json, os, pathlib, re, sys
 
 old, new = os.environ["OLD_VERSION"], os.environ["NEW_VERSION"]
 old_re = re.escape(old)
-readmes = [
-    "README.md",
-    "README.zh-CN.md",
-    "README.ja-JP.md",
-    "README.vi.md",
-    "README.ko-KR.md",
-]
+readmes = sys.argv[1:]
 
 def bump(path, pattern, repl, minimum):
     p = pathlib.Path(path)
@@ -142,7 +137,11 @@ bump("Cargo.toml", rf'^version = "{old_re}"$', f'version = "{new}"', 1)
 
 # 2) Internal codewhale-* dependency pins in every crate manifest.
 total = 0
-for manifest in sorted(pathlib.Path("crates").glob("*/Cargo.toml")):
+manifests = list(pathlib.Path("crates").glob("*/Cargo.toml"))
+kit_manifest = pathlib.Path("vendor/codewhale-ratatui/Cargo.toml")
+if kit_manifest.is_file():
+    manifests.append(kit_manifest)
+for manifest in sorted(manifests):
     text = manifest.read_text()
     out, n = re.subn(
         rf'(codewhale-[a-z0-9-]+\s*=\s*\{{[^}}]*version = "){old_re}(")',
@@ -155,6 +154,15 @@ for manifest in sorted(pathlib.Path("crates").glob("*/Cargo.toml")):
         total += n
 if total == 0:
     sys.exit("error: no internal dependency pins were bumped — wrong old version?")
+
+for lock_path in (pathlib.Path("vendor/codewhale-ratatui/Cargo.lock"), pathlib.Path("pet/tui/Cargo.lock")):
+    if not lock_path.is_file():
+        continue
+    text = lock_path.read_text()
+    out, count = re.subn(rf'(name = "codewhale-protocol"\nversion = "){old_re}("\n)', rf"\g<1>{new}\g<2>", text)
+    if count:
+        lock_path.write_text(out)
+        print(f"  {lock_path}: {count} Protocol record(s)")
 
 # 3) npm wrapper.
 bump(
@@ -193,14 +201,7 @@ for readme in readmes:
 #    Current docs deliberately describe installed output generically, so zero
 #    matches is valid. If numeric forms exist, validate that they agree with
 #    the old workspace version before replacing them.
-version_doc_files = [
-    "README.md",
-    "README.zh-CN.md",
-    "README.ja-JP.md",
-    "README.vi.md",
-    "README.ko-KR.md",
-    "docs/INSTALL.md",
-]
+version_doc_files = [*readmes, "docs/INSTALL.md"]
 for doc in version_doc_files:
     p = pathlib.Path(doc)
     text = p.read_text()

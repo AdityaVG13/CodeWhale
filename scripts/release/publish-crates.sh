@@ -27,6 +27,7 @@ packages=("${release_crates[@]}")
 crates_user_agent="CodeWhale release publish check (https://github.com/codewhale-hq/CodeWhale)"
 
 workspace_version=""
+build_dir=""
 
 metadata_inventory="$(
   python3 "${script_dir}/validate-crate-publish-order.py" "${packages[@]}"
@@ -36,6 +37,9 @@ while IFS=$'\t' read -r kind name value; do
     version)
       workspace_version="${name}"
       ;;
+    build-dir)
+      build_dir="${name}"
+      ;;
   esac
 done <<<"${metadata_inventory}"
 
@@ -43,8 +47,57 @@ if [[ -z "${workspace_version}" ]]; then
   echo "Could not determine workspace version." >&2
   exit 1
 fi
+if [[ -z "${build_dir}" ]]; then
+  echo "Could not determine Cargo's build directory." >&2
+  exit 1
+fi
 
 echo "Crate publication order OK: ${#packages[@]} workspace crates."
+
+cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+reused=()
+for package in "${packages[@]}"; do
+  for extracted in "${cargo_home}"/registry/src/*/"${package}-${workspace_version}"; do
+    if [[ -e "${extracted}" && "${extracted}" != "${cargo_home}"/registry/src/index.crates.io-*/* ]]; then
+      reused+=("extracted source ${extracted}")
+    fi
+  done
+done
+deps_dirs=("${build_dir}"/*/deps)
+if [[ -d "${deps_dirs[0]}" ]]; then
+  include_args=()
+  for package in "${packages[@]}"; do
+    include_args+=("--include=${package//-/_}-*.d")
+  done
+  crate_pattern="$(IFS='|'; echo "${packages[*]}")"
+  version_pattern="${workspace_version//./\\.}"
+  version_pattern="${version_pattern//+/\\+}"
+  units="$(
+    grep -rHoE "${include_args[@]}" -- "[^ ]*/registry/src/[^/ ]+/(${crate_pattern})-${version_pattern}/" "${deps_dirs[@]}" ||
+      [[ $? -eq 1 ]]
+  )" || {
+    echo "Could not scan ${build_dir} for compiled release crates." >&2
+    exit 1
+  }
+  while read -r count extracted; do
+    reused+=("${count} compiled unit(s) in ${build_dir} built from ${extracted%/}")
+  done < <(grep -v -e '^$' -e '/registry/src/index\.crates\.io-' <<<"${units}" | sort -u | cut -d: -f2- | sort | uniq -c)
+fi
+if (( ${#reused[@]} > 0 )); then
+  cache_root="${CODEWHALE_CACHE_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/codewhale}"
+  verify_root="${cache_root}/release-verify-$(git rev-parse --short=10 HEAD 2>/dev/null || echo candidate)-${mode}-$(date -u +%Y%m%dT%H%M%SZ)"
+  {
+    echo "Refusing to package release crates: Cargo would reuse ${workspace_version} state from an earlier package run instead of the current sources:"
+    printf '  %s\n' "${reused[@]}"
+    echo "Cargo treats crates served from its temporary package registry as immutable by name and version. It skips extraction once .cargo-ok exists and keeps compiled units that do not track their sources, so this run would verify old code. Nothing was deleted."
+    echo "Rerun from a new, empty Cargo home and build directory. Every run leaves state the next run at this version refuses, so publish and each partial-publish rerun need their own root:"
+    echo "  cd \"$(cd "${script_dir}/../.." && pwd)\" && mkdir -p \"${cache_root}\" && mkdir \"${verify_root}\" &&"
+    echo "    CARGO_HOME=\"${verify_root}/cargo-home\" CARGO_TARGET_DIR=\"${verify_root}/target\" python3 \"$(dirname "${script_dir}")/build-lock.py\" \"${CODEWHALE_BUILD_LOCK_FILE:-${cache_root}/build.lock}\" -- \"${script_dir}/publish-crates.sh\" ${mode}"
+    echo "CARGO_TARGET_DIR moves the build directory with plain cargo and with scripts/dev-cargo.sh, and build-lock.py holds the machine build lock whichever cargo is on PATH."
+    echo "For publish mode, pass the crates.io token as CARGO_REGISTRY_TOKEN for that one command, so Cargo writes no credentials.toml under the new root. After cargo login with that CARGO_HOME instead, run cargo logout with it once the publish finishes. See docs/RELEASE_RUNBOOK.md."
+  } >&2
+  exit 1
+fi
 
 if [[ "${mode}" == "publish" ]]; then
   "${script_dir}/require-release-tag-checkout.sh"

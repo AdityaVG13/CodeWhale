@@ -28,11 +28,11 @@ use std::path::{Path, PathBuf};
 use crate::tui::app::{App, MentionCompletionCache};
 use crate::tui::git_mention::{self, GitMentionCache, GitMentionKind};
 use crate::tui::mention_completion::{MentionDiscoveryBehavior, MentionDiscoveryKey};
-use crate::working_set::Workspace;
 use codewhale_core::{
     ContextReference, ContextReferenceKind, ContextReferenceSource, MediaAttachmentReference,
     media_attachment_references,
 };
+use codewhale_runtime::working_set::Workspace;
 
 /// Maximum number of `@`-mentions whose contents are inlined into one user
 /// message. Beyond this we stop appending blocks but the raw `@token` text
@@ -239,7 +239,9 @@ fn mention_menu_entries(app: &mut App, partial: &str, limit: usize) -> (Vec<Stri
     };
     let entries = match &discovery_key.behavior {
         MentionDiscoveryBehavior::Fuzzy => {
-            let ranked = crate::working_set::rank_completion_candidates(candidates, partial, limit);
+            let ranked = codewhale_runtime::working_set::rank_completion_candidates(
+                candidates, partial, limit,
+            );
             super::file_frecency::rerank_by_frecency(ranked)
         }
         MentionDiscoveryBehavior::Browser { .. } => {
@@ -762,7 +764,7 @@ const SCREENCAPTURE_TEMP_DIR_COMPACT: &str = "TemporaryItems";
 /// Stable per-session directory for stabilized screencapture files. Follows
 /// the same home-first convention as `clipboard.rs`'s clipboard-images dir.
 pub(crate) fn screenshot_stabilization_dir(workspace: &Path) -> PathBuf {
-    match crate::config::effective_home_dir() {
+    match codewhale_paths::user_home() {
         Some(home) => home.join(".codewhale").join("attachments"),
         None => workspace.join("attachments"),
     }
@@ -812,8 +814,19 @@ fn stabilize_screencapture_file(path: &Path, artifact_dir: &Path) -> Option<Path
     let name = stable_attachment_name(path.file_name()?);
     let dest = artifact_dir.join(&name);
     let relative = Path::new(artifact_dir.file_name()?).join(&name);
-    let target =
-        crate::fleet::files::WorkspaceFile::open(artifact_dir.parent()?, &relative, true).ok()?;
+    let root = artifact_dir.parent()?;
+    // `artifact_dir` sits under the user's own state root unless no home was
+    // available and it fell back to the workspace
+    // (`screenshot_stabilization_dir`). Only the state root may be a link the
+    // user made to relocate `~/.codewhale`.
+    let state_root = codewhale_paths::user_home()
+        .is_some_and(|home| root == home.join(codewhale_paths::CODEWHALE_APP_DIR));
+    let open = if state_root {
+        codewhale_util::files::WorkspaceFile::open_resolved_root
+    } else {
+        codewhale_util::files::WorkspaceFile::open
+    };
+    let target = open(root, &relative, true).ok()?;
     // An existing regular destination is reused; a link there fails to open.
     if target.open_file().is_ok() {
         return Some(dest);

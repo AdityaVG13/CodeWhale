@@ -16,12 +16,12 @@ export const docsRuntimeApi: DocsRuntimeApiDict = {
       blocks: [
         {
           code: `codewhale exec "Reply with exactly: pong"
-codewhale exec --auto "fix the failing test and run it again"
-codewhale exec --auto --output-format stream-json "update the changelog"`,
+codewhale exec --auto --sandbox workspace-write "fix the failing test and run it again"
+codewhale exec --auto --sandbox workspace-write --output-format stream-json "update the changelog"`,
           lang: "终端",
         },
         {
-          p: "普通的 `exec` 只回答一次，不使用工具。`--auto` 允许它使用工具并自动批准，所以只在你信任的仓库或容器中使用；它绝不会放宽[沙箱](/docs/sandbox)。`--output-format stream-json` 每行输出一个 JSON 事件，并保存会话，以便之后用 `--continue` 接着运行。`--max-turns` 和 `--allowed-tools` 可以为一次运行设定限制。",
+          p: "普通的 `exec` 只回答一次，不使用工具。`--auto` 默认启用 Full Access（完全访问）：工具无需批准即可运行，shell 命令没有 Codewhale 沙箱，信任模式允许文件工具写入工作区以外的路径。除 `danger-full-access` 外的任何 `--sandbox`（或配置中对应的 `sandbox_mode`）都会保持信任模式关闭。加上 `--sandbox workspace-write` 可在可用时启用 [shell 沙箱](/docs/sandbox)，并保留文件工具的工作区限制；`external-sandbox` 则依赖你自行提供的隔离。请把标志放在提示词前；提示词以 `-` 开头或包含需要按字面理解的 exec 标志时，应先加上 `--`。向模型提供工具的运行会在所有输出格式下保存。`--output-format stream-json` 每行输出一个 JSON 事件，也会保存仅作答的运行，以便之后用 `--continue` 接着运行。`--max-turns` 和 `--allowed-tools` 可以为一次运行设定限制。",
         },
       ],
     },

@@ -128,7 +128,7 @@ impl<T: Clone> SettingFact<T> {
 
 /// The narrow, read-only workbench projection available in this slice.
 ///
-/// `App` intentionally does not retain a resident [`crate::settings::Settings`]
+/// `App` intentionally does not retain a resident [`codewhale_runtime::settings::Settings`]
 /// value. Consequently this projection never reloads disk or guesses startup
 /// defaults: those lanes remain `None` until the settings owner supplies them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +170,7 @@ impl InteractionTargetId {
     pub const HEADER_ROUTE: Self = Self("header.route");
     /// The model name and effort tier inside the info line's route segment.
     pub const HEADER_MODEL: Self = Self("header.model");
+    pub const HEADER_UPDATE: Self = Self("header.update");
     /// A live count in the posture bar; opens the dock view it counts.
     pub const FOOTER_COUNT: Self = Self("footer.count");
     pub const DOCK_TAB_AGENTS: Self = Self("dock.tab.agents");
@@ -194,6 +195,7 @@ pub enum InteractionAction {
     /// Open the existing `/model` picker. Same discipline as the provider
     /// entry: an entry point, never a second catalog.
     OpenModelPicker,
+    OpenUpdate,
     /// Open the existing automations manager.
     OpenAutomations,
     ShowDockPanel(crate::tui::work_surface::RailPanel),
@@ -220,6 +222,7 @@ pub enum InspectDetail {
     /// The topbar exposes a route entry point, not a copied route snapshot.
     /// `ProviderPickerView` remains the authoritative presentation owner.
     Route,
+    Update,
 }
 
 /// A selectable region painted in the current frame.
@@ -274,7 +277,7 @@ mod tests {
         InteractionRegistry, InteractionTarget, InteractionTargetId, SettingApplySemantics,
         SettingAuthority, SettingFact, UiSnapshot,
     };
-    use crate::config::ProviderKind;
+    use codewhale_config::ProviderKind;
     use ratatui::layout::Rect;
 
     fn target(area: Rect, used_tokens: u32) -> InteractionTarget {

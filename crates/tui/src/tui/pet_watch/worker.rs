@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Legacy per-host replay fixtures only; live production consumers use the companion.
 //! Sandboxed, read-only execution of the generated Whalesong world. This reuses
 //! the workspace's existing QuickJS dependency; no JS filesystem/network APIs,
@@ -27,20 +26,6 @@ pub struct Raster {
     pub hollow: bool,
     pub dozing: bool,
     pub lit: f64,
-}
-
-impl Raster {
-    /// A hidden clock advance is not a new picture in reduced motion.
-    pub fn same_picture(&self, other: &Self) -> bool {
-        self.width == other.width
-            && self.height == other.height
-            && self.cells == other.cells
-            && self.channel == other.channel
-            && self.arch == other.arch
-            && self.hollow == other.hollow
-            && self.dozing == other.dozing
-            && self.lit == other.lit
-    }
 }
 
 pub enum Command {
@@ -318,7 +303,7 @@ mod tests {
     struct ArtifactRoot(Option<std::path::PathBuf>);
     impl Drop for ArtifactRoot {
         fn drop(&mut self) {
-            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            codewhale_runtime::artifacts::set_test_artifact_sessions_root(self.0.take());
         }
     }
 
@@ -438,13 +423,15 @@ mod tests {
 
     #[test]
     fn session_checkpoint_reopens_in_the_actual_worker_without_reviving_an_approval() {
-        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        let _guard = codewhale_runtime::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
             .lock()
             .unwrap();
         let root = tempfile::tempdir().unwrap();
-        let _restore = ArtifactRoot(crate::artifacts::set_test_artifact_sessions_root(Some(
-            root.path().to_owned(),
-        )));
+        let _restore = ArtifactRoot(
+            codewhale_runtime::artifacts::set_test_artifact_sessions_root(Some(
+                root.path().to_owned(),
+            )),
+        );
         let worker = Worker::start(Some("pet-worker-test".into())).unwrap();
         worker
             .tx

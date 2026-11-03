@@ -113,6 +113,22 @@ fn resolve_reports_a_provider_scoped_model_as_explicitly_configured() {
         Some("config [providers.*].model"),
         "{report:?}"
     );
+    let base = codewhale_config::ProviderKind::Zai
+        .provider()
+        .default_base_url();
+    let configured = format!(
+        "provider = 'zai'\n[providers.zai]\napi_key = 'fixture-only'\nmodel = 'GLM-5.2'\n[[custom_models]]\nprovider = 'zai'\nbase_url = '{base}'\nid = 'operator-only-fixture'\nlimit = {{ context = 96000, output = 8000 }}\n"
+    );
+    let report = resolve_with_config(&configured, &["operator-only-fixture"]);
+    assert_eq!(
+        report.get("resolved").map(String::as_str),
+        Some("operator-only-fixture")
+    );
+    assert_eq!(report.get("provider").map(String::as_str), Some("zai"));
+    assert_eq!(
+        report.get("used_fallback").map(String::as_str),
+        Some("false")
+    );
 }
 
 #[test]
@@ -323,12 +339,14 @@ fn top_level_provider_and_model_flags_report_the_runtime_route() {
 /// `kimi-k3`).
 #[test]
 fn moonshot_k3_products_resolve_without_crossing_providers() {
-    for model in ["kimi-k3", "k3"] {
-        let report = resolve_with_global_flags(
-            "provider = \"moonshot\"\n\n[providers.moonshot]\napi_key = \"k\"\n",
-            &[],
-            &[model, "--provider", "moonshot"],
+    for (model, base_url) in [
+        ("kimi-k3", "https://api.moonshot.ai/v1"),
+        ("k3", "https://api.kimi.com/coding/v1"),
+    ] {
+        let config = format!(
+            "provider = \"moonshot\"\n\n[providers.moonshot]\napi_key = \"k\"\nbase_url = \"{base_url}\"\n"
         );
+        let report = resolve_with_global_flags(&config, &[], &[model, "--provider", "moonshot"]);
 
         assert_eq!(
             report.get("provider").map(String::as_str),

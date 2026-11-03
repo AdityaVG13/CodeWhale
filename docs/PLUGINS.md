@@ -37,8 +37,11 @@ Codewhale is helpful about plugins, not pushy. The rules:
 - **Built-ins are never advertised.** Bundled plugins such as Computer Use
   appear only in `/plugin list` and Extensions.
 - **Specific terms only.** Generic words (accessibility, browser, chrome,
-  docs, screenshot, web, wiki, …) never trigger an offer. The matcher and the
-  marketplace's `check-marketplace.mjs` share one stoplist.
+  docs, screenshot, web, wiki, …) and Codewhale's own vocabulary (agent, code,
+  data, MCP, model, session, tool) never trigger an offer, so asking why an
+  MCP server is stuck does not suggest a vendor's plugin. Distinctive names,
+  phrases and domains still do. The matcher and the marketplace's
+  `check-marketplace.mjs` share one stoplist.
 - **Only what runs here.** Plugins whose `when.os` excludes this OS are not
   offered.
 - **Review before acting.** A model-requested row offers Review. Its button

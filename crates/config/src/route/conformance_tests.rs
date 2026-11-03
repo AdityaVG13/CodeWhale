@@ -19,6 +19,7 @@ fn none_request(kind: ProviderKind) -> RouteRequest {
         saved_provider_model: None,
         base_url_override: None,
         limit_overrides: Vec::new(),
+        wire_override: None,
     }
 }
 
@@ -125,6 +126,7 @@ fn every_provider_kind_resolves_the_auto_selector() {
             saved_provider_model: None,
             base_url_override: None,
             limit_overrides: Vec::new(),
+            wire_override: None,
         };
         let candidate = resolver
             .resolve(&request)
@@ -165,6 +167,7 @@ fn modelstudio_qwen38_max_offering_publishes_1m_context() {
             context_tokens: Some(1_000_000),
             input_tokens: None,
             output_tokens: Some(131_072),
+            output_declared: false,
         },
         "hand-seam limits must not be empty (empty won collisions and fell to 128K)"
     );
@@ -175,14 +178,9 @@ fn modelstudio_image_input_capability_is_per_model() {
     use super::capabilities::CapabilityState;
 
     // Owner's Token Plan console (verified 2026-08-03) lists Visual
-    // Understanding for exactly these four models; upstream Models.dev
-    // modalities agree (image/video input) and mark the rest text-only.
-    const VISION: &[&str] = &[
-        "qwen3.8-max",
-        "qwen3.8-max-preview",
-        "qwen3.7-plus",
-        "qwen3.6-flash",
-    ];
+    // Understanding for these models; upstream Models.dev modalities agree
+    // (image/video input) and mark the rest text-only.
+    const VISION: &[&str] = &["qwen3.8-max", "qwen3.7-plus", "qwen3.6-flash"];
     const TEXT_ONLY: &[&str] = &[
         "qwen3.7-max",
         "deepseek-v4-pro",

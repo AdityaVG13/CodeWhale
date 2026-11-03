@@ -23,11 +23,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Widget};
 use unicode_width::UnicodeWidthStr;
 
-use crate::plugins::recommend::{
-    PluginNextStep, load_marketplace_candidates, match_plugin_for_draft,
-};
 use crate::tui::app::{App, StatusToast, StatusToastKind, StatusToastLevel};
 use codewhale_localization::{MessageId, tr};
+use codewhale_plugins::recommend::{
+    PluginNextStep, load_marketplace_candidates, match_plugin_for_draft,
+};
 
 const CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -70,7 +70,7 @@ impl Default for PluginCtaState {
 }
 
 impl PluginCtaState {
-    pub(crate) fn from_settings(settings: &crate::settings::Settings) -> Self {
+    pub(crate) fn from_settings(settings: &codewhale_runtime::settings::Settings) -> Self {
         Self {
             dismissed: settings
                 .dismissed_plugin_suggestions
@@ -135,7 +135,7 @@ impl App {
             return;
         }
         self.last_plugin_catalog_poll = Some(now);
-        if let Some(message) = crate::plugins::plugin_reload_nudge(
+        if let Some(message) = codewhale_plugins::plugin_reload_nudge(
             self.plugin_registry.as_ref(),
             &mut self.plugin_reload_nudge_stamp,
         ) {
@@ -176,7 +176,7 @@ impl App {
         self.plugin_cta.dismissed.insert(name.clone());
         self.plugin_cta.phase = PluginCtaPhase::Hidden;
         self.needs_redraw = true;
-        if let Err(error) = crate::settings::Settings::transact_opt(|settings| {
+        if let Err(error) = codewhale_runtime::settings::Settings::transact_opt(|settings| {
             Ok(settings
                 .dismissed_plugin_suggestions
                 .insert(name)
@@ -301,9 +301,9 @@ pub fn draw_plugin_cta(app: &mut App, area: Rect, buf: &mut Buffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::tui::app::TuiOptions;
     use codewhale_localization::Locale;
+    use codewhale_runtime::config::Config;
     use std::fs;
     use tempfile::TempDir;
 
@@ -327,7 +327,7 @@ mod tests {
             mcp_config_path: temp.path().join("mcp.json"),
             ..crate::tui::test_support::test_tui_options(root.path())
         };
-        let discovery = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv();
+        let discovery = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv();
         let registry = discovery.registry_for_workspace(root.path());
         let mut app = App::new_with_plugin_registry(options, &Config::default(), registry);
         app.ui_locale = Locale::En;
@@ -487,8 +487,8 @@ mod tests {
 
     #[test]
     fn esc_clears_a_draft_first_then_dismisses_for_the_session_only() {
-        use crate::settings::Settings;
         use crate::tui::composer_ui::{EscapeAction, next_escape_action};
+        use codewhale_runtime::settings::Settings;
         let _lock = crate::test_support::lock_test_env();
         let (mut app, root, _home) = app_with_supabase_plugin();
         app.surface_plugin_review_request("supabase", "/plugin trust supabase");
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn dismissal_survives_restart_and_all_proactive_paths_preserving_settings() {
-        use crate::settings::Settings;
+        use codewhale_runtime::settings::Settings;
         let _lock = crate::test_support::lock_test_env();
         let (mut app, root, _home) = app_with_supabase_plugin();
         Settings::transact(|settings| settings.set("max_history", "321")).unwrap();
@@ -537,7 +537,7 @@ mod tests {
         restarted.surface_plugin_review_request("supabase", "/plugin trust supabase");
         assert!(!restarted.plugin_cta.phase.is_visible());
         assert!(
-            crate::plugins::recommend::lookup_reviewable_plugin(
+            codewhale_plugins::recommend::lookup_reviewable_plugin(
                 "supabase",
                 restarted.plugin_registry.as_ref(),
                 &[],
@@ -552,7 +552,7 @@ mod tests {
         let _lock = crate::test_support::lock_test_env();
         let (mut app, root, _home) = app_with_supabase_plugin();
         app.surface_plugin_review_request("supabase", "/plugin trust supabase");
-        let path = crate::settings::Settings::path().unwrap();
+        let path = codewhale_runtime::settings::Settings::path().unwrap();
         assert!(path.starts_with(root.path()));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let malformed = "theme = [private_fixture_payload\n";

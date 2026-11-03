@@ -30,12 +30,22 @@ notes="$(printf '%s\n' "${section}" | awk '
   !in_contributors { print }
 ')"
 
+summary="$(printf '%s\n' "${notes}" | awk '/^### / { in_details = 1 } !in_details { print }')"
+details="$(printf '%s\n' "${notes}" | awk '/^### / { in_details = 1 } in_details { print }')"
+if [[ -z "${summary//[[:space:]]/}" ]]; then
+  summary="${notes}"
+  details=""
+fi
+
+render_body() {
+printf "## What's in %s\n\n" "${tag}"
+if [[ -n "${summary}" ]]; then
+  printf '%s\n' "${summary}"
+else
+  printf '%s\n' "See the changelog link below for this release's notes."
+fi
+
 cat <<EOF
-> **Codewhale** is the public product from Shannon Labs. The \`codewhale\`
-> command, npm package, and release-asset names remain lowercase technical
-> identifiers. The legacy npm package \`deepseek-tui\` is deprecated and
-> receives no further releases. Users coming from v0.8.x legacy \`deepseek\` /
-> \`deepseek-tui\` names should migrate with \`docs/REBRAND.md\`.
 
 ## Install
 
@@ -97,6 +107,7 @@ Each archive below contains the same runtime under the \`codewhale\` and
 | Linux x64 | \`codewhale-linux-x64.tar.gz\` | \`install.sh\` |
 | Linux ARM64 | \`codewhale-linux-arm64.tar.gz\` | \`install.sh\` |
 | Android ARM64 (Termux) | \`codewhale-android-arm64.tar.gz\` | \`install.sh\` |
+| HarmonyOS ARM64 (native) | \`codewhale-ohos-arm64.tar.gz\` | \`install.sh\` |
 | macOS x64 | \`codewhale-macos-x64.tar.gz\` | \`install.sh\` |
 | macOS ARM | \`codewhale-macos-arm64.tar.gz\` | \`install.sh\` |
 | Windows x64 (installer) | \`CodeWhaleSetup.exe\` | NSIS setup |
@@ -150,13 +161,11 @@ shasum -a 256 -c codewhale-bundles-sha256.txt --ignore-missing
 shasum -a 256 -c codewhale-artifacts-sha256.txt --ignore-missing
 \`\`\`
 
-## What's in ${tag}
 EOF
 
-if [[ -n "${notes}" ]]; then
-  printf '%s\n' "${notes}"
-else
-  printf '%s\n' "See the changelog link below for this release's notes."
+if [[ -n "${details}" ]]; then
+  printf '%s\n\n' '<details>' '<summary>Full release notes</summary>'
+  printf '%s\n\n' "${details}" '</details>'
 fi
 
 cat <<EOF
@@ -174,3 +183,15 @@ cat <<EOF
 
 See [CHANGELOG.md](https://github.com/codewhale-hq/CodeWhale/blob/main/CHANGELOG.md) for full notes and [docs/CHANGELOG_ARCHIVE.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/CHANGELOG_ARCHIVE.md) for older releases.
 EOF
+}
+
+body="$(render_body)"
+if (( ${#body} >= 125000 )); then
+  details="The full notes exceed GitHub's release-description limit. Read the [complete changelog for ${tag}](https://github.com/codewhale-hq/CodeWhale/blob/${tag}/CHANGELOG.md)."
+  body="$(render_body)"
+fi
+if (( ${#body} >= 125000 )); then
+  echo "Release summary, installation instructions and contributor credits exceed GitHub's 125000-character limit." >&2
+  exit 1
+fi
+printf '%s\n' "${body}"

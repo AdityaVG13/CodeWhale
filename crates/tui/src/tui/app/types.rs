@@ -120,7 +120,6 @@ impl ComposerDensity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptSpacing {
     Compact,
-    Comfortable,
     Spacious,
 }
 
@@ -129,8 +128,7 @@ impl TranscriptSpacing {
     pub fn from_setting(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "compact" | "tight" => Self::Compact,
-            "spacious" | "loose" => Self::Spacious,
-            _ => Self::Comfortable,
+            _ => Self::Spacious,
         }
     }
 }
@@ -277,7 +275,11 @@ impl VimMode {}
 pub struct QueuedMessage {
     pub display: String,
     pub skill_instruction: Option<String>,
-    pub skill_provenance: Option<crate::skills::SkillProvenance>,
+    pub skill_provenance: Option<codewhale_skills::SkillProvenance>,
+    pub extension_command: Option<(
+        codewhale_engine::extension_host::command::ExtensionCommandRef,
+        String,
+    )>,
     /// True once this turn has been painted into `history` as `HistoryCell::User`.
     /// Queue/offline submit echoes before the model runs; Immediate prepare skips
     /// a second paint when this is set so drained queued turns do not double.
@@ -402,6 +404,7 @@ impl QueuedMessage {
             display,
             skill_instruction,
             skill_provenance: None,
+            extension_command: None,
             history_echoed: false,
         }
     }
@@ -409,7 +412,7 @@ impl QueuedMessage {
     #[must_use]
     pub fn with_skill_provenance(
         mut self,
-        provenance: Option<crate::skills::SkillProvenance>,
+        provenance: Option<codewhale_skills::SkillProvenance>,
     ) -> Self {
         self.skill_provenance = provenance;
         self
@@ -443,7 +446,7 @@ impl QueuedMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GoalControlIntent {
     SetStatus {
-        status: crate::tools::goal::GoalStatus,
+        status: codewhale_engine::tools::goal::GoalStatus,
         clear: bool,
     },
     SetObjective {
@@ -523,6 +526,10 @@ impl ScreenMode {
 /// Actions emitted by the UI event loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppAction {
+    OpenUndoSelector,
+    UndoLatestRequest {
+        force: bool,
+    },
     SetWorkspaceTrust {
         trusted: bool,
         save: bool,
@@ -668,7 +675,7 @@ pub enum AppAction {
     /// event loop awaits it, then shows its text and/or submits its prompt
     /// as the user's next message.
     RunExtensionCommand {
-        command: crate::extension_host::command::ExtensionCommandRef,
+        command: codewhale_engine::extension_host::command::ExtensionCommandRef,
         name: String,
         input: String,
     },
@@ -678,6 +685,7 @@ pub enum AppAction {
     /// acknowledges this history and its persisted snapshot is durable.
     ConversationUndo {
         sync: codewhale_command_contract::facets::SessionSyncPayload,
+        restored_files: usize,
         retry_input: Option<String>,
         /// `retry_input` is the text of a pending `/edit`, already taken from
         /// the composer. If the rollback is refused it must go back there, with
@@ -699,7 +707,7 @@ pub enum AppAction {
     /// dispatching a model turn. The UI layer translates this into
     /// `Op::SetGoalStatus`.
     SetGoalStatus {
-        status: crate::tools::goal::GoalStatus,
+        status: codewhale_engine::tools::goal::GoalStatus,
         clear: bool,
     },
     /// Set or replace the goal objective (`/goal <objective>`). The engine
@@ -762,7 +770,7 @@ pub enum AppAction {
     /// Switch provider+model through the same apply path as a `/model` route
     /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
     SwitchModelRoute {
-        identity: crate::config::ProviderIdentity,
+        identity: codewhale_runtime::config::ProviderIdentity,
         model: String,
     },
     UpdateCompaction(CompactionConfig),
@@ -777,7 +785,7 @@ pub enum AppAction {
     },
     /// Apply `/config search.provider` to the live Config and engine.
     UpdateSearchProvider {
-        provider: crate::config::SearchProvider,
+        provider: codewhale_runtime::config::SearchProvider,
     },
     /// Apply `/config prompt_suggestion` to the live Config.
     UpdatePromptSuggestion {
@@ -785,7 +793,7 @@ pub enum AppAction {
     },
     /// Apply one `/config notifications` scalar to the live Config.
     UpdateNotification {
-        update: crate::config::NotificationConfigUpdate,
+        update: codewhale_config::notifications::NotificationConfigUpdate,
     },
     /// Enable or disable the background advisor watcher for this session (#3982).
     SetAdvisorEnabled {

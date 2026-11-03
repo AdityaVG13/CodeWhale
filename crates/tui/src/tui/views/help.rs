@@ -6,7 +6,7 @@
 //! Help lead with commands, while keyboard shortcuts lead with the key
 //! reference that the footer promises. The command list is sourced from
 //! [`crate::commands::command_infos()`] and the keybinding list from
-//! [`crate::keybinding_table::KEYBINDINGS`] so neither can drift from the
+//! [`codewhale_engine::keybinding_table::KEYBINDINGS`] so neither can drift from the
 //! wired-up handlers.
 //!
 //! Keys: any printable character extends the filter, `Backspace` (or `Ctrl+H`)
@@ -32,14 +32,14 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands;
-use crate::keybinding_table::KEYBINDINGS;
-use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, render_modal_footer, render_panel_scroll_rail,
     render_underwater_surface,
 };
+use codewhale_engine::keybinding_table::KEYBINDINGS;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+use codewhale_tui_kit::menu_style;
 
 /// Two top-level sections rendered in the overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +168,7 @@ impl HelpView {
         skills: &[(String, String)],
     ) -> Self {
         commands::user_registry::with_registry_for_workspace(Some(workspace), |registry| {
-            Self::new_with_registry(locale, HelpOrdering::CommandsFirst, registry, skills)
+            Self::new_with_registry(locale, HelpOrdering::CommandsFirst, registry, skills, false)
         })
     }
 
@@ -183,12 +183,13 @@ impl HelpView {
                 },
                 registry,
                 &app.cached_skills,
+                app.composer_multiline_mode,
             )
         })
     }
     fn new_with_ordering(locale: Locale, ordering: HelpOrdering) -> Self {
         let registry = commands::user_registry::UserCommandRegistry::new();
-        Self::new_with_registry(locale, ordering, &registry, &[])
+        Self::new_with_registry(locale, ordering, &registry, &[], false)
     }
 
     fn new_with_registry(
@@ -196,8 +197,9 @@ impl HelpView {
         ordering: HelpOrdering,
         registry: &commands::user_registry::UserCommandRegistry,
         skills: &[(String, String)],
+        multiline_mode: bool,
     ) -> Self {
-        let entries = build_entries(locale, registry, skills);
+        let entries = build_entries(locale, registry, skills, multiline_mode);
         let mut view = Self {
             locale,
             ordering,
@@ -322,7 +324,7 @@ impl HelpView {
             .iter()
             .position(|candidate| self.focus.as_ref() == Some(candidate))
             .unwrap_or(0);
-        let next = crate::tui::list_nav::wrap_index(pos, focusable.len(), delta);
+        let next = codewhale_tui_kit::list_nav::wrap_index(pos, focusable.len(), delta);
         self.set_focus(focusable[next].clone());
     }
 
@@ -409,12 +411,12 @@ impl HelpView {
             .copied()
             .unwrap_or(label_cap);
         let inline_capacity = inner_width.saturating_sub(label_width + 4);
-        let inline = shed_to_width(&entry.description, inline_capacity);
-        let full = shed_to_width(&entry.description, inner_width);
+        let inline = shed_to_width(&entry.description, inline_capacity, self.locale);
+        let full = shed_to_width(&entry.description, inner_width, self.locale);
         let repaired = (full != inline && !full.is_empty()).then(|| full.to_string());
         match (entry.usage.as_deref(), repaired) {
             (None, repaired) => repaired,
-            (Some(usage), None) => Some(shed_to_width(usage, inner_width).to_string()),
+            (Some(usage), None) => Some(shed_to_width(usage, inner_width, self.locale).to_string()),
             (Some(usage), Some(description)) => {
                 // They join at a joint `shed_to_width` already sheds on, and
                 // the description leads: repairing the shed is what this slot
@@ -422,7 +424,7 @@ impl HelpView {
                 // spend itself on the argument shape and drop the sentence
                 // the row could not print.
                 let joined = format!("{description} — {usage}");
-                Some(shed_to_width(&joined, inner_width).to_string())
+                Some(shed_to_width(&joined, inner_width, self.locale).to_string())
             }
         }
     }
@@ -493,6 +495,7 @@ fn build_entries(
     locale: Locale,
     registry: &commands::user_registry::UserCommandRegistry,
     skills: &[(String, String)],
+    multiline_mode: bool,
 ) -> Vec<HelpEntry> {
     let mut entries = Vec::new();
 
@@ -605,10 +608,14 @@ fn build_entries(
     for binding in KEYBINDINGS {
         // macOS renders Alt chords with the Option glyph (`⌥V`), never
         // `Alt`/`Cmd` (TUI-DOG-002 acceptance).
-        let mut label = crate::tui::shell_key_routing::display_chord(binding.chord).into_owned();
-        // The newline row is the one chord whose availability depends on the
-        // terminal rather than the platform, so it is answered here instead
-        // of listing a key that may do nothing.
+        let chord = match (multiline_mode, binding.description_id) {
+            (true, MessageId::KbInsertNewline) => "Enter / Ctrl+J",
+            (true, MessageId::KbSendDraft) => "Alt+Enter / Shift+Enter (enhanced terminals)",
+            _ => binding.chord,
+        };
+        let mut label = crate::tui::shell_key_routing::display_chord(chord).into_owned();
+        // Shift+Enter depends on the startup capability receipt; Help never
+        // reads the terminal while the input pump owns it.
         if label.contains("Shift+Enter")
             && !crate::tui::composer_ui::terminal_can_report_shift_enter()
         {
@@ -762,14 +769,16 @@ fn group_label(entry: &HelpEntry, locale: Locale) -> String {
     }
 }
 
-fn keybinding_section_for_rank(rank: u8) -> Option<crate::keybinding_table::KeybindingSection> {
-    crate::keybinding_table::KeybindingSection::ALL
+fn keybinding_section_for_rank(
+    rank: u8,
+) -> Option<codewhale_engine::keybinding_table::KeybindingSection> {
+    codewhale_engine::keybinding_table::KeybindingSection::ALL
         .into_iter()
         .find(|section| section.rank() == rank)
 }
 
 fn default_collapsed(ordering: HelpOrdering) -> HashSet<String> {
-    use crate::keybinding_table::KeybindingSection;
+    use codewhale_engine::keybinding_table::KeybindingSection;
     let kb_keys = KeybindingSection::ALL
         .into_iter()
         .map(|section| format!("kb:{}", section.rank()));
@@ -816,7 +825,7 @@ const FIELD_JOINTS: [&str; 6] = [" (", "; ", " — ", ". ", ": ", ", "];
 /// share prefixes. So the description sheds its alias parenthetical first,
 /// then trailing clauses at its own joints, and finally itself. The label is
 /// never shed at all: it is the string the user has to type.
-fn shed_to_width(text: &str, max_width: usize) -> Cow<'_, str> {
+fn shed_to_width(text: &str, max_width: usize, locale: Locale) -> Cow<'_, str> {
     let trimmed = text.trim_end();
     if max_width == 0 {
         return Cow::Borrowed("");
@@ -879,7 +888,7 @@ fn shed_to_width(text: &str, max_width: usize) -> Cow<'_, str> {
         } else {
             oversize_clause
         };
-        shed_to_words(source, max_width)
+        shed_to_words(source, max_width, locale)
     } else {
         Cow::Borrowed(best)
     }
@@ -905,9 +914,9 @@ fn widest_char_prefix(text: &str, max_width: usize) -> &str {
 /// The scan used to stop on a space, so the last word was never included
 /// even when it fitted, and the two-pass short-word trim then left a simple
 /// verb + modifier + noun phrase without the noun — `/automation` read
-/// `Manage durable scheduled`. If that prefix lost the head noun, intervening
-/// modifiers are dropped so the noun survives.
-fn shed_to_words(text: &str, max_width: usize) -> Cow<'_, str> {
+/// `Manage durable scheduled`. In English, if that prefix lost the head noun,
+/// intervening modifiers are dropped so the noun survives.
+fn shed_to_words(text: &str, max_width: usize, locale: Locale) -> Cow<'_, str> {
     let mut end = 0usize;
     for (idx, ch) in text.char_indices() {
         if ch == ' ' && text[..idx].width() <= max_width {
@@ -940,7 +949,9 @@ fn shed_to_words(text: &str, max_width: usize) -> Cow<'_, str> {
         head = &head[..cut];
     }
     let head = head.trim_end_matches([' ', ',', ';', ':', '—', '-']);
-    if let Some(kept) = keep_simple_head_noun(text, head, max_width) {
+    if locale == Locale::En
+        && let Some(kept) = keep_simple_head_noun(text, head, max_width)
+    {
         return kept;
     }
     Cow::Borrowed(head)
@@ -1299,8 +1310,10 @@ impl ModalView for HelpView {
                         ));
                         let entry = &self.entries[entry_idx];
                         let is_selected = self.focus.as_ref() == Some(&HelpHit::Entry(slot));
-                        let cursor =
-                            format!("{} ", crate::tui::glyphs::selection_marker(is_selected));
+                        let cursor = format!(
+                            "{} ",
+                            codewhale_tui_kit::glyphs::selection_marker(is_selected)
+                        );
                         let label_width = label_widths
                             .get(&group_key(entry))
                             .copied()
@@ -1308,7 +1321,7 @@ impl ModalView for HelpView {
                         let pad = label_width.saturating_sub(entry.label.width());
                         let desc_capacity =
                             inner_width.saturating_sub(cursor.width() + label_width + 2);
-                        let desc = shed_to_width(&entry.description, desc_capacity);
+                        let desc = shed_to_width(&entry.description, desc_capacity, self.locale);
                         // The label is the string you type and the description
                         // qualifies it. They were both TEXT_PRIMARY, so the
                         // row said everything at one weight and the eye had
@@ -1382,6 +1395,23 @@ mod tests {
         let shortcuts = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst);
         assert_eq!(shortcuts.ordering, HelpOrdering::KeybindingsFirst);
         assert_eq!(first_filtered_section(&shortcuts), HelpSection::Keybinding);
+        let registry = commands::user_registry::UserCommandRegistry::new();
+        let multiline = HelpView::new_with_registry(
+            Locale::En,
+            HelpOrdering::KeybindingsFirst,
+            &registry,
+            &[],
+            true,
+        );
+        assert!(multiline.entries.iter().any(|entry| {
+            entry.label == "Enter / Ctrl+J"
+                && entry.description == tr(Locale::En, MessageId::KbInsertNewline)
+        }));
+        assert!(multiline.entries.iter().any(|entry| {
+            !entry.label.contains("Shift+Enter")
+                && entry.description == tr(Locale::En, MessageId::KbSendDraft)
+                && entry.label == crate::tui::shell_key_routing::display_chord("Alt+Enter")
+        }));
     }
 
     #[test]
@@ -1467,7 +1497,7 @@ mod tests {
             "help".to_string(),
             "---\ndescription: Custom help workflow\n---\ncustom help".to_string(),
         )]);
-        let entries = build_entries(Locale::En, &registry, &[]);
+        let entries = build_entries(Locale::En, &registry, &[], false);
 
         // The built-in row is suppressed so the name is not advertised twice.
         assert!(
@@ -1822,7 +1852,7 @@ mod tests {
     fn shedding_never_leaves_a_parenthesis_open() {
         let text = "Attach media  (aliases: /image, /media)";
         for width in 4..text.len() {
-            let shed = shed_to_width(text, width);
+            let shed = shed_to_width(text, width, Locale::En);
             let opens = shed.matches('(').count();
             let closes = shed.matches(')').count();
             assert_eq!(opens, closes, "unbalanced at width {width}: {shed:?}");
@@ -1836,7 +1866,7 @@ mod tests {
     #[test]
     fn a_jointless_description_sheds_to_whole_words() {
         let text = "Move the active branch to an existing session entry";
-        let shed = shed_to_width(text, 26);
+        let shed = shed_to_width(text, 26, Locale::En);
         assert!(text.starts_with(&*shed), "{shed:?}");
         assert!(!shed.is_empty());
         assert!(!shed.ends_with(" an"), "{shed:?}");
@@ -2227,7 +2257,7 @@ mod tests {
     #[test]
     fn localized_help_keybinding_descriptions_use_zh_hans() {
         let registry = commands::user_registry::UserCommandRegistry::new();
-        let entries = build_entries(Locale::ZhHans, &registry, &[]);
+        let entries = build_entries(Locale::ZhHans, &registry, &[], false);
         let kb_entries: Vec<_> = entries
             .iter()
             .filter(|e| e.section == HelpSection::Keybinding)
@@ -2538,7 +2568,7 @@ mod tests {
 
 #[cfg(test)]
 mod shed_to_words_script_tests {
-    use super::{shed_to_words, widest_char_prefix};
+    use super::{Locale, shed_to_words, widest_char_prefix};
     use unicode_width::UnicodeWidthStr;
 
     /// Japanese, Chinese and Thai do not put spaces between words, so a
@@ -2552,7 +2582,7 @@ mod shed_to_words_script_tests {
             "切換背景顧問",
         ] {
             for width in [8usize, 12, 20, 30] {
-                let shed = shed_to_words(text, width);
+                let shed = shed_to_words(text, width, Locale::En);
                 assert!(
                     !shed.is_empty(),
                     "{text:?} at {width}: description rendered blank",
@@ -2575,7 +2605,7 @@ mod shed_to_words_script_tests {
     #[test]
     fn an_overlong_first_word_sheds_to_characters_rather_than_nothing() {
         let text = "Internationalisation settings";
-        let shed = shed_to_words(text, 10);
+        let shed = shed_to_words(text, 10, Locale::En);
         assert!(!shed.is_empty(), "long first word rendered blank");
         assert!(shed.width() <= 10, "{shed:?}");
     }
@@ -2585,7 +2615,7 @@ mod shed_to_words_script_tests {
     #[test]
     fn english_still_sheds_on_word_boundaries() {
         let text = "Toggle the background advisor for this session";
-        let shed = shed_to_words(text, 24);
+        let shed = shed_to_words(text, 24, Locale::En);
         assert!(shed.width() <= 24, "{shed:?}");
         assert!(!shed.ends_with(' '), "{shed:?}");
         assert!(
@@ -2615,7 +2645,7 @@ mod shed_to_words_script_tests {
         // 35 is the description slot at 60 columns (measured).
         // 36 is the full phrase.
         for width in [24usize, 28, 32, 35, 36] {
-            let shed = shed_to_words(text, width);
+            let shed = shed_to_words(text, width, Locale::En);
             assert!(
                 shed.contains("automations"),
                 "width {width} dropped the head noun: {shed:?}"
@@ -2631,7 +2661,7 @@ mod shed_to_words_script_tests {
         // one column over the 35-column slot, so last-resort word shed must
         // run on that clause, not on the alias list.
         let aliased = "Manage durable scheduled automations  (aliases: /automations, /scheduled)";
-        let shed = super::shed_to_width(aliased, 35);
+        let shed = super::shed_to_width(aliased, 35, Locale::En);
         assert!(
             shed.contains("automations"),
             "aliased row dropped the head noun: {shed:?}"

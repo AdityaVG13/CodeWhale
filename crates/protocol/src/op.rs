@@ -2,7 +2,7 @@
 //! core/protocol extraction spec).
 //!
 //! The TUI engine already had an internal channel (`Op` in
-//! `crates/tui/src/core/ops.rs` with `tx_op` / `rx_op` and `tx_steer`).
+//! `crates/engine/src/core/ops.rs` with `tx_op` / `rx_op` and `tx_steer`).
 //! This protocol file formalizes that channel so TUI, CLI, app-server, and
 //! tests share one serializable API. The wire is `OpEnvelope` + `Op`;
 //! transports that already speak JSON (app-server, tests) can send the
@@ -10,7 +10,7 @@
 //! enum.
 //!
 //! Parity is compile-enforced from the engine side:
-//! `crates/tui/src/core/protocol_parity.rs` matches every engine `Op`
+//! `crates/engine/src/core/protocol_parity.rs` matches every engine `Op`
 //! variant exhaustively into a protocol `Op` (`protocol_covers_engine_ops`).
 //!
 //! What is deliberately stripped at this boundary:
@@ -52,7 +52,7 @@ where
 }
 
 use crate::ids::{SessionId, ThreadId};
-use crate::runtime::DynamicToolSpec;
+use codewhale_app_server_protocol::runtime::DynamicToolSpec;
 
 /// Every `Op` is paired with the ids that route it. This is the
 /// `Op`-in half of the `Op`-in / `EventMsg`-out contract.
@@ -103,7 +103,7 @@ fn default_capability_state() -> String {
 }
 
 /// Per-turn authority payload carried by [`Op::SendMessage`]. Serializable
-/// twin of `crates/tui/src/core/ops::TurnSpec`; extracted from the enum arm so
+/// twin of `crates/engine/src/core/ops::TurnSpec`; extracted from the enum arm so
 /// new per-turn fields accrete here instead of widening the variant. The
 /// `SendMessage(TurnSpec)` newtype keeps the internally-tagged wire shape
 /// byte-identical: `{"kind":"send_message", ...fields}`.
@@ -120,7 +120,7 @@ pub struct TurnSpec {
     pub max_output_tokens: Option<std::num::NonZeroU32>,
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<crate::runtime::RuntimeImageInput>,
+    pub images: Vec<codewhale_app_server_protocol::runtime::RuntimeImageInput>,
     /// Effective mode for this turn (`"plan" | "agent" | "operate"` etc).
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -174,14 +174,71 @@ pub struct TurnSpec {
     pub verbosity: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewOperationIntent {
+    pub title: String,
+    pub description: String,
+    pub commits: String,
+    pub linked_issue: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceFile {
+    pub path: String,
+    pub revision: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPriorFinding {
+    pub key: String,
+    pub path: String,
+    pub line: u32,
+    pub summary: String,
+    pub discussion: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewOperationContext {
+    pub files: Vec<ReviewSourceFile>,
+    pub omitted: Vec<String>,
+    pub previous_findings: Vec<ReviewPriorFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewOperation {
+    pub version: u32,
+    pub repository: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub base_sha: String,
+    pub diff: String,
+    pub intent: ReviewOperationIntent,
+    pub guidance: String,
+    pub max_claims: usize,
+    pub max_nits: usize,
+    pub max_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ReviewOperationContext>,
+}
+
 /// Operations that can be submitted to the core engine. This is the
-/// protocol view of `crates/tui/src/core/ops::Op` — same lifecycle,
+/// protocol view of `crates/engine/src/core/ops::Op` — same lifecycle,
 /// same provenance gate — but serializable and free of `mpsc` / `oneshot`
 /// fields. In-process callers convert at the boundary; out-of-process
 /// callers send the JSON directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Op {
+    Review {
+        turn: Box<TurnSpec>,
+        request: ReviewOperation,
+    },
     /// Drive one model turn: `role=user` content plus the resolved route
     /// receipt the engine will freeze at the client-freeze boundary. Headless
     /// and TUI must produce byte-identical `MessageRequest`s for identical
@@ -304,6 +361,9 @@ pub enum Op {
     FollowUpSubAgent {
         agent_id: String,
         text: String,
+    },
+    StartFleetMember {
+        member_id: String,
     },
 
     ChangeMode {
@@ -447,6 +507,7 @@ fn default_approval_mode() -> String {
 
 /// Every wire tag `Op` can carry, in declaration order.
 pub const OP_KINDS: &[&str] = &[
+    "review",
     "send_message",
     "steer",
     "continue_goal",
@@ -460,6 +521,7 @@ pub const OP_KINDS: &[&str] = &[
     "get_sub_agent_settlement",
     "cancel_sub_agent",
     "follow_up_sub_agent",
+    "start_fleet_member",
     "change_mode",
     "set_model",
     "set_compaction",
@@ -492,6 +554,7 @@ impl Op {
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
         match self {
+            Self::Review { .. } => "review",
             Self::SendMessage(_) => "send_message",
             Self::Steer { .. } => "steer",
             Self::ContinueGoal { .. } => "continue_goal",
@@ -505,6 +568,7 @@ impl Op {
             Self::GetSubAgentSettlement => "get_sub_agent_settlement",
             Self::CancelSubAgent { .. } => "cancel_sub_agent",
             Self::FollowUpSubAgent { .. } => "follow_up_sub_agent",
+            Self::StartFleetMember { .. } => "start_fleet_member",
             Self::ChangeMode { .. } => "change_mode",
             Self::SetModel { .. } => "set_model",
             Self::SetCompaction { .. } => "set_compaction",
@@ -588,7 +652,32 @@ mod tests {
 
     /// One instance of every variant, in declaration order.
     fn every_variant() -> Vec<Op> {
+        let Op::SendMessage(turn) = headless_send_message_op(ThreadId::new(), "review").op else {
+            unreachable!()
+        };
         vec![
+            Op::Review {
+                turn: Box::new(turn),
+                request: ReviewOperation {
+                    version: 1,
+                    repository: "owner/repo".into(),
+                    pr_number: 1,
+                    head_sha: "a".repeat(40),
+                    base_sha: "b".repeat(40),
+                    diff: "diff".into(),
+                    intent: ReviewOperationIntent {
+                        title: String::new(),
+                        description: String::new(),
+                        commits: String::new(),
+                        linked_issue: String::new(),
+                    },
+                    guidance: String::new(),
+                    max_claims: 40,
+                    max_nits: 3,
+                    max_chars: 60_000,
+                    context: None,
+                },
+            },
             headless_send_message_op(ThreadId::new(), "hello").op,
             Op::Steer {
                 content: "more".into(),
@@ -645,6 +734,9 @@ mod tests {
             Op::FollowUpSubAgent {
                 agent_id: "a1".into(),
                 text: "go".into(),
+            },
+            Op::StartFleetMember {
+                member_id: "m1".into(),
             },
             Op::ChangeMode {
                 mode: "operate".into(),

@@ -1,9 +1,9 @@
 //! `/hf` - Hugging Face MCP and provider concept helpers.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::mcp::{McpConfig, McpServerConfig};
 use crate::tui::app::App;
 use codewhale_localization::MessageId;
+use codewhale_mcp::config::{McpConfig, McpServerConfig};
 
 use super::CommandResult;
 
@@ -54,7 +54,7 @@ Codewhale has three distinct Hugging Face surfaces:
 2. Hugging Face MCP - Hub, docs, datasets, Spaces, and community tools
    Connect Codewhale to Hugging Face's MCP server through mcp.json.
    Use: /hf mcp status or /hf mcp setup
-   Then: /mcp validate or restart Codewhale so model-visible tools reload.
+   Then: /mcp reload or restart Codewhale so model-visible tools reload.
 
 3. Hugging Face Hub workflows - publish, upload, or manage repositories
    Use explicit Hub tooling such as huggingface_hub or git-based flows.
@@ -96,7 +96,7 @@ fn hf_mcp(app: &mut App, action: Option<&str>) -> CommandResult {
 }
 
 fn hf_mcp_status(app: &App) -> CommandResult {
-    match crate::mcp::load_config(&app.mcp_config_path) {
+    match codewhale_engine::mcp::load_config(&app.mcp_config_path) {
         Ok(config) => {
             if let Some(server_name) = configured_hf_mcp_server(&config) {
                 CommandResult::message(format!(
@@ -168,8 +168,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use crate::config::Config;
     use crate::tui::app::TuiOptions;
+    use codewhale_runtime::config::Config;
     use tempfile::tempdir;
 
     use super::*;

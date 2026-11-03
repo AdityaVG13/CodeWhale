@@ -1,8 +1,8 @@
 //! Real Engine/store through the actual authenticated owner dispatcher. Only
 //! the model is scripted; this is not a fake HTTP bridge or an independent lease.
 use super::*;
-use crate::llm_client::mock::{MockLlmClient, canned};
-use crate::session_manager::SessionManager;
+use codewhale_engine::llm_client::mock::{MockLlmClient, canned};
+use codewhale_engine::session_manager::SessionManager;
 
 struct AbortOnDrop(tokio::task::AbortHandle);
 impl Drop for AbortOnDrop {
@@ -66,7 +66,7 @@ async fn authenticated_owner_guest_runs_real_engine_and_reuses_held_store() -> R
     threads.set_test_model_client(model.clone());
     let manager = threads.clone();
     let (binding, generation) =
-        codewhale_app_server::daemon_socket::owner_work(move || manager.capture_control_owner())
+        codewhale_runtime::runtime_control::owner_work(move || manager.capture_control_owner())
             .await?;
     let owner_client = codewhale_app_server::daemon_client::connect(
         Some(config_path.clone()),
@@ -92,7 +92,7 @@ async fn authenticated_owner_guest_runs_real_engine_and_reuses_held_store() -> R
     #[cfg(windows)]
     assert_eq!(
         captured.principal,
-        codewhale_app_server::daemon_socket::owner_work(|| {
+        codewhale_runtime::runtime_control::owner_work(|| {
             codewhale_config::windows_identity::CurrentWindowsUser::open()?.sid_string()
         })
         .await?
@@ -112,12 +112,12 @@ async fn authenticated_owner_guest_runs_real_engine_and_reuses_held_store() -> R
     .await??;
     let manager = threads.clone();
     let (after_acp_eof, after_generation) =
-        codewhale_app_server::daemon_socket::owner_work(move || manager.capture_control_owner())
+        codewhale_runtime::runtime_control::owner_work(move || manager.capture_control_owner())
             .await?;
     assert_eq!(after_acp_eof.data_dir, captured.data_dir);
     assert_eq!(after_generation, captured.lease_generation);
     assert!(!threads.is_acp_host());
-    let unauthenticated = crate::tls::reqwest_client()
+    let unauthenticated = codewhale_release::tls::reqwest_client()
         .get(format!("http://{addr}/v1/threads"))
         .send()
         .await?;
@@ -159,7 +159,7 @@ async fn authenticated_owner_guest_runs_real_engine_and_reuses_held_store() -> R
             .send(
                 json!(id),
                 "prompt/request",
-                json!({"thread_id":conversation,"prompt":id,"model":"deepseek-v4-pro"}),
+                json!({"thread_id":conversation,"allowed_tools":[],"prompt":id,"model":"deepseek-v4-pro"}),
             )
             .await?;
         let result = reply(&mut guest, id).await?;
@@ -176,7 +176,7 @@ async fn authenticated_owner_guest_runs_real_engine_and_reuses_held_store() -> R
         )
         .await??;
     }
-    let catalog: Value = crate::tls::reqwest_client()
+    let catalog: Value = codewhale_release::tls::reqwest_client()
         .get(format!("http://{addr}/v1/threads"))
         .bearer_auth(&token)
         .send()
@@ -200,7 +200,7 @@ async fn authenticated_owner_guest_runs_real_engine_and_reuses_held_store() -> R
     assert!(detail.latest_seq > 0);
     let manager = threads.clone();
     let (after, generation) =
-        codewhale_app_server::daemon_socket::owner_work(move || manager.capture_control_owner())
+        codewhale_runtime::runtime_control::owner_work(move || manager.capture_control_owner())
             .await?;
     assert_eq!(after.data_dir, captured.data_dir);
     assert_eq!(generation, captured.lease_generation);
@@ -234,7 +234,7 @@ struct GatedOwnerModel {
     entered: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
 }
-impl crate::llm_client::LlmClient for GatedOwnerModel {
+impl codewhale_engine::llm_client::LlmClient for GatedOwnerModel {
     fn provider_name(&self) -> &'static str {
         "deepseek"
     }
@@ -245,17 +245,18 @@ impl crate::llm_client::LlmClient for GatedOwnerModel {
         &self,
         request: codewhale_models::MessageRequest,
     ) -> Result<codewhale_models::MessageResponse> {
-        crate::llm_client::LlmClient::create_message(&self.scripted, request).await
+        codewhale_engine::llm_client::LlmClient::create_message(&self.scripted, request).await
     }
     async fn create_message_stream(
         &self,
         request: codewhale_models::MessageRequest,
-    ) -> Result<crate::llm_client::StreamEventBox> {
+    ) -> Result<codewhale_engine::llm_client::StreamEventBox> {
         if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.entered.notify_one();
             self.release.acquire().await?.forget();
         }
-        crate::llm_client::LlmClient::create_message_stream(&self.scripted, request).await
+        codewhale_engine::llm_client::LlmClient::create_message_stream(&self.scripted, request)
+            .await
     }
 }
 fn listener_selection(
@@ -466,7 +467,7 @@ async fn real_normal_owner_distinct_listener_detach_keeps_turn_compat_acp_and_su
         .send(
             json!("compat"),
             "prompt/request",
-            json!({"thread_id":compat_id,"prompt":"same owner compatibility"}),
+            json!({"thread_id":compat_id,"allowed_tools":[],"prompt":"same owner compatibility"}),
         )
         .await?;
     let result = reply(&mut compat, "compat").await?;
@@ -562,7 +563,7 @@ async fn real_normal_owner_distinct_listener_detach_keeps_turn_compat_acp_and_su
 
     let captured = manager.clone();
     let (binding, generation) =
-        codewhale_app_server::daemon_socket::owner_work(move || captured.capture_control_owner())
+        codewhale_runtime::runtime_control::owner_work(move || captured.capture_control_owner())
             .await?;
     assert_eq!(generation, receipt.lease_generation);
     assert_eq!(binding.data_dir, receipt.data_dir);
@@ -710,7 +711,7 @@ async fn real_owner_exact_listener_reuse_scope_refusal_and_fresh_browser_project
     );
     // Cookies/proofs are admitted only at this selected origin and cannot
     // replace the original listener's bearer gate.
-    let unauth = crate::tls::reqwest_client();
+    let unauth = codewhale_release::tls::reqwest_client();
     let selected_origin = format!("http://{}", selected.endpoint);
     let created: Value = unauth
         .post(format!("{selected_origin}/v1/threads"))
@@ -777,7 +778,7 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
     #[cfg(windows)]
     let socket = PathBuf::from(format!(r"\\.\pipe\scope-owner-{}", Uuid::new_v4()));
     let token = "cwrt_scope_operator_only";
-    let workers = runtime_api_sub_agent_manager(&original_workspace, 2);
+    let workers = runtime_api_sub_agent_manager(&original_workspace, 2)?;
     let (scope_tx, scope_rx) = oneshot::channel();
     let (original, manager, server) =
         spawn_test_server_with_root_token_mobile_workspace_and_overrides(
@@ -938,7 +939,7 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
         "timeout_seconds":null,"metadata":{}
     }))?;
     let report = selected_fleet.create_run(
-        crate::fleet::task_spec::FleetTaskSpecDocument {
+        codewhale_engine::fleet::task_spec::FleetTaskSpecDocument {
             name: Some("selected lease".into()),
             labels: Default::default(),
             security_policy: None,
@@ -1005,7 +1006,7 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
     fs::create_dir(&execution_workspace)?;
     let mut actor = workers.clone().write_owned().await;
     let selected_root = selected_workspace.clone();
-    let direct_id = codewhale_app_server::daemon_socket::owner_work(move || {
+    let direct_id = codewhale_runtime::runtime_control::owner_work(move || {
         actor
             .insert_test_running_direct_child_in_origin(
                 "scope-direct",
@@ -1211,54 +1212,44 @@ async fn real_owner_two_workspace_services_share_scope_caches_and_settle_global_
         ));
     }
     drop(selected_fleet);
-    // The selected thread's live Engine keeps its own sub-agent coordination
-    // lock open at `.codewhale/state/subagents.v1.lock` for its lifetime.
-    // NTFS refuses to rename a directory while any file beneath it is open
-    // (ERROR_ACCESS_DENIED), so a live session also prevents replacement.
     #[cfg(windows)]
     {
         let error = fs::rename(&selected_workspace, &retired_workspace)
-            .expect_err("a live selected Engine must prevent workspace replacement");
+            .expect_err("a live Runtime owner must prevent workspace replacement");
         assert_eq!(error.raw_os_error(), Some(5), "{error}");
         assert!(!retired_workspace.exists());
     }
-    // Draining the owner's Engines releases that lock. The workspace scopes,
-    // their caches and the attached frontends under test stay live.
     manager.shutdown_and_wait().await?;
-    // File identity, not a stable pathname, binds the cache. Replacing the
-    // selected directory after the Fleet pins and the Engine's lock close
-    // cannot borrow its admitted LSP/MCP authority. Keep this check on
-    // Windows as well as Unix. Engine shutdown completes asynchronously, so
-    // Windows waits a bounded time for the lock to close.
-    let replace_deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(30));
-    loop {
-        match fs::rename(&selected_workspace, &retired_workspace) {
-            Ok(()) => break,
-            Err(error)
-                if cfg!(windows)
-                    && error.raw_os_error() == Some(5)
-                    && std::time::Instant::now() < replace_deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => {
-                return Err(error).context(
-                    "replace selected workspace after releasing the test Fleet manager and \
-                     the selected Engine",
-                );
-            }
-        }
-    }
-    fs::create_dir(&selected_workspace)?;
-    assert!(scopes.admit(selected_workspace.clone()).await.is_err());
-    assert_eq!(
+    #[cfg(windows)]
+    {
+        let error = fs::rename(&selected_workspace, &retired_workspace)
+            .expect_err("Engine shutdown must retain the Runtime owner's workspace lock");
+        assert_eq!(error.raw_os_error(), Some(5), "{error}");
+        assert!(!retired_workspace.exists());
+        assert!(Arc::ptr_eq(
+            &scopes.admit(selected_workspace.clone()).await?,
+            &selected_scope
+        ));
         client
             .get(format!("http://{}/v1/lsp", second_ready.endpoint))
             .send()
             .await?
-            .status(),
-        StatusCode::CONFLICT
-    );
+            .error_for_status()?;
+    }
+    #[cfg(unix)]
+    {
+        fs::rename(&selected_workspace, &retired_workspace)?;
+        fs::create_dir(&selected_workspace)?;
+        assert!(scopes.admit(selected_workspace.clone()).await.is_err());
+        assert_eq!(
+            client
+                .get(format!("http://{}/v1/lsp", second_ready.endpoint))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
     client
         .get(format!("http://{original}/v1/lsp"))
         .send()
@@ -1300,7 +1291,7 @@ async fn real_owner_rejects_different_operator_source_before_attach_and_accepts_
     fs::create_dir_all(&workspace)?;
     let config_path = root.join("operator.toml");
     fs::write(&config_path, "")?;
-    let config = Config::load(Some(config_path.clone()), None)?;
+    let config = codewhale_plugins::providers::load_config(Some(config_path.clone()), None)?;
     let other_config = root.join("other-operator.toml");
     fs::write(&other_config, "")?;
     let alias_directory = root.join("alias");
@@ -1479,7 +1470,7 @@ async fn canonical_history_import_runs_real_engine_retains_all_branches_and_refu
         reqwest::header::AUTHORIZATION,
         format!("Bearer {token}").parse()?,
     );
-    let client = crate::tls::reqwest_client_builder()
+    let client = codewhale_release::tls::reqwest_client_builder()
         .default_headers(headers)
         .build()?;
     let endpoint = format!("http://{addr}/v1/thread-history/import");
@@ -1508,13 +1499,13 @@ async fn canonical_history_import_runs_real_engine_retains_all_branches_and_refu
     // journal retains System while the Runtime item projection omits it.
     let operation_path = binding.data_dir.join("turn-operations").join(format!(
         "history_{}.json",
-        crate::hashing::sha256_hex(
+        codewhale_runtime::hashing::sha256_hex(
             format!("codewhale:history-operation:v1\0{}", request.operation_key).as_bytes()
         )
     ));
     let mut operation: Value = serde_json::from_slice(&fs::read(&operation_path)?)?;
     operation["committed"] = json!(false);
-    crate::utils::write_atomic(&operation_path, &serde_json::to_vec(&operation)?)?;
+    codewhale_util::utils::write_atomic(&operation_path, &serde_json::to_vec(&operation)?)?;
     let post_seed_retry: CanonicalThreadReceipt = client
         .post(&endpoint)
         .json(&request)
@@ -1530,7 +1521,7 @@ async fn canonical_history_import_runs_real_engine_retains_all_branches_and_refu
     let directory = sessions_dir.clone();
     let session_id = receipt.session_id.clone();
     let ticket = crate::test_support::env_scope_ticket();
-    let saved = codewhale_app_server::daemon_socket::owner_work(move || {
+    let saved = codewhale_runtime::runtime_control::owner_work(move || {
         let _scope = crate::test_support::join_env_scope(ticket);
         Ok(SessionManager::new(directory)?.load_session_snapshot(&session_id)?)
     })
@@ -1561,7 +1552,8 @@ async fn canonical_history_import_runs_real_engine_retains_all_branches_and_refu
         Some(receipt.session_id.as_str())
     );
     assert_eq!(full.data_dir, binding.data_dir);
-    let full: crate::session_manager::SavedSession = serde_json::from_value(full.session)?;
+    let full: codewhale_engine::session_manager::SavedSession =
+        serde_json::from_value(full.session)?;
     assert_eq!(
         full.journal
             .as_ref()
@@ -1629,7 +1621,8 @@ async fn canonical_history_import_runs_real_engine_retains_all_branches_and_refu
         .error_for_status()?
         .json()
         .await?;
-    let full: crate::session_manager::SavedSession = serde_json::from_value(full.session)?;
+    let full: codewhale_engine::session_manager::SavedSession =
+        serde_json::from_value(full.session)?;
     assert!(serde_json::to_string(&full)?.contains("retained inactive branch"));
     assert!(serde_json::to_string(&full.messages)?.contains("canonical successor"));
     // A pre-existing bare compatibility link adopts into this actual bound
@@ -1668,14 +1661,15 @@ async fn canonical_history_import_runs_real_engine_retains_all_branches_and_refu
         .error_for_status()?
         .json()
         .await?;
-    let full: crate::session_manager::SavedSession = serde_json::from_value(full.session)?;
+    let full: codewhale_engine::session_manager::SavedSession =
+        serde_json::from_value(full.session)?;
     assert!(serde_json::to_string(&full.journal)?.contains("legacy linked branch evidence"));
     assert!(!serde_json::to_string(&full.messages)?.contains("legacy linked branch evidence"));
     assert!(serde_json::to_string(&full.messages)?.contains("canonical successor"));
     let directory = sessions_dir;
     let session_id = receipt.session_id.clone();
     let ticket = crate::test_support::env_scope_ticket();
-    codewhale_app_server::daemon_socket::owner_work(move || {
+    codewhale_runtime::runtime_control::owner_work(move || {
         let _scope = crate::test_support::join_env_scope(ticket);
         let manager = SessionManager::new(directory.clone())?;
         let _lease = manager.reserve_session_for_external_write(&session_id)?;
@@ -1703,7 +1697,7 @@ async fn canonical_history_import_runs_real_engine_retains_all_branches_and_refu
     assert_eq!(
         runtime
             .list_threads(
-                crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
                 None
             )
             .await?
@@ -1760,7 +1754,7 @@ impl HistoryOperationFixture {
         Ok(Self {
             addr,
             runtime,
-            client: crate::tls::reqwest_client_builder()
+            client: codewhale_release::tls::reqwest_client_builder()
                 .default_headers(headers)
                 .build()?,
             sessions_dir,
@@ -1932,7 +1926,7 @@ async fn canonical_create_commits_one_identity_and_read_only_lookup_has_no_turn_
         fixture
             .runtime
             .list_threads(
-                crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
                 None
             )
             .await?
@@ -2008,7 +2002,7 @@ async fn canonical_fork_keeps_all_branches_selects_exact_leaf_and_recovers_after
     let fixture = HistoryOperationFixture::new(&root).await?;
     let original = fixture.import_branched_source().await?;
     let snapshot = fixture.snapshot(&original.runtime_thread_id).await?;
-    let source: crate::session_manager::SavedSession =
+    let source: codewhale_engine::session_manager::SavedSession =
         serde_json::from_value(snapshot.session.clone())?;
     let selected = source.journal.as_ref().context("source graph")?.entries[3]
         .id
@@ -2032,7 +2026,7 @@ async fn canonical_fork_keeps_all_branches_selects_exact_leaf_and_recovers_after
     assert_ne!(original.runtime_thread_id, receipt.runtime_thread_id);
     // The selected branch has two messages, unlike the three-message source.
     // Inspect raw publication before the protected loader can restore its count.
-    let raw: crate::session_manager::SavedSession = serde_json::from_slice(&fs::read(
+    let raw: codewhale_engine::session_manager::SavedSession = serde_json::from_slice(&fs::read(
         fixture
             .sessions_dir
             .join(format!("{}.json", receipt.session_id)),
@@ -2053,19 +2047,19 @@ async fn canonical_fork_keeps_all_branches_selects_exact_leaf_and_recovers_after
         .join("turn-operations")
         .join(format!(
             "history_{}.json",
-            crate::hashing::sha256_hex(
+            codewhale_runtime::hashing::sha256_hex(
                 format!("codewhale:history-operation:v1\0{}", request.operation_key).as_bytes()
             )
         ));
     let mut prepared: Value = serde_json::from_slice(&fs::read(&operation_path)?)?;
     assert_eq!(
         prepared["target_document_digest"],
-        json!(super::super::thread_history::saved_document_digest(&raw)?),
+        json!(codewhale_engine::runtime_threads::manager::history::saved_document_digest(&raw)?),
         "Fork recovery binds the exact shorter branch count published to disk"
     );
     // Model interruption after complete publication but before the intent commit.
     prepared["committed"] = json!(false);
-    crate::utils::write_atomic(&operation_path, &serde_json::to_vec(&prepared)?)?;
+    codewhale_util::utils::write_atomic(&operation_path, &serde_json::to_vec(&prepared)?)?;
     let association = match fixture.lookup(&request).await? {
         CanonicalThreadOperationStatus::Pending { association, .. } => association,
         other => anyhow::bail!("expected prepared Fork intent: {other:?}"),
@@ -2113,7 +2107,8 @@ async fn canonical_fork_keeps_all_branches_selects_exact_leaf_and_recovers_after
     assert_eq!(prepared_detail.items.len(), recovered_detail.items.len());
     assert!(fixture.model.captured_requests().is_empty());
     let fork = fixture.snapshot(&receipt.runtime_thread_id).await?;
-    let fork: crate::session_manager::SavedSession = serde_json::from_value(fork.session)?;
+    let fork: codewhale_engine::session_manager::SavedSession =
+        serde_json::from_value(fork.session)?;
     assert_eq!(
         fork.journal.as_ref().context("fork graph")?.entries,
         source.journal.as_ref().unwrap().entries,
@@ -2217,7 +2212,8 @@ async fn canonical_resume_offered_suffix_settles_once_and_full_graph_witness_ref
     let fixture = HistoryOperationFixture::new(&root).await?;
     let original = fixture.import_branched_source().await?;
     let snapshot = fixture.snapshot(&original.runtime_thread_id).await?;
-    let source: crate::session_manager::SavedSession = serde_json::from_value(snapshot.session)?;
+    let source: codewhale_engine::session_manager::SavedSession =
+        serde_json::from_value(snapshot.session)?;
     let mut offered = source
         .messages
         .iter()
@@ -2253,7 +2249,7 @@ async fn canonical_resume_offered_suffix_settles_once_and_full_graph_witness_ref
     assert_eq!(receipt.runtime_thread_id, original.runtime_thread_id);
     assert_eq!(receipt.session_id, original.session_id);
     // Inspect the exact publication before a protected loader can normalize it.
-    let raw: crate::session_manager::SavedSession = serde_json::from_slice(&fs::read(
+    let raw: codewhale_engine::session_manager::SavedSession = serde_json::from_slice(&fs::read(
         fixture
             .sessions_dir
             .join(format!("{}.json", receipt.session_id)),
@@ -2263,7 +2259,7 @@ async fn canonical_resume_offered_suffix_settles_once_and_full_graph_witness_ref
     let published_journal = raw.journal.as_ref().context("published full journal")?;
     let offered_leaf = format!(
         "offered:{}:3",
-        crate::hashing::sha256_hex(request.operation_key.as_bytes())
+        codewhale_runtime::hashing::sha256_hex(request.operation_key.as_bytes())
     );
     assert_eq!(
         published_journal.leaf_id.as_deref(),
@@ -2281,7 +2277,8 @@ async fn canonical_resume_offered_suffix_settles_once_and_full_graph_witness_ref
         "only the non-overlapping offered user suffix is seeded"
     );
     let full = fixture.snapshot(&receipt.runtime_thread_id).await?;
-    let full: crate::session_manager::SavedSession = serde_json::from_value(full.session)?;
+    let full: codewhale_engine::session_manager::SavedSession =
+        serde_json::from_value(full.session)?;
     assert_eq!(full.journal.as_ref().unwrap().entries.len(), 5);
     assert_eq!(full.messages.len(), 4);
     assert!(
@@ -2295,18 +2292,18 @@ async fn canonical_resume_offered_suffix_settles_once_and_full_graph_witness_ref
         .join("turn-operations")
         .join(format!(
             "history_{}.json",
-            crate::hashing::sha256_hex(
+            codewhale_runtime::hashing::sha256_hex(
                 format!("codewhale:history-operation:v1\0{}", request.operation_key).as_bytes()
             )
         ));
     let mut operation: Value = serde_json::from_slice(&fs::read(&operation_path)?)?;
     assert_eq!(
         operation["target_document_digest"],
-        json!(super::super::thread_history::saved_document_digest(&raw)?),
+        json!(codewhale_engine::runtime_threads::manager::history::saved_document_digest(&raw)?),
         "the retained recovery witness must bind the exact count and offered leaf published to disk"
     );
     operation["committed"] = json!(false);
-    crate::utils::write_atomic(&operation_path, &serde_json::to_vec(&operation)?)?;
+    codewhale_util::utils::write_atomic(&operation_path, &serde_json::to_vec(&operation)?)?;
     let association = match fixture.lookup(&request).await? {
         CanonicalThreadOperationStatus::Pending { association, .. } => association,
         other => anyhow::bail!("expected published pending intent: {other:?}"),
@@ -2407,21 +2404,23 @@ async fn canonical_resume_offered_suffix_settles_once_and_full_graph_witness_ref
     let file = fixture
         .sessions_dir
         .join(format!("{}.json", receipt.session_id));
-    let mut tampered: crate::session_manager::SavedSession =
+    let mut tampered: codewhale_engine::session_manager::SavedSession =
         serde_json::from_slice(&fs::read(&file)?)?;
     let entry = &mut tampered
         .journal
         .as_mut()
         .context("tampered full graph")?
         .entries[3];
-    let crate::session_tree::SessionEntryKind::Message { message } = &mut entry.kind else {
+    let codewhale_runtime::session_tree::SessionEntryKind::Message { message } =
+        std::sync::Arc::make_mut(&mut entry.kind)
+    else {
         anyhow::bail!("inactive fixture entry lost its message");
     };
     let codewhale_models::ContentBlock::Text { text, .. } = &mut message.content[0] else {
         anyhow::bail!("inactive fixture text missing");
     };
     *text = "tampered inactive branch".into();
-    crate::utils::write_atomic(&file, &serde_json::to_vec(&tampered)?)?;
+    codewhale_util::utils::write_atomic(&file, &serde_json::to_vec(&tampered)?)?;
     let lookup = codewhale_protocol::CanonicalThreadOperationLookup {
         version: 1,
         operation_key: request.operation_key,
@@ -2524,7 +2523,7 @@ async fn canonical_import_preserves_paused_goal_and_retry_never_overwrites_later
 #[tokio::test]
 async fn canonical_fork_copies_local_goal_under_source_witness_and_never_replays_evolution()
 -> Result<()> {
-    use crate::session_manager::{SessionGoalState, SessionGoalStatus, SessionManager};
+    use codewhale_engine::session_manager::{SessionGoalState, SessionGoalStatus, SessionManager};
     use codewhale_protocol::{CanonicalHistorySource, CanonicalThreadMutation};
     let _env = lock_test_env();
     let temp = tempfile::tempdir()?;
@@ -2603,7 +2602,7 @@ async fn canonical_fork_copies_local_goal_under_source_witness_and_never_replays
         .sessions_dir
         .join(".goals")
         .join(format!("{}.json", original.session_id));
-    crate::utils::write_atomic(&goal_path, b"{corrupt-local-goal")?;
+    codewhale_util::utils::write_atomic(&goal_path, b"{corrupt-local-goal")?;
     assert_eq!(
         fixture
             .client
@@ -2623,7 +2622,7 @@ async fn canonical_fork_copies_local_goal_under_source_witness_and_never_replays
 #[tokio::test]
 async fn native_fork_routes_keep_full_graph_local_goal_and_captured_session_directory() -> Result<()>
 {
-    use crate::session_manager::{
+    use codewhale_engine::session_manager::{
         SavedSession, SessionGoalState, SessionGoalStatus, SessionManager,
     };
     let _env = lock_test_env();
@@ -2633,7 +2632,7 @@ async fn native_fork_routes_keep_full_graph_local_goal_and_captured_session_dire
     let fixture = HistoryOperationFixture::new(&root).await?;
     assert_ne!(
         fixture.sessions_dir,
-        crate::session_manager::default_sessions_dir()?
+        codewhale_engine::session_manager::default_sessions_dir()?
     );
     let original = fixture.import_branched_source().await?;
     let manager = SessionManager::new(fixture.sessions_dir.clone())?;
@@ -2642,7 +2641,7 @@ async fn native_fork_routes_keep_full_graph_local_goal_and_captured_session_dire
         codewhale_protocol::MAX_CANONICAL_HISTORY_BYTES,
     )?;
     source.window_title = Some("captured native source window".into());
-    source.work_state = Some(crate::session_manager::SessionWorkState::default());
+    source.work_state = Some(codewhale_engine::session_manager::SessionWorkState::default());
     source.metadata.cost.session_cost_usd = 1.25;
     manager.save_session(&source)?;
     let source_bytes = fs::read(
@@ -2688,7 +2687,7 @@ async fn native_fork_routes_keep_full_graph_local_goal_and_captured_session_dire
             request
         };
         let response: Value = request.send().await?.error_for_status()?.json().await?;
-        let fork: crate::runtime_threads::ThreadRecord =
+        let fork: codewhale_engine::runtime_threads::ThreadRecord =
             serde_json::from_value(if suffix == "fork" {
                 response
             } else {
@@ -2756,7 +2755,7 @@ async fn native_fork_copy_refusal_never_publishes_a_shared_session_thread() -> R
     let before = fixture
         .runtime
         .list_threads(
-            crate::runtime_threads::ThreadListFilter::IncludeArchived,
+            codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
             None,
         )
         .await?;
@@ -2764,7 +2763,7 @@ async fn native_fork_copy_refusal_never_publishes_a_shared_session_thread() -> R
         .sessions_dir
         .join(format!("{}.json", original.session_id));
     let original_bytes = fs::read(&path)?;
-    crate::utils::write_atomic(&path, b"{invalid-complete-source")?;
+    codewhale_util::utils::write_atomic(&path, b"{invalid-complete-source")?;
     let refused = fixture
         .client
         .post(fixture.url(&format!("/v1/threads/{}/fork", original.runtime_thread_id)))
@@ -2774,7 +2773,7 @@ async fn native_fork_copy_refusal_never_publishes_a_shared_session_thread() -> R
     let after = fixture
         .runtime
         .list_threads(
-            crate::runtime_threads::ThreadListFilter::IncludeArchived,
+            codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
             None,
         )
         .await?;
@@ -2788,7 +2787,7 @@ async fn native_fork_copy_refusal_never_publishes_a_shared_session_thread() -> R
         Some(original.session_id.clone())
     );
     assert_eq!(fs::read(&path)?, b"{invalid-complete-source");
-    crate::utils::write_atomic(&path, &original_bytes)?;
+    codewhale_util::utils::write_atomic(&path, &original_bytes)?;
     assert!(fixture.model.captured_requests().is_empty());
     Ok(())
 }

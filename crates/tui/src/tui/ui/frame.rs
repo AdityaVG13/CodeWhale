@@ -20,12 +20,12 @@ pub(crate) fn info_context_percent(app: &App) -> u8 {
 /// Incomplete cost includes its receipt's reason, including an unclassified
 /// billing route. A provider switch cannot erase earlier missing coverage.
 pub(crate) fn session_cost_label(app: &App) -> String {
-    use crate::route_billing::UsageChip;
+    use codewhale_engine::route_billing::UsageChip;
     let usage_chip = app.cumulative_usage_chip();
     match &usage_chip {
         UsageChip::Money(amount) => Some(amount.clone()),
         UsageChip::PricedSubtotal { .. } | UsageChip::Unknown(_) => {
-            crate::route_billing::format_usage_chip(&usage_chip, app.ui_locale)
+            codewhale_engine::route_billing::format_usage_chip(&usage_chip, app.ui_locale)
         }
         _ => None,
     }
@@ -37,12 +37,12 @@ pub(crate) fn session_cost_label(app: &App) -> String {
 /// for flat-priced routes, for other vendors, and while auto routing has not
 /// pinned a concrete model.
 pub(crate) fn billing_tier_label(app: &App, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
-    use crate::config::ProviderKind;
+    use codewhale_config::ProviderKind;
     use codewhale_localization::{MessageId, tr};
     if app.auto_model || !matches!(app.api_provider, ProviderKind::Deepseek) {
         return None;
     }
-    let peak = crate::pricing::deepseek_time_tier(&app.model, now)?;
+    let peak = codewhale_engine::pricing::deepseek_time_tier(&app.model, now)?;
     let id = if peak {
         MessageId::InfoLinePeak
     } else {
@@ -72,14 +72,13 @@ fn output_tokens(app: &App) -> Option<u64> {
 /// the git bottom view own them. Fleet, whale and automation counts left too —
 /// the posture bar's live counts own activity.
 ///
-/// Composition is the user's (#5950): every segment here is gated on the
-/// matching [`StatusItem`] in `app.status_items`, which is what `/statusline`
-/// edits and `tui.status_items` persists. Between 0.9.12 and this change the
-/// row ignored that list entirely and the picker's toggles did nothing.
+/// Session metrics follow the matching [`StatusItem`] in `app.status_items`,
+/// which `/statusline` edits and `tui.status_items` persists. The active goal
+/// and available-update notice follow their own live state.
 pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
-    use crate::config::StatusItem;
     use codewhale_localization::MessageId;
     use codewhale_palette::ChromeInk;
+    use codewhale_runtime::config::StatusItem;
     let mut segments = Vec::new();
     let tier = crate::tui::underwater::ShellTier::for_chrome_width(width);
     let shows = |item: StatusItem| app.status_items.contains(&item);
@@ -195,7 +194,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     // reported progress with its bar. Painted only while a goal is actually
     // active — the percent is the model's own estimate, and the row never
     // invents one for a goal that has not reported.
-    if app.goal.status == crate::tools::goal::GoalStatus::Active
+    if app.goal.status == codewhale_engine::tools::goal::GoalStatus::Active
         && app.goal.objective.is_some()
         && let Some(started) = app.goal.started_at
     {
@@ -209,7 +208,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             Some(progress) => format!(
                 "({elapsed}) {}% {}",
                 progress.percent,
-                crate::tools::goal::goal_progress_bar(progress.percent)
+                codewhale_engine::tools::goal::goal_progress_bar(progress.percent)
             ),
             None => format!("({elapsed})"),
         };
@@ -253,7 +252,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
         && let Some(balance) = app.balance_cell.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
-                .and_then(crate::pricing::BalanceInfo::chip_label)
+                .and_then(codewhale_engine::pricing::BalanceInfo::chip_label)
         })
     {
         segments.push(InfoSegment::new(
@@ -325,6 +324,15 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
         }
     }
 
+    if let Some(label) = app.update_available.as_deref() {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Update,
+            "",
+            label,
+            ChromeInk::Info,
+        ));
+    }
+
     segments
 }
 
@@ -356,6 +364,7 @@ struct InfoLineInteractionHitboxes {
     /// The model name and its effort tier — one span, because they are
     /// always adjacent and `/model` owns both.
     model: Option<Rect>,
+    update: Option<Rect>,
 }
 
 /// Separator between rendered route fields. Three columns wide, matching
@@ -418,10 +427,9 @@ fn split_route_hitbox(
 }
 
 /// Render the info line into its one row and record its segment
-/// hitboxes (spec §5b `Constraint::Length(1)`). The ONE header on every
-/// screen: the session shell and the launch screen both call this, so the
-/// brand lockup, contextual segments, and the pinned meter + clock never
-/// change identity between pre- and post-session states. Segment rects are
+/// hitboxes (spec §5b `Constraint::Length(1)`). The session shell and launch
+/// screen both use this row, keeping the visible identity and notice facts
+/// consistent between pre- and post-session states. Segment rects are
 /// recorded for hover (this frame's highlight resolves against the previous
 /// frame's rects, the standard one-frame-lag registry pattern) and for typed
 /// click routing.
@@ -446,7 +454,10 @@ fn render_info_row(
         segments.retain(|segment| {
             matches!(
                 segment.id,
-                InfoSegmentId::Model | InfoSegmentId::Workspace | InfoSegmentId::GitBranch
+                InfoSegmentId::Model
+                    | InfoSegmentId::Workspace
+                    | InfoSegmentId::GitBranch
+                    | InfoSegmentId::Update
             )
         });
     }
@@ -455,8 +466,10 @@ fn render_info_row(
             .last_infoline_hitboxes
             .iter()
             .find(|hb| {
-                matches!(hb.id, InfoSegmentId::Model | InfoSegmentId::Context)
-                    && hb.area.x <= mx
+                matches!(
+                    hb.id,
+                    InfoSegmentId::Model | InfoSegmentId::Context | InfoSegmentId::Update
+                ) && hb.area.x <= mx
                     && mx < hb.area.right()
                     && hb.area.y == my
             })
@@ -476,7 +489,7 @@ fn render_info_row(
     let info = InfoLine::new(&app.ui_theme, &help_hint, &segments)
         .ascii_safe(crate::tui::color_compat::ascii_safe_enabled())
         .hovered(hovered)
-        .compact(app.metrics_line == crate::config::ChromeRowPreset::Compact);
+        .compact(app.metrics_line == codewhale_runtime::config::ChromeRowPreset::Compact);
     let hitboxes = infoline_hitboxes(&info, area);
     let route_area = hitboxes
         .iter()
@@ -500,6 +513,10 @@ fn render_info_row(
         context: crate::tui::infoline::context_meter_hitbox(&info, area),
         route: provider_area,
         model: model_area,
+        update: hitboxes
+            .iter()
+            .find(|hitbox| hitbox.id == InfoSegmentId::Update)
+            .map(|hitbox| hitbox.area),
     };
     // Keep the row's quiet background under the widget itself.
     let buf = f.buffer_mut();
@@ -599,7 +616,7 @@ fn register_clickable_chrome_for_hover(app: &App) {
     // nothing is the same defect as one that acts without lighting up.
     if let Some(composer) = app.viewport.last_composer_area
         && let Some(submit) = crate::tui::widgets::active_composer_submit_rect(app, composer)
-        && app.composer_enter_would_submit()
+        && app.composer_enter_would_submit(true)
     {
         crate::tui::hover_layer::register_rect(
             crate::tui::hover_hit::HoverTargetKind::Link,
@@ -658,6 +675,18 @@ fn register_info_interaction_targets(app: &mut App, hitboxes: InfoLineInteractio
                 inspect_detail: crate::tui::tideline::InspectDetail::Route,
             });
     }
+    if let Some(hitbox) = hitboxes.update {
+        app.viewport
+            .interaction_targets
+            .register(crate::tui::tideline::InteractionTarget {
+                id: crate::tui::tideline::InteractionTargetId::HEADER_UPDATE,
+                area: hitbox,
+                focus: crate::tui::tideline::InteractionFocus::Direct,
+                keyboard_action: None,
+                mouse_action: Some(crate::tui::tideline::InteractionAction::OpenUpdate),
+                inspect_detail: crate::tui::tideline::InspectDetail::Update,
+            });
+    }
 
     for target in app.viewport.interaction_targets.iter() {
         let label = match target.mouse_action {
@@ -690,6 +719,13 @@ fn register_info_interaction_targets(app: &mut App, hitboxes: InfoLineInteractio
                 codewhale_localization::tr(
                     app.ui_locale,
                     codewhale_localization::MessageId::CmdModelDescription,
+                ),
+            ),
+            Some(crate::tui::tideline::InteractionAction::OpenUpdate) => format!(
+                "/update · {}",
+                codewhale_localization::tr(
+                    app.ui_locale,
+                    codewhale_localization::MessageId::CmdUpdateDescription,
                 ),
             ),
             Some(crate::tui::tideline::InteractionAction::ShowDockPanel(panel)) => {
@@ -773,7 +809,7 @@ pub(crate) fn session_shell_area(area: Rect) -> Rect {
 ///   text or block the turn outright. Running them would give a *preview* the
 ///   side effects of a submit. So when any are configured, nothing downstream
 ///   of the text can be claimed exact and the whole manifest reports
-///   [`crate::core::engine::preview::PreviewUnresolved::MessageSubmitHooksConfigured`] —
+///   [`codewhale_engine::core::engine::preview::PreviewUnresolved::MessageSubmitHooksConfigured`] —
 ///   including under a
 ///   fixed model, because the tool policy is derived from the content too.
 /// - **Consuming the active skill.** A real submit *takes* `app.active_skill`.
@@ -790,8 +826,10 @@ pub(crate) async fn build_preview_request_inputs(
     config: &Config,
     engine_handle: &EngineHandle,
     hypothetical_prompt: Option<String>,
-) -> crate::core::engine::preview::PreviewRequestInputs {
-    use crate::core::engine::preview::{PreviewNextTurn, PreviewRequestInputs, PreviewUnresolved};
+) -> codewhale_engine::core::engine::preview::PreviewRequestInputs {
+    use codewhale_engine::core::engine::preview::{
+        PreviewNextTurn, PreviewRequestInputs, PreviewUnresolved,
+    };
 
     let requested_model = if app.auto_model {
         "auto".to_string()
@@ -807,7 +845,7 @@ pub(crate) async fn build_preview_request_inputs(
         approval_mode: app.approval_mode,
         allowed_tools: app.active_allowed_tools.clone(),
         dynamic_tools: Vec::new(),
-        provenance: crate::core::ops::UserInputProvenance::ExternalUser,
+        provenance: codewhale_engine::core::ops::UserInputProvenance::ExternalUser,
         requested_model: requested_model.clone(),
         requested_reasoning: app.reasoning_effort.as_setting().to_string(),
         auto_model: app.auto_model,
@@ -838,7 +876,7 @@ pub(crate) async fn build_preview_request_inputs(
 
     if app
         .hooks
-        .has_hooks_for_event(crate::hooks::HookEvent::MessageSubmit)
+        .has_hooks_for_event(codewhale_config::hooks::HookEvent::MessageSubmit)
     {
         return posture(None, PreviewUnresolved::MessageSubmitHooksConfigured);
     }
@@ -848,6 +886,7 @@ pub(crate) async fn build_preview_request_inputs(
         display: prompt.clone(),
         skill_instruction: app.active_skill.clone(),
         skill_provenance: app.active_skill_provenance.clone(),
+        extension_command: None,
         history_echoed: false,
     };
     let mut git_cache = crate::tui::git_mention::GitMentionCache::default();
@@ -901,17 +940,20 @@ pub(crate) async fn build_preview_request_inputs(
 
     match planned {
         Ok(planned) => {
-            let prompt_context = crate::core::engine::NextTurnPromptContext::for_planned_turn(
-                planned.route.identity.provider,
-                planned.route.model.clone(),
-                crate::route_budget::known_route_limits(planned.route.candidate.limits()),
-                app.mode,
-                paused_dispatch.goal_objective(app),
-                app.goal.status,
-                app.goal.token_budget,
-                app.translation_enabled,
-                app.verbosity.clone(),
-            );
+            let prompt_context =
+                codewhale_engine::core::engine::NextTurnPromptContext::for_planned_turn(
+                    planned.route.identity.provider,
+                    planned.route.model.clone(),
+                    codewhale_engine::route_budget::known_route_limits(
+                        planned.route.candidate.limits(),
+                    ),
+                    app.mode,
+                    paused_dispatch.goal_objective(app),
+                    app.goal.status,
+                    app.goal.token_budget,
+                    app.translation_enabled,
+                    app.verbosity.clone(),
+                );
             posture(
                 Some(Box::new(PreviewNextTurn {
                     content,
@@ -938,8 +980,14 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         .provider_identity
         .as_ref()
         .filter(|identity| config.verify_provider_identity(identity).is_ok());
-    let max_subagents = app.max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
+    let max_subagents = app
+        .max_subagents
+        .clamp(1, codewhale_runtime::config::MAX_SUBAGENTS);
     EngineConfig {
+        user_input_responder: true,
+        session_checkpoint_backend: Some(
+            codewhale_engine::core::events::SessionCheckpointProjection::Exact,
+        ),
         model: app.model.clone(),
         active_route_limits: app.active_route_limits,
         workspace: app.workspace.clone(),
@@ -952,10 +1000,11 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         trust_mode: app.trust_mode,
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
+        mcp_auth_context: Default::default(),
         mcp_oauth_callback_port: config.mcp_oauth_callback_port,
         mcp_oauth_callback_url: config.mcp_oauth_callback_url.clone(),
         skills_dir: app.skills_dir.clone(),
-        skills_discovery_mode: app.skills_discovery_mode,
+        skills_config: app.skills_config.clone(),
         plugin_registry: Some(std::sync::Arc::clone(&app.plugin_registry)),
         instructions: configured_instruction_sources(config),
         project_context_pack_enabled: config.project_context_pack_enabled(),
@@ -979,20 +1028,23 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         subagents_enabled: identity
             .is_some_and(|identity| config.subagents_enabled_for_provider(identity)),
         features: config.features(),
-        auto_review_policy: config.auto_review_policy(),
+        auto_review_policy:
+            codewhale_engine::core::authority::auto_review::AutoReviewPolicy::from_config(config),
         compaction: app.compaction_config(),
         todos: app.todos.clone(),
         plan_state: app.plan_state.clone(),
         goal_state: app.last_known_goal_state.as_ref().map_or_else(
             || {
-                crate::tools::goal::new_shared_goal_state_from_host_status(
+                codewhale_engine::tools::goal::new_shared_goal_state_from_host_status(
                     app.goal.objective.clone(),
                     app.goal.token_budget,
                     app.goal.status,
                 )
             },
             |goal| {
-                crate::tools::goal::new_shared_goal_state_from_snapshot(&goal.to_runtime_snapshot())
+                codewhale_engine::tools::goal::new_shared_goal_state_from_snapshot(
+                    &goal.to_runtime_snapshot(),
+                )
             },
         ),
         max_spawn_depth: identity.map_or_else(
@@ -1004,27 +1056,26 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         max_tool_calls: None,
         hook_executor: app.runtime_services.hook_executor.clone(),
         network_policy: config.network.clone().map(|toml_cfg| {
-            crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
+            codewhale_net::network_policy::NetworkPolicyDecider::with_default_audit(
+                codewhale_net::network_policy::NetworkPolicy::from(toml_cfg),
+            )
         }),
         snapshots_enabled: config.snapshots_config().enabled,
         snapshots_max_workspace_bytes: config
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
-        // The TUI records no snapshot receipts; its post-turn snapshot stays
-        // off the input path (#234).
-        record_restore_points: false,
-        lsp_config: config
-            .lsp
-            .clone()
-            .map(crate::config::LspConfigToml::into_runtime),
+        record_restore_points: true,
+        lsp_config: config.lsp.clone().map(codewhale_lsp::LspConfig::from),
         runtime_services: app.runtime_services.clone(),
         subagent_model_overrides: config.subagent_model_overrides(),
-        fleet_roster: std::sync::Arc::new(crate::fleet::identity::load_effective_roster(
-            &config.fleet_config(),
-            &app.workspace,
-            Some(app.extension_plugin_view().as_ref()),
-        )),
+        fleet_roster: std::sync::Arc::new(
+            codewhale_engine::fleet::identity::load_effective_roster(
+                &config.fleet_config(),
+                &app.workspace,
+                Some(app.extension_plugin_view().as_ref()),
+            ),
+        ),
         subagent_api_timeout: Duration::from_secs(identity.map_or_else(
             || config.subagent_api_timeout_secs(),
             |identity| config.subagent_api_timeout_secs_for_provider(identity),
@@ -1040,11 +1091,11 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             |identity| config.subagent_heartbeat_timeout_secs_for_provider(identity),
         )),
         prefer_bwrap: config.prefers_bwrap(),
-        bwrap_extensions: crate::sandbox::BwrapMountExtensions {
+        bwrap_extensions: codewhale_sandbox::BwrapMountExtensions {
             read_only_roots: config.bwrap_ro_roots.clone(),
             device_roots: config.bwrap_dev_roots.clone(),
         },
-        read_denylist: config.read_denylist(),
+        read_denylist: codewhale_sandbox::read_guard::ReadDenylist::from_config(config),
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
         speech_output_dir: config.speech_output_dir(),
@@ -1057,12 +1108,11 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         goal_continuation_delay_seconds: config.goal_continuation_delay_seconds(),
         goal_enforce_token_budget: config.goal_enforce_token_budget(),
         reasoning_only_max_reprompts: config.reasoning_only_max_reprompts(),
+        reasoning_only_on_output_limit: config.reasoning_only_on_output_limit(),
         reasoning_only_reprompt_message: Some(config.reasoning_only_reprompt_message().to_string()),
         locale_tag: app.ui_locale.tag().to_string(),
         workshop: {
-            crate::tools::large_output_router::WorkshopConfig::install_active(
-                config.workshop.as_ref(),
-            );
+            codewhale_runtime::active_workshop::install_active_workshop(config.workshop.as_ref());
             config.workshop.clone()
         },
         search_provider: config.search_provider(),
@@ -1070,7 +1120,9 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
         search_native: config.search_native(),
         tools_always_load: config.tools_always_load(),
-        user_input_limits: config.user_input_limits(),
+        user_input_limits: codewhale_engine::tools::user_input::UserInputLimits::from_config(
+            config,
+        ),
         user_input_timeout: config.user_input_timeout(),
         goal_max_steps: Some(config.goal_max_steps()),
         tools: config.tools.clone(),
@@ -1080,8 +1132,8 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         advisor_config: config
             .advisor
             .as_ref()
-            .map(crate::tools::subagent::AdvisorConfig::from_toml)
-            .unwrap_or_else(crate::tools::subagent::AdvisorConfig::disabled),
+            .map(codewhale_engine::tools::subagent::AdvisorConfig::from_toml)
+            .unwrap_or_else(codewhale_engine::tools::subagent::AdvisorConfig::disabled),
     }
 }
 
@@ -1096,7 +1148,7 @@ pub(crate) fn build_app_system_prompt_with_goal(
     goal_objective: Option<&str>,
 ) -> SystemPrompt {
     let instructions = configured_instruction_sources(config);
-    let user_memory_block = crate::native_memory::native_prompt_block(
+    let user_memory_block = codewhale_runtime::native_memory::native_prompt_block(
         config.memory_enabled(),
         &config.memory_path(),
         &app.workspace,
@@ -1104,11 +1156,42 @@ pub(crate) fn build_app_system_prompt_with_goal(
     // Keep the previewed/rebuilt prompt identical to the engine's: the
     // recovery hint is part of the prefix when a prior workspace session
     // ended mid-turn (#5715).
-    let recovery_hint = crate::session_manager::session_recovery_hint(
+    let recovery_hint = codewhale_engine::session_manager::session_recovery_hint(
         &app.workspace,
         app.current_session_id.as_deref(),
     );
-    prompts::system_prompt_for_mode_with_context_skills_and_session(
+    let settings = codewhale_engine::project_context::InstructionSettings::from_config(config);
+    let raw = codewhale_engine::project_context::capture_instruction_context(
+        &app.workspace,
+        &instructions,
+        &settings,
+    );
+    let effort = codewhale_engine::core::engine::turn_loop::resolve_auto_effort(
+        Some(app.reasoning_effort.as_setting()),
+        app.api_provider,
+        &config.active_route_base_url(),
+        &app.model,
+    );
+    let budgets = codewhale_engine::project_context::InstructionBudgets::resolve_or_default(
+        &settings.budget,
+        codewhale_engine::route_runtime::ContextWindowResolution {
+            tokens: app.effective_context_window(),
+            source: app.effective_context_window_source(),
+        }
+        .instruction_budget_tokens(),
+        Some({
+            let (provider, model, limits, window) = app.effective_budget_route();
+            codewhale_engine::route_budget::effective_max_output_tokens_for_turn_with_window(
+                provider,
+                model,
+                limits,
+                window.map(|window| window.tokens),
+                None,
+                effort.as_deref(),
+            ) as usize
+        }),
+    );
+    prompts::system_prompt_with_instruction_assembly_for_host(
         &app.workspace,
         None,
         Some(&app.skills_dir),
@@ -1120,18 +1203,40 @@ pub(crate) fn build_app_system_prompt_with_goal(
             locale_tag: app.ui_locale.tag(),
             translation_enabled: app.translation_enabled,
             model_id: &app.model,
-            context_window_override: Some(crate::route_budget::route_context_window_tokens(
-                app.api_provider,
-                &app.model,
-                app.active_route_limits,
-            )),
+            context_window_override: Some(app.effective_context_window()),
             verbosity: app.verbosity.as_deref(),
             recovery_hint: recovery_hint.as_deref(),
-            skills_discovery_mode: app.skills_discovery_mode,
+            skills_config: app.skills_config.clone(),
             plugin_registry: Some(app.extension_plugin_view().as_ref()),
             mode: app.mode,
         },
+        prompts::PromptHost::Interactive,
+        Some((&raw, &settings, budgets)),
     )
+    .0
+}
+
+fn record_window_reroot(
+    session_id: Option<&str>,
+    reason: &str,
+    cause: &str,
+    previous_window: usize,
+    window: usize,
+    journal_entries: usize,
+) {
+    let details = serde_json::json!({
+        "session_id": session_id,
+        "reason": reason,
+        "cause": cause,
+        "previous_window": previous_window,
+        "window": window,
+        "journal_entries": journal_entries,
+    });
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || {
+            codewhale_runtime::audit::log_sensitive_event("session.window.rerooted", details);
+        });
+    }
 }
 
 /// Build the session snapshot every product caller queues into the
@@ -1153,14 +1258,36 @@ pub(crate) fn build_session_snapshot(
     // Drop what a bounded save already archived (#6842) so the live journal
     // matches the document. No I/O: the ids come from the save path.
     if let Some(session_id) = app.current_session_id.as_deref() {
-        let archived = crate::session_manager::take_archived_journal_ids(session_id);
+        let archived = codewhale_engine::session_manager::take_archived_journal_ids(session_id);
         if let Err(error) = app.session_journal.remove_entries(&archived) {
             tracing::warn!(%error, "kept archived journal entries in memory");
         }
     }
-    app.session_journal
+    let journal_entries_before = app.session_journal.entries.len();
+    let cause = app.window_reroot_cause.take();
+    let rebranch = app
+        .session_journal
         .rebranch_active_messages_stamped(&app.api_messages, &app.api_message_stamps);
-    let mut session = crate::session_manager::create_saved_session_journal_only(
+    let reroot_reason = if rebranch.replaced_from_root() {
+        Some("first_message_changed")
+    } else if rebranch.previous_active == 0 && journal_entries_before > 0 {
+        Some("active_path_empty")
+    } else {
+        None
+    };
+    if let Some(reason) = reroot_reason
+        && !app.api_messages.is_empty()
+    {
+        record_window_reroot(
+            app.current_session_id.as_deref(),
+            reason,
+            cause.unwrap_or("unattributed"),
+            rebranch.previous_active,
+            app.api_messages.len(),
+            app.session_journal.entries.len(),
+        );
+    }
+    let mut session = codewhale_engine::session_manager::create_saved_session_journal_only(
         app.current_session_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -1172,6 +1299,15 @@ pub(crate) fn build_session_snapshot(
         app.system_prompt.as_ref(),
         Some(app.mode.as_setting()),
     );
+    session.write_receipt = if app.current_session_id.is_none() {
+        Some(
+            manager
+                .expect_absent_session(&session.metadata.id)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        app.session_write_receipt.clone()
+    };
     let computed_title = session.metadata.title.clone();
     if let Some(cached) = app
         .current_session_metadata
@@ -1185,68 +1321,32 @@ pub(crate) fn build_session_snapshot(
             .clone_from(&cached.parent_session_id);
         session.metadata.forked_from_message_count = cached.forked_from_message_count;
         session.metadata.archived = cached.archived;
+        session.metadata.title.clone_from(&cached.title);
+        session.metadata.title_is_custom = cached.title_is_custom;
         session
             .metadata
             .runtime_store
             .clone_from(&cached.runtime_store);
     }
-    // The cache above is a hint; disk is the authority for lifecycle state.
-    // Re-reading here is what makes "an archive or rename cannot be reverted
-    // by autosave" true regardless of which surface applied it or when
-    // (#2934 / #4397). One bounded metadata-prefix read, not a transcript scan.
-    let merged = manager.merge_persisted_lifecycle(&mut session.metadata);
     if let Some(binding) = app
         .runtime_services
         .task_manager
         .as_ref()
         .and_then(|tasks| tasks.session_store_binding())
     {
-        if session
-            .metadata
-            .runtime_store
-            .as_ref()
-            .is_some_and(|saved| {
-                saved != &binding && !saved.is_missing_session_store().unwrap_or(false)
-            })
-        {
-            return Err(
-                "session snapshot refused to replace its saved Runtime store ownership".into(),
-            );
-        }
         session.metadata.runtime_store = Some(binding);
     }
-    // Title resolution, in priority order:
-    // 1. Disk, when the session already exists (#2934/#4397: a rename applied
-    //    through the session manager is persisted and must survive autosave).
-    // 2. The in-memory cache, when there is no disk record for the session
-    //    yet. (The session picker normally persists renames to disk first via
-    //    `rename_selected`; this branch covers sessions that have never been
-    //    saved, where the cache is the only title source.)
-    // 3. The title computed from the conversation (first user message).
-    //    The cache is NOT a candidate on its own: it is only refreshed at the
-    //    end of this function, so a snapshot taken before any user message
-    //    pins it to the `DEFAULT_SESSION_TITLE` placeholder, and restoring it
-    //    would prevent every later title update (the bug this block fixes).
-    if !merged
-        && let Some(cached) = app.current_session_metadata.as_ref()
-        && cached.id == session.metadata.id
+    if !session.metadata.title_is_custom
+        && session.metadata.title == codewhale_engine::session_manager::DEFAULT_SESSION_TITLE
+        && computed_title != codewhale_engine::session_manager::DEFAULT_SESSION_TITLE
     {
-        session.metadata.title.clone_from(&cached.title);
-    }
-    if session.metadata.title == crate::session_manager::DEFAULT_SESSION_TITLE
-        && computed_title != crate::session_manager::DEFAULT_SESSION_TITLE
-    {
-        // The placeholder survived from an earlier snapshot; the conversation
-        // now has a real first user message, so let the computed title win.
-        // Known edge: a session deliberately renamed to the literal
-        // placeholder title is treated the same way and yields to the
-        // computed title on the next snapshot.
         session.metadata.title = computed_title;
     }
     if let Some(cached) = app.current_session_metadata.as_mut()
         && cached.id == session.metadata.id
     {
         cached.title.clone_from(&session.metadata.title);
+        cached.title_is_custom = session.metadata.title_is_custom;
         cached.archived = session.metadata.archived;
     }
     session
@@ -1259,6 +1359,7 @@ pub(crate) fn build_session_snapshot(
     session.work_state = work_state;
     session.last_auto_route = app.auto_route_for_persistence();
     session.window_title.clone_from(&app.window_title);
+    session.composer_color.clone_from(&app.composer_color);
     app.current_session_metadata = Some(session.metadata.clone());
     // Claim ownership of this session for the process. From here on the
     // Runtime API refuses external renames/archives of it with a typed 409
@@ -1338,6 +1439,18 @@ pub(crate) fn accrue_streaming_token_estimate(app: &mut App, visible_text: &str)
         .saturating_add(estimate_output_tokens_from_text(visible_text));
 }
 
+/// Take a finished text block's remaining buffer, leaving a reasoning block
+/// untouched (#7123). A text drain must never carry reasoning into the
+/// assistant cell, and must never take a block that is not its own: taking a
+/// reasoning tail here would append it to the prose and drop it from the card.
+pub(crate) fn drain_text_block(state: &mut codewhale_tui_kit::streaming::StreamingState) -> String {
+    if state.block_is_thinking(0) {
+        String::new()
+    } else {
+        state.finalize_block_text(0)
+    }
+}
+
 pub(crate) fn commit_streaming_display_tick(
     app: &mut App,
     stream_display_clock: &mut StreamDisplayClock,
@@ -1352,27 +1465,32 @@ pub(crate) fn commit_streaming_display_tick(
     // function of the clock instead of the provider's chunking.
     let interval = stream_display_clock.interval();
     let mut updated = false;
-    if let Some(index) = app.streaming_message_index {
-        let budget =
-            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
-        let committed = app.streaming_state.commit_text(0, budget);
-        if !committed.is_empty() {
-            append_streaming_text(app, index, &committed);
-            accrue_streaming_token_estimate(app, &committed);
-            updated = true;
-        }
-    } else if let Some(entry_idx) = app.streaming_thinking_active_entry {
-        let budget =
-            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
-        let committed = app.streaming_state.commit_text(0, budget);
-        if !committed.is_empty() {
+    let budget =
+        codewhale_tui_kit::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+    let committed = app.streaming_state.commit_text(0, budget);
+    if !committed.is_empty() {
+        // #7123: route by the block's own kind. An assistant cell stays live
+        // from an earlier text block while a later thinking block streams, so
+        // preferring `streaming_message_index` wrote reasoning into the prose
+        // body, splitting one sentence across the thinking card and the
+        // answer that follows it.
+        if app.streaming_state.block_is_thinking(0) {
+            let entry_idx = app
+                .streaming_thinking_active_entry
+                .unwrap_or_else(|| streaming_thinking::ensure_active_entry(app));
             if app.translation_enabled {
                 streaming_thinking::set_placeholder(app, entry_idx);
             } else {
                 streaming_thinking::append(app, entry_idx, &committed);
             }
-            updated = true;
+        } else {
+            let index = app
+                .streaming_message_index
+                .unwrap_or_else(|| ensure_streaming_assistant_history_cell(app));
+            append_streaming_text(app, index, &committed);
+            accrue_streaming_token_estimate(app, &committed);
         }
+        updated = true;
     }
 
     if app.streaming_state.has_pending_stream_text(0) {
@@ -1453,6 +1571,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // allocation. `Off` leaves the render byte-identical to before.
     app.view_stack
         .set_focus_texture(app.focus_texture, app.ui_theme);
+    app.view_stack.set_locale(app.ui_locale);
     app.sidebar_hover = crate::tui::app::SidebarHoverState::default();
     app.viewport.last_prompt_area = None;
     app.viewport.interaction_targets.clear();
@@ -1460,9 +1579,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // alt-tabbed sessions communicate state without a second in-app spinner.
     crate::tui::underwater::sync_title_activity(app);
 
-    // Clear entire area with the configured app background.
-    let background = Block::default().style(Style::default().bg(app.ui_theme.surface_bg));
-    f.render_widget(background, size);
+    // Frame-wide ink backstop (#400), including gaps after pane toggles or resize.
+    // Frame's buffer is exactly its viewport; preserve symbols and all non-bg style.
+    for cell in &mut f.buffer_mut().content {
+        cell.set_bg(app.ui_theme.surface_bg);
+    }
 
     // Show onboarding screen if needed
     if app.onboarding != OnboardingState::None {
@@ -1521,7 +1642,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // session readings until a conversation exists.
     let info_height = if pet_main
         || (mini && !mini_cfg.keep_header)
-        || app.metrics_line == crate::config::ChromeRowPreset::Hidden
+        || app.metrics_line == codewhale_runtime::config::ChromeRowPreset::Hidden
     {
         0
     } else {
@@ -1535,7 +1656,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     let footer_height = if pet_main {
         crate::tui::phase_strip::height()
     } else if (mini && !mini_cfg.keep_footer)
-        || app.posture_bar == crate::config::ChromeRowPreset::Hidden
+        || app.posture_bar == codewhale_runtime::config::ChromeRowPreset::Hidden
     {
         0
     } else {
@@ -1573,6 +1694,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     let body_area = shell_area;
 
     let body_height = body_area.height;
+    let density_rows = crate::tui::widgets::composer_max_height(app.composer_density);
     let composer_max_height = body_height
         .saturating_sub(
             MIN_CHAT_HEIGHT
@@ -1580,7 +1702,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
                 .saturating_add(info_height)
                 .saturating_add(top_work_strip_height),
         )
-        .max(MIN_COMPOSER_HEIGHT);
+        .max(MIN_COMPOSER_HEIGHT)
+        .min((body_height / 2).max(density_rows));
     let composer_height = if !pet_main && mini && !mini_cfg.keep_input {
         0
     } else {
@@ -1725,13 +1848,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // rejected build still read as the old TUI under a gradient.
     let shell_ocean;
     {
-        // Defensive backstop (#400): fill the entire body area with ink
-        // background before any sub-widgets render, so cells that end up
-        // uncovered by layout splits (e.g. after file-tree toggle or
-        // resize) don't retain stale content from a previous frame.
-        Block::default()
-            .style(Style::default().bg(app.ui_theme.surface_bg))
-            .render(work_chat_area, f.buffer_mut());
+        // The frame-wide ink backstop above also covers layout gaps here
+        // after file-tree toggles and resize; do not repaint the same cells.
 
         // When the file-tree pane is visible and the terminal is wide
         // enough, reserve the left ~25% for the file tree.
@@ -1879,7 +1997,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
                 &app.ui_theme,
                 crate::tui::color_compat::ascii_safe_enabled(),
             )
-            .compact(app.posture_bar == crate::config::ChromeRowPreset::Compact);
+            .compact(app.posture_bar == codewhale_runtime::config::ChromeRowPreset::Compact);
         let buf = f.buffer_mut();
         Block::default()
             .style(Style::default().bg(app.ui_theme.footer_bg))
@@ -2216,11 +2334,7 @@ pub(crate) fn estimated_context_tokens(app: &App) -> Option<i64> {
 }
 
 pub(crate) fn context_usage_snapshot(app: &App) -> Option<(i64, u32, f64)> {
-    let max = crate::route_budget::route_context_window_tokens(
-        app.api_provider,
-        app.effective_model_for_budget(),
-        app.active_route_limits,
-    );
+    let max = app.effective_context_window();
     context_usage_snapshot_for_window(app, max)
 }
 
@@ -2230,8 +2344,12 @@ pub(crate) fn context_usage_snapshot_for_window(app: &App, max: u32) -> Option<(
     // A submitted first turn has started the conversation even before the
     // engine mirrors its messages back, and so has any provider usage; those
     // keep the real pressure reading.
-    let conversation_started =
-        !app.api_messages.is_empty() || app.is_loading || count_user_history_cells(app) > 0;
+    let conversation_started = !app.api_messages.is_empty()
+        || app.is_loading
+        || app
+            .history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. }));
     if !conversation_started
         && app.session.last_prompt_tokens.unwrap_or(0) == 0
         && app.last_billed_input_tokens.unwrap_or(0) == 0
@@ -2301,8 +2419,43 @@ pub(crate) fn workflow_tool_is_running(app: &App) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{register_info_interaction_targets, render_info_row, short_title_truncate};
+    use super::{
+        drain_text_block, register_info_interaction_targets, render_info_row, short_title_truncate,
+    };
     use ratatui::{Terminal, backend::TestBackend};
+
+    /// #7123: the text drain must never take a reasoning block. A reasoning
+    /// tail handed to the assistant cell would appear as prose, which is the
+    /// split sentence this fix exists to prevent.
+    #[test]
+    fn issue_7123_drain_text_block_leaves_a_reasoning_block_alone() {
+        use codewhale_tui_kit::streaming::StreamingState;
+
+        let mut state = StreamingState::new();
+        state.start_thinking(0);
+        state.push_content(0, "reasoning tail");
+        assert_eq!(
+            drain_text_block(&mut state),
+            "",
+            "a reasoning block must not be drained into the prose"
+        );
+        assert_eq!(
+            state.pending_len(0),
+            "reasoning tail".len(),
+            "the reasoning tail must stay buffered for its own drain"
+        );
+
+        let mut state = StreamingState::new();
+        state.start_text(0);
+        state.push_content(0, "prose tail");
+        assert_eq!(drain_text_block(&mut state), "prose tail");
+        assert_eq!(state.pending_len(0), 0);
+
+        // An empty state has no block at index 0; the drain is a no-op rather
+        // than a panic.
+        let mut state = StreamingState::new();
+        assert_eq!(drain_text_block(&mut state), "");
+    }
 
     /// Chrome that answers a click must also answer the pointer, or the app
     /// teaches people that pointing at things does not work here.
@@ -2533,9 +2686,9 @@ mod tests {
 
     // ── #5950: the bottom chrome is the user's to compose ─────────────
 
-    use crate::config::StatusItem;
     use crate::tui::app::App;
     use crate::tui::infoline::{InfoLine, InfoSegmentId};
+    use codewhale_runtime::config::StatusItem;
 
     /// A session whose context is `pct` full, by pinning the route's window
     /// to a multiple of what this conversation actually estimates. Nothing
@@ -2595,10 +2748,10 @@ mod tests {
 
     #[test]
     fn footer_keeps_reasoning_label_for_every_effort_tier() {
-        use crate::reasoning_preference::ReasoningEffort;
+        use codewhale_engine::reasoning_preference::ReasoningEffort;
 
         let mut app = app_with_context_percent(1);
-        app.api_provider = crate::config::ProviderKind::Openai;
+        app.api_provider = codewhale_config::ProviderKind::Openai;
         app.active_route_base_url = "https://api.openai.com/v1".to_string();
         app.model = "gpt-5.6".to_string();
         app.auto_model = false;
@@ -2731,11 +2884,11 @@ mod tests {
         use crate::tui::underwater::ShellTier;
 
         let mut app = app_with_context_percent(10);
-        app.set_provider_identity(crate::config::ProviderKind::Custom, "my-gateway");
+        app.set_provider_identity(codewhale_config::ProviderKind::Custom, "my-gateway");
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
-        app.reasoning_effort = crate::reasoning_preference::ReasoningEffort::High;
+        app.reasoning_effort = codewhale_engine::reasoning_preference::ReasoningEffort::High;
         assert_eq!(
             app.reasoning_effort_display_label(),
             "high→effective unavailable",
@@ -2777,8 +2930,8 @@ mod tests {
     /// beside the cost; flat routes and other vendors show nothing.
     #[test]
     fn deepseek_tiered_routes_paint_the_billing_tier_beside_the_cost() {
-        use crate::config::ProviderKind;
         use chrono::TimeZone as _;
+        use codewhale_config::ProviderKind;
         let mut app = app_with_context_percent(10);
         app.auto_model = false;
         app.api_provider = ProviderKind::Deepseek;
@@ -2826,14 +2979,14 @@ mod tests {
     /// A provider switch must not hide missing historical coverage.
     #[test]
     fn cost_unknown_preserves_saved_coverage_across_route_changes() {
-        use crate::route_billing::BillingPresentation;
+        use codewhale_engine::route_billing::BillingPresentation;
         let mut app = app_with_context_percent(10);
         app.session.cost_coverage_unknown_legacy = true;
 
         app.billing_presentation = BillingPresentation::Metered;
         assert!(matches!(
             app.cumulative_usage_chip(),
-            crate::route_billing::UsageChip::Unknown(_)
+            codewhale_engine::route_billing::UsageChip::Unknown(_)
         ));
         assert_eq!(
             super::session_cost_label(&app),
@@ -2848,7 +3001,7 @@ mod tests {
         app.billing_presentation = BillingPresentation::Unknown;
         assert!(matches!(
             app.cumulative_usage_chip(),
-            crate::route_billing::UsageChip::Unknown(_)
+            codewhale_engine::route_billing::UsageChip::Unknown(_)
         ));
         assert_eq!(
             super::session_cost_label(&app),
@@ -2876,7 +3029,7 @@ mod tests {
         assert!(
             matches!(
                 app.cumulative_usage_chip(),
-                crate::route_billing::UsageChip::Money(_)
+                codewhale_engine::route_billing::UsageChip::Money(_)
             ),
             "{:?}",
             app.cumulative_usage_chip()
@@ -2927,7 +3080,7 @@ mod tests {
         let mut app = app_with_context_percent(60);
         app.ui_locale = codewhale_localization::Locale::En;
         app.status_items = StatusItem::default_footer();
-        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        app.metrics_line = codewhale_runtime::config::ChromeRowPreset::Compact;
         app.session_metrics
             .record_model_call(120, 4_800, Some(1_000), Some(5_000));
         for width in [80, 100, 140] {
@@ -2968,9 +3121,8 @@ mod tests {
         }
     }
 
-    /// Every remaining status item owns a segment, and an empty list leaves
-    /// the row with nothing but the help hint — no toggle in `/statusline`
-    /// paints something no toggle can remove.
+    /// Every selected status item owns its segment; without live notices an
+    /// empty list leaves the metrics line empty.
     #[test]
     fn every_metrics_segment_answers_to_a_status_item() {
         let mut app = app_with_context_percent(60);
@@ -2980,12 +3132,13 @@ mod tests {
         app.streaming_output_token_estimate = 1_200;
         app.is_loading = true;
         app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
-        *app.balance_cell.lock().expect("balance cell") = Some(crate::pricing::BalanceInfo {
-            currency: "USD".to_string(),
-            total_balance: "4.32".to_string(),
-            topped_up_balance: String::new(),
-            granted_balance: String::new(),
-        });
+        *app.balance_cell.lock().expect("balance cell") =
+            Some(codewhale_engine::pricing::BalanceInfo {
+                currency: "USD".to_string(),
+                total_balance: "4.32".to_string(),
+                topped_up_balance: String::new(),
+                granted_balance: String::new(),
+            });
         app.status_items = StatusItem::all().to_vec();
         app.workspace_context = Some("main | clean".to_string());
 
@@ -3015,17 +3168,20 @@ mod tests {
 
     #[test]
     fn empty_session_keeps_opted_in_workspace_identity_visible() {
+        let _guard = crate::tui::hover_layer::HOVER_TEST_LOCK.lock().unwrap();
         let mut app = app_with_context_percent(0);
         app.workspace = std::path::PathBuf::from("/fixture/checkout");
         app.workspace_context = Some("feature-6112 | clean".to_string());
         app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
-        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        app.update_available = Some("↑ v9.9.9".to_string());
+        app.metrics_line = codewhale_runtime::config::ChromeRowPreset::Compact;
         let backend = ratatui::backend::TestBackend::new(100, 1);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                super::render_info_row(frame, &mut app, area, true);
+                let hitboxes = super::render_info_row(frame, &mut app, area, true);
+                super::register_info_interaction_targets(&mut app, hitboxes);
             })
             .unwrap();
         let rendered: String = terminal
@@ -3037,6 +3193,57 @@ mod tests {
             .collect();
         assert!(rendered.contains("checkout"), "{rendered}");
         assert!(rendered.contains("feature-6112"), "{rendered}");
+        assert!(rendered.contains("v9.9.9"), "{rendered}");
+        let target = *app
+            .viewport
+            .interaction_targets
+            .iter()
+            .find(|target| target.id == crate::tui::tideline::InteractionTargetId::HEADER_UPDATE)
+            .expect("visible update notice is actionable");
+        assert_eq!(
+            target.mouse_action,
+            Some(crate::tui::tideline::InteractionAction::OpenUpdate)
+        );
+        app.last_mouse_pos = Some((target.area.x, target.area.y));
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_info_row(frame, &mut app, area, true);
+            })
+            .unwrap();
+        assert!(
+            terminal.backend().buffer()[(target.area.x, target.area.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        for launch_visible in [true, false] {
+            app.launch.visible = launch_visible;
+            let events = crate::tui::mouse_ui::handle_mouse_event(
+                &mut app,
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: target.area.x,
+                    row: target.area.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            );
+            assert!(matches!(
+                events.as_slice(),
+                [crate::tui::views::ViewEvent::CommandPaletteSelected {
+                    action: crate::tui::views::CommandPaletteAction::ExecuteCommand { command },
+                }] if command == "/update"
+            ));
+        }
+        let mut notice = super::super::UpdateNotice {
+            current: "0.10.1".to_string(),
+            latest: "0.10.2".to_string(),
+            staged: Some(false),
+        };
+        assert_eq!(notice.chip_label(), "↑ v0.10.2");
+        notice.staged = Some(true);
+        assert_eq!(notice.chip_label(), "↑ v0.10.2 ready");
     }
 
     /// #6112: the opt-in workspace and branch chips read cached state only —

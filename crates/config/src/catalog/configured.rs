@@ -53,6 +53,7 @@ impl ConfiguredModel {
             provider: self.provider.clone(),
             wire_model_id: self.id.clone(),
             endpoint_key: "chat".into(),
+            provider_api: Some(self.base_url.clone()),
             limit: self.limit.clone(),
             cost: self.cost.clone(),
             modalities: self.modalities.clone(),
@@ -115,11 +116,12 @@ pub fn validate_configured_models(models: &[ConfiguredModel]) -> anyhow::Result<
         {
             return Err(invalid("limit"));
         }
-        if model
-            .cost
-            .as_ref()
-            .is_some_and(|cost| !crate::pricing::catalog_cost_is_valid(cost))
-        {
+        if model.cost.as_ref().is_some_and(|cost| {
+            !crate::pricing::catalog_cost_is_valid(cost)
+                || cost.context_tiers().iter().any(|tier| {
+                    tier.tier.kind != "context" || !tier.cost.context_tiers().is_empty()
+                })
+        }) {
             return Err(invalid("cost"));
         }
         if model.extras.keys().any(|key| {
@@ -187,7 +189,37 @@ fn deserialize_limit<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ModelsDev
     deserialize_known(d, &["context", "input", "output"])
 }
 fn deserialize_cost<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ModelsDevCost>, D::Error> {
-    deserialize_known(d, &["input", "output", "cache_read", "cache_write"])
+    fn supported_fields(value: &toml::Value, is_tier: bool) -> bool {
+        let Some(table) = value.as_table() else {
+            return false;
+        };
+        table.iter().all(|(key, value)| match key.as_str() {
+            "input" | "output" | "cache_read" | "cache_write" | "reasoning" | "input_audio"
+            | "output_audio" => true,
+            "tiers" => value
+                .as_array()
+                .is_some_and(|tiers| tiers.iter().all(|tier| supported_fields(tier, true))),
+            "context_over_200k" => supported_fields(value, false),
+            "tier" if is_tier => value.as_table().is_some_and(|tier| {
+                tier.keys()
+                    .all(|key| matches!(key.as_str(), "type" | "size"))
+            }),
+            _ => false,
+        })
+    }
+
+    Option::<toml::Value>::deserialize(d)?
+        .map(|value| {
+            if !supported_fields(&value, false) {
+                return Err(serde::de::Error::custom(
+                    "unsupported nested custom model metadata field",
+                ));
+            }
+            value
+                .try_into()
+                .map_err(|_| serde::de::Error::custom("invalid custom model metadata"))
+        })
+        .transpose()
 }
 fn deserialize_modalities<'de, D: Deserializer<'de>>(
     d: D,

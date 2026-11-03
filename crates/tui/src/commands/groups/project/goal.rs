@@ -29,12 +29,12 @@ fn translate(presentation: &mut dyn CommandPresentationContext, key: &str) -> St
 /// This is the bounded FEAT-037 temporary action reference: the handler only
 /// constructs data-only `AppAction` payloads and never touches the goal
 /// service, config, or session manager.
-fn to_action_status(status: ProjectGoalStatus) -> crate::tools::goal::GoalStatus {
+fn to_action_status(status: ProjectGoalStatus) -> codewhale_engine::tools::goal::GoalStatus {
     match status {
-        ProjectGoalStatus::Active => crate::tools::goal::GoalStatus::Active,
-        ProjectGoalStatus::Paused => crate::tools::goal::GoalStatus::Paused,
-        ProjectGoalStatus::Complete => crate::tools::goal::GoalStatus::Complete,
-        ProjectGoalStatus::Blocked => crate::tools::goal::GoalStatus::Blocked,
+        ProjectGoalStatus::Active => codewhale_engine::tools::goal::GoalStatus::Active,
+        ProjectGoalStatus::Paused => codewhale_engine::tools::goal::GoalStatus::Paused,
+        ProjectGoalStatus::Complete => codewhale_engine::tools::goal::GoalStatus::Complete,
+        ProjectGoalStatus::Blocked => codewhale_engine::tools::goal::GoalStatus::Blocked,
     }
 }
 
@@ -46,7 +46,7 @@ fn goal_command(
 ) -> CommandResult {
     match arg {
         Some("clear") | Some("reset") => CommandResult::action(AppAction::SetGoalStatus {
-            status: crate::tools::goal::GoalStatus::Active,
+            status: codewhale_engine::tools::goal::GoalStatus::Active,
             clear: true,
         }),
         Some("done") | Some("complete") => {
@@ -197,18 +197,17 @@ fn resume_goal(
         return CommandResult::error("No paused goal set. Use /goal <objective> first.");
     }
 
-    // Resuming an already-active goal is a no-op: the continuation loop is
-    // already running, and re-asserting Active could stack a second
-    // autonomous turn. Report progress instead.
     if effective_goal_status(goal) == ProjectGoalStatus::Active {
         if goal.pending_controls {
             return CommandResult::message(translate(presentation, "goal_control_accepted"));
         }
-        return goal_status(goal, presentation);
+        if goal.is_loading || goal.goal_continuation_waiting {
+            return goal_status(goal, presentation);
+        }
     }
 
     CommandResult::action(AppAction::SetGoalStatus {
-        status: crate::tools::goal::GoalStatus::Active,
+        status: codewhale_engine::tools::goal::GoalStatus::Active,
         clear: false,
     })
 }
@@ -315,7 +314,7 @@ mod tests {
     /// the `tool_search` activation path.
     #[test]
     fn bare_goal_brief_names_only_callable_tools() {
-        crate::tools::canonical_action::tests::assert_text_names_only_callable_tools(
+        codewhale_engine::tools::canonical_action_test_support::assert_text_names_only_callable_tools(
             "bare /goal brief",
             BARE_GOAL_BRIEF,
         );
@@ -425,7 +424,7 @@ mod tests {
         assert!(matches!(
             paused.action,
             Some(AppAction::SetGoalStatus {
-                status: crate::tools::goal::GoalStatus::Paused,
+                status: codewhale_engine::tools::goal::GoalStatus::Paused,
                 clear: false
             })
         ));
@@ -435,7 +434,7 @@ mod tests {
         assert!(matches!(
             cleared.action,
             Some(AppAction::SetGoalStatus {
-                status: crate::tools::goal::GoalStatus::Active,
+                status: codewhale_engine::tools::goal::GoalStatus::Active,
                 clear: true
             })
         ));
@@ -505,19 +504,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_on_an_active_goal_is_a_no_op_report() {
-        // Re-asserting Active while the loop is already running must not
-        // schedule a second autonomous turn.
+    fn resume_on_an_active_goal_only_kicks_when_idle() {
         let mut goal = goal_state();
         goal.objective = Some("Keep the build green".to_string());
         goal.status = ProjectGoalStatus::Active;
-        let resumed = run(&goal, Some("resume"));
-        assert!(!resumed.is_error);
-        assert!(
-            resumed.action.is_none(),
-            "no control op on already-active goal"
-        );
-        assert!(resumed.message.unwrap().contains("Keep the build green"));
+        for (is_loading, waiting) in [(false, false), (true, false), (false, true)] {
+            goal.is_loading = is_loading;
+            goal.goal_continuation_waiting = waiting;
+            let resumed = run(&goal, Some("resume"));
+            assert!(!resumed.is_error);
+            if is_loading || waiting {
+                assert!(resumed.action.is_none());
+                assert!(resumed.message.unwrap().contains("Keep the build green"));
+            } else {
+                assert!(matches!(
+                    resumed.action,
+                    Some(AppAction::SetGoalStatus {
+                        status: codewhale_engine::tools::goal::GoalStatus::Active,
+                        clear: false
+                    })
+                ));
+            }
+        }
     }
 
     #[test]

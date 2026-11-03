@@ -16,18 +16,18 @@ use serde_json::json;
 use tempfile::tempdir;
 
 use super::{build_context_report, format_context_report, format_context_summary};
-use crate::compaction::{
+use crate::test_support::{EnvVarGuard, lock_test_env};
+use crate::tui::app::App;
+use codewhale_engine::compaction::{
     CompactionConfig, compaction_pressure_reached_with_billed, estimate_input_tokens_conservative,
     estimate_input_tokens_for_pressure,
 };
-use crate::config::Config;
-use crate::core::engine::{Engine, EngineConfig};
-use crate::core::events::{Event, TurnOutcomeStatus};
-use crate::core::ops::{Op, TurnSpec, UserInputProvenance};
-use crate::llm_client::mock::{MockLlmClient, canned};
-use crate::route_runtime::{ResolvedRuntimeRoute, resolve_runtime_route};
-use crate::test_support::{EnvVarGuard, lock_test_env};
-use crate::tui::app::App;
+use codewhale_engine::core::engine::{Engine, EngineConfig};
+use codewhale_engine::core::events::{Event, TurnOutcomeStatus};
+use codewhale_engine::core::ops::{Op, TurnSpec, UserInputProvenance};
+use codewhale_engine::llm_client::mock::{MockLlmClient, canned};
+use codewhale_engine::route_runtime::{ResolvedRuntimeRoute, resolve_runtime_route};
+use codewhale_runtime::config::Config;
 
 const THRESHOLD: usize = 40_000;
 const PRIVATE_BASE_URL: &str = "https://private-fixture.test/v1";
@@ -35,12 +35,12 @@ const PRIVATE_MODEL: &str = "private-fixture-deployment";
 const PRIVATE_WINDOW: u32 = 200_000;
 
 fn private_route_config() -> Config {
-    Config {
-        provider: Some("custom".to_string()),
-        providers: Some(crate::config::ProvidersConfig {
+    {
+        let __cw_config_init_0_0 = Some("custom".to_string());
+        let __cw_config_init_0_1 = Some(codewhale_runtime::config::ProvidersConfig {
             custom: std::collections::HashMap::from([(
                 "custom".to_string(),
-                crate::config::ProviderConfig {
+                codewhale_runtime::config::ProviderConfig {
                     kind: Some("openai-compatible".to_string()),
                     api_key: Some("test-private-key".to_string()),
                     base_url: Some(PRIVATE_BASE_URL.to_string()),
@@ -50,8 +50,11 @@ fn private_route_config() -> Config {
                 },
             )]),
             ..Default::default()
-        }),
-        ..Default::default()
+        });
+        let mut __cw_config_init_0_value: Config = Default::default();
+        __cw_config_init_0_value.provider = __cw_config_init_0_0;
+        __cw_config_init_0_value.providers = __cw_config_init_0_1;
+        __cw_config_init_0_value
     }
 }
 
@@ -84,7 +87,7 @@ fn turn_op(content: &str, route: &ResolvedRuntimeRoute) -> Op {
         initial_routed_usage: Box::default(),
         goal_objective: None,
         goal_token_budget: None,
-        goal_status: crate::tools::goal::GoalStatus::Active,
+        goal_status: codewhale_engine::tools::goal::GoalStatus::Active,
         reasoning_effort: None,
         reasoning_effort_auto: false,
         auto_model: false,
@@ -122,7 +125,7 @@ struct TurnEvents {
     receipts: Vec<(String, Option<u64>)>,
 }
 
-async fn run_turn(handle: &crate::core::engine::EngineHandle, op: Op) -> TurnEvents {
+async fn run_turn(handle: &codewhale_engine::core::engine::EngineHandle, op: Op) -> TurnEvents {
     handle.send(op).await.expect("send turn");
     let mut events = TurnEvents::default();
     let mut rx = handle.rx_event.write().await;
@@ -163,8 +166,10 @@ fn assert_one_pressure_number(
 ) -> usize {
     app.api_provider = route.identity.provider;
     app.model = route.model.clone();
-    app.active_route_limits = crate::route_budget::known_route_limits(route.candidate.limits());
+    app.active_route_limits =
+        codewhale_engine::route_budget::known_route_limits(route.candidate.limits());
     app.active_context_window_source = route.context_window.source;
+    app.active_context_window = Some(route.context_window);
     // Install the transcript the way the host applies an engine session
     // projection (`apply_engine_session_projection`): the meter's per-message
     // cache is dropped before the rewritten history lands, so a compaction
@@ -188,7 +193,7 @@ fn assert_one_pressure_number(
     );
 
     // Compaction preflight (live input the turn loop measures).
-    let preflight = crate::core::turn::TurnContext::new(8)
+    let preflight = codewhale_engine::core::turn::TurnContext::new(8)
         .live_input_tokens_for_compaction(messages, system, None)
         .expect("non-empty request");
 
@@ -247,7 +252,7 @@ fn assert_one_pressure_number(
         billed >= THRESHOLD,
         "{label}: billed gate decision"
     );
-    let billed_preflight = crate::core::turn::TurnContext::new(8)
+    let billed_preflight = codewhale_engine::core::turn::TurnContext::new(8)
         .live_input_tokens_for_compaction(
             messages,
             system,
@@ -302,7 +307,7 @@ fn one_pressure_number_across_mid_turn_compaction_and_route_switch() {
             .expect("write fixture");
 
         let default_config = Config::default();
-        let route_a = resolve(&default_config, crate::config::DEFAULT_TEXT_MODEL);
+        let route_a = resolve(&default_config, codewhale_config::descriptors::defaults::DEFAULT_TEXT_MODEL);
         let private_config = private_route_config();
         let route_b = resolve(&private_config, PRIVATE_MODEL);
         assert_ne!(

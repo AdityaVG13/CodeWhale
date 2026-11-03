@@ -3,21 +3,21 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::hooks::HookEvent;
-use crate::tools::ReviewOutput;
-use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
-use crate::tools::canonical_action::canonical_action_alias;
-use crate::tools::plan::PlanSnapshot;
-use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::app::{App, ToolDetailRecord, ToolEvidence};
 use crate::tui::history::{
-    ExecCell, ExecSource, ExploringEntry, GenericToolCell, HistoryCell, McpToolCell,
-    PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
+    ExecCell, ExecSource, ExecWait, ExploringCell, ExploringEntry, GenericToolCell, HistoryCell,
+    McpToolCell, PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
     WebSearchCell, output_looks_like_diff, summarize_mcp_output, summarize_tool_args,
     summarize_tool_output,
 };
 use crate::tui::workspace_context;
+use codewhale_config::hooks::HookEvent;
+use codewhale_engine::tools::ReviewOutput;
+use codewhale_engine::tools::plan::PlanSnapshot;
+use codewhale_engine::tools::spec::{ToolError, ToolResult};
+use codewhale_execpolicy::canonical_action::canonical_action_alias;
+use codewhale_tools::patch_preflight::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn handle_tool_call_started(
@@ -45,35 +45,24 @@ pub(super) fn handle_tool_call_started(
     }
 
     if is_exploring_tool(semantic_name) {
-        let label = exploring_label(semantic_name, input);
-        // ensure_exploring + append_to_exploring keeps all parallel exploring
-        // starts in a single ExploringCell entry.
-        let active = app.active_cell.as_mut().expect("active_cell just ensured");
-        let entry_idx = active.ensure_exploring();
-        app.active_tool_entry_completed_at.remove(&entry_idx);
-        let inner = active
-            .append_to_exploring(
-                id.clone(),
-                ExploringEntry {
+        let label = exploring_label(semantic_name, input, &app.workspace);
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::Exploring(ExploringCell {
+                entries: vec![ExploringEntry {
                     label,
                     status: ToolStatus::Running,
                     error: None,
-                },
-            )
-            .map_or(0, |(_, inner)| inner);
-        app.exploring_cell = Some(entry_idx);
-        let virtual_index = app.history.len() + entry_idx;
-        app.exploring_entries
-            .insert(id.clone(), (virtual_index, inner));
-        register_tool_cell(app, &id, name, input, virtual_index);
-        app.mark_history_updated();
+                }],
+            })),
+        );
+        let virtual_index = app.tool_cells[&id];
+        app.exploring_entries.insert(id, (virtual_index, 0));
         return;
     }
-
-    // Non-exploring tool: each is its own entry inside the active cell. We
-    // intentionally do NOT clear `exploring_cell` here — the active cell can
-    // hold both an exploring aggregate AND independent tool entries
-    // simultaneously, which is exactly the case CX#7 fixes.
 
     if is_exec_tool(semantic_name) {
         let command = exec_target_from_input(input);
@@ -109,9 +98,10 @@ pub(super) fn handle_tool_call_started(
                     shell_task_id: None,
                     owner_agent_id: None,
                     owner_agent_name: None,
-                    started_at: Some(Instant::now()),
+                    started_at: None,
                     duration_ms: None,
                     stale_elapsed_since_output_ms: None,
+                    waiting: None,
                     source,
                     description: None,
                     interaction: Some(summary.clone()),
@@ -147,9 +137,10 @@ pub(super) fn handle_tool_call_started(
                 shell_task_id: None,
                 owner_agent_id: None,
                 owner_agent_name: None,
-                started_at: Some(Instant::now()),
+                started_at: None,
                 duration_ms: None,
                 stale_elapsed_since_output_ms: None,
+                waiting: None,
                 source,
                 description: input
                     .get("description")
@@ -327,6 +318,55 @@ fn push_active_tool_cell(
     app.mark_history_updated();
 }
 
+pub(crate) fn hold_exec_cards_for_approval(app: &mut App, tool_id: &str) {
+    if !codewhale_engine::tools::subagent::SubAgentManager::is_child_approval_id(tool_id) {
+        let queued: Vec<usize> = app
+            .tool_cells
+            .iter()
+            .filter(|(id, _)| id.as_str() != tool_id)
+            .map(|(_, &index)| index)
+            .filter(|&index| {
+                matches!(
+                    app.cell_at_virtual_index(index),
+                    Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+                        if exec.status == ToolStatus::Running
+                            && exec.started_at.is_none()
+                            && exec.waiting.is_none()
+                )
+            })
+            .collect();
+        for index in queued {
+            set_exec_card_waiting(app, index, Some(ExecWait::Queue));
+        }
+    }
+    if let Some(&index) = app.tool_cells.get(tool_id) {
+        set_exec_card_waiting(app, index, Some(ExecWait::Approval));
+    }
+}
+
+pub(crate) fn start_exec_card(app: &mut App, tool_id: &str) {
+    if let Some(&index) = app.tool_cells.get(tool_id) {
+        set_exec_card_waiting(app, index, None);
+    }
+}
+
+fn set_exec_card_waiting(app: &mut App, index: usize, waiting: Option<ExecWait>) {
+    let is_change = matches!(
+        app.cell_at_virtual_index(index),
+        Some(HistoryCell::Tool(ToolCell::Exec(exec)))
+            if exec.status == ToolStatus::Running
+                && (exec.waiting != waiting || (waiting.is_none() && exec.started_at.is_none()))
+    );
+    if !is_change {
+        return;
+    }
+    if let Some(HistoryCell::Tool(ToolCell::Exec(exec))) = app.cell_at_virtual_index_mut(index) {
+        exec.waiting = waiting;
+        exec.started_at = waiting.is_none().then(Instant::now);
+        app.needs_redraw = true;
+    }
+}
+
 fn register_tool_cell(
     app: &mut App,
     tool_id: &str,
@@ -350,6 +390,7 @@ fn register_tool_cell(
         // cell index.
         app.active_tool_details.insert(tool_id.to_string(), record);
     }
+    app.bump_details_epoch();
 }
 
 /// Per-record ceiling on a retained tool output (#5472 finding 3).
@@ -411,12 +452,13 @@ fn store_tool_detail_output(
         detail.output = Some(payload);
     }
     release_oldest_tool_detail_outputs(app);
+    app.bump_details_epoch();
 }
 
 /// Hold the retained-output total under [`TOOL_DETAIL_TOTAL_BUDGET_BYTES`] by
 /// dropping the oldest cells' outputs. The records themselves stay, so the
 /// inspector still lists the call and its input.
-fn release_oldest_tool_detail_outputs(app: &mut App) {
+pub(super) fn release_oldest_tool_detail_outputs(app: &mut App) {
     let mut total = 0usize;
     for detail in app.tool_details_by_cell.values() {
         total = total.saturating_add(detail.output.as_ref().map_or(0, String::len));
@@ -460,12 +502,13 @@ fn accrue_child_token_cost_if_any(app: &mut App, result: &Result<ToolResult, Too
     let Some(metadata) = tool_result.metadata.as_ref() else {
         return;
     };
-    if let Some(batch) = crate::cost_status::child_usage_records_from_metadata(metadata) {
+    if let Some(batch) = codewhale_engine::cost_status::child_usage_records_from_metadata(metadata)
+    {
         for record in &batch.records {
             accrue_child_route_usage(app, &record.usage);
         }
         for record in &batch.drop_records {
-            let pending = crate::cost_status::background_cost_for_runtime_drop(record);
+            let pending = codewhale_engine::cost_status::background_cost_for_runtime_drop(record);
             app.absorb_pending_background_cost(&pending);
         }
         let residual_dropped_records = batch
@@ -486,23 +529,27 @@ fn accrue_child_token_cost_if_any(app: &mut App, result: &Result<ToolResult, Too
         }
         return;
     }
-    let Some(route) = crate::cost_status::child_route_envelope_from_metadata(metadata) else {
+    let Some(route) = codewhale_engine::cost_status::child_route_envelope_from_metadata(metadata)
+    else {
         return;
     };
     // Use the same parser as the runtime host. It deliberately returns a
     // zero-valued usage record when the producer emitted the canonical child
     // fields: a model-backed call is still an auditable/priced-zero call, and
     // replay/server-tool telemetry must not disappear in the TUI projection.
-    let Some(usage) = crate::cost_status::child_usage_from_metadata(metadata) else {
+    let Some(usage) = codewhale_engine::cost_status::child_usage_from_metadata(metadata) else {
         return;
     };
     accrue_child_route_usage(
         app,
-        &crate::cost_status::EffectiveRouteUsage { route, usage },
+        &codewhale_engine::cost_status::EffectiveRouteUsage { route, usage },
     );
 }
 
-fn accrue_child_route_usage(app: &mut App, routed: &crate::cost_status::EffectiveRouteUsage) {
+fn accrue_child_route_usage(
+    app: &mut App,
+    routed: &codewhale_engine::cost_status::EffectiveRouteUsage,
+) {
     // `route` is the child's own dispatch receipt, rehydrated from the
     // complete `child_*` metadata `attach_child_usage_metadata` emits at the
     // child's wire boundary (review/verify/rlm are the three producers). An
@@ -567,15 +614,16 @@ fn record_spillover_artifact_if_any(
     {
         return;
     }
-    app.session_artifacts
-        .push(crate::artifacts::record_tool_output_artifact_with_size(
+    app.session_artifacts.push(
+        codewhale_runtime::artifacts::record_tool_output_artifact_with_size(
             session_id,
             id,
             name,
             storage_path,
             byte_size,
             content_for_preview,
-        ));
+        ),
+    );
 }
 
 pub(super) fn evidence_completion_should_be_ignored(
@@ -658,7 +706,7 @@ fn fire_tool_completion_hooks(
     let wants_after = app.hooks.has_hooks_for_event(HookEvent::ToolCallAfter);
     let wants_error = app
         .hooks
-        .has_hooks_for_event(crate::hooks::HookEvent::OnError);
+        .has_hooks_for_event(codewhale_config::hooks::HookEvent::OnError);
     if !wants_after && !wants_error {
         // Fast path: skip the result clone and HookContext allocation when
         // the user has configured neither event.
@@ -695,7 +743,7 @@ fn fire_tool_completion_hooks(
     }
 
     if let Some(context) = error_context
-        && let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context)
+        && let Err(error) = app.submit_hooks(codewhale_config::hooks::HookEvent::OnError, context)
     {
         app.surface_observer_hook_submission_failure(error);
     }
@@ -754,7 +802,8 @@ pub(super) fn handle_tool_call_complete(
     let displayed;
     let result = match result {
         Ok(tool_result) => {
-            let shown_content = crate::core::engine::content_without_approval_note(tool_result);
+            let shown_content =
+                codewhale_engine::core::engine::content_without_approval_note(tool_result);
             if shown_content.len() == tool_result.content.len() {
                 result
             } else {
@@ -771,6 +820,7 @@ pub(super) fn handle_tool_call_complete(
     // live in the active cell or in finalized history; the path is the same.
     if let Some((cell_index, entry_index)) = app.exploring_entries.remove(id) {
         app.tool_cells.remove(id);
+        app.bump_details_epoch();
         store_tool_detail_output(app, id, cell_index, result);
         if let Some(HistoryCell::Tool(ToolCell::Exploring(cell))) =
             app.cell_at_virtual_index_mut(cell_index)
@@ -809,6 +859,7 @@ pub(super) fn handle_tool_call_complete(
         push_orphan_tool_completion(app, id, name, result);
         return;
     };
+    app.bump_details_epoch();
 
     store_tool_detail_output(app, id, cell_index, result);
     let in_active = cell_index >= app.history.len();
@@ -933,7 +984,7 @@ pub(super) fn handle_tool_call_complete(
                 match result.as_ref() {
                     Ok(tool_result) => {
                         if tool_result.success {
-                            review.output = Some(ReviewOutput::from_str(&tool_result.content));
+                            review.output = Some(ReviewOutput::parse(&tool_result.content));
                         } else {
                             review.error = Some(tool_result.content.clone());
                         }
@@ -1243,7 +1294,7 @@ fn apply_workflow_run_record(app: &mut App, value: &serde_json::Value, may_creat
         panel.merge_dispatch_failures_from_run_json(value);
         if let Some(summary) = value
             .get("result")
-            .and_then(crate::tools::workflow::workflow_result_preview)
+            .and_then(codewhale_engine::tools::workflow::workflow_result_preview)
         {
             panel.result_summary = Some(summary);
         }
@@ -1527,7 +1578,7 @@ fn push_orphan_tool_completion(
             .files
             .first()
             .map_or_else(|| "<file>".to_string(), |file| file.path.clone());
-        let summary = receipt.semantic_summary();
+        let summary = receipt.semantic_summary(app.ui_locale);
         HistoryCell::Tool(ToolCell::PatchSummary(PatchSummaryCell {
             path,
             summary,
@@ -1561,6 +1612,7 @@ fn push_orphan_tool_completion(
             },
         },
     );
+    app.bump_details_epoch();
 
     // The virtual-index rebase this path used to do inline now lives in
     // `App::add_message`, so every mid-turn history insert gets it — not just
@@ -1571,15 +1623,9 @@ fn push_orphan_tool_completion(
 fn tool_status_from_result(result: &Result<ToolResult, ToolError>) -> ToolStatus {
     match result.as_ref() {
         Ok(tool_result) if is_deferred_schema_hydration(tool_result) => ToolStatus::Hydrated,
-        Ok(tool_result) => match tool_result.metadata.as_ref() {
-            Some(meta)
-                if meta
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| s == "Running") =>
-            {
-                ToolStatus::Running
-            }
+        Ok(tool_result) => match metadata_status(tool_result.metadata.as_ref()) {
+            Some("Running") => ToolStatus::Running,
+            Some("Killed") => ToolStatus::Stopped,
             _ => {
                 if tool_result.success {
                     ToolStatus::Success
@@ -1588,8 +1634,17 @@ fn tool_status_from_result(result: &Result<ToolResult, ToolError>) -> ToolStatus
                 }
             }
         },
-        Err(_) => ToolStatus::Failed,
+        Err(err) => match metadata_status(err.metadata()) {
+            Some("Killed") => ToolStatus::Stopped,
+            _ => ToolStatus::Failed,
+        },
     }
+}
+
+fn metadata_status(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    metadata
+        .and_then(|meta| meta.get("status"))
+        .and_then(serde_json::Value::as_str)
 }
 
 fn is_deferred_schema_hydration(tool_result: &ToolResult) -> bool {
@@ -1642,20 +1697,23 @@ pub(super) fn refreshes_workspace_context_on_completion(name: &str) -> bool {
     )
 }
 
-pub(super) fn exploring_label(name: &str, input: &serde_json::Value) -> String {
+pub(super) fn exploring_label(
+    name: &str,
+    input: &serde_json::Value,
+    workspace: &std::path::Path,
+) -> String {
     let fallback = format!("{name} tool");
     let obj = input.as_object();
+    let path = || {
+        obj.and_then(|o| o.get("path"))
+            .and_then(|v| v.as_str())
+            .map(|path| codewhale_util::utils::workspace_relative(path, workspace))
+    };
     match name {
-        "read_file" => obj
-            .and_then(|o| o.get("path"))
-            .and_then(|v| v.as_str())
-            .map_or(fallback, |path| format!("Reading {path}")),
-        "list_dir" => obj
-            .and_then(|o| o.get("path"))
-            .and_then(|v| v.as_str())
-            .map_or("Listing directory".to_string(), |path| {
-                format!("Listing {path}")
-            }),
+        "read_file" => path().map_or(fallback, |path| format!("Reading {path}")),
+        "list_dir" => path().map_or("Listing directory".to_string(), |path| {
+            format!("Listing {path}")
+        }),
         "grep_files" => {
             let pattern = obj
                 .and_then(|o| o.get("pattern"))
@@ -1947,7 +2005,7 @@ fn exec_is_background(input: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::plan::StepStatus;
+    use codewhale_engine::tools::plan::StepStatus;
     use serde_json::json;
 
     #[test]
@@ -2459,7 +2517,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ignored_tool_calls_still_fire_after_and_error_hooks_once() {
-        use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
+        use codewhale_config::hooks::{Hook, HookEvent, HooksConfig};
+        use codewhale_engine::hooks::HookExecutor;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let after_log = dir.path().join("after.log");
@@ -2523,8 +2582,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bash_completion_hooks_get_exit_code_and_status_for_failures() {
-        use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
-        use crate::tools::spec::{ToolContext, ToolSpec};
+        use codewhale_config::hooks::{Hook, HookEvent, HooksConfig};
+        use codewhale_engine::hooks::HookExecutor;
+        use codewhale_engine::tools::spec::{ToolContext, ToolSpec};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let after_log = dir.path().join("after.log");
@@ -2566,8 +2626,9 @@ mod tests {
             ),
         ];
         for (id, input) in cases {
-            let result =
-                runtime.block_on(crate::tools::shell::LowercaseBashTool.execute(input, &context));
+            let result = runtime.block_on(
+                codewhale_engine::tools::shell::LowercaseBashTool.execute(input, &context),
+            );
             handle_tool_call_complete(&mut app, id, "bash", &result);
         }
 
@@ -2692,7 +2753,7 @@ mod tests {
             "objective": "Make Plan mode reviewable",
             "context_summary": "Grounded in issue #2691",
             "sources_used": [" gh issue view 2691 ", ""],
-            "critical_files": ["crates/tui/src/tools/plan.rs"],
+            "critical_files": ["crates/engine/src/tools/plan.rs"],
             "constraints": ["No secrets"],
             "recommended_approach": "Enrich update_plan",
             "verification_plan": "Run focused tests",
@@ -2708,7 +2769,7 @@ mod tests {
         assert_eq!(snapshot.sources_used, vec!["gh issue view 2691"]);
         assert_eq!(
             snapshot.critical_files,
-            vec!["crates/tui/src/tools/plan.rs"]
+            vec!["crates/engine/src/tools/plan.rs"]
         );
         assert_eq!(snapshot.constraints, vec!["No secrets"]);
         assert_eq!(
@@ -2771,6 +2832,7 @@ mod tests {
             started_at: None,
             duration_ms: Some(120),
             stale_elapsed_since_output_ms: None,
+            waiting: None,
             source: ExecSource::Assistant,
             description: None,
             interaction: None,
@@ -2828,22 +2890,29 @@ mod tests {
     fn oldest_tool_outputs_are_released_once_the_budget_is_exceeded() {
         let mut app = crate::tui::app::App::new(
             crate::tui::test_support::test_tui_options(std::path::PathBuf::from(".")),
-            &crate::config::Config::default(),
+            &codewhale_runtime::config::Config::default(),
         );
         // 200 records x 64 KiB = 12.8 MiB, well past the 8 MiB budget.
         let record_count = 200usize;
         for index in 0..record_count {
-            app.tool_details_by_cell.insert(
-                index,
+            let tool_id = format!("tool-{index}");
+            super::handle_tool_call_started(
+                &mut app,
+                &tool_id,
+                "read_file",
+                &serde_json::json!({ "path": format!("file-{index}.txt") }),
+            );
+            app.active_tool_details.insert(
+                tool_id.clone(),
                 ToolDetailRecord {
-                    tool_id: format!("tool-{index}"),
-                    tool_name: "Bash".to_string(),
+                    tool_id,
+                    tool_name: "read_file".to_string(),
                     input: serde_json::Value::Null,
                     output: Some("y".repeat(super::TOOL_DETAIL_OUTPUT_MAX_BYTES)),
                 },
             );
         }
-        super::release_oldest_tool_detail_outputs(&mut app);
+        app.flush_active_cell();
 
         let retained: usize = app
             .tool_details_by_cell

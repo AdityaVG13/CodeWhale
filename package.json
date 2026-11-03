@@ -2,7 +2,7 @@
   "name": "codewhale",
   "private": true,
   "scripts": {
-    "test": "npm test --workspaces --if-present && npm --prefix crates/tui/extension-host test && npm --prefix web test",
+    "test": "npm test --workspaces --if-present && npm --prefix crates/engine/extension-host test && npm --prefix web test",
     "check:web": "npm --prefix web run check"
   },
   "workspaces": [
@@ -13,6 +13,6 @@
   "overrides": {
     "esbuild": "0.28.1",
     "ws": "8.21.0",
-    "undici": "7.29.1"
+    "undici": "7.30.1"
   }
 }

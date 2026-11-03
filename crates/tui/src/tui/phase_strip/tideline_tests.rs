@@ -458,8 +458,8 @@ fn enter_again_hint_shows_at_zero_and_one_use_and_clears_at_two() {
     assert!(tideline_footer_from_app(&mut app, 120).hint.is_none());
 }
 
-fn completed_subagent(id: &str) -> crate::tools::subagent::SubAgentResult {
-    crate::tools::subagent::SubAgentResult {
+fn completed_subagent(id: &str) -> codewhale_engine::tools::subagent::SubAgentResult {
+    codewhale_engine::tools::subagent::SubAgentResult {
         usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
@@ -467,15 +467,15 @@ fn completed_subagent(id: &str) -> crate::tools::subagent::SubAgentResult {
         fork_context: false,
         workspace: None,
         git_branch: None,
-        agent_type: crate::tools::subagent::FleetRole::Worker,
-        assignment: crate::tools::subagent::SubAgentAssignment {
+        agent_type: codewhale_agent_contract::role::FleetRole::Worker,
+        assignment: codewhale_engine::tools::subagent::SubAgentAssignment {
             native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
         },
         model: String::new(),
         nickname: None,
-        status: crate::tools::subagent::SubAgentStatus::Completed,
+        status: codewhale_engine::tools::subagent::SubAgentStatus::Completed,
         worker_status: None,
         runtime_permissions: None,
         parent_run_id: None,
@@ -519,7 +519,7 @@ fn agent_arrow_hints_show_at_zero_and_one_use_and_clear_at_two() {
 /// notice used to read `Rewound to previous user message` and said nothing
 /// about files.
 #[test]
-fn rewind_notice_states_the_file_fact_first_and_names_undo_when_it_fits() {
+fn rewind_notice_states_the_file_fact_first_and_names_restore_when_it_fits() {
     use crate::tui::history::HistoryCell;
     let mut app = session_app();
     app.add_message(HistoryCell::User {
@@ -540,11 +540,11 @@ fn rewind_notice_states_the_file_fact_first_and_names_undo_when_it_fits() {
     };
     assert_eq!(
         shown(&mut app, 80).as_deref(),
-        Some("Files not changed. /undo puts them back.")
+        Some("Files not changed. Use /restore.")
     );
     assert_eq!(
         shown(&mut app, 124).as_deref(),
-        Some("Files not changed. /undo puts them back. Conversation rewound.")
+        Some("Files not changed. Use /restore. Conversation rewound.")
     );
 }
 
@@ -671,7 +671,8 @@ fn clock_distinguishes_working_from_waiting_on_something() {
     // Waiting on the user parks the clock in the waiting ink.
     app.pending_user_input_prompt = Some((
         "tool-call-1".to_string(),
-        crate::tools::user_input::UserInputRequest {
+        codewhale_engine::tools::user_input::UserInputRequest {
+            require_typed_answers: false,
             questions: Vec::new(),
         },
     ));

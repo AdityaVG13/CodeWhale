@@ -38,9 +38,10 @@ the code actually guarantees — no more:
   selectable preset to the same floors: body, soft, and muted text at 4.5:1
   on every primary surface (including selection and error surfaces); hint and
   dim text at 3:1; status, warning, success, and info roles at 3:1 because
-  they are redundant — every status also carries a glyph and a word label,
-  so color is never the only channel. Diff foreground/background pairs are
-  held to 3:1.
+  they are redundant — every status also carries a glyph, and every state
+  except a finished, successful shell command also carries a word label (that
+  card's `✓`, ASCII `Y`, stands alone), so color is never the only channel.
+  Diff foreground/background pairs are held to 3:1.
 * The **Terminal** (transparent) theme is exempt by design: it paints
   `Color::Reset` surfaces and ANSI accents so the host terminal's own scheme
   shows through. Those colors are terminal-owned and cannot be measured, so

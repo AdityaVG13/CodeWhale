@@ -210,7 +210,12 @@ class SeedGeneratorTests(unittest.TestCase):
         self.out = self.dir / "seed.json"
         self.upstream = self.dir / "upstream.json"
         self.corrections = self.dir / "corrections.json"
+        self.descriptors = self.dir / "provider_descriptors.json"
         self.spec.write_text(SPEC_FIXTURE, encoding="utf-8")
+        self.descriptors.write_text(
+            json.dumps({"providers": [{"id": "moonshot", "catalog_id": "moonshotai", "default_model": "kimi-k3"}]}),
+            encoding="utf-8",
+        )
         self.upstream.write_text(json.dumps(UPSTREAM_FIXTURE), encoding="utf-8")
         self.corrections.write_text(
             json.dumps(
@@ -234,13 +239,15 @@ class SeedGeneratorTests(unittest.TestCase):
     def lock_cmd(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return run_script(
             "seed", "lock", "--spec", str(self.spec), "--lock", str(self.lock),
-            "--corrections", str(self.corrections), *extra, env=self.env(),
+            "--corrections", str(self.corrections), "--descriptors", str(self.descriptors), *extra,
+            env=self.env(),
         )
 
     def render_cmd(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return run_script(
             "seed", "render", "--spec", str(self.spec), "--lock", str(self.lock),
-            "--out", str(self.out), "--corrections", str(self.corrections), *extra,
+            "--out", str(self.out), "--corrections", str(self.corrections),
+            "--descriptors", str(self.descriptors), *extra,
         )
 
     def test_dry_run_writes_nothing(self) -> None:
@@ -340,8 +347,9 @@ class CommittedSeedTests(unittest.TestCase):
         data = json.loads(SEED.read_text())
         source = json.loads((ROOT / "crates/config/assets/catalog_corrections.json").read_text())
         self.assertEqual(data["_reviewed"], source["reviewed"])
-        self.assertIn("fetched 2026-09-26", data["_meta"]["upstream"])
-        self.assertEqual(len(data["_reviewed"]["public_models"]), 78)
+        lock = json.loads((ROOT / "scripts/catalog/models_dev_seed.lock.json").read_text())
+        self.assertIn(f"fetched {lock['source']['fetched_at']}", data["_meta"]["upstream"])
+        self.assertEqual(len(data["_reviewed"]["public_models"]), 91)
 
     def test_reviewed_malformed_and_duplicate_public_facts_are_refused(self) -> None:
         sys.path.insert(0, str(ROOT / "scripts"))

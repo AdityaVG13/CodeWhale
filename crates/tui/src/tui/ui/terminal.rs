@@ -222,7 +222,7 @@ pub(crate) fn enter_alt_screen<W: Write>(writer: &mut W) -> io::Result<()> {
 
 /// Leave the alternate screen; the counterpart of [`enter_alt_screen`].
 pub(crate) fn leave_alt_screen<W: Write>(writer: &mut W) -> io::Result<()> {
-    if crate::tui::mark::kitty_graphics_supported() {
+    if codewhale_tui_kit::mark::kitty_graphics_supported() {
         crate::tui::pet_watch::clear_images(writer)?;
     }
     execute!(writer, LeaveAlternateScreen)?;
@@ -330,11 +330,11 @@ pub(crate) fn switch_screen_mode(
             if on_alt_screen {
                 enter_alt_screen(&mut stdout)?;
                 #[cfg(windows)]
-                crate::logging::set_verbose(false);
+                codewhale_runtime::logging::set_verbose(false);
             } else {
                 leave_alt_screen(&mut stdout)?;
                 #[cfg(windows)]
-                crate::logging::restore_verbose_state();
+                codewhale_runtime::logging::restore_verbose_state();
             }
             Ok(())
         },
@@ -463,7 +463,7 @@ pub(crate) fn pause_terminal(
     if use_alt_screen {
         attempt(leave_alt_screen(terminal.backend_mut()));
         #[cfg(windows)]
-        crate::logging::restore_verbose_state();
+        codewhale_runtime::logging::restore_verbose_state();
     }
     if use_mouse_capture {
         attempt(execute!(terminal.backend_mut(), DisableMouseCapture));
@@ -493,7 +493,7 @@ pub(crate) fn resume_terminal(
         // Re-entering alt-screen after mode recovery — suppress verbose
         // CLI logging again so eprintln! doesn't leak into the TUI.
         #[cfg(windows)]
-        crate::logging::set_verbose(false);
+        codewhale_runtime::logging::set_verbose(false);
     }
     recover_terminal_modes(
         terminal.backend_mut(),
@@ -632,11 +632,11 @@ pub(crate) fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
 /// raw mode + kitty keyboard flags cleared, which is what causes the
 /// `^[[>5u` shell pollution reported in #1583.
 pub fn emergency_restore_terminal() {
-    if crate::tui::mark::kitty_graphics_supported() {
+    if codewhale_tui_kit::mark::kitty_graphics_supported() {
         let _ = crate::tui::pet_watch::clear_images(&mut std::io::stdout());
     }
     let mut stdout = std::io::stdout();
-    crate::tui::cursor_accent::restore_cursor_accent();
+    codewhale_tui_kit::cursor_accent::restore_cursor_accent();
     pop_keyboard_enhancement_flags(&mut stdout);
     disable_alternate_scroll_mode(&mut stdout);
     let _ = execute!(stdout, DisableFocusChange);
@@ -821,10 +821,10 @@ pub(crate) const UI_QUIESCENT_POLL_MS: u64 = 250;
 pub(crate) struct IdleFacts {
     /// Live sub-agents (`running_agent_count(app) > 0`).
     pub(crate) has_running_agents: bool,
-    /// A spinner, the underwater scene, or a launch animation wants frames.
+    /// A spinner, the underwater scene, or a launch animation wants frames
+    /// faster than [`UI_QUIESCENT_POLL_MS`]; slower motion is woken by its
+    /// own frame deadline.
     pub(crate) animation_active: bool,
-    /// Durable tasks queued, running or waiting.
-    pub(crate) durable_tasks_active: bool,
     /// A terminal event is already buffered for this iteration.
     pub(crate) input_pending: bool,
     /// A sub-agent list refresh is waiting for room in the engine mailbox.
@@ -837,18 +837,18 @@ pub(crate) struct IdleFacts {
 /// the list errs towards "busy".
 pub(crate) fn ui_state_is_quiescent(app: &App, facts: &IdleFacts, now: Instant) -> bool {
     let toast_live = |toast: &StatusToast| toast.ttl_ms.is_some() && !toast.is_expired(now);
-    !(app.is_loading
+    let deciding = decision_prompt_waiting(app);
+    !((app.is_loading && !deciding)
         || app.is_compacting
         || app.is_purging
-        || app.turn_started_at.is_some()
-        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || (app.turn_started_at.is_some() && !deciding)
+        || (matches!(app.runtime_turn_status.as_deref(), Some("in_progress")) && !deciding)
         || facts.has_running_agents
         || facts.animation_active
-        || facts.durable_tasks_active
         || facts.input_pending
         || facts.pending_engine_op
         || app.needs_redraw
-        || !app.view_stack.is_empty()
+        || (!app.view_stack.is_empty() && !deciding)
         || app.onboarding != OnboardingState::None
         || app.redaction_gate
         || !app.queued_messages.is_empty()
@@ -860,6 +860,13 @@ pub(crate) fn ui_state_is_quiescent(app: &App, facts: &IdleFacts, now: Instant) 
         || app.viewport.selection_autoscroll.is_some()
         || app.status_toasts.iter().any(toast_live)
         || app.sticky_status.as_ref().is_some_and(toast_live))
+}
+
+pub(crate) fn decision_prompt_waiting(app: &App) -> bool {
+    matches!(
+        app.view_stack.top_kind(),
+        Some(ModalKind::Approval | ModalKind::Elevation | ModalKind::UserInput)
+    )
 }
 
 /// The idle poll for this iteration: [`idle_poll_ms`] normally, relaxed to
@@ -990,13 +997,6 @@ mod idle_poll_tests {
                     ..IdleFacts::default()
                 },
                 "something is animating",
-            ),
-            (
-                IdleFacts {
-                    durable_tasks_active: true,
-                    ..IdleFacts::default()
-                },
-                "a durable task is live",
             ),
             (
                 IdleFacts {
@@ -1289,12 +1289,12 @@ mod screen_mode_tests {
 }
 
 /// The terminal UI's implementation of the runtime's one terminal port
-/// (`crate::host_terminal`). The composition root installs it for every host
+/// (`codewhale_runtime::host_terminal`). The composition root installs it for every host
 /// this binary launches, so runtime code (the shell tools, the dispatcher)
 /// reaches raw mode only through it and never links crossterm.
 struct TuiHostTerminal;
 
-impl crate::host_terminal::HostTerminal for TuiHostTerminal {
+impl codewhale_runtime::host_terminal::HostTerminal for TuiHostTerminal {
     fn suspend_raw_mode(&self) -> bool {
         let was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
         if was_enabled {
@@ -1315,7 +1315,10 @@ impl crate::host_terminal::HostTerminal for TuiHostTerminal {
         crate::tui::notifications::set_terminal_focused(focused);
     }
 
-    fn apply_notification_settings(&self, config: &crate::config::NotificationsConfig) {
+    fn apply_notification_settings(
+        &self,
+        config: &codewhale_config::notifications::NotificationsConfig,
+    ) {
         let _ = crate::tui::notifications::apply_settings(config);
     }
 
@@ -1328,15 +1331,15 @@ impl crate::host_terminal::HostTerminal for TuiHostTerminal {
 /// Install the TUI as the process's terminal host. Idempotent: the first
 /// install wins.
 pub(crate) fn install_host_terminal() {
-    let _ = crate::host_terminal::install(Box::new(TuiHostTerminal));
+    let _ = codewhale_runtime::host_terminal::install(Box::new(TuiHostTerminal));
 }
 
 #[cfg(test)]
 mod host_terminal_tests {
     use super::TuiHostTerminal;
-    use crate::host_terminal::HostTerminal;
-    use crate::notify::DeliveryOutcome;
     use crate::tui::notifications::{configured_method, install_configured_method};
+    use codewhale_notify::DeliveryOutcome;
+    use codewhale_runtime::host_terminal::HostTerminal;
 
     /// The `notify` tool reaches delivery only through the installed host:
     /// the TUI's host must hand the model's text to the delivery path that
@@ -1345,7 +1348,7 @@ mod host_terminal_tests {
     fn tui_host_routes_the_notify_tool_through_the_installed_method() {
         let _lock = crate::test_support::lock_test_env();
         let previous_method = configured_method();
-        let config = |text: &str| -> crate::config::Config {
+        let config = |text: &str| -> codewhale_runtime::config::Config {
             toml::from_str(text).expect("notifications config should parse")
         };
         // Settings reach the host the way the composition root sends them;

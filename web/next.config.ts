@@ -37,6 +37,7 @@ const sourceCommittedAt =
 // prerendered/cached responses).
 const nextConfig: NextConfig = {
   outputFileTracingRoot: webRoot,
+  poweredByHeader: false,
   reactStrictMode: true,
   // Public, non-secret provenance for the exact source used to build the
   // deployed worker. Next inlines these values into server output, allowing a

@@ -15,6 +15,26 @@ codewhale 可以通过 MCP（Model Context Protocol，模型上下文协议）�
 - `codewhale serve --http` 运行运行时 HTTP/SSE API（独立模式）。
 - `codewhale mcp-server` 是同一个统一运行时上等价的 stdio 入口。
 
+原生 stdio 服务器支持 **2026-07-28**：请求必须携带所需的逐请求元数据，
+可使用 `server/discover`，不需要初始化握手。传统版本 **2024-11-05**、
+**2025-03-26**、**2025-06-18** 和 **2025-11-25** 通过 `initialize` 协商。
+初始化不会选择现代版本；不受支持的初始化版本回退为 2025-11-25。
+传统客户端应发送 `notifications/initialized`，但收到有效初始化响应后即可调用。
+这里描述的是 Codewhale 作为服务器的能力，不会改变它作为 MCP 客户端的版本支持。
+
+`resources/list` 分页列出当前生效的原生 Skill 指令；`resources/read` 仅接受
+清单中的 `codewhale://skills/...` URI，并返回已通过现有发现机制接受的指令正文。
+发现遵循配置目录、优先级与工作区信任，排除禁用的 Skill。读取不会激活指令。
+这些资源不是原始 SKILL.md 文件或完整 Skill 包，也不包含插件 Skill、任意文件路径
+或会话记录。旧的工作区/会话条目因没有对应读取实现而移除。资源模板清单为空，
+清单与读取使用私有缓存、零 TTL；目录变化使游标失效时需重新分页。
+
+服务器只声明工具与资源能力，不声明订阅、清单变更通知、Skills 扩展、Apps、
+任务或交互式审批。工具仍通过 Rust 注册表串行执行，请求取消会传入现有工具上下文。
+收到响应前应保持 stdin 打开；关闭输入会取消尚未完成的工作。SDK 传输限制输入大小，
+丢弃无法解析或超大的输入帧，对格式完整但不符合 JSON-RPC 的请求返回错误。
+
+
 0.10.1 移除了旧的子服务器聚合代理。`mcp-server` 现在与 `serve --mcp`
 使用同一个原生工具服务器，不再启动旧的 `mcp.server_definitions` 列表。
 已保存的定义会保留。请在 `mcp.json` 中为现有 MCP 客户端配置外部服务器，
@@ -107,7 +127,7 @@ v0.9.10 的产品建议使用这些经过审查的固定版本定义。Plugins �
 | --- | --- | --- | --- | --- |
 | Chrome DevTools | MCP 服务器（stdio） | `npx -y chrome-devtools-mcp@1.7.0`（Windows 上为 `npx.cmd`） | [ChromeDevTools 官方项目](https://github.com/ChromeDevTools/chrome-devtools-mcp) | 用户重启 MCP 时，npm 可能会下载固定版本的包。 |
 | Playwright | MCP 服务器（stdio） | `npx -y @playwright/mcp@0.0.79 --isolated`（Windows 上为 `npx.cmd`） | [微软官方项目](https://github.com/microsoft/playwright-mcp) | `--isolated` 会启动全新的浏览器配置文件；npm 只会在显式重启后才下载固定版本的包。 |
-| Computer Use | 第一方插件（MCP + skill） | 随二进制内置为 `computer-use` 插件 | Codewhale；通过 `/plugin` 或扩展市场启用 | 这是 Codewhale 唯一推荐的计算机操作集成。此处不再列出第三方桌面控制 MCP。 |
+| Computer Use | 第一方插件（MCP + skill） | 从第一方目录安装 `computer-use` 插件，可独立更新 | Codewhale；通过连接器或 `/plugin` 安装、审核并启用 | 这是 Codewhale 唯一推荐的计算机操作集成。此处不再列出第三方桌面控制 MCP。 |
 | Browser Use | Skill 加单独安装的 Python 运行时 | Skill/运行时版本 `0.13.8` | [browser-use 官方项目](https://github.com/browser-use/browser-use) | 可选配套：不是 MCP 服务器。Codewhale 不会自动运行上游的 Skill 安装器，也不会安装其浏览器/运行时依赖。 |
 | Anthropic Sandbox Runtime | 沙箱适配器配套 | `@anthropic-ai/sandbox-runtime@0.0.73` | [anthropic-experimental 官方项目](https://github.com/anthropic-experimental/sandbox-runtime)；测试版 | v0.9.10 中仅文档说明的适配器候选：不是 MCP 服务器，也不是活跃的 Codewhale 插件适配器。它不会取代 Codewhale 的沙箱策略。 |
 
@@ -115,7 +135,7 @@ v0.9.10 的产品建议使用这些经过审查的固定版本定义。Plugins �
 
 这种呈现方式遵循了本地 Grokbuild 扩展视图中的同样有用的边界（一个产品插件可以暴露 MCP 或 Skill 组件，同时组件标签页仍可检查）、Kimi 市场的显式显示名称/层级/来源字段，以及 Codex 市场的显式来源和安装策略字段。Codewhale 保持其更严格的规则：来源和外部策略只是显示元数据，绝不会被继承为信任或自动安装。完整的插件包和市场语义请参阅[插件包](./PLUGIN_BUNDLES.md)。
 
-`/mcp validate`（别名 `/mcp doctor`）只为了 UI 发现而重新连接：它刷新你在分页器中看到的管理器快照，而不是模型拿到的目录。
+`/mcp validate`（别名 `/mcp doctor`）不带名称时，会在 **Extensions → MCP** 上方的分页器中报告 TUI 最近记录的 MCP 快照里每个服务器的状态。该快照通常是引擎连接池的最新报告，但某些操作（例如 `/mcp import`）会用一次单独的 UI 发现结果替换它，而那次发现也会连接引擎尚未启动的 `lazy` 服务器。validate 还会在不连接的情况下重新读取 MCP 配置文件：先报告配置加载错误，列出快照中尚未观察到的已配置服务器，并在需要 `/mcp reload` 时提示。它不会重新连接任何东西，也不会改变模型拿到的目录；`/mcp reload` 才是全新的探测。
 
 `/mcp reload`（别名 `/mcp reconnect`、`/mcp restart`）是热重载路径。它会重新读取 MCP 配置来源，并通过引擎持有的连接池重新连接，因此重建后的目录正是下一个模型回合所用的目录——无需重启 TUI。从 TUI 中做出的配置修改会立即写入，管理器会把快照标记为需要重载，直到你运行它；重载失败会保留之前活跃的连接池不变，并如实说明。
 
@@ -172,6 +192,8 @@ codewhale mcp login remote
 
 Codewhale 会发现服务器的 OAuth 元数据，在你的浏览器中打开授权 URL，监听本地回调，交换授权码，并通过 Codewhale 的机密后端存储令牌响应。存储的 OAuth 令牌会按服务器名称加 URL 查找，并在可能的情况下于请求前刷新。登录期间，CLI 会打印授权 URL 和等待状态，同时本地回调监听器处于活动状态。如果基于 URL 的服务器在连接/发现期间返回 401 或 Unauthorized，`codewhale mcp connect <name>` 会报告需要 OAuth 认证，并指向 `codewhale mcp login <name>`。资源辅助工具的列表还会为认证类失败显示 `authentication_required` 条目，而不是静默地看起来为空。
 
+每份凭据还保存发现时的授权发行方（issuer）和资源（resource）的精确值。重新加载时，Codewhale 会先核对这两个值，再安装凭据。发行方或资源发生变化时必须重新登录。缺少此绑定的旧凭据会被保留，但不会继续使用；运行 `codewhale mcp login <name>`，授权成功后替换旧记录。
+
 可选的 OAuth 字段：
 
 ```json
@@ -181,13 +203,18 @@ Codewhale 会发现服务器的 OAuth 元数据，在你的浏览器中打开授
       "url": "https://example.com/mcp",
       "scopes": ["tools/read"],
       "oauth": {
-        "client_id": "public-client-id"
+        "client_id": "public-client-id",
+        "issuer": "https://auth.example.com"
       },
-      "oauth_resource": "https://example.com"
+      "oauth_resource": "https://example.com/mcp"
     }
   }
 }
 ```
+
+预注册的 `oauth.client_id` 必须同时配置精确的 `oauth.issuer`；CLI 对应 `--oauth-client-id` 和 `--oauth-issuer`。`oauth_resource` 仅用于精确核对 SDK 发现的资源，不会附加或覆盖第二个受众参数。
+
+也可以将 `oauth.client_metadata_url`（CLI：`--oauth-client-metadata-url`）设为运维方托管的 HTTPS 客户端元数据文档 URL。当授权服务器声明支持 CIMD 时使用该文档，否则尝试服务器声明的动态注册；预注册客户端优先。Codewhale 将桌面/CLI 客户端声明为 `native`；托管文档必须描述该客户端及其实际回调 URL。此设置不提供 Codewhale 托管的文档。服务器必须发布可发现的授权元数据；登录和凭据加载不会使用猜测的旧式 OAuth 端点。
 
 当提供商（provider）要求固定重定向时，用户级配置可以设置回调行为：
 
@@ -367,7 +394,9 @@ codewhale mcp tools codewhale
 
 ## 连接生命周期
 
-会话启动时会在后台连接：每个已启用且被允许的用户配置服务器都会并发启动，不会阻塞第一个回合。把较重的服务器标记为 `lazy = true`，则在某个回合的 `allowed_tools`/`tools.always_load` 选择覆盖了它的 `mcp_<server>_*` 名称、某次模型调用解析到它的某个工具，或显式 `/mcp retry <name>` 请求它之前不会启动。标记为 `required` 的服务器即使是 `lazy` 也会在启动时连接，以便其失败在第一个回合之前暴露出来。尚未连接的服务器显示为 `not connected`，绝不会显示 `connecting`；`connecting` 标签只描述实际正在进行中的握手。OAuth 登录完成后，只有该服务器会自动重新连接。插件提供的服务器按需连接，除非标记为 `required` 或被会话的工具选择点名。
+会话启动时会在后台连接：每个已启用且被允许的服务器（无论是用户配置的，还是已启用插件提供的）都会并发启动，不会阻塞第一个回合。插件服务器在会话启动时要通过的审查、信任和启用检查，与首次使用时完全相同。把较重的用户配置服务器标记为 `lazy = true`，则在某个回合的 `allowed_tools`/`tools.always_load` 选择覆盖了它的 `mcp_<server>_*` 名称、某次模型调用解析到它的某个工具，或显式 `/mcp retry <name>` 请求它之前不会启动。标记为 `required` 的服务器即使是 `lazy` 也会在启动时连接，以便其失败在第一个回合之前暴露出来。尚未连接的服务器显示为 `not connected`，绝不会显示 `connecting`；`connecting` 标签只描述实际正在进行中的握手。OAuth 登录完成后，只有该服务器会自动重新连接。
+
+执行 `/new`、`/resume`、`/load`，从恢复选择器切换会话，或更换提供商、配置档案或插件时，用户配置的 stdio 服务器会继续运行：只要其配置、工作区和 MCP 后端未变，正在运行的进程会直接转交给新对话或新引擎，无需重启。服务器保存在内存中的状态（例如浏览器会话及其登录）也会一并保留；需要全新的服务器时请运行 `/mcp reload`。HTTP/SSE 服务器会重新连接，从而使用当前的凭据和 `[network]` 策略。运行时添加的服务器和插件提供的服务器不会被转交，在上述每种情况下都会关闭（即使对话仍在继续）；插件提供的服务器会在下一次会话启动时重新连接，而运行时添加的服务器需要重新启动。切换工作区会重启所有服务器。如果交接时上一个对话仍有 MCP 调用在执行，则不转交任何连接，服务器照旧重启；否则，上一个对话的后台工作此后发起的调用会直接失败，而不会重新连接。
 
 面向 MCP 的 `tool_search` 也是明确的发现请求：可搜索已配置的服务器名称
 （例如 `engram`）、完整的 `mcp_<server>_...` 名称，或使用
@@ -375,6 +404,24 @@ codewhale mcp tools codewhale
 每批最多连接八台，沿用现有的五秒等待上限和取消机制。普通搜索不会启动所有
 可选服务器。只有实际 `tools/list` 返回的模式才进入延迟工具目录；失败、禁用
 或失去授权的服务器不会获得虚构工具。匹配超过八台时，请按服务器名称缩小搜索。
+
+每次模型请求前，同一条有界运行时记录会观察当前允许的 MCP 服务器：
+`configured` 表示尚无连接结果，其他状态为 `connecting`、`failed`、
+`authorization_required`、`unknown` 和 `connected`。失败与待授权项优先显示，
+最多列出 24 个名称，每个名称最多 64 个字符，并说明省略数量。名称仅是数据；
+记录不包含原始错误、命令、网址或凭据。
+
+新快照取代先前状态，写入会话历史，不改变缓存的系统提示词。观察本身不会
+启动服务器或加载模式；状态不变时不重复，压缩移除后会重新记录。可使用
+`tool_search` 时，可按允许的服务器名获取真实工具或重试相关连接；否则只列出
+当前实际暴露工具所对应的服务器。禁用或超出本回合发现权限的服务器不列出。
+`connected` 仅表示观察到当前且仍获授权的传输连接，不保证模式、调用权限或
+工具执行成功。
+
+服务器指导与状态共用一次非阻塞连接池读取。连接池忙、配置文件变化或范围
+撤销时，会撤回旧记录；恢复会话也会先撤回保存的 MCP 状态，等待实时观察。
+子代理、RLM、ACP 与隔离宿主不会因此扩大权限。状态仅在请求边界观察；配置与
+授权恢复仍由现有 MCP 管理器负责。
 
 `codewhale mcp connect`、`validate` 和 `tools` 使用各自进程的连接池，不会向
 正在运行的 TUI 或 exec 会话附加连接。请使用会话内的发现、明确工具选择，
@@ -396,7 +443,7 @@ codewhale mcp tools codewhale
 - `disabled`（布尔值，可选）
 - `enabled`（布尔值，可选，默认 `true`）
 - `required`（布尔值，可选）：如果该服务器无法初始化，启动/连接验证会失败。
-- `lazy`（布尔值，可选，默认 `false`）：在某个回合、工具调用或 `/mcp retry` 请求它之前不启动该服务器。不设置时，用户配置的服务器在会话启动时连接；插件提供的服务器按需连接，除非标记为 `required` 或被会话的工具选择点名。
+- `lazy`（布尔值，可选，默认 `false`）：在某个回合、工具调用或 `/mcp retry` 请求它之前不启动该服务器。不设置时，该服务器在会话启动时连接。插件清单没有 `lazy` 字段：已启用插件的服务器在会话启动时连接，禁用该插件即可停止它们。
 - `enabled_tools`（数组，可选）：该服务器的工具名称允许列表。
 - `disabled_tools`（数组，可选）：在 `enabled_tools` 之后应用的拒绝列表。
 - `url`（字符串，可选）：远程 MCP 服务器的 Streamable HTTP 端点。
@@ -406,8 +453,10 @@ codewhale mcp tools codewhale
 - `env_headers` 或 `env_http_headers`（对象，可选）：请求头名称到环境变量名称的映射。
 - `bearer_token_env_var`（字符串，可选）：包含 bearer token 的环境变量。
 - `scopes`（数组，可选）：`mcp login` 的默认 OAuth 作用域。
-- `oauth.client_id`（字符串，可选）：预先注册的 OAuth 客户端 ID。
-- `oauth_resource`（字符串，可选）：附加到授权 URL 的资源参数。
+- `oauth.client_id`（字符串，可选）：预注册的 OAuth 客户端 ID，必须同时配置 `oauth.issuer`。
+- `oauth.issuer`（字符串，可选）：授权发行方的精确绑定值；预注册客户端必填。
+- `oauth.client_metadata_url`（字符串，可选）：运维方托管的客户端元数据文档 HTTPS URL，路径不能为根路径。
+- `oauth_resource`（字符串，可选）：与 SDK 发现的资源进行精确比较的绑定值。
 
 ## 安全说明
 
@@ -418,7 +467,7 @@ MCP 工具与内置工具走相同的审批框架。只读的 MCP 辅助工具�
 ## 故障排查
 
 - 运行 `codewhale doctor` 确认它解析出的 MCP 配置路径以及该路径是否存在。
-- 在 TUI 中运行 `/mcp validate` 刷新可见的服务器/工具快照。
-- 如果配置或凭据变更后模型的目录中缺少工具，运行 `/mcp reload` —— `/mcp validate` 只刷新 UI 快照。
+- 在 TUI 中运行 `/mcp validate`，查看最近记录的 MCP 快照中每个服务器的状态，以及配置加载错误和尚未连接的已配置服务器。
+- 如果配置或凭据变更后模型的目录中缺少工具，运行 `/mcp reload` —— `/mcp validate` 只报告最近记录的快照，从不重新连接。
 - 如果 MCP 配置缺失，运行 `codewhale mcp init --force` 重新生成它。
 - 如果工具没有出现，请验证服务器命令能否在你的 shell 中工作，以及服务器是否支持 MCP 的 `tools/list`。

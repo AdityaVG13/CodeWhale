@@ -30,4 +30,11 @@ export const changelog: ChangelogDict = {
   emptyTitle: "No release notes were derived",
   emptyBody:
     "The build did not find a parsable CHANGELOG.md. The GitHub release list is still the record.",
+  versionMetaTitle: "Codewhale {version} release notes",
+  versionMetaDescription:
+    "Every change in Codewhale {version}, section by section, drawn from CHANGELOG.md in the repository.",
+  versionKicker: "Release notes",
+  versionLead: "Released {date}. Every entry for this version, drawn from the repository's CHANGELOG.md.",
+  versionLeadUndated: "Every entry for this version, drawn from the repository's CHANGELOG.md.",
+  allReleasesLink: "All releases",
 };

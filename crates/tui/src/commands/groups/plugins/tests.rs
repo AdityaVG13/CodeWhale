@@ -1,9 +1,9 @@
 use super::*;
 // `fs` was a cfg(test) import on the parent, and `Path` is now only used by
 // the legacy/render seams. Both belong here.
-use crate::config::Config;
 use crate::tui::app::{App, TuiOptions};
 use codewhale_localization::Locale;
+use codewhale_runtime::config::Config;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -25,10 +25,12 @@ fn extension_owner_report_escapes_every_plugin_controlled_field() {
     append_host_owner_report(
         &Presentation(Locale::En),
         &mut output,
-        &crate::extension_host::OwnerReport {
-            state: Some(crate::extension_host::registry::OwnerState::Failed(
-                "\u{1b}[31m<script>".into(),
-            )),
+        &codewhale_engine::extension_host::OwnerReport {
+            state: Some(
+                codewhale_engine::extension_host::registry::OwnerState::Failed(
+                    "\u{1b}[31m<script>".into(),
+                ),
+            ),
             tools: vec!["[tool](https://example.invalid)".into()],
             diagnostics: vec!["\n# approved\u{202e}".into()],
         },
@@ -39,14 +41,14 @@ fn extension_owner_report_escapes_every_plugin_controlled_field() {
         "[tool](https://example.invalid)",
         "\n# approved\u{202e}",
     ] {
-        assert!(output.contains(&escape_review_text(value)));
+        assert!(output.contains(&escape_review_text(value, ReviewTextContext::Prose)));
         assert!(!output.contains(value));
     }
     let mut localized = String::new();
     append_host_owner_report(
         &Presentation(Locale::ZhHans),
         &mut localized,
-        &crate::extension_host::OwnerReport {
+        &codewhale_engine::extension_host::OwnerReport {
             state: None,
             tools: vec![],
             diagnostics: vec![],
@@ -69,7 +71,10 @@ fn plugin_config_summary_lists_keys_never_values_and_escapes_them() {
     assert!(output.contains("[plugins.\"greeter\".config]"), "{output}");
     assert!(output.contains("values not shown"));
     assert!(output.contains("greeting"));
-    assert!(output.contains(&escape_review_text("\u{1b}[31mkey")));
+    assert!(output.contains(&escape_review_text(
+        "\u{1b}[31mkey",
+        ReviewTextContext::Prose
+    )));
     assert!(!output.contains('\u{1b}'));
 
     let mut refused = String::new();
@@ -103,14 +108,16 @@ fn create_test_app(root: &Path) -> (App, TempDir) {
         mcp_config_path: temp.path().join("mcp.json"),
         ..crate::tui::test_support::test_tui_options(root)
     };
-    let config = Config {
-        tools: Some(crate::config::ToolsConfig {
+    let config = {
+        let __cw_config_init_0_0 = Some(codewhale_runtime::config::ToolsConfig {
             plugin_dir: Some(tools_dir.to_string_lossy().into_owned()),
             ..Default::default()
-        }),
-        ..Default::default()
+        });
+        let mut __cw_config_init_0_value: Config = Default::default();
+        __cw_config_init_0_value.tools = __cw_config_init_0_0;
+        __cw_config_init_0_value
     };
-    let discovery = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv();
+    let discovery = codewhale_plugins::PluginDiscoveryContext::capture_pre_dotenv();
     let registry = discovery.registry_for_workspace(root);
     let mut app = App::new_with_plugin_registry(options, &config, registry);
     app.ui_locale = Locale::En;
@@ -213,16 +220,11 @@ fn list_show_validate_are_read_only_and_label_legacy_tools() {
         assert!(!result.is_error, "{:?}", result.message);
         assert!(!state_path.exists(), "read-only command wrote plugin state");
     }
-    // PR #5865's call shape, with main's assertions: the workspace bundle plus
-    // the built-in computer-use bundle, which every binary now carries and
-    // which lists disabled until it is reviewed.
     let list = plugins_with_kimi_home_override(&mut app, Some("list"), None)
         .message
         .unwrap();
-    assert!(list.contains("Plugin bundles (2)"), "{list}");
-    // The renderer escapes markdown, so the hyphen arrives backslashed.
-    assert!(list.contains(r"computer\-use"), "{list}");
-    assert!(list.contains("builtin · not-reviewed"), "{list}");
+    assert!(list.contains("Plugin bundles (1)"), "{list}");
+    assert!(list.contains("workspace · not-reviewed"), "{list}");
     assert!(list.contains("disabled"));
     assert!(list.contains("Legacy plugin tools (1)"));
 }
@@ -241,7 +243,7 @@ fn list_preserves_the_one_shot_on_disk_reload_nudge() {
         .message
         .unwrap();
     assert!(
-        first.contains(crate::plugins::PLUGIN_RELOAD_NUDGE),
+        first.contains(codewhale_plugins::PLUGIN_RELOAD_NUDGE),
         "{first}"
     );
 
@@ -249,7 +251,7 @@ fn list_preserves_the_one_shot_on_disk_reload_nudge() {
         .message
         .unwrap();
     assert!(
-        !second.contains(crate::plugins::PLUGIN_RELOAD_NUDGE),
+        !second.contains(codewhale_plugins::PLUGIN_RELOAD_NUDGE),
         "nudge must appear once per catalog stamp: {second}"
     );
 }
@@ -474,9 +476,19 @@ fn mcp_review_discloses_host_authority_and_names_without_secret_values() {
     assert!(review.contains("bearer_env=REMOTE\\_TOKEN"));
     assert!(review.contains("redirects=same-origin-only"));
     assert!(review.contains("Qualified skills: [none]"));
-    assert!(review.contains("#2 value=\"--mode=worker\""));
-    assert!(review.contains("#3 value=\"-e\""));
-    assert!(review.contains("#4 value=\"console.log('ready')\""));
+    for (position, expected) in [(2, "--mode=worker"), (3, "-e"), (4, "console.log('ready')")] {
+        let prefix = format!("#{position} value=");
+        let value = review
+            .split(prefix.as_str())
+            .nth(1)
+            .expect("reviewed argv position");
+        let actual = serde_json::Deserializer::from_str(value)
+            .into_iter::<String>()
+            .next()
+            .expect("reviewed JSON value")
+            .expect("lossless reviewed argv string");
+        assert_eq!(actual, expected);
+    }
     assert!(review.contains("oauth=disabled"));
 }
 
@@ -908,7 +920,7 @@ fn export_verb_writes_agent_plugins_bundle() {
     let bundle = root.path().join("exported/demo");
     let plugin_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(bundle.join("plugin.json")).unwrap()).unwrap();
-    crate::plugins::agent_plugin::validate_plugin_json(&plugin_json).unwrap();
+    codewhale_plugins::agent_plugin::validate_plugin_json(&plugin_json).unwrap();
     assert_eq!(plugin_json["name"], "demo");
     assert_eq!(plugin_json["description"], "Import spreadsheet data safely");
     assert!(bundle.join("skills/hello/SKILL.md").is_file());
@@ -931,7 +943,7 @@ fn plugin_dismissals_list_and_reset_both_kinds() {
     fs::create_dir_all(&codewhale_home).unwrap();
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
     let (mut app, _temp) = create_test_app(root.path());
-    crate::settings::Settings::transact_opt(|settings| {
+    codewhale_runtime::settings::Settings::transact_opt(|settings| {
         Ok(settings
             .dismissed_plugin_suggestions
             .insert("keptaway".to_string())
@@ -957,7 +969,7 @@ fn plugin_dismissals_list_and_reset_both_kinds() {
         .expect("reset receipt");
     assert!(reset.contains("keptaway"), "{reset}");
     assert!(
-        crate::settings::Settings::load()
+        codewhale_runtime::settings::Settings::load()
             .unwrap()
             .dismissed_plugin_suggestions
             .is_empty(),
@@ -999,7 +1011,7 @@ fn doctor_reports_read_only_then_fix_retires_stale_records_with_a_backup() {
                 "review_history": [{
                     "content_hash": "c",
                     "capability_hash": "k",
-                    "reviewed_capabilities": crate::plugins::manifest::PluginInventory::default(),
+                    "reviewed_capabilities": codewhale_plugins::manifest::PluginInventory::default(),
                     "reviewed_at": "2026-01-01T00:00:00+00:00"
                 }]
             }

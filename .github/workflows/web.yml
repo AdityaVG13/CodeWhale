@@ -1,59 +1,12 @@
 name: Web Frontend
 
 on:
-  push:
-    branches: [master, main]
-    paths:
-      # Everything the web gates read, not only web/. derive-facts,
-      # check-facts, check-docs, check-cloud-facts, gt-site and the vitest
-      # contract tests read these repo paths (and git history of the model
-      # declarations under crates/). workflow_dispatch ignores path filters,
-      # so a manual deploy always runs.
-      - 'web/**'
-      - 'crates/**'
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - 'Cargo.toml'
-      - 'package.json'
-      - 'npm/codewhale/**'
-      - 'vendor/codewhale-design/**'
-      - 'telemetry-ingest/test/golden/**'
-      - 'workflows/**'
-      - 'fleets/**'
-      - '.codewhale/**'
-      - '.github/SECURITY.md'
-      - '.github/workflows/web.yml'
-      - 'scripts/export-design-tokens.py'
-  pull_request:
-    branches: [master, main]
-    # Same list as push above.
-    paths:
-      - 'web/**'
-      - 'crates/**'
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - 'Cargo.toml'
-      - 'package.json'
-      - 'npm/codewhale/**'
-      - 'vendor/codewhale-design/**'
-      - 'telemetry-ingest/test/golden/**'
-      - 'workflows/**'
-      - 'fleets/**'
-      - '.codewhale/**'
-      - '.github/SECURITY.md'
-      - '.github/workflows/web.yml'
-      - 'scripts/export-design-tokens.py'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # A new push to a PR cancels its superseded web run. Push and dispatch runs
-  # get a per-run group so a queued manual deploy is never cancelled by a
-  # later push (the deploy job additionally serializes on its own group).
   group: ${{ github.event_name == 'pull_request' && format('web-pr-{0}', github.event.pull_request.number) || format('web-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -74,7 +27,7 @@ jobs:
           # history, so every date collapses to the tip commit and the committed
           # facts always read as stale. ci.yml pins depth 0 for the same reason.
           fetch-depth: 0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: 'npm'
@@ -114,8 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: lint
-    # Deploy is MANUAL ONLY: a human dispatches this workflow on main. Pushes
-    # and pull requests still run `lint` above, but they never reach Cloudflare.
+    # Deploy is MANUAL ONLY: an authorized dispatch on main runs `lint`
+    # before deploying. Pushes and pull requests do not start this workflow.
     # This mirrors scripts/check-cloudflare-deploy-env.mjs, which fails closed
     # unless GITHUB_EVENT_NAME is workflow_dispatch, GITHUB_REF is
     # refs/heads/main, and GITHUB_SHA is an exact 40-hex revision — a push
@@ -146,7 +99,7 @@ jobs:
         # while the run is queued behind the concurrency group.
         with:
           ref: ${{ github.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: 'npm'

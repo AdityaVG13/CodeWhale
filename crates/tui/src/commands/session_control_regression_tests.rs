@@ -12,13 +12,14 @@ use tempfile::TempDir;
 
 use crate::commands::groups::session::MAX_TITLE_LEN;
 use crate::commands::{CommandResult, execute};
-use crate::config::{Config, ProviderKind};
-use crate::session_manager::{SessionManager, create_saved_session_with_mode};
 use crate::test_support::{EnvVarGuard, TestEnvLock};
 use crate::tui::app::{App, AppAction, TuiOptions};
 use codewhale_config::AppMode;
+use codewhale_config::ProviderKind;
+use codewhale_engine::session_manager::{SessionManager, create_saved_session_with_mode};
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_models::{ContentBlock, Message, Role, SystemPrompt};
+use codewhale_runtime::config::Config;
 
 /// Owns the global environment lock for as long as its CODEWHALE_HOME guard.
 /// Fields are ordered so the guard restores the environment before the lock
@@ -60,6 +61,7 @@ impl ControlHarness {
         let session_id = session.metadata.id.clone();
         self.manager.save_session(&session).expect("save session");
         self.app.current_session_id = Some(session_id.clone());
+        self.app.capture_session_fixture_source();
         session_id
     }
 }
@@ -125,6 +127,7 @@ fn rename_persists_all_live_metadata_through_public_dispatch() {
         .save_session(&session)
         .expect("save session");
     harness.app.current_session_id = Some(session_id.clone());
+    harness.app.capture_session_fixture_source();
     harness
         .app
         .set_model_selection("local-code-model".to_string());
@@ -135,7 +138,7 @@ fn rename_persists_all_live_metadata_through_public_dispatch() {
     harness.app.system_prompt = None;
     harness.app.todos.try_lock().expect("todos lock").add(
         "live rename state".to_string(),
-        crate::tools::todo::TodoStatus::InProgress,
+        codewhale_engine::tools::todo::TodoStatus::InProgress,
     );
     let expected_work_state = harness.app.work_state_snapshot().expect("work snapshot");
 
@@ -215,6 +218,7 @@ fn rename_recovers_first_snapshot_from_checkpoint() {
         .save_checkpoint(&checkpoint)
         .expect("save checkpoint");
     harness.app.current_session_id = Some(session_id.clone());
+    harness.app.capture_session_fixture_source();
     harness.app.api_messages =
         std::sync::Arc::new(vec![user_message("first turn still streaming")]);
 
@@ -235,6 +239,7 @@ fn rename_builds_from_app_state_before_any_checkpoint_exists() {
     let mut harness = ControlHarness::new();
     let session_id = "live-before-first-checkpoint";
     harness.app.current_session_id = Some(session_id.to_string());
+    harness.app.capture_session_fixture_source();
     harness.app.api_messages =
         std::sync::Arc::new(vec![user_message("turn one, nothing persisted yet")]);
 
@@ -258,6 +263,8 @@ fn title_requires_an_active_session_and_preserves_raw_length_limit() {
     assert!(result_text(&no_session).contains("No active session"));
 
     harness.app.current_session_id = Some("any".to_string());
+
+    harness.app.capture_session_fixture_source();
     let too_long = "x".repeat(MAX_TITLE_LEN + 1);
     let result = dispatch(&mut harness.app, "title", Some(&too_long));
     assert!(result.is_error);
@@ -276,6 +283,7 @@ fn title_set_and_clear_persist_without_renaming_the_session() {
         .save_session(&session)
         .expect("save session");
     harness.app.current_session_id = Some("title-test".to_string());
+    harness.app.capture_session_fixture_source();
 
     let result = dispatch(&mut harness.app, "title", Some("parallel-task"));
     assert!(!result.is_error, "{result:?}");
@@ -346,6 +354,7 @@ fn title_recovers_first_snapshot_from_checkpoint() {
         .save_checkpoint(&checkpoint)
         .expect("save checkpoint");
     harness.app.current_session_id = Some(session_id.clone());
+    harness.app.capture_session_fixture_source();
     harness.app.api_messages =
         std::sync::Arc::new(vec![user_message("first turn still streaming")]);
 
@@ -367,6 +376,7 @@ fn title_builds_from_app_state_before_any_checkpoint_exists() {
     let mut harness = ControlHarness::new();
     let session_id = "live-title-before-first-checkpoint";
     harness.app.current_session_id = Some(session_id.to_string());
+    harness.app.capture_session_fixture_source();
     harness.app.api_messages =
         std::sync::Arc::new(vec![user_message("turn one, nothing persisted yet")]);
 

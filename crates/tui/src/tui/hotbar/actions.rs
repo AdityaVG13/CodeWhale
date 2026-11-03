@@ -6,13 +6,14 @@ use anyhow::Result;
 use codewhale_config::AppMode;
 
 use crate::commands::{self, CommandInfo, CommandResult};
-use crate::config::{Config, ProviderIdentity, ProviderKind};
-use crate::provider_lake::models_for_provider;
 use crate::tui::app::{App, AppAction};
 use crate::tui::command_palette::{
     CommandPaletteView, build_entries_with_plugins as build_command_palette_entries,
 };
+use codewhale_config::ProviderKind;
+use codewhale_engine::provider_lake::models_for_provider;
 use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_runtime::config::{Config, ProviderIdentity};
 
 pub const HOTBAR_COMPACT_LABEL_MAX_WIDTH: usize = 7;
 
@@ -540,7 +541,10 @@ impl HotbarActionRegistry {
     /// Called when a live MCP discovery snapshot lands (or is refreshed) so
     /// the hotbar only ever lists tools that are already loaded; the hotbar
     /// itself never triggers server connections.
-    pub fn replace_mcp_tools(&mut self, snapshot: Option<&crate::mcp::McpManagerSnapshot>) {
+    pub fn replace_mcp_tools(
+        &mut self,
+        snapshot: Option<&codewhale_engine::mcp::McpManagerSnapshot>,
+    ) {
         self.actions
             .retain(|_, action| action.category() != HotbarActionCategory::Mcp.as_str());
         if let Some(snapshot) = snapshot {
@@ -585,7 +589,7 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
         registry.register(AppHotbarAction::new(
             "mode.agent",
             "agent",
-            "Act mode",
+            "Work mode",
             "Do direct work in the current session.",
             AppHotbarKind::Mode(AppMode::Agent),
         ));
@@ -700,7 +704,7 @@ impl HotbarActionSource for SkillHotbarActionSource<'_> {
 /// it prefills the composer with the tool's model-visible name so the actual
 /// call still goes through the agent and the tool approval flow.
 struct McpToolHotbarActionSource<'a> {
-    snapshot: &'a crate::mcp::McpManagerSnapshot,
+    snapshot: &'a codewhale_engine::mcp::McpManagerSnapshot,
 }
 
 impl HotbarActionSource for McpToolHotbarActionSource<'_> {
@@ -771,7 +775,11 @@ impl HotbarActionSource for ConfiguredRouteHotbarActionSource<'_> {
             if identity.provider == ProviderKind::Antigravity {
                 continue;
             }
-            if !crate::config::provider_is_configured_for_active(self.config, &identity, active) {
+            if !codewhale_engine::provider_readiness::provider_is_configured_for_active(
+                self.config,
+                &identity,
+                active,
+            ) {
                 continue;
             }
             for model in configured_route_models_for_provider(
@@ -993,7 +1001,7 @@ impl HotbarAction for AppHotbarAction {
             AppHotbarKind::SessionCompact => app.is_compacting || app.manual_compaction_queued,
             AppHotbarKind::Mode(mode) => app.mode == mode,
             AppHotbarKind::ReasoningCycle => {
-                app.reasoning_effort != crate::reasoning_preference::ReasoningEffort::Off
+                app.reasoning_effort != codewhale_engine::reasoning_preference::ReasoningEffort::Off
             }
             AppHotbarKind::SidebarToggle => {
                 app.work_surface.placement != crate::tui::work_surface::WorkSurfacePlacement::Off
@@ -1069,7 +1077,7 @@ impl HotbarAction for AppHotbarAction {
                     build_command_palette_entries(
                         app.ui_locale,
                         &app.skills_dir,
-                        app.skills_discovery_mode,
+                        &app.skills_config,
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
@@ -1192,7 +1200,7 @@ impl RouteHotbarAction {
         let trimmed_model = model.trim().to_string();
         Self {
             id: route_action_id(&identity, &trimmed_model),
-            short_label: crate::tui::ui_text::truncate_line_to_width(
+            short_label: codewhale_tui_kit::ui_text::truncate_line_to_width(
                 identity.key.as_str(),
                 HOTBAR_COMPACT_LABEL_MAX_WIDTH,
             ),
@@ -1272,7 +1280,7 @@ impl SkillHotbarAction {
         Self {
             name: name.to_string(),
             id: format!("skill.{name}"),
-            short_label: crate::tui::ui_text::truncate_line_to_width(
+            short_label: codewhale_tui_kit::ui_text::truncate_line_to_width(
                 name,
                 HOTBAR_COMPACT_LABEL_MAX_WIDTH,
             ),
@@ -1340,14 +1348,14 @@ struct McpToolHotbarAction {
 }
 
 impl McpToolHotbarAction {
-    fn new(server: &str, tool: &crate::mcp::McpDiscoveredItem) -> Self {
+    fn new(server: &str, tool: &codewhale_engine::mcp::McpDiscoveredItem) -> Self {
         Self {
             server: server.to_string(),
             tool_name: tool.name.clone(),
             model_name: tool.model_name.trim().to_string(),
             description: tool.description.clone(),
             id: format!("mcp.{server}.{}", tool.name),
-            short_label: crate::tui::ui_text::truncate_line_to_width(
+            short_label: codewhale_tui_kit::ui_text::truncate_line_to_width(
                 &tool.name,
                 HOTBAR_COMPACT_LABEL_MAX_WIDTH,
             ),
@@ -1466,10 +1474,11 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
 
-    use crate::config::{Config, ProviderKind};
-    use crate::reasoning_preference::ReasoningEffort;
     use crate::tui::app::TuiOptions;
     use crate::tui::views::ModalKind;
+    use codewhale_config::ProviderKind;
+    use codewhale_engine::reasoning_preference::ReasoningEffort;
+    use codewhale_runtime::config::Config;
 
     use super::*;
 
@@ -1496,8 +1505,8 @@ mod tests {
         test_app_with_paths(PathBuf::from("."), PathBuf::from("."))
     }
 
-    fn test_mcp_snapshot() -> crate::mcp::McpManagerSnapshot {
-        use crate::mcp::{McpDiscoveredItem, McpManagerSnapshot, McpServerSnapshot};
+    fn test_mcp_snapshot() -> codewhale_engine::mcp::McpManagerSnapshot {
+        use codewhale_engine::mcp::{McpDiscoveredItem, McpManagerSnapshot, McpServerSnapshot};
         let server = |name: &str, enabled: bool, tools: Vec<McpDiscoveredItem>| McpServerSnapshot {
             name: name.to_string(),
             enabled,
@@ -1511,9 +1520,9 @@ mod tests {
             error: None,
             auth_required: false,
             capability_metadata: if enabled {
-                crate::mcp::McpServerCapabilityMetadata::LegacyFallback
+                codewhale_engine::mcp::McpServerCapabilityMetadata::LegacyFallback
             } else {
-                crate::mcp::McpServerCapabilityMetadata::NotObserved
+                codewhale_engine::mcp::McpServerCapabilityMetadata::NotObserved
             },
             tools,
             resources: Vec::new(),
@@ -1823,11 +1832,14 @@ mod tests {
         let palette_slash_ids = build_command_palette_entries(
             Locale::En,
             tmp.path(),
-            crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
+            &codewhale_runtime::config::SkillsConfig {
+                scan_codewhale_only: Some(true),
+                ..Default::default()
+            },
             tmp.path(),
             &tmp.path().join("mcp.json"),
             None,
-            &crate::plugins::PluginRegistry::empty(tmp.path()),
+            &codewhale_plugins::PluginRegistry::empty(tmp.path()),
         )
         .into_iter()
         .filter(|entry| entry.section() == crate::tui::command_palette::PaletteSection::Command)
@@ -2363,9 +2375,11 @@ mod tests {
             "---\nname: hotbar-demo-skill\ndescription: Demo skill for hotbar tests\n---\n\nFollow the demo instructions.\n",
         )
         .expect("write SKILL.md");
-        let config = Config {
-            skills_dir: Some(skills_dir.path().to_string_lossy().into_owned()),
-            ..Config::default()
+        let config = {
+            let __cw_config_init_0_0 = Some(skills_dir.path().to_string_lossy().into_owned());
+            let mut __cw_config_init_0_value: Config = Config::default();
+            __cw_config_init_0_value.skills_dir = __cw_config_init_0_0;
+            __cw_config_init_0_value
         };
         let mut app = test_app_with_paths_and_config(
             workspace.path().to_path_buf(),
@@ -2590,7 +2604,7 @@ mod tests {
         let _codewhale_config = crate::test_support::EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
         let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
-        crate::settings::Settings::transact(|settings| {
+        codewhale_runtime::settings::Settings::transact(|settings| {
             settings.reasoning_effort = Some("off".to_string());
             Ok(())
         })
@@ -2613,7 +2627,7 @@ mod tests {
         assert_eq!(app.reasoning_effort, ReasoningEffort::Off);
         assert_eq!(app.startup_defaults.pending_len(), 0);
         assert_eq!(
-            crate::settings::Settings::load()
+            codewhale_runtime::settings::Settings::load()
                 .expect("reload settings")
                 .reasoning_effort
                 .as_deref(),
@@ -2635,7 +2649,7 @@ mod tests {
         let reasoning = registry.get("reasoning.cycle").expect("reasoning action");
         let mut app = test_app();
         app.set_provider_identity_record(
-            crate::config::Config::default()
+            codewhale_runtime::config::Config::default()
                 .resolve_provider_identity(ProviderKind::OpenaiCodex.as_str())
                 .expect("captured fixture provider"),
         );

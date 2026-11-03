@@ -11,6 +11,7 @@ description = "Pure redaction and output sanitization without credential storage
 workspace = true
 
 [dependencies]
+icu_properties = { version = "2.2", default-features = false, features = ["compiled_data"] }
 regex = "1.11"
 serde_json = { workspace = true, features = ["preserve_order"] }
 url = "2.5"

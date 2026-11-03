@@ -37,13 +37,13 @@ use codewhale_protocol::ids::{SessionId, ThreadId};
 
 use super::golden::{self, Failures, Masker, Sandbox};
 use super::stream_json;
-use crate::compaction::CompactionConfig;
-use crate::config::Config;
-use crate::core::engine::{Engine, EngineConfig};
-use crate::core::events::Event;
-use crate::core::ops::{Op, TurnSpec, UserInputProvenance};
-use crate::core::protocol_parity::{ProtocolIds, event_to_protocol};
-use crate::llm_client::{LlmClient, StreamEventBox};
+use codewhale_engine::compaction::CompactionConfig;
+use codewhale_engine::core::engine::{Engine, EngineConfig};
+use codewhale_engine::core::events::Event;
+use codewhale_engine::core::ops::{Op, TurnSpec, UserInputProvenance};
+use codewhale_engine::core::protocol_parity::{ProtocolIds, event_to_protocol};
+use codewhale_engine::llm_client::{LlmClient, StreamEventBox};
+use codewhale_runtime::config::Config;
 
 const FAMILY: &str = "events";
 pub(super) const PREFIX_OWNED_BY_PROMPT_FAMILY: &str = "<pinned by the prompt family>";
@@ -200,7 +200,7 @@ fn approval_mode(case: &Value) -> ApprovalMode {
 
 pub(super) fn send_message_op(case: &Value, config: &Config) -> Op {
     let model = case["model"].as_str().expect("case.model");
-    let route = crate::route_runtime::resolve_runtime_route(
+    let route = codewhale_engine::route_runtime::resolve_runtime_route(
         config,
         config.active_provider_identity().unwrap().provider,
         Some(model),
@@ -221,7 +221,7 @@ pub(super) fn send_message_op(case: &Value, config: &Config) -> Op {
         initial_routed_usage: Box::default(),
         goal_objective: None,
         goal_token_budget: None,
-        goal_status: crate::tools::goal::GoalStatus::Active,
+        goal_status: codewhale_engine::tools::goal::GoalStatus::Active,
         reasoning_effort: None,
         reasoning_effort_auto: false,
         auto_model: false,
@@ -254,7 +254,7 @@ fn workspace_listing(workspace: &Path) -> BTreeMap<String, String> {
                     .expect("inside workspace")
                     .to_string_lossy()
                     .replace('\\', "/");
-                let digest = crate::hashing::sha256_hex(&bytes);
+                let digest = codewhale_runtime::hashing::sha256_hex(&bytes);
                 out.insert(relative, digest[..16].to_string());
             }
         }
@@ -296,8 +296,8 @@ fn run_scripted_turn_with_deadline(
     let (os, shell) = recorded_environment(case);
     // Held across the whole turn: the engine builds and refreshes its system
     // prompt on this thread's current-thread runtime.
-    let _environment = crate::prompts::pin_recorded_environment(&os, &shell);
-    let _host_tools = crate::dependencies::pin_recorded_host_tools(recorded_host_tools(case));
+    let _environment = codewhale_engine::prompts::pin_recorded_environment(&os, &shell);
+    let _host_tools = codewhale_dependencies::pin_recorded_host_tools(recorded_host_tools(case));
     let record = runtime.block_on(async {
         let config = Config::default();
         let engine_config = EngineConfig {
@@ -307,7 +307,7 @@ fn run_scripted_turn_with_deadline(
             session_id: Some("conformance-session".to_string()),
             ..EngineConfig::default()
         };
-        let client: crate::core::model_client::SharedModelClient = provider.clone();
+        let client: codewhale_engine::core::model_client::SharedModelClient = provider.clone();
         let (mut engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
         let (enforcement, no_new_privs_active) = recorded_platform(case);
         engine.pin_recorded_platform_posture(enforcement, no_new_privs_active);
@@ -328,8 +328,10 @@ fn run_scripted_turn_with_deadline(
 /// what the Engine does on that platform rather than which machine ran it.
 /// A case without them fails loud instead of silently probing the host. The
 /// label for each platform is owned and tested by `sandbox::policy`.
-fn recorded_platform(case: &Value) -> (crate::sandbox::policy::SandboxEnforcement, Option<bool>) {
-    use crate::sandbox::policy::SandboxEnforcement;
+fn recorded_platform(
+    case: &Value,
+) -> (codewhale_sandbox::policy::SandboxEnforcement, Option<bool>) {
+    use codewhale_sandbox::policy::SandboxEnforcement;
     let platform = case
         .get("recorded_platform")
         .expect("scripted conformance case must declare `recorded_platform`");
@@ -386,7 +388,7 @@ fn recorded_host_tools(case: &Value) -> Vec<String> {
 /// `TurnComplete`, then everything the engine emits while it shuts down.
 async fn drive_turn(
     engine: Engine,
-    handle: crate::core::engine::EngineHandle,
+    handle: codewhale_engine::core::engine::EngineHandle,
     op: Op,
     driver: &[Value],
     deadline: Duration,
@@ -920,7 +922,7 @@ fn golden_turn_events_match() {
     // The goldens carry the span numbers of one pass over the cases in an
     // otherwise idle process (`one_tool_call` #1, `parallel_tool_calls` #2
     // and #3); replay that numbering whatever else this process runs.
-    let _spans = crate::core::engine::pin_replay_span_sequence();
+    let _spans = codewhale_engine::core::engine::pin_replay_span_sequence();
     let names = golden::case_names(FAMILY);
     let mut failures = Failures::default();
     for name in &names {

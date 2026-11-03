@@ -1,8 +1,10 @@
+use codewhale_app_server_protocol::runtime::{
+    RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION, RuntimeEventEnvelope,
+};
 use codewhale_protocol::{
     AppRequest, EventFrame, ThreadGoal, ThreadGoalProgressParams, ThreadGoalSetParams,
     ThreadGoalStatus, ThreadListParams, ThreadRequest, ThreadResumeParams, ToolOutput,
     UserInputAnswerEvent, UserInputOptionEvent, UserInputQuestionEvent, UserInputRequestEvent,
-    runtime::{RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION, RuntimeEventEnvelope},
 };
 use serde_json::{Value, json};
 
@@ -331,10 +333,16 @@ fn user_input_request_event_frame_round_trip() {
             call_id: "call-1".to_string(),
             turn_id: "turn-1".to_string(),
             request_id: "ui-1".to_string(),
+            require_typed_answers: true,
             questions: vec![UserInputQuestionEvent {
                 header: "Scope".to_string(),
                 id: "scope".to_string(),
                 question: "Which surfaces?".to_string(),
+                detail: Some("Detailed plan".to_string()),
+                intent: Some(codewhale_protocol::UserInputIntentEvent::PlanReview {
+                    approve: "All".into(),
+                    call_id: Some("plan-call".into()),
+                }),
                 options: vec![
                     UserInputOptionEvent {
                         label: "TUI".to_string(),
@@ -354,6 +362,19 @@ fn user_input_request_event_frame_round_trip() {
     let encoded = serde_json::to_value(&frame).expect("serialize user input frame");
     assert_eq!(encoded["event"], "user_input_request");
     assert_eq!(encoded["request"]["call_id"], "call-1");
+    assert_eq!(encoded["request"]["require_typed_answers"], true);
+    assert_eq!(
+        encoded["request"]["questions"][0]["detail"],
+        "Detailed plan"
+    );
+    assert_eq!(
+        encoded["request"]["questions"][0]["intent"]["kind"],
+        "plan-review"
+    );
+    assert_eq!(
+        encoded["request"]["questions"][0]["intent"]["call_id"],
+        "plan-call"
+    );
     assert_eq!(encoded["request"]["request_id"], "ui-1");
     assert_eq!(encoded["request"]["questions"][0]["header"], "Scope");
     assert_eq!(encoded["request"]["questions"][0]["allow_free_text"], true);
@@ -400,6 +421,9 @@ fn user_input_request_event_defaults_flags_when_omitted() {
     let EventFrame::UserInputRequest { request } = decoded else {
         panic!("expected user_input_request frame");
     };
+    assert!(!request.require_typed_answers);
+    assert_eq!(request.questions[0].detail, None);
+    assert_eq!(request.questions[0].intent, None);
     assert!(!request.questions[0].allow_free_text);
     assert!(!request.questions[0].multi_select);
 }
@@ -411,6 +435,7 @@ fn submit_user_input_app_request_round_trip() {
     let req = AppRequest::SubmitUserInput {
         request_id: "ui-1".to_string(),
         answers: vec![UserInputAnswerEvent {
+            kind: Some(codewhale_protocol::UserInputAnswerKindEvent::Choice),
             id: "scope".to_string(),
             label: "All".to_string(),
             value: "All".to_string(),
@@ -431,6 +456,10 @@ fn submit_user_input_app_request_round_trip() {
     assert_eq!(request_id, "ui-1");
     assert_eq!(answers.len(), 1);
     assert_eq!(answers[0].label, "All");
+    assert_eq!(
+        answers[0].kind,
+        Some(codewhale_protocol::UserInputAnswerKindEvent::Choice)
+    );
 }
 
 #[test]

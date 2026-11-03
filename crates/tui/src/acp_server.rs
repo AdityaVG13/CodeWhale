@@ -2,21 +2,25 @@
 //! History, provider requests, tools, approval and cancellation are Core facts.
 //! This module keeps only connection configuration, canonical bindings and
 //! JSON-RPC correlation. Secure cross-process attachment is not yet qualified.
-use crate::config::{Config, ProviderKind};
-#[cfg(test)]
-use crate::runtime_threads::RuntimeThreadManagerConfig;
-use crate::runtime_threads::{CreateThreadRequest, RuntimeThreadManager, UpdateThreadRequest};
 use anyhow::{Result, anyhow};
 use codewhale_config::AppMode;
+use codewhale_config::ProviderKind;
+use codewhale_engine::core::authority::{SandboxNetworkAccess, sandbox_policy_for_turn};
+#[cfg(test)]
+use codewhale_engine::runtime_threads::manager::RuntimeThreadManagerConfig;
+use codewhale_engine::runtime_threads::{
+    manager::CreateThreadRequest, manager::RuntimeThreadManager, manager::UpdateThreadRequest,
+};
 use codewhale_execpolicy::ApprovalMode;
+use codewhale_runtime::config::Config;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncBufRead, AsyncWrite};
 #[cfg(test)]
-use tokio::io::BufReader;
-use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, BufReader};
 mod runtime;
 const ACP_PROTOCOL_VERSION: u64 = 1;
 const MAX_ACP_SESSIONS: usize = 64;
@@ -27,10 +31,12 @@ pub async fn run_acp_server(
     config: Config,
     model: String,
     default_cwd: PathBuf,
-    plugins: Arc<crate::plugins::PluginDiscoveryContext>,
+    plugins: Arc<codewhale_plugins::PluginDiscoveryContext>,
     config_path: Option<PathBuf>,
     config_profile: Option<String>,
 ) -> Result<()> {
+    ensure_acp_approval_posture(&config)?;
+    eprintln!("{}", acp_startup_posture(&config, &default_cwd));
     crate::runtime_api::run_http_server(
         config,
         default_cwd,
@@ -39,7 +45,9 @@ pub async fn run_acp_server(
             port: 0,
             config_path,
             config_profile,
-            control_frontend: Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }),
+            control_frontend: Some(
+                codewhale_runtime::runtime_control::RuntimeControlFrontend::Acp { model },
+            ),
             ..Default::default()
         },
     )
@@ -64,6 +72,7 @@ pub(crate) fn capture_frontend(
     config_path: Option<PathBuf>,
     config_profile: Option<String>,
 ) -> Result<Arc<CapturedAcpFrontend>> {
+    ensure_acp_approval_posture(&config)?;
     Ok(Arc::new(CapturedAcpFrontend {
         config,
         model,
@@ -90,7 +99,7 @@ impl CapturedAcpFrontend {
                 self.config_path.clone(),
                 self.config_profile.clone(),
             );
-            let mut input = codewhale_app_server::BoundedLines::new(input);
+            let mut input = codewhale_app_server::stdio::BoundedLines::new(input);
             server.serve(&mut input, &mut output).await
         })
     }
@@ -191,10 +200,19 @@ impl AcpServer {
     }
     async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         &mut self,
-        reader: &mut codewhale_app_server::BoundedLines<R>,
+        reader: &mut codewhale_app_server::stdio::BoundedLines<R>,
         writer: &mut W,
     ) -> Result<()> {
-        while let Some(line) = reader.next_line().await? {
+        loop {
+            let line = match reader.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) if codewhale_app_server::stdio::is_frame_refusal(&error) => {
+                    write_jsonrpc_error(writer, None, -32700, error.to_string()).await?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -239,11 +257,17 @@ impl AcpServer {
                         }
                     }
                     Err(error) => {
+                        if codewhale_app_server::stdio::is_control_write_failure(&error) {
+                            return Err(error);
+                        }
                         write_jsonrpc_error(
                             writer,
                             response_id,
                             -32603,
-                            crate::client::redact_model_bound_text(&error.to_string(), &[]),
+                            codewhale_engine::client::redact_model_bound_text(
+                                &error.to_string(),
+                                &[],
+                            ),
                         )
                         .await?
                     }
@@ -252,8 +276,21 @@ impl AcpServer {
             }
             match self.handle_request(method, params).await {
                 Ok(AcpDispatch::Response(result)) => {
-                    if let Some(id) = response_id {
-                        write_jsonrpc_result(writer, id, result).await?;
+                    let replayed = match result.get("sessionId").and_then(Value::as_str) {
+                        Some(session) if method == "session/load" => {
+                            self.replay_history(writer, session).await
+                        }
+                        _ => Ok(()),
+                    };
+                    match (replayed, response_id) {
+                        (Ok(()), Some(id)) => write_jsonrpc_result(writer, id, result).await?,
+                        (Ok(()), None) => {}
+                        (Err(error), id) => {
+                            if codewhale_app_server::stdio::is_control_write_failure(&error) {
+                                return Err(error);
+                            }
+                            write_jsonrpc_error(writer, id, -32603, error.to_string()).await?
+                        }
                     }
                 }
                 Ok(AcpDispatch::Shutdown) => {
@@ -350,6 +387,7 @@ impl AcpServer {
         self.sessions.insert(id, AcpSession { thread_id, cursor });
     }
     async fn new_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+        validate_mcp_servers(&params)?;
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -421,15 +459,16 @@ impl AcpServer {
                 ));
             }
         };
-        let sessions = crate::session_manager::SessionManager::new(self.sessions_dir.clone())
-            .ok()
-            .and_then(|manager| manager.list_sessions().ok())
-            .unwrap_or_default();
+        let sessions =
+            codewhale_engine::session_manager::SessionManager::new(self.sessions_dir.clone())
+                .ok()
+                .and_then(|manager| manager.list_sessions().ok())
+                .unwrap_or_default();
         let sessions: Vec<Value> = sessions
             .into_iter()
             .filter(|meta| {
                 cwd.as_ref().is_none_or(|cwd| {
-                    crate::session_manager::paths_equivalent(&meta.workspace, cwd)
+                    codewhale_engine::session_manager::paths_equivalent(&meta.workspace, cwd)
                 })
             })
             .map(|meta| {
@@ -447,6 +486,7 @@ impl AcpServer {
     }
 
     async fn load_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+        validate_mcp_servers(&params)?;
         let requested = params
             .get("sessionId")
             .and_then(Value::as_str)
@@ -454,8 +494,9 @@ impl AcpServer {
         if self.sessions.contains_key(requested) {
             return self.session_configuration(requested).await;
         }
-        let store = crate::session_manager::SessionManager::new(self.sessions_dir.clone())
-            .map_err(|error| AcpError::internal(error.to_string()))?;
+        let store =
+            codewhale_engine::session_manager::SessionManager::new(self.sessions_dir.clone())
+                .map_err(|error| AcpError::internal(error.to_string()))?;
         let saved = store
             .resume_session_by_prefix(requested)
             .map_err(|error| {
@@ -472,14 +513,7 @@ impl AcpServer {
             &id,
             crate::runtime_api::sessions::ResumeSessionRequest {
                 model: None,
-                mode: Some(
-                    if acp_mode(&self.config) == AppMode::Plan {
-                        "plan"
-                    } else {
-                        saved.metadata.mode.as_deref().unwrap_or("agent")
-                    }
-                    .to_string(),
-                ),
+                mode: (acp_mode(&self.config) == AppMode::Plan).then(|| "plan".to_string()),
             },
             (self.config_path.as_deref(), self.config_profile.as_deref()),
             Some(self.shell_allowed()),
@@ -510,20 +544,133 @@ impl AcpServer {
         self.remember(id.clone(), resumed.thread_id, cursor);
         self.session_configuration(&id).await
     }
-    fn permission_value(&self) -> &'static str {
-        match acp_approval_mode(&self.config) {
-            ApprovalMode::Bypass => "full-access",
-            ApprovalMode::Auto => "auto-review",
-            ApprovalMode::Never => "never",
-            ApprovalMode::Suggest => "ask",
+    async fn replay_history<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        session_id: &str,
+    ) -> Result<()> {
+        use codewhale_models::ContentBlock;
+        let saved =
+            codewhale_engine::session_manager::SessionManager::new(self.sessions_dir.clone())?
+                .load_session(session_id)?;
+        let secrets =
+            codewhale_engine::runtime_threads::manager::receipt_secret_values(self.config.clone())
+                .await?;
+        let mut calls = HashMap::new();
+        for message in &saved.messages {
+            let kind = match message.role.as_str() {
+                "user" => Some("user_message_chunk"),
+                "assistant" => Some("agent_message_chunk"),
+                _ => None,
+            };
+            if let Some(kind) = kind
+                && !codewhale_engine::runtime_handoff::is_internal_runtime_handoff(message)
+                && codewhale_models::turn_classify::restored_subagent_checkpoint_display(message)
+                    .is_none()
+            {
+                let mut chunks = Vec::<String>::new();
+                let mut coalesce = false;
+                for (index, block) in message.content.iter().enumerate() {
+                    match block {
+                        ContentBlock::Text { text, .. } => {
+                            if codewhale_engine::runtime_handoff::is_turn_metadata_block(
+                                message, index, text,
+                            ) {
+                                continue;
+                            }
+                            if text.starts_with("[tool_history_repair]")
+                                || (message.role == "assistant"
+                                    && codewhale_engine::runtime_handoff::archived_context_parts(
+                                        text,
+                                    )
+                                    .is_some())
+                            {
+                                coalesce = false;
+                                continue;
+                            }
+                            if coalesce {
+                                if let Some(chunk) = chunks.last_mut() {
+                                    if !chunk.is_empty() {
+                                        chunk.push('\n');
+                                    }
+                                    chunk.push_str(text);
+                                }
+                            } else {
+                                chunks.push(text.clone());
+                            }
+                            coalesce = true;
+                        }
+                        ContentBlock::Thinking { thinking, .. }
+                            if thinking != "(reasoning omitted)" =>
+                        {
+                            coalesce = false;
+                        }
+                        ContentBlock::ToolUse { name, .. } if name == "update_plan" => {
+                            coalesce = false;
+                        }
+                        _ => {}
+                    }
+                }
+                for text in chunks {
+                    write_json_line(
+                        writer,
+                        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}}),
+                    )
+                    .await?;
+                }
+            }
+            for block in &message.content {
+                let Some(key) = block.tool_call_key().map(|key| key.as_str().to_string()) else {
+                    continue;
+                };
+                match block {
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        let call = PendingToolCall {
+                            execution_id: key.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        };
+                        write_tool_call_start(writer, session_id, &call).await?;
+                        calls.insert(key, call);
+                    }
+                    ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => {
+                        if let Some(call) = calls.remove(&key) {
+                            let status = if is_error.unwrap_or(false) {
+                                "failed"
+                            } else {
+                                "completed"
+                            };
+                            let detail =
+                                codewhale_engine::runtime_threads::manager::tool_receipt_detail(
+                                    &call.name, content, &secrets,
+                                );
+                            write_tool_call_update(
+                                writer,
+                                session_id,
+                                &call,
+                                status,
+                                Some(&detail),
+                            )
+                            .await?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
+        Ok(())
+    }
+    fn permission_value(&self) -> &'static str {
+        acp_permission_value(&self.config)
     }
     async fn session_configuration(
         &self,
         session_id: &str,
     ) -> std::result::Result<Value, AcpError> {
         use codewhale_localization::{MessageId, resolve_locale, tr};
-        let settings = crate::settings::Settings::load().unwrap_or_default();
+        let settings = codewhale_runtime::settings::Settings::load().unwrap_or_default();
         let locale = resolve_locale(&settings.locale);
         let binding = self
             .sessions
@@ -541,7 +688,8 @@ impl AcpServer {
                 thread.model_provider_id.as_deref(),
             )
             .map_err(AcpError::invalid_params)?;
-        let mut models = crate::provider_lake::models_for_provider(&self.config, &identity);
+        let mut models =
+            codewhale_engine::provider_lake::models_for_provider(&self.config, &identity);
         if !models.contains(&thread.model) {
             models.push(thread.model.clone());
         }
@@ -676,7 +824,7 @@ impl AcpServer {
 
     fn list_providers(&self) -> Value {
         let mut providers = self.config.provider_identities().into_iter().filter(|identity| identity.provider != ProviderKind::Antigravity).map(|identity| {
-            json!({"id": identity.key, "displayName": identity.compatibility().map(|row| row.label).unwrap_or(identity.key.as_str()), "defaultModel": crate::model_inventory::provider_default_model(&self.config, &identity)})
+            json!({"id": identity.key, "displayName": identity.compatibility().map(|row| row.label).unwrap_or(identity.key.as_str()), "defaultModel": codewhale_engine::model_inventory::provider_default_model(&self.config, &identity)})
         }).collect::<Vec<_>>();
         providers.extend(self.config.unadmitted_provider_keys().into_iter().map(|key| json!({"id": key, "displayName": format!("{key} (unavailable)"), "defaultModel": "", "available": false, "reason": "provider_identity_unavailable"})));
         json!({"providers": providers})
@@ -722,7 +870,38 @@ impl AcpServer {
         Ok(self.current_model())
     }
 }
-const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale --approval-policy full-access serve --acp`, or set approval_policy = \"full-access\" in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
+const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale serve --acp --full-access` (alias `--yolo`), or set `yolo = true` in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
+
+fn acp_permission_value(config: &Config) -> &'static str {
+    match acp_approval_mode(config) {
+        ApprovalMode::Bypass => "full-access",
+        ApprovalMode::Auto => "auto-review",
+        ApprovalMode::Never => "never",
+        ApprovalMode::Suggest => "ask",
+    }
+}
+
+fn acp_startup_posture(config: &Config, workspace: &Path) -> String {
+    let approval = acp_approval_mode(config);
+    let sandbox = sandbox_policy_for_turn(
+        acp_mode(config),
+        approval,
+        config.sandbox_mode.as_deref(),
+        workspace,
+        SandboxNetworkAccess::from_config(config.sandbox_network_access),
+    );
+    let mut line = format!(
+        "ACP permission: {}; sandbox: {}.",
+        acp_permission_value(config),
+        sandbox.config_value()
+    );
+    if approval != ApprovalMode::Bypass {
+        line.push_str(
+            " For Full Access start with `codewhale serve --acp --full-access` or set `yolo = true`; sandbox_mode alone never turns it on.",
+        );
+    }
+    line
+}
 
 fn acp_mode(config: &Config) -> AppMode {
     if config.sandbox_mode.as_deref() == Some("read-only") {
@@ -747,6 +926,14 @@ fn acp_approval_mode(config: &Config) -> ApprovalMode {
             .and_then(ApprovalMode::from_config_value)
             .unwrap_or_default()
     }
+}
+
+fn ensure_acp_approval_posture(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        acp_approval_mode(config) != ApprovalMode::Never,
+        "approval_policy \"never\" is not supported by `codewhale serve --acp`: ACP sessions run under Ask, Auto-Review or Full Access. Set approval_policy = \"on-request\" for this server, or start it with --full-access for Full Access."
+    );
+    Ok(())
 }
 
 /// ACP `kind` hint for a tool call, used by the client to pick an icon/label.
@@ -901,6 +1088,17 @@ impl AcpError {
             code: -32601,
             message: format!("method not found: {method}"),
         }
+    }
+}
+
+fn validate_mcp_servers(params: &Value) -> std::result::Result<(), AcpError> {
+    match params.get("mcpServers") {
+        None => Ok(()),
+        Some(Value::Array(servers)) if servers.is_empty() => Ok(()),
+        Some(Value::Array(_)) => Err(AcpError::invalid_params(
+            "Client-supplied MCP servers are unsupported by Codewhale's ACP adapter. Use an empty mcpServers list, or configure MCP through codewhale app-server --http and the Runtime API. ACP v1 stdio MCP support is incomplete.",
+        )),
+        Some(_) => Err(AcpError::invalid_params("mcpServers must be an array")),
     }
 }
 
@@ -1062,18 +1260,30 @@ where
     .await
 }
 
-async fn write_json_line<W>(writer: &mut W, value: Value) -> Result<()>
+async fn write_json_line<W>(writer: &mut W, mut value: Value) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        writer.write_all(value.to_string().as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await
-    })
-    .await
-    .map_err(|_| anyhow!("ACP transport write did not settle within 30 seconds"))??;
-    Ok(())
+    let frame = match codewhale_app_server::stdio::serialize_control_frame(&value) {
+        Ok(frame) => frame,
+        Err(error)
+            if codewhale_app_server::stdio::is_frame_refusal(&error)
+                && value.get("method").is_none() =>
+        {
+            let id = value.get_mut("id").map(Value::take).unwrap_or(Value::Null);
+            let mut failure = json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"ACP response exceeds the 8 MiB transport limit; inspect canonical state without replay"}});
+            match codewhale_app_server::stdio::serialize_control_frame(&failure) {
+                Ok(frame) => frame,
+                Err(error) if codewhale_app_server::stdio::is_frame_refusal(&error) => {
+                    failure["id"] = Value::Null;
+                    codewhale_app_server::stdio::serialize_control_frame(&failure)?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    codewhale_app_server::stdio::write_control_line(writer, &frame).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1114,7 +1324,7 @@ fn is_jsonrpc_response(message: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::mock::{MockLlmClient, canned};
+    use codewhale_engine::llm_client::mock::{MockLlmClient, canned};
     use codewhale_models::{ContentBlock, Role};
     use std::time::Duration;
 
@@ -1126,12 +1336,12 @@ mod tests {
             .collect()
     }
     pub(super) fn fixture_config() -> Config {
-        let mut config = Config {
-            provider: Some("acp-fixture".into()),
-            providers: Some(crate::config::ProvidersConfig {
+        let mut config = {
+            let __cw_config_init_0_0 = Some("acp-fixture".into());
+            let __cw_config_init_0_1 = Some(codewhale_runtime::config::ProvidersConfig {
                 custom: HashMap::from([(
                     "acp-fixture".into(),
-                    crate::config::ProviderConfig {
+                    codewhale_runtime::config::ProviderConfig {
                         kind: Some("openai-compatible".into()),
                         base_url: Some("http://127.0.0.1:18181/v1".into()),
                         model: Some("fixture-model".into()),
@@ -1140,12 +1350,16 @@ mod tests {
                     },
                 )]),
                 ..Default::default()
-            }),
-            snapshots: Some(crate::config::SnapshotsConfig {
+            });
+            let __cw_config_init_0_2 = Some(codewhale_runtime::config::SnapshotsConfig {
                 enabled: false,
                 ..Default::default()
-            }),
-            ..Default::default()
+            });
+            let mut __cw_config_init_0_value: Config = Default::default();
+            __cw_config_init_0_value.provider = __cw_config_init_0_0;
+            __cw_config_init_0_value.providers = __cw_config_init_0_1;
+            __cw_config_init_0_value.snapshots = __cw_config_init_0_2;
+            __cw_config_init_0_value
         };
         config.set_feature("mcp", false).unwrap();
         config.set_feature("subagents", false).unwrap();
@@ -1161,13 +1375,13 @@ mod tests {
     impl Rig {
         pub(super) fn new(
             config: Config,
-            turns: Vec<crate::llm_client::mock::CannedTurn>,
+            turns: Vec<codewhale_engine::llm_client::mock::CannedTurn>,
         ) -> Result<Self> {
             Self::with_base(config, turns, true)
         }
         fn with_base(
             config: Config,
-            turns: Vec<crate::llm_client::mock::CannedTurn>,
+            turns: Vec<codewhale_engine::llm_client::mock::CannedTurn>,
             acp: bool,
         ) -> Result<Self> {
             let dir = tempfile::tempdir()?;
@@ -1176,19 +1390,20 @@ mod tests {
             std::fs::create_dir(&workspace)?;
             let runtime_dir = dir.path().join("runtime");
             let manager_config = RuntimeThreadManagerConfig {
+                mcp_auth_context: Default::default(),
                 data_dir: runtime_dir.clone(),
                 task_data_dir: runtime_dir,
                 sessions_dir: None,
                 max_active_threads: 4,
             };
-            let plugins = Arc::new(crate::plugins::PluginRegistry::empty(&workspace));
+            let plugins = Arc::new(codewhale_plugins::PluginRegistry::empty(&workspace));
             let manager = Arc::new(if acp {
                 RuntimeThreadManager::open_host(
                     config.clone(),
                     workspace.clone(),
                     manager_config,
                     plugins,
-                    crate::core::engine::EngineHostProfile::Acp,
+                    codewhale_engine::core::engine::EngineHostProfile::Acp,
                     None,
                     None,
                 )?
@@ -1202,7 +1417,7 @@ mod tests {
             });
             let mock = Arc::new(MockLlmClient::new(turns));
             manager.set_test_model_client(mock.clone());
-            let sessions = crate::session_manager::default_sessions_dir()?;
+            let sessions = codewhale_engine::session_manager::default_sessions_dir()?;
             Ok(Self {
                 server: AcpServer::new(
                     config,
@@ -1232,7 +1447,7 @@ mod tests {
         ) -> Result<(&'static str, Vec<Value>)> {
             // Keep the transport input open: an empty reader is a real EOF/cancel.
             let (client, input) = tokio::io::duplex(4096);
-            let mut reader = codewhale_app_server::BoundedLines::new(BufReader::new(input));
+            let mut reader = codewhale_app_server::stdio::BoundedLines::new(BufReader::new(input));
             let mut output = Vec::new();
             let result = tokio::time::timeout(
                 Duration::from_secs(if cfg!(windows) { 120 } else { 20 }),
@@ -1307,10 +1522,9 @@ mod tests {
         )?;
         let manager = rig.server.runtime.clone();
         let capture = manager.clone();
-        let (binding, generation) = codewhale_app_server::daemon_socket::owner_work(move || {
-            capture.capture_control_owner()
-        })
-        .await?;
+        let (binding, generation) =
+            codewhale_runtime::runtime_control::owner_work(move || capture.capture_control_owner())
+                .await?;
         #[cfg(unix)]
         let socket_directory = rig._dir.path().canonicalize()?.join("endpoint");
         #[cfg(unix)]
@@ -1327,7 +1541,7 @@ mod tests {
         let principal =
             codewhale_config::private_directory::PrivateDirectory::current_user_id().to_string();
         #[cfg(windows)]
-        let principal = codewhale_app_server::daemon_socket::owner_work(|| {
+        let principal = codewhale_runtime::runtime_control::owner_work(|| {
             codewhale_config::windows_identity::CurrentWindowsUser::open()?.sid_string()
         })
         .await?;
@@ -1373,6 +1587,11 @@ mod tests {
             None,
         )
         .await?;
+        // ACP publications are discovered through this socket, so an
+        // unbound one is a failure here rather than a degraded start.
+        let daemon = daemon.ok_or_else(|| {
+            anyhow!("this filesystem cannot hold the private runtime endpoint directory")
+        })?;
         let shutdown = daemon.shutdown_handle();
         let owner = tokio::spawn(daemon.serve());
         let _abort = AbortOnDrop(owner.abort_handle());
@@ -1431,7 +1650,7 @@ mod tests {
         );
         let rows = manager
             .list_threads(
-                crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
                 None,
             )
             .await?;
@@ -1445,7 +1664,7 @@ mod tests {
             let ordinary = manager
                 .start_turn(
                     &rows[0].id,
-                    crate::runtime_threads::StartTurnRequest {
+                    codewhale_engine::runtime_threads::manager::StartTurnRequest {
                         prompt: "ordinary successor".into(),
                         ..Default::default()
                     },
@@ -1456,7 +1675,8 @@ mod tests {
                     let detail = manager.get_thread_detail(&rows[0].id).await?;
                     if detail.turns.iter().any(|t| {
                         t.id == ordinary.id
-                            && t.status == crate::runtime_threads::RuntimeTurnStatus::Completed
+                            && t.status
+                                == codewhale_engine::runtime_threads::RuntimeTurnStatus::Completed
                     }) {
                         return Ok::<_, anyhow::Error>(());
                     }
@@ -1490,10 +1710,9 @@ mod tests {
             assert_eq!(manager.get_thread_detail(&rows[0].id).await?.turns.len(), 2);
         }
         let capture = manager.clone();
-        let (after, generation) = codewhale_app_server::daemon_socket::owner_work(move || {
-            capture.capture_control_owner()
-        })
-        .await?;
+        let (after, generation) =
+            codewhale_runtime::runtime_control::owner_work(move || capture.capture_control_owner())
+                .await?;
         assert_eq!(after.data_dir, receipt.data_dir);
         assert_eq!(
             generation, receipt.lease_generation,
@@ -1514,14 +1733,18 @@ mod tests {
     #[test]
     fn acp_approval_mode_derives_from_server_config() {
         // #6337: `--yolo --danger-full-access` must not silently run as Ask.
-        let yolo = Config {
-            yolo: Some(true),
-            ..Config::default()
+        let yolo = {
+            let __cw_config_init_1_0 = Some(true);
+            let mut __cw_config_init_1_value: Config = Config::default();
+            __cw_config_init_1_value.yolo = __cw_config_init_1_0;
+            __cw_config_init_1_value
         };
         assert_eq!(acp_approval_mode(&yolo), ApprovalMode::Bypass);
-        let policy = Config {
-            approval_policy: Some("never".into()),
-            ..Config::default()
+        let policy = {
+            let __cw_config_init_2_0 = Some("never".into());
+            let mut __cw_config_init_2_value: Config = Config::default();
+            __cw_config_init_2_value.approval_policy = __cw_config_init_2_0;
+            __cw_config_init_2_value
         };
         assert_eq!(acp_approval_mode(&policy), ApprovalMode::Never);
         assert_eq!(acp_approval_mode(&Config::default()), ApprovalMode::Suggest);
@@ -1705,9 +1928,25 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn new_session_returns_durable_bare_uuid_without_provider_or_history() -> Result<()> {
         let mut rig = Rig::new(fixture_config(), vec![])?;
+        for servers in [
+            json!([{"name":"fixture","command":"must-not-execute","args":[],"env":[]}]),
+            json!({}),
+            Value::Null,
+        ] {
+            let error = rig
+                .server
+                .new_session(json!({"mcpServers":servers}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, -32602);
+            assert!(rig.server.sessions.is_empty());
+            assert!(rig.server.insertion_order.is_empty());
+        }
         let id = rig.new_session().await;
         uuid::Uuid::parse_str(&id)?;
-        let store = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?;
+        let store = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?;
         let saved = store.load_session(&id)?;
         assert!(saved.messages.is_empty());
         assert_eq!(
@@ -1725,6 +1964,12 @@ mod tests {
             Some(id.as_str())
         );
         assert_eq!(rig.mock.call_count(), 0);
+        for requested in [id.as_str(), &id[..8]] {
+            let error = rig.server.load_session(json!({"sessionId":requested,"mcpServers":[{"name":"fixture","command":"must-not-execute","args":[],"env":[]}]})).await.unwrap_err();
+            assert_eq!(error.code, -32602);
+            assert_eq!(rig.server.sessions.len(), 1);
+            assert_eq!(rig.mock.call_count(), 0);
+        }
         let loaded = rig
             .server
             .load_session(json!({"sessionId":&id[..8]}))
@@ -1785,11 +2030,117 @@ mod tests {
         let bh = serde_json::to_string(&rig.history(&b).await)?;
         assert!(ah.contains("A prompt") && ah.contains("A answer") && !ah.contains("B prompt"));
         assert!(bh.contains("B prompt") && bh.contains("B answer") && !bh.contains("A prompt"));
+        for (session, prompt, answer) in
+            [(&a, "A prompt", "A answer"), (&b, "B prompt", "B answer")]
+        {
+            let mut output = Vec::new();
+            rig.server.replay_history(&mut output, session).await?;
+            let updates = parse_lines(output);
+            let text: Vec<_> = updates
+                .iter()
+                .map(|update| {
+                    (
+                        update["params"]["update"]["sessionUpdate"]
+                            .as_str()
+                            .unwrap(),
+                        update["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                text,
+                vec![
+                    ("user_message_chunk", prompt),
+                    ("agent_message_chunk", answer)
+                ]
+            );
+        }
         let listed = rig
             .server
             .list_sessions(json!({"cwd":rig.workspace}))
             .unwrap();
         assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
+        let store = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?;
+        let mut saved = store.load_session(&a)?;
+        saved.messages = serde_json::from_value(json!([
+            {"role":"user","content":[
+                {"type":"text","text":""},
+                {"type":"text","text":"alpha"},
+                {"type":"text","text":"<turn_meta>hidden middle</turn_meta>"},
+                {"type":"text","text":"beta"},
+                {"type":"thinking","thinking":"(reasoning omitted)"},
+                {"type":"text","text":"gamma"},
+                {"type":"thinking","thinking":"private reasoning"},
+                {"type":"text","text":"delta"},
+                {"type":"tool_use","id":"saved-plan","name":"update_plan","input":{}},
+                {"type":"text","text":"epsilon"},
+                {"type":"text","text":"[tool_history_repair] hidden repair"},
+                {"type":"text","text":"zeta"},
+                {"type":"text","text":"<turn_meta>hidden tail</turn_meta>"}
+            ]},
+            {"role":"assistant","content":[
+                {"type":"text","text":"before archive"},
+                {"type":"text","text":"<archived_context level=\"1\">summary</archived_context>"},
+                {"type":"text","text":"after archive"},
+                {"type":"text","text":"<archived_context</archived_context>"},
+                {"type":"tool_use","id":"saved-read","name":"read","input":{}},
+                {"type":"text","text":"tail"}
+            ]},
+            {"role":"user","content":[
+                {"type":"text","text":"<turn_meta>literal example</turn_meta>"}
+            ]},
+            {"role":"assistant_interrupted","content":[
+                {"type":"text","text":"interrupted answer"}
+            ]}
+        ]))?;
+        saved
+            .messages
+            .push(codewhale_engine::runtime_handoff::operate_contract_runtime_message());
+        saved.messages.extend(
+            codewhale_engine::runtime_handoff::project_owned_messages_for_restore(vec![
+                codewhale_engine::runtime_handoff::subagent_completion_runtime_message("{}"),
+            ]),
+        );
+        store.save_session(&saved)?;
+        let mut output = Vec::new();
+        rig.server.replay_history(&mut output, &a).await?;
+        let updates = parse_lines(output);
+        let text: Vec<_> = updates
+            .iter()
+            .filter_map(|update| {
+                let kind = update["params"]["update"]["sessionUpdate"].as_str()?;
+                matches!(kind, "user_message_chunk" | "agent_message_chunk").then(|| {
+                    (
+                        kind,
+                        update["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            text,
+            vec![
+                ("user_message_chunk", "alpha\nbeta\ngamma"),
+                ("user_message_chunk", "delta"),
+                ("user_message_chunk", "epsilon"),
+                ("user_message_chunk", "zeta"),
+                ("agent_message_chunk", "before archive"),
+                (
+                    "agent_message_chunk",
+                    "after archive\n<archived_context</archived_context>\ntail"
+                ),
+                (
+                    "user_message_chunk",
+                    "<turn_meta>literal example</turn_meta>"
+                ),
+            ]
+        );
         rig.close().await;
         Ok(())
     }
@@ -1849,8 +2200,10 @@ mod tests {
             .count();
         assert_eq!(uses, 2);
         assert_eq!(results, 2);
-        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
-            .load_session(&id)?;
+        let saved = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?
+        .load_session(&id)?;
         assert_eq!(
             saved.messages, history,
             "checkpoint is the full Engine snapshot, not display chunks"
@@ -1900,8 +2253,10 @@ mod tests {
                 .flat_map(|m| &m.content)
                 .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
         );
-        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
-            .load_session(&id)?;
+        let saved = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?
+        .load_session(&id)?;
         assert_eq!(saved.messages, history);
         let detail = rig
             .server
@@ -1910,7 +2265,7 @@ mod tests {
             .await?;
         assert_eq!(
             detail.turns.last().unwrap().status,
-            crate::runtime_threads::RuntimeTurnStatus::Failed
+            codewhale_engine::runtime_threads::RuntimeTurnStatus::Failed
         );
         rig.close().await;
         Ok(())
@@ -1932,6 +2287,7 @@ mod tests {
         let mut rig = Rig::new(
             config,
             vec![
+                canned::tool_call_turn("law-read", "read", r#"{"path":"AGENTS.md"}"#),
                 canned::tool_call_turn(
                     "law-write",
                     "write",
@@ -1949,13 +2305,15 @@ mod tests {
             "new-self-authored-law"
         );
         let requests = rig.mock.captured_requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(
             serde_json::to_vec(&requests[0].system)?,
-            serde_json::to_vec(&requests[1].system)?
+            serde_json::to_vec(&requests[2].system)?
         );
-        let prompt = crate::prompts::system_prompt_flat_text(requests[0].system.as_ref().unwrap());
-        assert!(prompt.contains(crate::prompts::text::BASE_PROMPT.trim()));
+        let prompt = codewhale_engine::prompts::system_prompt_flat_text(
+            requests[0].system.as_ref().unwrap(),
+        );
+        assert!(prompt.contains(codewhale_engine::prompts::text::BASE_PROMPT.trim()));
         assert!(prompt.contains("initial-project-law"));
         assert!(!prompt.contains("new-self-authored-law"));
         let chunks: Vec<_> = wire
@@ -2098,9 +2456,9 @@ mod tests {
         let target = rig.workspace.join("ask.txt");
         let (client, transport) = tokio::io::duplex(65536);
         let (read, mut write) = tokio::io::split(transport);
-        let mut reader = codewhale_app_server::BoundedLines::new(BufReader::new(read));
+        let mut reader = codewhale_app_server::stdio::BoundedLines::new(BufReader::new(read));
         let (cr, mut cw) = tokio::io::split(client);
-        let mut cr = codewhale_app_server::BoundedLines::new(BufReader::new(cr));
+        let mut cr = codewhale_app_server::stdio::BoundedLines::new(BufReader::new(cr));
         let sid = id.clone();
         let target_in = target.clone();
         let client = async move {
@@ -2198,8 +2556,10 @@ mod tests {
                 assert!(!target.exists());
             }
         }
-        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
-            .load_session(&id)?;
+        let saved = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?
+        .load_session(&id)?;
         assert!(saved.messages.iter().any(|m| m.role == Role::User));
         if !base_acp {
             let thread = rig.server.sessions[&id].thread_id.clone();
@@ -2208,7 +2568,7 @@ mod tests {
                 .runtime
                 .start_turn(
                     &thread,
-                    crate::runtime_threads::StartTurnRequest {
+                    codewhale_engine::runtime_threads::manager::StartTurnRequest {
                         prompt: "ordinary after cancelled ACP".into(),
                         ..Default::default()
                     },
@@ -2243,7 +2603,7 @@ mod tests {
         manager: &RuntimeThreadManager,
         thread: &str,
         turn: &str,
-    ) -> Result<crate::runtime_threads::TurnRecord> {
+    ) -> Result<codewhale_engine::runtime_threads::TurnRecord> {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let detail = manager.get_thread_detail(thread).await?;
@@ -2251,8 +2611,8 @@ mod tests {
                     record.id == turn
                         && !matches!(
                             record.status,
-                            crate::runtime_threads::RuntimeTurnStatus::InProgress
-                                | crate::runtime_threads::RuntimeTurnStatus::Queued
+                            codewhale_engine::runtime_threads::RuntimeTurnStatus::InProgress
+                                | codewhale_engine::runtime_threads::RuntimeTurnStatus::Queued
                         )
                 }) && manager
                     .events_since_async(thread, None)
@@ -2280,7 +2640,7 @@ mod tests {
         )?;
         let session = rig.new_session().await;
         let thread = rig.server.sessions[&session].thread_id.clone();
-        let request = crate::runtime_threads::StartTurnRequest {
+        let request = codewhale_engine::runtime_threads::manager::StartTurnRequest {
             prompt: "same semantic request".into(),
             operation_key: Some("acp-operation".into()),
             ..Default::default()
@@ -2308,7 +2668,7 @@ mod tests {
             wait_real_turn(&rig.server.runtime, &thread, &first.id)
                 .await?
                 .status,
-            crate::runtime_threads::RuntimeTurnStatus::Completed
+            codewhale_engine::runtime_threads::RuntimeTurnStatus::Completed
         );
         assert_eq!(
             rig.mock.call_count(),
@@ -2317,7 +2677,7 @@ mod tests {
         );
         rig.mock
             .push_turn(canned::simple_text_turn("ordinary initial"));
-        let ordinary_request = crate::runtime_threads::StartTurnRequest {
+        let ordinary_request = codewhale_engine::runtime_threads::manager::StartTurnRequest {
             operation_key: Some("ordinary-operation".into()),
             ..request
         };
@@ -2338,7 +2698,7 @@ mod tests {
             wait_real_turn(&rig.server.runtime, &thread, &ordinary.id)
                 .await?
                 .status,
-            crate::runtime_threads::RuntimeTurnStatus::Completed
+            codewhale_engine::runtime_threads::RuntimeTurnStatus::Completed
         );
         assert_eq!(
             rig.server
@@ -2585,8 +2945,10 @@ mod tests {
                 );
             }
         }
-        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
-            .load_session(&session)?;
+        let saved = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?
+        .load_session(&session)?;
         assert_eq!(
             saved.messages, history,
             "ACP persists the full paired Core history"
@@ -2600,7 +2962,7 @@ mod tests {
         assert_eq!(detail.turns.len(), 1);
         assert_eq!(
             detail.turns[0].status,
-            crate::runtime_threads::RuntimeTurnStatus::Completed
+            codewhale_engine::runtime_threads::RuntimeTurnStatus::Completed
         );
         rig.close().await;
         Ok(())
@@ -2609,7 +2971,9 @@ mod tests {
     async fn foreign_canonical_store_refuses_before_allocating_or_copying_history() -> Result<()> {
         let mut rig = Rig::new(fixture_config(), vec![])?;
         let id = rig.new_session().await;
-        let store = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?;
+        let store = codewhale_engine::session_manager::SessionManager::new(
+            rig.server.sessions_dir.clone(),
+        )?;
         let mut saved = store.load_session(&id)?;
         let path = store.save_session(&saved)?;
         let original = std::fs::read(&path)?;
@@ -2627,7 +2991,7 @@ mod tests {
             .server
             .runtime
             .list_threads(
-                crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
                 None,
             )
             .await?
@@ -2642,7 +3006,7 @@ mod tests {
             rig.server
                 .runtime
                 .list_threads(
-                    crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                    codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
                     None
                 )
                 .await?
@@ -2668,7 +3032,7 @@ mod tests {
                 canned::simple_text_turn("image read"),
             ],
         )?;
-        let image = crate::image_attach::tests::runtime_image_fixture(21);
+        let image = codewhale_engine::image_attach::test_support::runtime_image_fixture(21);
         std::fs::write(
             rig.workspace.join("shot.png"),
             base64::engine::general_purpose::STANDARD.decode(image.data_base64)?,
@@ -2697,7 +3061,7 @@ mod tests {
     }
     async fn finite_engine_step_budget_case(base_acp: bool) -> Result<()> {
         let mut config = fixture_config();
-        config.tui = Some(crate::config::TuiConfig {
+        config.tui = Some(codewhale_runtime::config::TuiConfig {
             max_model_steps: Some(1),
             ..Default::default()
         });
@@ -2729,7 +3093,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .stop_reason,
-            Some(crate::runtime_threads::RuntimeTurnStopReason::StepBudgetExhausted)
+            Some(codewhale_engine::runtime_threads::RuntimeTurnStopReason::StepBudgetExhausted)
         );
         assert_eq!(
             rig.mock.call_count(),
@@ -2745,7 +3109,7 @@ mod tests {
                 .runtime
                 .start_turn(
                     &thread,
-                    crate::runtime_threads::StartTurnRequest {
+                    codewhale_engine::runtime_threads::manager::StartTurnRequest {
                         prompt: "ordinary after step stop".into(),
                         ..Default::default()
                     },
@@ -2755,7 +3119,7 @@ mod tests {
                 wait_real_turn(&rig.server.runtime, &thread, &successor.id)
                     .await?
                     .status,
-                crate::runtime_threads::RuntimeTurnStatus::Completed
+                codewhale_engine::runtime_threads::RuntimeTurnStatus::Completed
             );
             let requests = rig.mock.captured_requests();
             assert_eq!(requests.len(), 3);
@@ -2775,7 +3139,8 @@ mod tests {
             json!({"jsonrpc":"2.0","id":5,"method":"fabricated"}),
             json!({"jsonrpc":"2.0","id":6,"method":"shutdown"})
         );
-        let mut reader = codewhale_app_server::BoundedLines::new(BufReader::new(input.as_bytes()));
+        let mut reader =
+            codewhale_app_server::stdio::BoundedLines::new(BufReader::new(input.as_bytes()));
         let mut output = Vec::new();
         rig.server.serve(&mut reader, &mut output).await?;
         let wire = parse_lines(output);
@@ -2831,7 +3196,7 @@ mod tests {
             rig.server
                 .runtime
                 .list_threads(
-                    crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                    codewhale_engine::runtime_threads::manager::ThreadListFilter::IncludeArchived,
                     None,
                 )
                 .await?

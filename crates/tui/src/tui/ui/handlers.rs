@@ -14,7 +14,7 @@ const FLEET_TOGGLE_TOAST_TTL_MS: u64 = 6_000;
 /// takes: the saved-fleet views call it directly, and `/fleet add|remove`,
 /// ⇧F, and auto-enroll reach it through `App::fleet_roster_stale`.
 pub(crate) fn sync_fleet_roster(app: &mut App, config: &Config, engine_handle: &EngineHandle) {
-    let roster = crate::fleet::identity::load_effective_roster(
+    let roster = codewhale_engine::fleet::identity::load_effective_roster(
         &config.fleet_config(),
         &app.workspace,
         Some(app.extension_plugin_view().as_ref()),
@@ -87,7 +87,7 @@ pub(super) fn toggle_model_picker_pin(
 ) {
     let locale = app.ui_locale;
     let route = format!("{provider_key}/{model}");
-    let (receipt, level) = match crate::settings::Settings::transact(|settings| {
+    let (receipt, level) = match codewhale_runtime::settings::Settings::transact(|settings| {
         Ok(settings.toggle_pinned_model(provider_key, model))
     }) {
         Ok(true) => (
@@ -103,7 +103,7 @@ pub(super) fn toggle_model_picker_pin(
             StatusToastLevel::Error,
         ),
     };
-    if let Ok(settings) = crate::settings::Settings::load_persisted() {
+    if let Ok(settings) = codewhale_runtime::settings::Settings::load_persisted() {
         app.pinned_models = settings.pinned_models;
     }
     app.status_message = Some(receipt.clone());
@@ -119,7 +119,7 @@ pub(super) fn toggle_model_picker_fleet(
     provider_key: &str,
     model: &str,
 ) {
-    use crate::fleet::members::{FleetModelChange, change_receipt, toggle_fleet_model};
+    use codewhale_engine::fleet::members::{FleetModelChange, change_receipt, toggle_fleet_model};
     let locale = app.ui_locale;
     let (receipt, level) = if let Some(rejection) =
         crate::commands::fleet_provider_rejection(app, config, provider_key)
@@ -190,11 +190,15 @@ pub(crate) fn flush_stale_fleet_roster(
 pub(crate) fn handle_memory_quick_add(app: &mut App, input: &str, config: &Config) {
     let path = config.memory_path();
     let note = input.trim_start_matches('#').trim();
-    let result = crate::native_memory::NativeMemoryStore::from_global_path(&path)
+    let result = codewhale_runtime::native_memory::NativeMemoryStore::from_global_path(&path)
         .ok_or_else(|| format!("{} is not a native memory path", path.display()))
         .and_then(|store| {
             store
-                .remember(crate::native_memory::MemoryScope::Global, None, note)
+                .remember(
+                    codewhale_runtime::native_memory::MemoryScope::Global,
+                    None,
+                    note,
+                )
                 .map(|hit| hit.source)
                 .map_err(|err| err.to_string())
         });
@@ -227,7 +231,7 @@ pub(crate) fn handle_bracketed_paste(app: &mut App, text: &str) {
     // so fast typing / IME commits / autocomplete bursts don't get
     // mis-classified as a paste.
     app.bracketed_paste_seen = true;
-    if app.is_history_search_active() {
+    if app.is_history_search_active() && app.view_stack.is_empty() {
         app.history_search_insert_str(text);
     } else if paste_text_into_provider_picker(app, text) || app.view_stack.handle_paste(text) {
         // Modal consumed the paste (e.g. provider picker key entry).
@@ -528,7 +532,13 @@ fn report_mcp_login(app: &mut App, message: String, level: StatusToastLevel) {
     app.needs_redraw = true;
 }
 
-fn start_mcp_login(app: &mut App, config: &Config, name: String, scopes: Vec<String>) {
+fn start_mcp_login(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    name: String,
+    scopes: Vec<String>,
+) {
     use crate::tui::app::{McpLoginProgress, PendingMcpLogin};
 
     if let Some(pending) = &app.mcp_login {
@@ -547,11 +557,14 @@ fn start_mcp_login(app: &mut App, config: &Config, name: String, scopes: Vec<Str
     let workspace = app.workspace.clone();
     let plugin_registry = Arc::clone(&app.plugin_registry);
     let network_policy = config.network.clone().map(|network| {
-        crate::network_policy::NetworkPolicyDecider::with_default_audit(network.into_runtime())
+        codewhale_net::network_policy::NetworkPolicyDecider::with_default_audit(
+            codewhale_net::network_policy::NetworkPolicy::from(network),
+        )
     });
     let callback_port = config.mcp_oauth_callback_port;
     let callback_url = config.mcp_oauth_callback_url.clone();
     let locale = app.ui_locale;
+    let auth_context = engine_handle.mcp_auth_context();
     let pending = PendingMcpLogin {
         server: name.clone(),
         cancel: tokio_util::sync::CancellationToken::new(),
@@ -570,7 +583,7 @@ fn start_mcp_login(app: &mut App, config: &Config, name: String, scopes: Vec<Str
 
     tokio::spawn(async move {
         let handshake = async {
-            let cfg = crate::mcp::load_config_with_workspace_and_plugins(
+            let cfg = codewhale_engine::mcp::load_config_with_workspace_and_plugins(
                 &path,
                 &workspace,
                 plugin_registry.as_ref(),
@@ -581,13 +594,14 @@ fn start_mcp_login(app: &mut App, config: &Config, name: String, scopes: Vec<Str
                         .replace("{server}", &name)
                 )
             })?;
-            crate::mcp::oauth::begin_oauth_login_for_server_tool(
+            codewhale_engine::mcp::oauth::begin_oauth_login_for_server_tool_with_auth_context(
                 &name,
                 server,
                 (!scopes.is_empty()).then_some(scopes),
                 callback_port,
                 callback_url.as_deref(),
                 network_policy.as_ref(),
+                auth_context,
             )
             .await
         };
@@ -612,7 +626,7 @@ fn start_mcp_login(app: &mut App, config: &Config, name: String, scopes: Vec<Str
             biased;
             () = cancel.cancelled() => return,
             result = operation => result.map_err(|error| {
-                crate::mcp::oauth::mask_oauth_secrets(&format!("{error:#}"))
+                codewhale_engine::mcp::oauth::mask_oauth_secrets(&format!("{error:#}"))
             }),
         };
         if let Ok(mut cell) = progress.lock() {
@@ -646,7 +660,7 @@ pub(crate) fn poll_mcp_login(app: &mut App) {
         McpLoginProgress::Finished(outcome) => {
             app.mcp_login = None;
             match outcome {
-                Ok(()) if crate::mcp::mcp_name_is_command_safe(&server) => {
+                Ok(()) if codewhale_engine::mcp::mcp_name_is_command_safe(&server) => {
                     app.mcp_login_reconnect = Some(server);
                     return;
                 }
@@ -703,7 +717,7 @@ fn mcp_scoped_config_path(
     global_path: &std::path::Path,
     name: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let scope = crate::mcp::resolve_server_scope(global_path, &app.workspace, name);
+    let scope = codewhale_engine::mcp::resolve_server_scope(global_path, &app.workspace, name);
     scope.config_path(global_path).ok_or_else(|| {
         anyhow::anyhow!(
             "MCP server '{name}' is provided by a plugin, not by a config file. \
@@ -758,7 +772,7 @@ pub(crate) fn start_mcp_retry(app: &mut App, engine_handle: &EngineHandle, name:
             let outcome = handle
                 .retry_mcp_server(server)
                 .await
-                .map_err(|error| crate::mcp::format_mcp_error_for_display(&error));
+                .map_err(|error| codewhale_engine::mcp::format_mcp_error_for_display(&error));
             if let Ok(mut cell) = result.lock() {
                 *cell = Some(outcome);
             }
@@ -831,7 +845,7 @@ pub(crate) fn poll_mcp_retries(app: &mut App) {
 fn mcp_retry_receipt(
     app: &App,
     server: &str,
-    snapshot: &crate::mcp::McpManagerSnapshot,
+    snapshot: &codewhale_engine::mcp::McpManagerSnapshot,
 ) -> (String, StatusToastLevel) {
     let Some(observed) = snapshot.servers.iter().find(|row| row.name == server) else {
         return (
@@ -858,7 +872,7 @@ fn mcp_retry_receipt(
                 .replace("{server}", server)
                 .replace(
                     "{command}",
-                    &crate::mcp::McpRecoveryKind::Reauth.slash_command(server),
+                    &codewhale_engine::mcp::McpRecoveryKind::Reauth.slash_command(server),
                 ),
             StatusToastLevel::Warning,
         )
@@ -882,7 +896,7 @@ pub(crate) async fn handle_mcp_ui_action(
     config: &Config,
     action: crate::tui::app::McpUiAction,
 ) {
-    use crate::mcp::{self, McpWriteStatus};
+    use codewhale_engine::mcp::{self, McpWriteStatus};
 
     let path = app.mcp_config_path.clone();
     let mut changed = false;
@@ -913,7 +927,65 @@ pub(crate) async fn handle_mcp_ui_action(
     let action_result = match action {
         crate::tui::app::McpUiAction::Diagnose { name } => {
             let receipt = mcp_server_diagnosis(app, &name);
+            if app.view_stack.extensions_is_top() {
+                open_text_pager(app, name.clone(), receipt.clone());
+            }
             report_mcp_login(app, receipt, StatusToastLevel::Info);
+            return;
+        }
+        crate::tui::app::McpUiAction::Validate => {
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            let configured = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp::load_config_with_workspace_and_plugins(&path, &workspace, plugins.as_ref())
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("MCP config read failed")));
+            let mut names: std::collections::BTreeSet<String> = app
+                .mcp_snapshot
+                .iter()
+                .flat_map(|snapshot| snapshot.servers.iter().map(|server| server.name.clone()))
+                .collect();
+            let mut sections = Vec::new();
+            let config_loaded = match configured {
+                Ok(config) => {
+                    names.extend(config.servers.into_keys());
+                    true
+                }
+                Err(err) => {
+                    sections.push(format!(
+                        "MCP config could not be loaded: {}. Fix it, then run /mcp reload.",
+                        mcp::format_mcp_error_for_display(&err)
+                    ));
+                    false
+                }
+            };
+            if app.mcp_reload_required {
+                sections.push(
+                    "MCP config changed since the live pool loaded. Run /mcp reload to apply it."
+                        .to_string(),
+                );
+            }
+            if names.is_empty() && config_loaded {
+                sections.push(app.tr(MessageId::ExtensionsMcpEmpty).into_owned());
+            }
+            sections.extend(names.iter().map(|name| mcp_server_diagnosis(app, name)));
+            let receipt = sections.join("\n\n");
+            if !app.view_stack.extensions_is_top() {
+                open_mcp_extensions(app);
+            }
+            open_text_pager(
+                app,
+                app.tr(MessageId::ConfigSectionMcp).into_owned(),
+                receipt.clone(),
+            );
+            add_mcp_message(app, receipt);
+            app.needs_redraw = true;
             return;
         }
         crate::tui::app::McpUiAction::Show => Ok(()),
@@ -981,7 +1053,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 .map(|()| message = Some(format!("Removed MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Login { name, scopes } => {
-            start_mcp_login(app, config, name, scopes);
+            start_mcp_login(app, config, engine_handle, name, scopes);
             // Login owns its background discovery. Do not start a second
             // discovery here or await network work on the input loop.
             return;
@@ -1054,7 +1126,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 Err(_) => Err(anyhow::anyhow!("MCP import failed")),
             }
         }
-        crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
+        crate::tui::app::McpUiAction::Reload => Ok(()),
         // Dispatched before this match.
         crate::tui::app::McpUiAction::Retry { .. } => Ok(()),
     };
@@ -1086,7 +1158,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 Some(snapshot) => {
                     app.mcp_configured_count = snapshot.servers.len();
                     app.mcp_snapshot = Some(snapshot);
-                    app.mcp_initializing = false;
+                    app.set_mcp_boot_initializing(false);
                     app.mcp_connecting.clear();
                     app.hotbar_actions
                         .replace_mcp_tools(app.mcp_snapshot.as_ref());
@@ -1135,7 +1207,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 // the reload-started line.
                 app.mcp_reload_required = false;
                 app.mcp_reload_in_flight = true;
-                app.mcp_initializing = true;
+                app.set_mcp_boot_initializing(true);
                 if is_reload {
                     add_mcp_message(
                         app,
@@ -1160,7 +1232,9 @@ pub(crate) async fn handle_mcp_ui_action(
         }
     } else if discover {
         let network_policy = config.network.clone().map(|toml_cfg| {
-            crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
+            codewhale_net::network_policy::NetworkPolicyDecider::with_default_audit(
+                codewhale_net::network_policy::NetworkPolicy::from(toml_cfg),
+            )
         });
         mcp::discover_manager_snapshot_with_workspace_and_plugins(
             &path,
@@ -1168,7 +1242,7 @@ pub(crate) async fn handle_mcp_ui_action(
             network_policy,
             app.mcp_reload_required,
             std::sync::Arc::clone(&app.plugin_registry),
-            mcp::McpBackend::from_config(config),
+            config.mcp_backend(),
         )
         .await
         .map(|snapshot| (snapshot, None))
@@ -1199,7 +1273,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 app.mcp_snapshot_generation_invalidated = true;
             }
             app.mcp_snapshot = Some(snapshot.clone());
-            app.mcp_initializing = false;
+            app.set_mcp_boot_initializing(false);
             app.mcp_connecting.clear();
             // #2068: keep the hotbar's MCP-tool actions in sync with the tools
             // that are actually loaded; the hotbar never connects on its own.
@@ -1263,13 +1337,19 @@ pub(crate) fn handle_shell_job_action(app: &mut App, action: crate::tui::app::Sh
         }
         crate::tui::app::ShellJobAction::Cancel { id } => {
             match manager.kill_for_session(&active_session_id, &id) {
-                Ok(result) => add_shell_job_message(app, format_shell_poll(&result)),
+                Ok(result) => {
+                    manager.mark_cancel_reported(&result);
+                    add_shell_job_message(app, format_shell_poll(&result));
+                }
                 Err(err) => add_shell_job_message(app, format!("Command cancel failed: {err}")),
             }
         }
         crate::tui::app::ShellJobAction::CancelAll => {
             match manager.kill_running_for_session(&active_session_id) {
                 Ok(results) => {
+                    for result in &results {
+                        manager.mark_cancel_reported(result);
+                    }
                     let count = results.len();
                     if count == 0 {
                         add_shell_job_message(app, "No running commands to cancel.".to_string());
@@ -1292,10 +1372,10 @@ pub(crate) fn handle_shell_job_action(app: &mut App, action: crate::tui::app::Sh
 
 pub(crate) async fn handle_skill_mutation_requested(
     app: &mut App,
-    request: crate::skills::mutation::SkillMutationRequest,
+    request: codewhale_skills::mutation::SkillMutationRequest,
 ) {
-    use crate::skills::install::{DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL};
-    use crate::skills::mutation::{MutationContext, SkillMutationOutcome, SkillMutationRequest};
+    use codewhale_skill_install::install::{DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL};
+    use codewhale_skills::mutation::{MutationContext, SkillMutationOutcome, SkillMutationRequest};
 
     let focus = match &request {
         SkillMutationRequest::ImportExternal { source_id, .. } => Some(source_id.clone()),
@@ -1309,12 +1389,12 @@ pub(crate) async fn handle_skill_mutation_requested(
     };
 
     let workspace = app.workspace.clone();
-    let home = crate::config::effective_home_dir();
-    let cfg = crate::config::Config::load(None, None).unwrap_or_default();
+    let home = codewhale_paths::user_home();
+    let cfg = codewhale_plugins::providers::load_config(None, None).unwrap_or_default();
     let network = cfg
         .network
         .clone()
-        .map(|policy| policy.into_runtime())
+        .map(codewhale_net::network_policy::NetworkPolicy::from)
         .unwrap_or_default();
     let skills_cfg = cfg.skills.as_ref();
     let max_size = skills_cfg
@@ -1334,7 +1414,7 @@ pub(crate) async fn handle_skill_mutation_requested(
             max_size,
             registry_url: &registry_url,
         };
-        crate::skills::mutation::execute(request, &ctx).await
+        codewhale_skills::mutation::execute(request, &ctx).await
     };
 
     let (status, refresh_skills) = match result {
@@ -1484,13 +1564,49 @@ pub(crate) fn is_plan_handoff_request(app: &App, tool_id: &str) -> bool {
 
 fn plan_handoff_seed_title(plan: &crate::tui::plan_handoff::PendingPlanHandoff) -> String {
     // Match the graph's trimmed title without changing the approved message.
-    plan.text
-        .trim()
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut in_fence = false;
+    let title = plan
+        .text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            if line.starts_with("```") || line.starts_with("~~~") {
+                in_fence = !in_fence;
+                return false;
+            }
+            !in_fence && !line.starts_with('#')
+        })
+        .map(|line| {
+            collapse(
+                &line
+                    .trim_start_matches(['-', '*', '+', '>'])
+                    .replace(['*', '`'], ""),
+            )
+        })
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| collapse(&plan.text));
+    title
         .chars()
         .take(1024)
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+fn plan_handoff_proceed_message(
+    app: &App,
+    plan: &crate::tui::plan_handoff::PendingPlanHandoff,
+) -> String {
+    let message = format!("{}\n\n{}", app.tr(MessageId::PlanHandoffProceed), plan.text);
+    if plan.seeded_todo_id.is_none() {
+        return message;
+    }
+    format!(
+        "{message}\n\n{}",
+        app.tr(MessageId::PlanHandoffTodoNote)
+            .replace("{title}", &plan_handoff_seed_title(plan))
+    )
 }
 
 /// Stage one graph-owned item for a prose plan without replacing existing work.
@@ -1512,7 +1628,7 @@ async fn seed_plan_handoff_todos(
         return if todos.items.iter().any(|item| {
             item.id == id
                 && item.content == content
-                && item.status == crate::tools::todo::TodoStatus::Pending
+                && item.status == codewhale_engine::tools::todo::TodoStatus::Pending
         }) {
             Ok(())
         } else {
@@ -1527,10 +1643,10 @@ async fn seed_plan_handoff_todos(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| "To-do item IDs are exhausted".to_string())?;
-    todos.items.push(crate::tools::todo::TodoItem {
+    todos.items.push(codewhale_engine::tools::todo::TodoItem {
         id,
         content,
-        status: crate::tools::todo::TodoStatus::Pending,
+        status: codewhale_engine::tools::todo::TodoStatus::Pending,
     });
     work.apply_todo_update(&plan.session_id, "todo_write", &todos)
         .await?;
@@ -1558,7 +1674,7 @@ async fn rollback_plan_handoff_seed(
     let mut todos = work.current_todos().await?;
     if let Some(item) = todos.items.iter().find(|item| item.id == id) {
         if item.content != plan_handoff_seed_title(plan)
-            || item.status != crate::tools::todo::TodoStatus::Pending
+            || item.status != codewhale_engine::tools::todo::TodoStatus::Pending
         {
             return Err(
                 "The approved plan's To-do changed; review it before continuing".to_string(),
@@ -1580,6 +1696,7 @@ fn reopen_plan_handoff(
     app.view_stack.push(UserInputView::new(
         plan.request_id.clone(),
         crate::tui::plan_handoff::request(app.ui_locale),
+        app.ui_locale,
     ));
     let notice = app
         .tr(MessageId::SessionSaveFailed)
@@ -1660,10 +1777,7 @@ pub(crate) async fn apply_plan_handoff_with_checkpoint(
                 reopen_plan_handoff(app, &plan, &reason);
                 return Ok(());
             }
-            QueuedMessage::new(
-                format!("{}\n\n{}", app.tr(MessageId::PlanHandoffProceed), plan.text),
-                None,
-            )
+            QueuedMessage::new(plan_handoff_proceed_message(app, &plan), None)
         }
     };
     // Consume before ordinary composer admission. Its existing recovery owns
@@ -1922,7 +2036,10 @@ pub(crate) async fn handle_view_events(
                     });
                 }
             }
-            ViewEvent::SessionSelected { session_id } => {
+            ViewEvent::SessionSelected {
+                session_id,
+                workspace,
+            } => {
                 let manager = match SessionManager::default_location() {
                     Ok(manager) => manager,
                     Err(err) => {
@@ -1934,14 +2051,14 @@ pub(crate) async fn handle_view_events(
 
                 // Another window's open session is refused, not attached
                 // as a second autosaving writer.
-                match manager.attach_session(&session_id) {
+                match manager.attach_session_in_workspace(&session_id, Some(&workspace)) {
                     Ok((recovery, lease)) => {
                         let session = recovery.session;
                         let next_config = config.clone();
                         let message_count = session.metadata.message_count;
                         // Keep the saved-store confinement check a pure
                         // comparison on this runtime (#6522).
-                        crate::runtime_threads::prepare_canonical_sessions_root().await;
+                        codewhale_engine::runtime_threads::prepare_canonical_sessions_root().await;
                         let respawn = match apply_loaded_session_config_snapshot(
                             app,
                             config,
@@ -1971,9 +2088,7 @@ pub(crate) async fn handle_view_events(
                         // order (drop = engine/UI desync). A wedge is possible
                         // only while a saturated engine finishes its turn.
                         if respawn {
-                            let _ = engine_handle.send(Op::Shutdown).await;
-                            *engine_handle =
-                                spawn_tui_engine(build_engine_config(app, config), config);
+                            replace_tui_engine(app, config, engine_handle).await;
                         } else {
                             let _ = engine_handle
                                 .send(Op::SetModel {
@@ -1985,6 +2100,7 @@ pub(crate) async fn handle_view_events(
                         }
                         let _ = engine_handle
                             .send(Op::SyncSession {
+                                control: app.session_sync_control(),
                                 session_id: app.current_session_id.clone(),
                                 messages: app.api_messages.as_ref().clone(),
                                 system_prompt: app.system_prompt.clone(),
@@ -2004,7 +2120,7 @@ pub(crate) async fn handle_view_events(
                         // no findable record that the resume happened.
                         let loaded_message = format!(
                             "Session loaded (ID: {}, {} messages)",
-                            crate::session_manager::truncate_id(&session_id),
+                            codewhale_engine::session_manager::truncate_id(&session_id),
                             message_count
                         );
                         app.add_message(HistoryCell::System {
@@ -2019,7 +2135,7 @@ pub(crate) async fn handle_view_events(
                             app,
                             format!(
                                 "Failed to load session {}: {err}",
-                                crate::session_manager::truncate_id(&session_id)
+                                codewhale_engine::session_manager::truncate_id(&session_id)
                             ),
                         );
                     }
@@ -2034,14 +2150,16 @@ pub(crate) async fn handle_view_events(
                 {
                     match build_session_snapshot(app, &manager) {
                         Ok(session) => {
+                            let projection = saved_work_projection(app, &session);
                             if let Err(err) = persist_with_pending_work_boundary(
                                 app,
                                 PersistRequest::SessionSnapshot(session),
+                                &projection,
                             ) {
                                 tracing::warn!(
                                     session_id = %session_id,
                                     error = %err,
-                                    "Could not queue active session rename Work snapshot"
+                                    "Could not complete active session rename Work boundary"
                                 );
                                 work_snapshot_warning = Some(format!(
                                     "Session renamed, but Work snapshot is pending ({err})"
@@ -2060,12 +2178,13 @@ pub(crate) async fn handle_view_events(
                 app.status_message = Some(work_snapshot_warning.unwrap_or_else(|| {
                     format!(
                         "Renamed session {} to \"{}\"",
-                        crate::session_manager::truncate_id(&session_id),
+                        codewhale_engine::session_manager::truncate_id(&session_id),
                         title
                     )
                 }));
             }
             ViewEvent::SessionArchived { metadata } => {
+                app.adopt_session_mutation(&metadata);
                 // The manager already wrote the flag. Keep the active app's
                 // cached metadata in step so the next autosave carries the new
                 // state forward instead of reverting it, and drop the rail
@@ -2082,14 +2201,14 @@ pub(crate) async fn handle_view_events(
                     } else {
                         "Restored"
                     },
-                    crate::session_manager::truncate_id(&metadata.id),
+                    codewhale_engine::session_manager::truncate_id(&metadata.id),
                     metadata.title
                 ));
             }
             ViewEvent::SessionDeleted { session_id, title } => {
                 app.status_message = Some(format!(
                     "Deleted session {} ({})",
-                    crate::session_manager::truncate_id(&session_id),
+                    codewhale_engine::session_manager::truncate_id(&session_id),
                     title
                 ));
             }
@@ -2134,7 +2253,7 @@ pub(crate) async fn handle_view_events(
                 app.status_items = items.clone();
                 app.needs_redraw = true;
                 if final_save {
-                    match crate::config_persistence::persist_status_items(&items) {
+                    match codewhale_runtime::config_persistence::persist_status_items(&items) {
                         Ok(path) => {
                             app.status_message =
                                 Some(format!("Status line saved to {}", path.display()));
@@ -2450,7 +2569,7 @@ pub(crate) async fn handle_view_events(
                 let validation = scoped
                     .scope_to_provider_identity(&identity)
                     .and_then(|()| {
-                        crate::route_runtime::resolve_runtime_route_for_identity(
+                        codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
                             &scoped,
                             &identity,
                             Some(&model),
@@ -2524,8 +2643,8 @@ pub(crate) async fn handle_view_events(
                 // A project-scope save is refused (never silently redirected)
                 // when project profiles are disabled for this launch: the file
                 // would be written where nothing loads it.
-                if scope == crate::fleet::profile::FleetProfileScope::Project
-                    && !crate::fleet::roster::project_agent_profiles_enabled()
+                if scope == codewhale_engine::fleet::profile::FleetProfileScope::Project
+                    && !codewhale_engine::fleet::roster::project_agent_profiles_enabled()
                 {
                     app.set_sticky_status(
                         tr(app.ui_locale, MessageId::FleetDestProjectDisabledSave).into_owned(),
@@ -2539,8 +2658,10 @@ pub(crate) async fn handle_view_events(
                 // draft and written atomically; the target path is derived
                 // from the sanitized id, never model-chosen.
                 let profile_dir =
-                    match crate::fleet::profile::agent_profile_dir_for_scope(scope, &app.workspace)
-                    {
+                    match codewhale_engine::fleet::profile::agent_profile_dir_for_scope(
+                        scope,
+                        &app.workspace,
+                    ) {
                         Ok(dir) => dir,
                         Err(err) => {
                             app.set_sticky_status(
@@ -2564,7 +2685,15 @@ pub(crate) async fn handle_view_events(
                 // unreadable files, and invalid ids still fail closed because
                 // then we cannot prove there is no collision.
                 let existing_profiles =
-                    crate::fleet::profile::load_agent_profile_identities_from_dir(&profile_dir);
+                    if scope == codewhale_engine::fleet::profile::FleetProfileScope::Project {
+                        codewhale_engine::fleet::profile::load_workspace_agent_profile_identities(
+                            &app.workspace,
+                        )
+                    } else {
+                        codewhale_engine::fleet::profile::load_agent_profile_identities_from_dir(
+                            &profile_dir,
+                        )
+                    };
                 if let Err(err) = &existing_profiles {
                     let message = tr(app.ui_locale, MessageId::FleetProfileIdentityVerifyFailed)
                         .replace("{error}", &format!("{err:#}"));
@@ -2597,7 +2726,7 @@ pub(crate) async fn handle_view_events(
                             .resolve_provider_pin_identity(provider_id)
                             .and_then(|identity| {
                                 let active = app.admitted_provider_identity()?;
-                                if crate::config::provider_is_configured_for_active(
+                                if codewhale_engine::provider_readiness::provider_is_configured_for_active(
                                     config, &identity, active,
                                 ) {
                                     Ok(())
@@ -2623,12 +2752,13 @@ pub(crate) async fn handle_view_events(
                 txn.stage(target.clone(), draft.render_toml().into_bytes());
                 match txn.commit() {
                     Ok(()) => {
-                        let roster =
-                            std::sync::Arc::new(crate::fleet::identity::load_effective_roster(
+                        let roster = std::sync::Arc::new(
+                            codewhale_engine::fleet::identity::load_effective_roster(
                                 &config.fleet_config(),
                                 &app.workspace,
                                 Some(app.extension_plugin_view().as_ref()),
-                            ));
+                            ),
+                        );
                         let roster_refresh_failed = engine_handle
                             .try_send(Op::SetFleetRoster { roster })
                             .is_err();
@@ -2865,7 +2995,7 @@ pub(crate) async fn handle_view_events(
                 delta,
             } => {
                 let provider_key = provider_id.unwrap_or_else(|| provider.as_str().to_string());
-                let reordered = crate::settings::Settings::transact_opt(|settings| {
+                let reordered = codewhale_runtime::settings::Settings::transact_opt(|settings| {
                     if !settings.move_pinned_model(&provider_key, &model, delta) {
                         return Ok(None);
                     }
@@ -3037,13 +3167,7 @@ pub(crate) async fn handle_view_events(
                 refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerClaudeOAuthRequested => {
-                let switched =
-                    run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
-                complete_provider_picker_onboarding_if_switched(
-                    app,
-                    ProviderKind::Anthropic,
-                    switched,
-                );
+                app.pending_claude_login = Some(true);
             }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 let switched =
@@ -3192,43 +3316,39 @@ pub(crate) async fn handle_view_events(
                 app.needs_redraw = true;
             }
             ViewEvent::BacktrackConfirm => {
+                let undo = std::mem::take(&mut app.undo_selection);
                 if let Some(depth) = app.backtrack.confirm() {
-                    // Reserve the slot before mutating history (#6150): the
-                    // loop must not await a full op channel, and applying the
-                    // backtrack without delivering SyncSession would desync
-                    // the engine's messages from ours.
-                    match engine_handle.tx_op.clone().try_reserve_owned() {
-                        Ok(permit) => {
-                            apply_backtrack(app, depth);
-                            engine_handle.send_reserved_op(
-                                permit,
-                                Op::SyncSession {
-                                    session_id: app.current_session_id.clone(),
-                                    messages: app.api_messages.as_ref().clone(),
-                                    system_prompt: app.system_prompt.clone(),
-                                    system_prompt_override: false,
-                                    model: app.model.clone(),
-                                    workspace: app.workspace.clone(),
-                                    mode: app.mode,
-                                },
-                            );
+                    if undo {
+                        if let Err(error) =
+                            apply_range_undo(terminal, app, engine_handle, config, depth).await
+                        {
+                            let message = format!("Undo failed: {error:#}");
+                            app.add_message(HistoryCell::System {
+                                content: message.clone(),
+                            });
+                            app.push_status_toast(message, StatusToastLevel::Error, None);
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            app.status_message = Some(
-                                "Engine busy — backtrack not applied; try again in a moment"
-                                    .to_string(),
-                            );
-                            app.needs_redraw = true;
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            app.status_message =
-                                Some("Engine stopped — backtrack not applied".to_string());
-                            app.needs_redraw = true;
+                        app.needs_redraw = true;
+                        continue;
+                    }
+                    match apply_conversation_undo(app, engine_handle, ConversationRewind::Backtrack(depth)).await {
+                        Ok(None) => {}
+                        Ok(Some(error)) => app.push_status_toast(
+                            format!("Conversation rewound, but its save or Work update failed: {error:#}"),
+                            StatusToastLevel::Error,
+                            None,
+                        ),
+                        Err(error) => {
+                            if app.view_stack.top_kind() == Some(ModalKind::LiveTranscript) {
+                                app.view_stack.pop();
+                            }
+                            app.push_status_toast(format!("Backtrack failed: {error:#}"), StatusToastLevel::Error, None);
                         }
                     }
                 }
             }
             ViewEvent::BacktrackCancel => {
+                app.undo_selection = false;
                 app.backtrack.reset();
                 app.status_message = Some("Backtrack canceled".to_string());
                 app.needs_redraw = true;

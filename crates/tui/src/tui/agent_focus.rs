@@ -25,9 +25,9 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::tools::subagent::SubAgentStatus;
 use crate::tui::app::App;
 use crate::tui::history::{HistoryCell, history_cells_from_message};
+use codewhale_engine::tools::subagent::SubAgentStatus;
 use codewhale_localization::MessageId;
 use codewhale_models::Message;
 
@@ -67,6 +67,8 @@ pub struct AgentFocus {
     /// on an unchanged message count still triggers a rebuild.
     receipt_count: usize,
     last_refresh: Instant,
+    settled_refreshed: bool,
+    wrapped: Option<(u16, codewhale_palette::UiTheme, Vec<Line<'static>>)>,
 }
 
 impl AgentFocus {
@@ -84,6 +86,8 @@ impl AgentFocus {
             last_total: 0,
             receipt_count: 0,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
+            settled_refreshed: false,
+            wrapped: None,
         }
     }
 
@@ -100,13 +104,16 @@ pub(crate) fn resolve_agent_transcript_messages(
     app: &App,
     agent_id: &str,
 ) -> (Vec<Message>, usize) {
-    if let Ok(messages) =
-        crate::tools::subagent::load_subagent_transcript_artifact(&app.workspace, agent_id)
-        && !messages.is_empty()
+    if let Ok(display) =
+        codewhale_engine::tools::subagent::load_subagent_transcript_display_artifact(
+            &app.workspace,
+            agent_id,
+        )
+        && display.conversation_count > 0
     {
-        return (messages, 0);
+        return (display.messages, 0);
     }
-    use crate::tools::handle::{HandleValue, VarHandle};
+    use codewhale_engine::tools::handle::{HandleValue, VarHandle};
     let lookup = VarHandle {
         kind: "var_handle".to_string(),
         session_id: format!("agent:{agent_id}"),
@@ -232,8 +239,8 @@ pub(crate) fn settled_result_raw(app: &App, agent_id: &str) -> Option<(String, b
         .and_then(|row| {
             let failed = matches!(
                 row.state,
-                crate::agent_roster::RosterState::Failed
-                    | crate::agent_roster::RosterState::Cancelled
+                codewhale_engine::agent_roster::RosterState::Failed
+                    | codewhale_engine::agent_roster::RosterState::Cancelled
             );
             row.outcome.clone().map(|text| (text, failed))
         });
@@ -261,7 +268,7 @@ pub(crate) fn settled_result_raw(app: &App, agent_id: &str) -> Option<(String, b
 /// Strip terminal escapes and redact secrets before agent text is shown.
 fn visible_agent_text(text: &str) -> String {
     let mut visible = String::with_capacity(text.len());
-    crate::tui::osc8::strip_ansi_into(text, &mut visible);
+    codewhale_tui_kit::osc8::strip_ansi_into(text, &mut visible);
     codewhale_config::persistence::redact_secrets(&visible)
 }
 
@@ -277,8 +284,8 @@ pub(crate) fn settled_result(app: &App, agent_id: &str) -> Option<(String, bool)
 /// text is in the agent's focused view.
 pub(crate) fn settled_headline(app: &App, agent_id: &str) -> Option<String> {
     let (text, _) = settled_result_raw(app, agent_id)?;
-    crate::agent_roster::result_headline(&text)
-        .map(|headline| crate::agent_roster::one_line(&visible_agent_text(&headline)))
+    codewhale_engine::agent_roster::result_headline(&text)
+        .map(|headline| codewhale_engine::agent_roster::one_line(&visible_agent_text(&headline)))
 }
 
 /// The result block for a settled agent, unless the transcript already ends
@@ -300,7 +307,7 @@ fn result_block_for(app: &App, agent_id: &str, messages: &[Message]) -> Option<(
         .find(|message| message.role == "assistant")
         .map(message_plain_text)
         .is_some_and(|last| {
-            crate::agent_roster::result_headline(text)
+            codewhale_engine::agent_roster::result_headline(text)
                 .is_some_and(|headline| last.contains(headline.as_str()))
         });
     (!answered || failed).then(|| (text.to_string(), failed))
@@ -350,7 +357,7 @@ pub(crate) fn focus_agent(app: &mut App, agent_id: &str) {
     focus.result = result_block_for(app, agent_id, &messages);
     focus.last_refresh = Instant::now();
     app.agent_focus = Some(focus);
-    crate::extension_host::command::bump_epoch();
+    codewhale_engine::extension_host::command::bump_epoch();
     // The composer is now the natural owner: the next keys address the
     // worker, and Esc leaves focus rather than the rail.
     crate::tui::work_surface::release_focus(app);
@@ -365,7 +372,7 @@ pub(crate) fn focus_agent(app: &mut App, agent_id: &str) {
 
 /// Return to the main conversation. Returns whether a focus was active.
 pub(crate) fn exit_focus(app: &mut App) -> bool {
-    crate::extension_host::command::bump_epoch();
+    codewhale_engine::extension_host::command::bump_epoch();
     let Some(focus) = app.agent_focus.take() else {
         return false;
     };
@@ -389,6 +396,14 @@ pub(crate) fn refresh_focus(app: &mut App) {
         return;
     }
     let agent_id = focus.agent_id.clone();
+    let settled = app
+        .subagent_cache
+        .iter()
+        .find(|agent| agent.agent_id == agent_id)
+        .is_some_and(|agent| !matches!(agent.status, SubAgentStatus::Running));
+    if settled && focus.settled_refreshed {
+        return;
+    }
     let (messages, omitted) = resolve_agent_transcript_messages(app, &agent_id);
     let receipts = child_receipts(app, &agent_id).to_vec();
     // The result lands when the agent settles, often with no new message.
@@ -397,8 +412,10 @@ pub(crate) fn refresh_focus(app: &mut App) {
         return;
     };
     focus.last_refresh = Instant::now();
+    focus.settled_refreshed = settled;
     if focus.result != result {
         focus.result = result;
+        focus.wrapped = None;
         app.needs_redraw = true;
     }
     let Some(focus) = app.agent_focus.as_mut() else {
@@ -411,6 +428,7 @@ pub(crate) fn refresh_focus(app: &mut App) {
         return;
     }
     let previous_count = focus.source_message_count;
+    focus.wrapped = None;
     focus.cells = cells_for_messages(&messages, &receipts);
     focus.receipt_count = receipts.len();
     focus.source_message_count = messages.len();
@@ -449,6 +467,7 @@ pub(crate) fn echo_user_follow_up(app: &mut App, text: &str) {
         focus.local_cells.push(HistoryCell::User {
             content: text.to_string(),
         });
+        focus.wrapped = None;
         focus.scroll_top = None;
         app.needs_redraw = true;
     }
@@ -459,7 +478,7 @@ pub(crate) fn echo_user_follow_up(app: &mut App, text: &str) {
 pub(crate) fn apply_follow_up_receipt(
     app: &mut App,
     agent_id: &str,
-    outcome: &Result<crate::tools::subagent::UserFollowUpOutcome, String>,
+    outcome: &Result<codewhale_engine::tools::subagent::UserFollowUpOutcome, String>,
 ) {
     let label = agent_display_label(app, agent_id);
     let note = match outcome {
@@ -478,10 +497,11 @@ pub(crate) fn apply_follow_up_receipt(
                     .map(|focus| focus.local_cells.clone())
                     .unwrap_or_default();
                 app.agent_focus = None;
-                crate::extension_host::command::bump_epoch();
+                codewhale_engine::extension_host::command::bump_epoch();
                 focus_agent(app, &receipt.target_agent_id);
                 if let Some(focus) = app.agent_focus.as_mut() {
                     focus.local_cells = carried;
+                    focus.wrapped = None;
                 }
             }
             app.tr(MessageId::AgentFocusFollowUpContinued)
@@ -520,6 +540,7 @@ pub(crate) fn apply_follow_up_receipt(
         focus.local_cells.push(HistoryCell::System {
             content: note.clone(),
         });
+        focus.wrapped = None;
         focus.scroll_top = None;
     }
     app.status_message = Some(note.clone());
@@ -730,14 +751,32 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
             Style::default().fg(theme.text_muted),
         )));
     }
-    for cell in focus
-        .cells
-        .iter()
-        .chain(result_cells.iter())
-        .chain(focus.local_cells.iter())
+    if !focus
+        .wrapped
+        .as_ref()
+        .is_some_and(|(cached_width, cached_theme, _)| {
+            *cached_width == width && *cached_theme == theme
+        })
     {
-        lines.extend(cell.transcript_lines(width));
-        lines.push(Line::default());
+        let mut body = Vec::new();
+        for cell in focus
+            .cells
+            .iter()
+            .chain(result_cells.iter())
+            .chain(focus.local_cells.iter())
+        {
+            body.extend(cell.transcript_lines(width));
+            body.push(Line::default());
+        }
+        if let Some(focus) = app.agent_focus.as_mut() {
+            focus.wrapped = Some((width, theme, body));
+        }
+    }
+    let Some(focus) = app.agent_focus.as_ref() else {
+        return;
+    };
+    if let Some((_, _, body)) = focus.wrapped.as_ref() {
+        lines.extend(body.iter().cloned());
     }
     let visible = usize::from(area.height.saturating_sub(1)).max(1);
     let total = lines.len();
@@ -768,7 +807,7 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
     app.viewport.ocean_semantic_surfaces = codewhale_ratatui::ocean::ocean_semantic_surfaces(
         plan.display_rows(),
         plan.area,
-        crate::tui::ui_text::grapheme_display_width,
+        codewhale_tui_kit::ui_text::grapheme_display_width,
     );
     // The focused view owns the transcript geometry for paging keys.
     app.viewport.last_transcript_area = Some(plan.body_area);
@@ -780,8 +819,8 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::tui::app::TuiOptions;
+    use codewhale_runtime::config::Config;
     use serde_json::json;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -975,7 +1014,7 @@ mod tests {
             json!([{"role": "user", "content": [{"type": "text", "text": "look around", "cache_control": null}]}]),
         );
         app.subagent_cache
-            .push(crate::tools::subagent::SubAgentResult {
+            .push(codewhale_engine::tools::subagent::SubAgentResult {
                 usage: None,
                 name: "agent_scout".to_string(),
                 agent_id: "agent_scout".to_string(),
@@ -983,8 +1022,8 @@ mod tests {
                 fork_context: false,
                 workspace: None,
                 git_branch: None,
-                agent_type: crate::tools::subagent::FleetRole::Scout,
-                assignment: crate::tools::subagent::SubAgentAssignment {
+                agent_type: codewhale_agent_contract::role::FleetRole::Scout,
+                assignment: codewhale_engine::tools::subagent::SubAgentAssignment {
                     native_preset: None,
                     objective: "look around".to_string(),
                     role: Some("explore".to_string()),
@@ -1052,8 +1091,8 @@ mod tests {
         agent_id: &str,
         status: SubAgentStatus,
         result: Option<&str>,
-    ) -> crate::tools::subagent::SubAgentResult {
-        crate::tools::subagent::SubAgentResult {
+    ) -> codewhale_engine::tools::subagent::SubAgentResult {
+        codewhale_engine::tools::subagent::SubAgentResult {
             usage: None,
             name: agent_id.to_string(),
             agent_id: agent_id.to_string(),
@@ -1061,8 +1100,8 @@ mod tests {
             fork_context: false,
             workspace: None,
             git_branch: None,
-            agent_type: crate::tools::subagent::FleetRole::Scout,
-            assignment: crate::tools::subagent::SubAgentAssignment {
+            agent_type: codewhale_agent_contract::role::FleetRole::Scout,
+            assignment: codewhale_engine::tools::subagent::SubAgentAssignment {
                 native_preset: None,
                 objective: "audit the docs".to_string(),
                 role: Some("explore".to_string()),
@@ -1255,7 +1294,7 @@ mod tests {
         let mut app = test_app(tmp.path().to_path_buf());
         focus_agent(&mut app, "agent_done");
         echo_user_follow_up(&mut app, "one more thing");
-        let outcome = Ok(crate::tools::subagent::UserFollowUpOutcome {
+        let outcome = Ok(codewhale_engine::tools::subagent::UserFollowUpOutcome {
             agent_id: "agent_done".to_string(),
             target_agent_id: "agent_fork".to_string(),
             delivered: true,
@@ -1278,7 +1317,7 @@ mod tests {
                 .any(|cell| matches!(cell, HistoryCell::System { .. })),
             "receipt shown in the focused view"
         );
-        let failed: Result<crate::tools::subagent::UserFollowUpOutcome, String> =
+        let failed: Result<codewhale_engine::tools::subagent::UserFollowUpOutcome, String> =
             Err("status is cancelled".to_string());
         apply_follow_up_receipt(&mut app, "agent_fork", &failed);
         assert!(
@@ -1295,7 +1334,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let mut app = test_app(tmp.path().to_path_buf());
         focus_agent(&mut app, "agent_b");
-        let outcome = Ok(crate::tools::subagent::UserFollowUpOutcome {
+        let outcome = Ok(codewhale_engine::tools::subagent::UserFollowUpOutcome {
             agent_id: "agent_a".to_string(),
             target_agent_id: "agent_a".to_string(),
             delivered: true,
@@ -1403,8 +1442,8 @@ mod transcript_legacy;
 #[cfg(test)]
 mod mounted_transcript_acceptance {
     use super::*;
-    use crate::config::Config;
     use codewhale_localization::Locale;
+    use codewhale_runtime::config::Config;
     use std::path::PathBuf;
 
     fn fixture(locale: Locale, offset: Option<usize>) -> App {

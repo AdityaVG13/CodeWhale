@@ -1,6 +1,7 @@
 const { spawn: spawnChild } = require("child_process");
 const os = require("os");
 const { getBinaryPath, installFailureHint } = require("./install");
+const { openHarmonyDirections } = require("./artifacts");
 
 const pkg = require("../package.json");
 
@@ -8,9 +9,18 @@ function isVersionFlag(args = process.argv.slice(2)) {
   return args.includes("--version") || args.includes("-V");
 }
 
+const OPEN_HARMONY_EXEC_ERRORS = ["ENOEXEC", "EACCES", "EPERM"];
+const OPEN_HARMONY_STARTUP_SIGNALS = ["SIGKILL", "SIGSYS", "SIGSEGV", "SIGBUS", "SIGILL", "SIGABRT"];
+const OPEN_HARMONY_STARTUP_MS = 5_000;
+
 // Print the install hint (mirror / release-base guidance) for a failure that
-// looks like a download problem. Prints nothing for other failures.
+// looks like a download problem, or the HarmonyOS directions when the Linux
+// build cannot be executed on native HarmonyOS. Prints nothing otherwise.
 function printInstallFailureHint(error, log = console.error) {
+  if (os.platform() === "openharmony" && OPEN_HARMONY_EXEC_ERRORS.includes(error && error.code)) {
+    log(`The Linux build could not start on native HarmonyOS/OpenHarmony.\n${openHarmonyDirections()}`);
+    return;
+  }
   const hint = installFailureHint(error);
   if (hint) {
     log(hint);
@@ -134,6 +144,7 @@ async function run(binaryName, options = {}) {
     throw error;
   }
 
+  const startedAt = Date.now();
   const result = await runChild(spawn, binaryPath, args, proc);
   if (result.error) {
     if (versionFlag) {
@@ -141,6 +152,16 @@ async function run(binaryName, options = {}) {
       return exit(0);
     }
     throw result.error;
+  }
+  if (
+    os.platform() === "openharmony" &&
+    OPEN_HARMONY_STARTUP_SIGNALS.includes(result.signal) &&
+    Date.now() - startedAt < OPEN_HARMONY_STARTUP_MS
+  ) {
+    console.error(
+      `${binaryName} stopped with ${result.signal} at startup; the Linux build may not run on native HarmonyOS/OpenHarmony.\n` +
+        openHarmonyDirections(),
+    );
   }
   return exitLikeChild(result, exit, proc);
 }

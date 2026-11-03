@@ -27,4 +27,10 @@ export const changelog: ChangelogDict = {
   releaseNotesLink: "{version} 完整说明 ↗",
   emptyTitle: "没有解析出发布说明",
   emptyBody: "构建时没有找到可解析的 CHANGELOG.md。GitHub 的发布列表仍然是权威记录。",
+  versionMetaTitle: "Codewhale {version} 发布说明",
+  versionMetaDescription: "Codewhale {version} 的全部改动，按章节列出，取自仓库中的 CHANGELOG.md。",
+  versionKicker: "发布说明",
+  versionLead: "发布于 {date}。以下是该版本的全部条目，取自仓库中的 CHANGELOG.md，条目原文为英文。",
+  versionLeadUndated: "以下是该版本的全部条目，取自仓库中的 CHANGELOG.md，条目原文为英文。",
+  allReleasesLink: "全部版本",
 };

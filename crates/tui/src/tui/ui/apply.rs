@@ -16,8 +16,9 @@ use super::*;
 /// later usage envelope may confirm or replace it with the provider's
 /// effective route while also adding provider and token facts.
 pub(crate) fn record_agent_spawned_route(app: &mut App, agent_id: &str, model: &str) {
-    let model =
-        bound_agent_activity_text(&crate::cost_status::sanitize_persisted_route_label(model));
+    let model = bound_agent_activity_text(
+        &codewhale_runtime::safe_label::sanitize_persisted_route_label(model),
+    );
     app.agent_progress_meta
         .entry(agent_id.to_string())
         .or_default()
@@ -92,7 +93,7 @@ pub(crate) fn apply_agent_complete_status_and_observer(
 
 pub(crate) fn apply_coordination_detail_projection(
     app: &mut App,
-    projection: crate::tools::subagent::CoordinationDetailProjection,
+    projection: codewhale_engine::tools::subagent::CoordinationDetailProjection,
 ) {
     // §2.6: when this process does not own the workspace coordination flock,
     // say so on the sticky status strip. A silent "running (543s)" row on a
@@ -111,7 +112,7 @@ pub(crate) fn apply_coordination_detail_projection(
             .as_deref()
             .unwrap_or("another Codewhale process owns delegated coordination for this workspace");
         let same_process_handover =
-            note.contains(crate::tools::subagent::COORDINATION_SAME_PROCESS_HANDOVER);
+            note.contains(codewhale_engine::tools::subagent::COORDINATION_SAME_PROCESS_HANDOVER);
         // The strip is one row. The old copy opened with the diagnosis
         // ("Delegated coordination unavailable — ") and buried the cause
         // behind a `{note}` carrying a pid, an absolute workspace path, and an
@@ -120,7 +121,9 @@ pub(crate) fn apply_coordination_detail_projection(
         // that explains it — a second session is open here — and leave the pid
         // and path to the coordination detail view, which already renders
         // `process_lock_note` in full.
-        let message = if note.contains(crate::tools::subagent::COORDINATION_LOCK_TIMEOUT_MARKER) {
+        let message = if note
+            .contains(codewhale_engine::tools::subagent::COORDINATION_LOCK_TIMEOUT_MARKER)
+        {
             "Timed out claiming delegated coordination for this workspace — job rows still settle locally.".to_string()
         } else {
             "Another Codewhale session in this workspace owns delegated coordination — job rows still settle locally.".to_string()
@@ -165,11 +168,12 @@ pub(crate) fn apply_alt_0_shortcut(app: &mut App, modifiers: KeyModifiers) {
 
 pub(crate) fn apply_picker_session_rename_to_active_app(
     app: &mut App,
-    metadata: crate::session_manager::SessionMetadata,
+    metadata: codewhale_engine::session_manager::SessionMetadata,
 ) -> bool {
     if app.current_session_id.as_deref() != Some(metadata.id.as_str()) {
         return false;
     }
+    app.adopt_session_mutation(&metadata);
     app.session_title = Some(metadata.title.clone());
     app.current_session_metadata = Some(metadata);
     true
@@ -178,17 +182,14 @@ pub(crate) fn apply_picker_session_rename_to_active_app(
 /// Translate an `EngineEvent::Error` into UI state updates.
 ///
 /// The engine's `recoverable` flag (mirrored on `ErrorEnvelope`) decides
-/// whether the session flips into offline mode: stream stalls, chunk
-/// timeouts, transient network errors, and rate-limit/server hiccups arrive
-/// recoverable and must NOT flip into offline. Hard failures (auth, billing,
-/// invalid request) arrive non-recoverable; those flip offline so subsequent
-/// messages get queued instead of silently lost mid-flight.
+/// whether an active turn stays live. Only an environment-only authentication
+/// failure enables offline queueing here while reopening provider setup.
 ///
 /// `severity` drives transcript color: red for `Error`/`Critical`, amber for
 /// `Warning`, dim for `Info`.
 pub(crate) fn apply_engine_error_to_app(
     app: &mut App,
-    envelope: crate::error_taxonomy::ErrorEnvelope,
+    envelope: codewhale_error_taxonomy::ErrorEnvelope,
 ) {
     let recoverable = envelope.recoverable;
     let message = envelope.message.clone();
@@ -204,7 +205,7 @@ pub(crate) fn apply_engine_error_to_app(
     // The engine decides whether the question was taken back out of the
     // session; the host only follows, so the two cannot disagree (#6566).
     let credential_rejected_before_output = turn_was_in_progress
-        && envelope.code == crate::error_taxonomy::CREDENTIAL_REJECTED_UNSENT_CODE;
+        && envelope.code == codewhale_error_taxonomy::CREDENTIAL_REJECTED_UNSENT_CODE;
     streaming_thinking::finalize_current(app);
     if turn_was_in_progress {
         app.finalize_streaming_assistant_as_interrupted();
@@ -232,10 +233,10 @@ pub(crate) fn apply_engine_error_to_app(
     // skip when no hooks configured.
     if app
         .hooks
-        .has_hooks_for_event(crate::hooks::HookEvent::OnError)
+        .has_hooks_for_event(codewhale_config::hooks::HookEvent::OnError)
     {
         let context = app.base_hook_context().with_error(&message);
-        if let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context) {
+        if let Err(error) = app.submit_hooks(codewhale_config::hooks::HookEvent::OnError, context) {
             surface_observer_hook_submission_failure(app, error);
         }
     }
@@ -268,7 +269,7 @@ pub(crate) fn apply_engine_error_to_app(
     }
     if matches!(
         envelope.category,
-        crate::error_taxonomy::ErrorCategory::Authentication
+        codewhale_error_taxonomy::ErrorCategory::Authentication
     ) && app.api_key_env_only
     {
         app.offline_mode = true;
@@ -279,11 +280,12 @@ pub(crate) fn apply_engine_error_to_app(
         app.onboarding_missing_key_recovery = true;
         app.onboarding = OnboardingState::Provider;
         let provider = app.api_provider;
-        let config_path = match crate::config::resolve_load_config_path(app.config_path.clone()) {
-            Ok(Some(path)) => path.display().to_string(),
-            Ok(None) => "~/.codewhale/config.toml".to_string(),
-            Err(error) => error.to_string(),
-        };
+        let config_path =
+            match codewhale_runtime::config::resolve_load_config_path(app.config_path.clone()) {
+                Ok(Some(path)) => path.display().to_string(),
+                Ok(None) => "~/.codewhale/config.toml".to_string(),
+                Err(error) => error.to_string(),
+            };
         let notice = tr(app.ui_locale, MessageId::OnboardApiKeyRejectedEnv)
             .replace("{provider}", provider.as_str())
             .replace("{env}", &provider.provider().env_vars().join(" / "))
@@ -291,7 +293,7 @@ pub(crate) fn apply_engine_error_to_app(
         // The setup screen covers the transcript, so it must say why it
         // opened. The log records the reason without the provider's message,
         // which the transcript already carries.
-        crate::logging::warn(format!(
+        codewhale_runtime::logging::warn(format!(
             "{} rejected the environment API key; opening provider setup",
             provider.as_str()
         ));
@@ -306,9 +308,9 @@ pub(crate) fn apply_engine_error_to_app(
     if recoverable
         && matches!(
             envelope.category,
-            crate::error_taxonomy::ErrorCategory::Network
-                | crate::error_taxonomy::ErrorCategory::RateLimit
-                | crate::error_taxonomy::ErrorCategory::Timeout
+            codewhale_error_taxonomy::ErrorCategory::Network
+                | codewhale_error_taxonomy::ErrorCategory::RateLimit
+                | codewhale_error_taxonomy::ErrorCategory::Timeout
         )
         && app.advance_fallback(message.clone()).is_some()
     {
@@ -322,10 +324,6 @@ pub(crate) fn apply_engine_error_to_app(
             StatusToastLevel::Warning,
             Some(8_000),
         );
-        return;
-    }
-    if !recoverable {
-        app.offline_mode = true;
     }
     // Error is already in the transcript as HistoryCell::Error above;
     // don't emit a redundant status_message that would become a sticky
@@ -337,14 +335,14 @@ pub(crate) fn apply_engine_error_to_app(
 pub(crate) fn apply_message_submit_outcome(
     app: &mut App,
     message: &mut QueuedMessage,
-    outcome: crate::hooks::MessageSubmitOutcome,
+    outcome: codewhale_engine::hooks::MessageSubmitOutcome,
 ) -> bool {
     if let Some(warning) = outcome.warning() {
         app.status_message = Some(warning.to_string());
     }
     match outcome {
-        crate::hooks::MessageSubmitOutcome::Unchanged { .. } => true,
-        crate::hooks::MessageSubmitOutcome::Replaced { text, .. } => {
+        codewhale_engine::hooks::MessageSubmitOutcome::Unchanged { .. } => true,
+        codewhale_engine::hooks::MessageSubmitOutcome::Replaced { text, .. } => {
             // A queued message was already echoed with its pre-hook text.
             // Retarget that one cell so dispatch reuses it instead of adding a
             // second User cell beside the stale echo (U02-03).
@@ -360,7 +358,7 @@ pub(crate) fn apply_message_submit_outcome(
             message.display = text;
             true
         }
-        crate::hooks::MessageSubmitOutcome::Blocked { reason } => {
+        codewhale_engine::hooks::MessageSubmitOutcome::Blocked { reason } => {
             app.status_message = Some(reason);
             false
         }
@@ -369,7 +367,7 @@ pub(crate) fn apply_message_submit_outcome(
 
 fn visible_goal_as_durable(
     app: &App,
-) -> Result<Option<crate::session_manager::SessionGoalState>, String> {
+) -> Result<Option<codewhale_engine::session_manager::SessionGoalState>, String> {
     let Some(objective) = app.goal.objective.as_deref() else {
         return Ok(None);
     };
@@ -379,7 +377,7 @@ fn visible_goal_as_durable(
         .map(|started| started.elapsed().as_secs())
         .unwrap_or(app.goal.time_used_seconds)
         .max(app.goal.time_used_seconds);
-    crate::session_manager::SessionGoalState::from_runtime(&GoalSnapshot {
+    codewhale_engine::session_manager::SessionGoalState::from_runtime(&GoalSnapshot {
         objective: Some(objective.to_string()),
         status: app.goal.status.as_str().to_string(),
         token_budget: app.goal.token_budget,
@@ -396,7 +394,7 @@ fn visible_goal_as_durable(
 fn desired_goal_state(
     app: &App,
     intent: &GoalControlIntent,
-) -> Result<Option<crate::session_manager::SessionGoalState>, String> {
+) -> Result<Option<codewhale_engine::session_manager::SessionGoalState>, String> {
     let mut base = if app.pending_goal_controls.is_empty() {
         match app.last_known_goal_state.clone() {
             Some(goal) => Some(goal),
@@ -416,26 +414,32 @@ fn desired_goal_state(
             let goal = base
                 .as_mut()
                 .ok_or_else(|| "No goal is available for this control.".to_string())?;
+            let was_active =
+                goal.status == codewhale_engine::session_manager::SessionGoalStatus::Active;
             goal.status = match status {
-                GoalStatus::Active => crate::session_manager::SessionGoalStatus::Active,
-                GoalStatus::Paused => crate::session_manager::SessionGoalStatus::Paused,
-                GoalStatus::Complete => crate::session_manager::SessionGoalStatus::Complete,
-                GoalStatus::Blocked => crate::session_manager::SessionGoalStatus::Blocked,
+                GoalStatus::Active => codewhale_engine::session_manager::SessionGoalStatus::Active,
+                GoalStatus::Paused => codewhale_engine::session_manager::SessionGoalStatus::Paused,
+                GoalStatus::Complete => {
+                    codewhale_engine::session_manager::SessionGoalStatus::Complete
+                }
+                GoalStatus::Blocked => {
+                    codewhale_engine::session_manager::SessionGoalStatus::Blocked
+                }
             };
-            if *status == GoalStatus::Active {
+            if *status == GoalStatus::Active && !was_active {
                 goal.goal_id = Some(uuid::Uuid::new_v4().to_string());
                 goal.last_gap_fingerprint = None;
                 goal.repeated_gap_count = 0;
                 goal.last_gap_pass = None;
             }
             goal.pause_reason = (*status == GoalStatus::Paused)
-                .then_some(crate::tools::goal::GoalPauseReason::User);
+                .then_some(codewhale_engine::tools::goal::GoalPauseReason::User);
             Ok(base)
         }
         GoalControlIntent::SetObjective {
             objective,
             token_budget,
-        } => crate::session_manager::SessionGoalState::from_runtime(&GoalSnapshot {
+        } => codewhale_engine::session_manager::SessionGoalState::from_runtime(&GoalSnapshot {
             goal_id: Some(uuid::Uuid::new_v4().to_string()),
             objective: Some(objective.clone()),
             status: GoalStatus::Active.as_str().to_string(),
@@ -449,17 +453,20 @@ fn desired_goal_state(
 
 fn persist_accepted_goal_state(
     app: &mut App,
-    desired: Option<&crate::session_manager::SessionGoalState>,
+    desired: Option<&codewhale_engine::session_manager::SessionGoalState>,
 ) -> Result<(), String> {
     let manager = SessionManager::default_location()
         .map_err(|error| format!("could not open the session store: {error}"))?;
     if app.current_session_id.is_none() {
         let session = build_session_snapshot(app, &manager)?;
         let session_id = session.metadata.id.clone();
-        if !persistence_actor::try_persist(PersistRequest::SaveCheckpoint { session }) {
+        if !super::session_state::try_persist_session(
+            app,
+            PersistRequest::SaveCheckpoint { session },
+        ) {
             return Err("the persistence worker is unavailable".to_string());
         }
-        app.current_session_id = Some(session_id);
+        app.set_current_session_id(Some(session_id));
     }
     let session_id = app
         .current_session_id
@@ -508,7 +515,7 @@ pub(crate) fn flush_pending_goal_controls(app: &mut App, engine_handle: &EngineH
 
 fn goal_control_matches(
     intent: &GoalControlIntent,
-    durable: Option<&crate::session_manager::SessionGoalState>,
+    durable: Option<&codewhale_engine::session_manager::SessionGoalState>,
 ) -> bool {
     match intent {
         GoalControlIntent::SetStatus { clear: true, .. } => durable.is_none(),
@@ -518,10 +525,18 @@ fn goal_control_matches(
         } => durable.is_some_and(|goal| {
             goal.status
                 == match status {
-                    GoalStatus::Active => crate::session_manager::SessionGoalStatus::Active,
-                    GoalStatus::Paused => crate::session_manager::SessionGoalStatus::Paused,
-                    GoalStatus::Complete => crate::session_manager::SessionGoalStatus::Complete,
-                    GoalStatus::Blocked => crate::session_manager::SessionGoalStatus::Blocked,
+                    GoalStatus::Active => {
+                        codewhale_engine::session_manager::SessionGoalStatus::Active
+                    }
+                    GoalStatus::Paused => {
+                        codewhale_engine::session_manager::SessionGoalStatus::Paused
+                    }
+                    GoalStatus::Complete => {
+                        codewhale_engine::session_manager::SessionGoalStatus::Complete
+                    }
+                    GoalStatus::Blocked => {
+                        codewhale_engine::session_manager::SessionGoalStatus::Blocked
+                    }
                 }
         }),
         GoalControlIntent::SetObjective {
@@ -529,7 +544,7 @@ fn goal_control_matches(
             token_budget,
         } => durable.is_some_and(|goal| {
             goal.objective == *objective
-                && goal.status == crate::session_manager::SessionGoalStatus::Active
+                && goal.status == codewhale_engine::session_manager::SessionGoalStatus::Active
                 && goal.token_budget == *token_budget
         }),
     }
@@ -555,7 +570,7 @@ fn accept_goal_control(app: &mut App, engine_handle: &EngineHandle, intent: Goal
             clear: false
         }
     ) {
-        crate::audit::log_sensitive_event(
+        codewhale_runtime::audit::log_sensitive_event(
             "goal.user_completed",
             serde_json::json!({ "accepted": true }),
         );
@@ -583,13 +598,14 @@ fn accept_goal_control(app: &mut App, engine_handle: &EngineHandle, intent: Goal
 }
 
 pub(crate) fn apply_goal_snapshot_to_app(app: &mut App, snapshot: &GoalSnapshot) -> bool {
-    let durable_goal = match crate::session_manager::SessionGoalState::from_runtime(snapshot) {
-        Ok(goal) => goal,
-        Err(error) => {
-            tracing::warn!("ignoring invalid runtime goal snapshot: {error}");
-            return false;
-        }
-    };
+    let durable_goal =
+        match codewhale_engine::session_manager::SessionGoalState::from_runtime(snapshot) {
+            Ok(goal) => goal,
+            Err(error) => {
+                tracing::warn!("ignoring invalid runtime goal snapshot: {error}");
+                return false;
+            }
+        };
     let pending_desired = app.last_known_goal_state.clone();
     let matched_pending = app.pending_goal_controls.front().is_some_and(|pending| {
         pending.dispatched
@@ -692,7 +708,8 @@ pub(crate) fn apply_goal_snapshot_to_app(app: &mut App, snapshot: &GoalSnapshot)
     // report the user is handed back with.
     if progress_changed
         && (verdict == GoalStatus::Active
-            || snapshot.pause_reason == Some(crate::tools::goal::GoalPauseReason::Yielded))
+            || snapshot.pause_reason
+                == Some(codewhale_engine::tools::goal::GoalPauseReason::Yielded))
         && let Some(progress) = snapshot.progress.as_ref()
     {
         let mut content = app
@@ -700,7 +717,7 @@ pub(crate) fn apply_goal_snapshot_to_app(app: &mut App, snapshot: &GoalSnapshot)
             .replace("{percent}", &progress.percent.to_string())
             .replace(
                 "{bar}",
-                &crate::tools::goal::goal_progress_bar(progress.percent),
+                &codewhale_engine::tools::goal::goal_progress_bar(progress.percent),
             );
         if let Some(now) = progress.now.as_deref() {
             content.push('\n');
@@ -801,7 +818,9 @@ pub(crate) async fn apply_yolo_compat_update(
 /// keepalive bound to this workspace. Burn rate is optional; default is
 /// unbounded.
 async fn present_operate_board(app: &mut App, config: &Config) {
-    let store = match crate::operate::OperationStore::open(crate::operate::default_operate_dir()) {
+    let store = match codewhale_engine::operate::OperationStore::open(
+        codewhale_engine::operate::default_operate_dir(),
+    ) {
         Ok(store) => store,
         Err(error) => {
             app.add_message(crate::tui::history::HistoryCell::System {
@@ -836,7 +855,11 @@ async fn present_operate_board(app: &mut App, config: &Config) {
     };
     let (lead_model, credentials) = {
         let manager = automations.lock().await;
-        match crate::operate::keepalive_readiness(&manager, config, Some((&identity, &model))) {
+        match codewhale_engine::operate::keepalive_readiness(
+            &manager,
+            config,
+            Some((&identity, &model)),
+        ) {
             Ok(credentials) => credentials,
             Err(error) => {
                 app.add_message(crate::tui::history::HistoryCell::System {
@@ -846,7 +869,7 @@ async fn present_operate_board(app: &mut App, config: &Config) {
             }
         }
     };
-    let operation = match crate::operate::attach_or_start_operation(
+    let operation = match codewhale_engine::operate::attach_or_start_operation(
         &store,
         &app.workspace,
         None,
@@ -881,7 +904,7 @@ async fn present_operate_board(app: &mut App, config: &Config) {
         .is_some_and(|plan| !plan.slices.is_empty());
     {
         let manager = automations.lock().await;
-        if let Err(error) = crate::operate::upsert_keepalive(
+        if let Err(error) = codewhale_engine::operate::upsert_keepalive(
             &manager,
             &app.workspace,
             needs_lead_plan,
@@ -894,13 +917,13 @@ async fn present_operate_board(app: &mut App, config: &Config) {
         }
     }
     app.add_message(crate::tui::history::HistoryCell::System {
-        content: crate::operate::render_plan_board_locale(&operation, app.ui_locale),
+        content: codewhale_engine::operate::render_plan_board_locale(&operation, app.ui_locale),
     });
 }
 
 pub(crate) async fn apply_model_and_compaction_update(
     engine_handle: &EngineHandle,
-    compaction: crate::compaction::CompactionConfig,
+    compaction: codewhale_engine::compaction::CompactionConfig,
     mode: AppMode,
     route_limits: Option<codewhale_config::route::RouteLimits>,
 ) {
@@ -930,10 +953,10 @@ pub(crate) async fn apply_model_picker_choice(
     engine_handle: &mut EngineHandle,
     config: &mut Config,
     model: String,
-    target_identity: Option<crate::config::ProviderIdentity>,
-    effort: crate::reasoning_preference::ReasoningEffort,
+    target_identity: Option<codewhale_runtime::config::ProviderIdentity>,
+    effort: codewhale_engine::reasoning_preference::ReasoningEffort,
     previous_model: String,
-    previous_effort: crate::reasoning_preference::ReasoningEffort,
+    previous_effort: codewhale_engine::reasoning_preference::ReasoningEffort,
     save_as_startup_default: bool,
 ) {
     if app.reject_setting_change_while_busy(
@@ -999,8 +1022,9 @@ pub(crate) async fn apply_model_picker_choice(
     let model_changed = model != previous_model || app.auto_model != model_is_auto;
     let mut resolved_model = model.clone();
     let mut route_base_url = config.active_route_base_url();
+    let mut resolved_budget = None;
     if !model_is_auto {
-        match crate::route_runtime::resolve_runtime_route_for_identity(
+        match codewhale_engine::route_runtime::resolve_runtime_route_for_identity(
             config,
             &current_identity,
             Some(&model),
@@ -1009,12 +1033,8 @@ pub(crate) async fn apply_model_picker_choice(
                 resolved_model = resolution.candidate.wire_model_id().as_str().to_string();
                 route_base_url = resolution.candidate.endpoint().base_url.clone();
                 if model_changed {
-                    app.set_active_context_window_override(config, &current_identity);
-                    app.set_active_route_resolution(
-                        route_base_url.clone(),
-                        resolution.candidate.limits(),
-                        resolution.context_window.source,
-                    );
+                    resolved_budget =
+                        Some((resolution.candidate.limits(), resolution.context_window));
                 }
             }
             Err(reason) => {
@@ -1023,25 +1043,33 @@ pub(crate) async fn apply_model_picker_choice(
                 return;
             }
         }
-    } else if model_changed {
-        app.set_active_context_window_override(config, &current_identity);
-        app.active_route_limits = app.context_window_override_limits();
-        app.active_route_base_url = route_base_url.clone();
-        app.active_context_window_source = app
-            .configured_context_window_for(&app.model)
-            .map(|resolution| resolution.source)
-            .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
     }
 
     let effective_effort = if model_is_auto {
         effort
     } else {
-        effort.normalize_for_route(app.api_provider, &route_base_url, &resolved_model)
+        effort.normalize_for_route_identity(
+            app.api_provider,
+            current_identity.key.as_str(),
+            &route_base_url,
+            &resolved_model,
+        )
     };
     let effort_changed = effort != previous_effort;
 
     if model_changed {
         app.set_model_selection(resolved_model.clone());
+        app.set_active_context_window_override(config, &current_identity);
+        if let Some((limits, context_window)) = resolved_budget {
+            app.set_active_route_resolution(route_base_url.clone(), limits, context_window);
+        } else {
+            app.active_route_limits = app.context_window_override_limits();
+            app.active_route_base_url = route_base_url.clone();
+            app.active_context_window_source = app.active_context_window.map_or(
+                codewhale_engine::route_runtime::ContextWindowSource::Fallback,
+                |window| window.source,
+            );
+        }
         let provider_identity = app.provider_identity_for_persistence().to_string();
         app.provider_models
             .insert(provider_identity.clone(), resolved_model.clone());
@@ -1241,7 +1269,7 @@ pub(crate) async fn apply_provider_fallback_switch(
     let resolved_endpoint = resolved_route.candidate.endpoint().base_url.clone();
     let next_config = resolved_route.config;
     let new_model = resolved_route.model;
-    let context_window_source = resolved_route.context_window.source;
+    let context_window = resolved_route.context_window;
 
     if let Err(err) = CodewhaleClient::from_candidate(&next_config, &resolved_route.candidate) {
         app.set_provider_identity_record(previous_identity);
@@ -1260,7 +1288,7 @@ pub(crate) async fn apply_provider_fallback_switch(
     *config = *next_config;
     app.refresh_notification_settings(config);
     app.set_provider_identity_record(target_identity.clone());
-    app.billing_presentation = crate::route_billing::for_route(config, &target_identity);
+    app.billing_presentation = codewhale_engine::route_billing::for_route(config, &target_identity);
 
     let new_base_url = resolved_endpoint;
     let new_endpoint = display_base_url_host(&new_base_url);
@@ -1272,7 +1300,7 @@ pub(crate) async fn apply_provider_fallback_switch(
     app.set_active_route_resolution(
         new_base_url.clone(),
         resolved_route.candidate.limits(),
-        context_window_source,
+        context_window,
     );
     app.update_model_compaction_budget();
     if cache_scope_changed {
@@ -1282,13 +1310,12 @@ pub(crate) async fn apply_provider_fallback_switch(
         app.session.last_completion_tokens = None;
     }
 
-    let _ = engine_handle.send(Op::Shutdown).await;
-    let engine_config = build_engine_config(app, config);
-    *engine_handle = spawn_tui_engine(engine_config, config);
+    replace_tui_engine(app, config, engine_handle).await;
 
     if !app.api_messages.is_empty() {
         let _ = engine_handle
             .send(Op::SyncSession {
+                control: app.session_sync_control(),
                 session_id: app.current_session_id.clone(),
                 messages: app.api_messages.as_ref().clone(),
                 system_prompt: app.system_prompt.clone(),
@@ -1349,7 +1376,7 @@ pub(super) fn reject_inline_inference_while_runtime_chat_owns_run(
 pub(crate) fn apply_notification_update(
     app: &mut App,
     config: &mut Config,
-    update: crate::config::NotificationConfigUpdate,
+    update: codewhale_config::notifications::NotificationConfigUpdate,
 ) -> Result<()> {
     let mut notifications = config.notifications_config();
     let setting = update.setting();
@@ -1366,54 +1393,104 @@ pub(crate) fn apply_notification_update(
     Ok(())
 }
 
+pub(super) enum ConversationRewind {
+    Command(codewhale_command_contract::facets::SessionSyncPayload),
+    Backtrack(usize),
+    FileRange(usize),
+}
+
 /// Roll back only this idle Engine conversation, then require a durability
 /// receipt before a retry can reach inference. A save failure leaves the
 /// acknowledged undo visible, reports the error, and sends no replacement turn.
-async fn apply_conversation_undo(
+pub(super) async fn apply_conversation_undo(
     app: &mut App,
     engine: &EngineHandle,
-    sync: codewhale_command_contract::facets::SessionSyncPayload,
-) -> Result<()> {
+    target: ConversationRewind,
+) -> Result<Option<anyhow::Error>> {
     anyhow::ensure!(
         !app.is_loading
             && !app.dispatch_in_flight
             && !app.remote_control.runtime_chat_blocks_local_dispatch(),
         "wait for the active turn to finish before undoing its conversation"
     );
-    let before = engine.get_session_snapshot().await?;
+    let control = codewhale_engine::core::ops::SessionControlId::new();
+    let captured_source = app.session_write_receipt.clone();
+    let captured_owner = app.session_write_owner.clone();
+    let backtrack = !matches!(target, ConversationRewind::Command(_));
+    let before = if backtrack {
+        let (tx, receive) = tokio::sync::oneshot::channel();
+        engine.try_send(Op::GetSessionSnapshot {
+            tx: Arc::new(std::sync::Mutex::new(Some(tx))),
+        })?;
+        receive.await?
+    } else {
+        engine.get_session_snapshot().await?
+    };
     let before_prompt =
-        crate::compaction::strip_compaction_summaries(before.system_prompt.as_ref());
+        codewhale_engine::compaction::strip_compaction_summaries(before.system_prompt.as_ref());
+    let changed = || {
+        app.tr(MessageId::ConversationChangedBeforeUndo)
+            .into_owned()
+    };
     anyhow::ensure!(
         app.current_session_id
             .as_deref()
             .is_none_or(|id| id == before.session_id)
-            && sync.session_id == app.current_session_id
-            && sync.workspace == before.workspace
-            && sync.model == before.model
+            && app.workspace == before.workspace
+            && app.model == before.model
             && before.mode == app.mode.as_setting()
-            && crate::compaction::strip_compaction_summaries(app.system_prompt.as_ref())
-                == before_prompt
-            && crate::compaction::strip_compaction_summaries(sync.system_prompt.as_ref())
+            && codewhale_engine::compaction::strip_compaction_summaries(app.system_prompt.as_ref())
                 == before_prompt
             && before.messages.as_slice() == app.api_messages.as_slice()
-            && sync.messages.len() < before.messages.len()
-            && before.messages.starts_with(&sync.messages),
+            && captured_owner
+                .as_ref()
+                .zip(before.source.as_ref())
+                .is_some_and(|(owner, source)| owner.matches_source(source)),
         "{}",
-        app.tr(MessageId::ConversationChangedBeforeUndo)
+        changed()
+    );
+    let (messages, backtrack_depth) = match target {
+        ConversationRewind::Command(sync) => {
+            anyhow::ensure!(
+                sync.session_id == app.current_session_id
+                    && sync.workspace == before.workspace
+                    && sync.model == before.model
+                    && codewhale_engine::compaction::strip_compaction_summaries(
+                        sync.system_prompt.as_ref()
+                    ) == before_prompt,
+                "{}",
+                changed()
+            );
+            (sync.messages, None)
+        }
+        ConversationRewind::Backtrack(depth) | ConversationRewind::FileRange(depth) => {
+            let cut =
+                backtrack_api_cut_index(app, depth).ok_or_else(|| anyhow::anyhow!(changed()))?;
+            (app.api_messages[..cut].to_vec(), Some(depth))
+        }
+    };
+    anyhow::ensure!(
+        messages.len() < before.messages.len() && before.messages.starts_with(&messages),
+        "{}",
+        changed()
     );
     let id = before.session_id.clone();
     // A live rewind retains the checkpoint already owned by these messages.
     // The Engine alone restores it and invalidates dependent caches.
     let expected =
-        crate::runtime_handoff::project_owned_messages_for_restore(sync.messages.clone());
+        codewhale_engine::runtime_handoff::project_owned_messages_for_restore(messages.clone());
     let (tx, receive) = tokio::sync::oneshot::channel();
-    engine
-        .send(Op::RewindConversation {
-            expected: Box::new(before),
-            messages: sync.messages,
-            tx,
-        })
-        .await?;
+    let rewind = Op::RewindConversation {
+        control: control.clone(),
+        expected: Box::new(before),
+        messages,
+        tx,
+    };
+    if backtrack {
+        engine.try_send(rewind)?;
+    } else {
+        engine.send(rewind).await?;
+    }
     // This receipt comes from the same Engine operation that compares and
     // installs history. A queued update between preflight and rewind refuses.
     let installed = receive.await?.ok_or_else(|| {
@@ -1423,46 +1500,185 @@ async fn apply_conversation_undo(
         )
     })?;
     anyhow::ensure!(
-        installed.session_id == id && installed.messages == expected,
+        installed.session_id == id
+            && installed.messages == expected
+            && installed.source.as_ref()
+                == Some(
+                    &codewhale_engine::core::ops::SessionSnapshotSource::control(control.clone())
+                ),
         "the Engine did not acknowledge the conversation rollback"
     );
-    while !app.history.is_empty() {
-        let last_is_user = matches!(app.history.last(), Some(HistoryCell::User { .. }));
-        app.pop_history();
-        if last_is_user {
-            break;
+    if let Some(depth) = backtrack_depth {
+        apply_backtrack(app, depth);
+    } else {
+        while !app.history.is_empty() {
+            let last_is_user = matches!(app.history.last(), Some(HistoryCell::User { .. }));
+            app.pop_history();
+            if last_is_user {
+                break;
+            }
         }
     }
+    app.session_write_owner =
+        Some(codewhale_engine::session_manager::SessionWriteOwner::Control(control));
+    app.session_write_receipt = captured_source;
     app.set_api_messages(Arc::new(installed.messages));
-    app.current_session_id = Some(id);
+    app.set_current_session_id(Some(id));
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
     app.exploring_entries.clear();
     app.ignored_tool_calls.clear();
+    app.bump_details_epoch();
     app.mark_history_updated();
-    let manager = tokio::task::spawn_blocking(SessionManager::default_location).await??;
-    let session = build_session_snapshot(app, &manager).map_err(anyhow::Error::msg)?;
-    // CompletedCommit supersedes an older queued checkpoint as well as its
-    // snapshot. A plain snapshot could let crash recovery revive the old turn.
+    let persistence = async {
+        let manager = tokio::task::spawn_blocking(SessionManager::default_location).await??;
+        let session = build_session_snapshot(app, &manager).map_err(anyhow::Error::msg)?;
+        let projection = saved_work_projection(app, &session);
+        anyhow::ensure!(
+            super::session_state::try_persist_session(
+                app,
+                PersistRequest::CompletedCommit { session }
+            ),
+            "the session persistence worker is unavailable"
+        );
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        anyhow::ensure!(
+            persistence_actor::try_persist(PersistRequest::FlushAndReport { reply }),
+            "could not request the session save receipt"
+        );
+        let report = receive.await?;
+        anyhow::ensure!(
+            report.failures.is_empty(),
+            "the session save failed: {:?}",
+            report.failures
+        );
+        publish_saved_work_projection(app, &projection)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    Ok(persistence.err())
+}
+
+pub(super) async fn apply_range_undo(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine: &EngineHandle,
+    config: &Config,
+    depth: usize,
+) -> Result<()> {
     anyhow::ensure!(
-        persistence_actor::try_persist(PersistRequest::CompletedCommit { session }),
-        "the session persistence worker is unavailable"
+        !app.is_loading
+            && !app.is_compacting
+            && !app.dispatch_in_flight
+            && !app.remote_control.runtime_chat_blocks_local_dispatch(),
+        "Wait for all active work in this workspace to finish; nothing was undone."
     );
-    let (reply, receive) = tokio::sync::oneshot::channel();
-    anyhow::ensure!(
-        persistence_actor::try_persist(PersistRequest::FlushAndReport { reply }),
-        "could not request the session save receipt"
-    );
-    let report = receive.await?;
-    anyhow::ensure!(
-        report.failures.is_empty(),
-        "the session save failed: {:?}",
-        report.failures
-    );
-    publish_pending_work_projection(app)
+    let restore_guard = app
+        .remote_control
+        .workspace_restore_guard(&app.workspace)
         .await
         .map_err(anyhow::Error::msg)?;
-    Ok(())
+    anyhow::ensure!(
+        engine.get_subagent_settlement().await?.is_settled(),
+        "Wait for delegated work to settle; nothing was undone."
+    );
+    anyhow::ensure!(
+        app.goal.objective.is_none()
+            || app.goal.status != codewhale_engine::tools::goal::GoalStatus::Active,
+        "Pause the active goal before undoing workspace files; nothing was undone."
+    );
+    if let Some(shells) = app.runtime_services.shell_manager.clone() {
+        let session_id = app.current_session_id.clone().unwrap_or_default();
+        let running = tokio::task::spawn_blocking(move || {
+            shells
+                .lock()
+                .map(|mut manager| {
+                    let running = manager.list_jobs().iter().any(|job| {
+                        job.status == codewhale_engine::tools::shell::ShellStatus::Running
+                    });
+                    running || manager.may_have_undelivered_completion_for_session(&session_id)
+                })
+                .map_err(|_| anyhow::anyhow!("Shell tracking is unavailable; nothing was undone."))
+        })
+        .await??;
+        anyhow::ensure!(
+            !running,
+            "Wait for background shell work and pending completion receipts to settle before undoing files; nothing was undone."
+        );
+    }
+    let cut = backtrack_api_cut_index(app, depth).ok_or_else(|| {
+        anyhow::anyhow!(
+            "The selected request no longer matches the conversation; nothing was undone."
+        )
+    })?;
+    let before = engine.get_session_snapshot().await?;
+    anyhow::ensure!(
+        before.messages == *app.api_messages
+            && before.workspace == app.workspace
+            && before.model == app.model
+            && before.mode == app.mode.as_setting()
+            && codewhale_engine::compaction::strip_compaction_summaries(
+                before.system_prompt.as_ref()
+            ) == codewhale_engine::compaction::strip_compaction_summaries(
+                app.system_prompt.as_ref()
+            )
+            && app.current_session_id.as_deref() == Some(before.session_id.as_str()),
+        "The conversation changed before undo; nothing was undone."
+    );
+    if app.view_stack.top_kind() == Some(ModalKind::LiveTranscript) {
+        app.view_stack.pop();
+    }
+    let progress = format!("Checking restore points for {} requests…", depth + 1);
+    app.status_message = Some(progress.clone());
+    app.push_status_toast_record(
+        StatusToast::new(progress, StatusToastLevel::Info, Some(4_000)).for_command_receipt(),
+    );
+    draw_app_frame_inner(terminal, app, config, false)?;
+    let input = commands::undo_range_input(app, cut)?;
+    let plan = tokio::task::spawn_blocking(move || commands::plan_undo_range(input)).await??;
+    anyhow::ensure!(
+        engine.get_session_snapshot().await? == before,
+        "The conversation changed during undo preparation; nothing was undone."
+    );
+    let progress = format!("Restoring workspace files for {} requests…", depth + 1);
+    app.status_message = Some(progress.clone());
+    app.push_status_toast_record(
+        StatusToast::new(progress, StatusToastLevel::Info, Some(4_000)).for_command_receipt(),
+    );
+    draw_app_frame_inner(terminal, app, config, false)?;
+    let (restored, _restore_guard) =
+        tokio::task::spawn_blocking(move || (commands::restore_undo_range(plan), restore_guard))
+            .await?;
+    let summary = restored?;
+    let progress = format!("Saving conversation rewind for {} requests…", depth + 1);
+    app.status_message = Some(progress.clone());
+    app.push_status_toast_record(
+        StatusToast::new(progress, StatusToastLevel::Info, Some(4_000)).for_command_receipt(),
+    );
+    let _ = draw_app_frame_inner(terminal, app, config, false);
+    match apply_conversation_undo(app, engine, ConversationRewind::FileRange(depth)).await {
+        Ok(None) => {
+            let message = format!("Undid {} request(s). {summary}", depth + 1);
+            app.add_message(HistoryCell::System {
+                content: message.clone(),
+            });
+            app.status_message = Some(message.clone());
+            app.push_status_toast_record(
+                StatusToast::new(message, StatusToastLevel::Success, Some(4_000))
+                    .for_command_receipt(),
+            );
+            app.needs_redraw = true;
+            Ok(())
+        }
+        Ok(Some(error)) => anyhow::bail!(
+            "{summary} Conversation rewound, but could not be saved: {error:#}. The pre-restore safety snapshot retains the former workspace files."
+        ),
+        Err(error) => anyhow::bail!(
+            "{summary} Conversation rewind failed: {error:#}. The original conversation and pre-restore safety snapshot retain recovery evidence."
+        ),
+    }
 }
 
 // The event loop awaits this dispatcher at several call sites. In debug
@@ -1557,20 +1773,24 @@ async fn apply_command_result_inner(
                         return Ok(false);
                     }
                 };
-                let fresh_config =
-                    match Config::load(app.config_path.clone(), app.config_profile.as_deref()) {
-                        Ok(config) => config,
-                        Err(err) => {
-                            crate::tui::ui::session_state::surface_session_load_failure(
-                                app,
-                                format!("Failed to load live config for session restore: {err}"),
-                            );
-                            return Ok(false);
-                        }
-                    };
+                let fresh_config = match codewhale_plugins::providers::load_config(
+                    app.config_path.clone(),
+                    app.config_profile.as_deref(),
+                ) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to load live config for session restore: {err}"),
+                        );
+                        return Ok(false);
+                    }
+                };
                 let resumed_id = session.metadata.id.clone();
-                let title = crate::session_manager::sanitize_session_title(&session.metadata.title);
-                crate::runtime_threads::prepare_canonical_sessions_root().await;
+                let title = codewhale_engine::session_manager::sanitize_session_title(
+                    &session.metadata.title,
+                );
+                codewhale_engine::runtime_threads::prepare_canonical_sessions_root().await;
                 let respawn = match apply_loaded_session_config_snapshot(
                     app,
                     config,
@@ -1592,8 +1812,7 @@ async fn apply_command_result_inner(
                 };
                 sync_runtime_workspace_state(task_manager, app.workspace.clone()).await;
                 if respawn {
-                    let _ = engine_handle.send(Op::Shutdown).await;
-                    *engine_handle = spawn_tui_engine(build_engine_config(app, config), config);
+                    replace_tui_engine(app, config, engine_handle).await;
                 } else {
                     let _ = engine_handle
                         .send(Op::SetModel {
@@ -1605,6 +1824,7 @@ async fn apply_command_result_inner(
                 }
                 let _ = engine_handle
                     .send(Op::SyncSession {
+                        control: app.session_sync_control(),
                         session_id: app.current_session_id.clone(),
                         messages: app.api_messages.as_ref().clone(),
                         system_prompt: app.system_prompt.clone(),
@@ -1702,8 +1922,7 @@ async fn apply_command_result_inner(
                 resolve_loaded_session_route(app, config);
                 app.update_model_compaction_budget();
                 if provider_changed || workspace_changed {
-                    let _ = engine_handle.send(Op::Shutdown).await;
-                    *engine_handle = spawn_tui_engine(build_engine_config(app, config), config);
+                    replace_tui_engine(app, config, engine_handle).await;
                 }
                 // SyncSession carries the conversation but not resolved route
                 // limits. Refresh the engine's model first so a loaded,
@@ -1718,6 +1937,7 @@ async fn apply_command_result_inner(
                     .await;
                 let _ = engine_handle
                     .send(Op::SyncSession {
+                        control: app.session_sync_control(),
                         session_id,
                         messages,
                         system_prompt,
@@ -1805,13 +2025,15 @@ async fn apply_command_result_inner(
             AppAction::PluginRegistryChanged => {
                 // Revoke a disabled or untrusted plugin's host code now, not at
                 // the next turn's rebuild.
-                crate::extension_host::plugins_changed(std::sync::Arc::clone(&app.plugin_registry));
+                codewhale_engine::extension_host::plugins_changed(std::sync::Arc::clone(
+                    &app.plugin_registry,
+                ));
                 let command_errors = crate::commands::user_registry::install_plugin_registry(
                     &app.workspace,
                     app.plugin_registry.as_ref(),
                 );
                 app.hooks = app.hooks.rebind(
-                    crate::hooks::HooksConfig::load_with_project_and_plugins(
+                    codewhale_engine::hooks::config::load_with_project_and_plugins(
                         config.hooks_config(),
                         &app.workspace,
                         Some(app.plugin_registry.as_ref()),
@@ -1829,11 +2051,11 @@ async fn apply_command_result_inner(
                         None,
                     );
                 }
-                let _ = engine_handle.send(Op::Shutdown).await;
-                *engine_handle = spawn_tui_engine(build_engine_config(app, config), config);
+                replace_tui_engine(app, config, engine_handle).await;
                 if !app.api_messages.is_empty() {
                     let _ = engine_handle
                         .send(Op::SyncSession {
+                            control: app.session_sync_control(),
                             session_id: app.current_session_id.clone(),
                             messages: app.api_messages.as_ref().clone(),
                             system_prompt: app.system_prompt.clone(),
@@ -1847,20 +2069,60 @@ async fn apply_command_result_inner(
             }
             AppAction::ConversationUndo {
                 sync,
+                restored_files,
                 retry_input,
                 edit_replacement,
             } => {
-                if let Err(error) = apply_conversation_undo(app, engine_handle, sync).await {
-                    // A refused `/edit` rollback has already consumed the
-                    // revision from the composer: hand it back, with edit mode
-                    // re-armed, so the user can retry instead of retyping.
-                    if edit_replacement && let Some(content) = retry_input {
-                        let restored = build_queued_message(app, content);
-                        restore_failed_immediate_submit(app, restored, &error);
-                        app.edit_in_progress = true;
+                let persistence_error = match apply_conversation_undo(
+                    app,
+                    engine_handle,
+                    ConversationRewind::Command(sync),
+                )
+                .await
+                {
+                    Ok(error) => error,
+                    Err(error) => {
+                        // A refused `/edit` rollback has already consumed the
+                        // revision from the composer: hand it back, with edit mode
+                        // re-armed, so the user can retry instead of retyping.
+                        if edit_replacement && let Some(content) = retry_input {
+                            let restored = build_queued_message(app, content);
+                            restore_failed_immediate_submit(app, restored, &error);
+                            app.edit_in_progress = true;
+                        }
+                        let message = if restored_files > 0 {
+                            format!(
+                                "Restored {restored_files} file changes. Conversation rollback failed: {error:#}"
+                            )
+                        } else {
+                            format!("Conversation rollback failed; retry was not sent: {error:#}")
+                        };
+                        app.push_status_toast(message, StatusToastLevel::Error, None);
+                        return Ok(false);
+                    }
+                };
+                if let Some(error) = persistence_error {
+                    let mut retry_note = "";
+                    let mut recovery = "";
+                    if let Some(message) = conversation_message {
+                        app.add_message(HistoryCell::System { content: message });
+                    }
+                    if let Some(content) = retry_input {
+                        retry_note = "; retry was not sent";
+                        if edit_replacement {
+                            let restored = build_queued_message(app, content);
+                            restore_failed_immediate_submit(app, restored, &error);
+                            app.edit_in_progress = false;
+                            recovery = " The replacement is in the composer.";
+                        } else {
+                            app.add_message(HistoryCell::System {
+                                content: format!("Retry prompt was not sent. Copy it from here to retry:\n{content}"),
+                            });
+                            recovery = " The retry prompt is in the conversation above; copy it before leaving this session.";
+                        }
                     }
                     app.push_status_toast(
-                        format!("Conversation rollback failed; retry was not sent: {error:#}"),
+                        format!("Conversation was rewound, but its save or Work update needs attention{retry_note}: {error:#}.{recovery}"),
                         StatusToastLevel::Error,
                         None,
                     );
@@ -1889,14 +2151,14 @@ async fn apply_command_result_inner(
                 name,
                 input,
             } => {
-                use crate::extension_host::command::CommandOutcome;
+                use codewhale_engine::extension_host::command::CommandOutcome;
                 // The origin labels the output: it is the plugin's text, not
                 // Codewhale's.
                 let origin = command.origin.clone();
                 app.status_message = Some(format!("Running /{name} ({origin})..."));
                 // Awaited here like `/balance`; the call is bounded by its
                 // deadline and cancelled in the host when it expires.
-                match crate::extension_host::run_command_for_plugins(
+                match codewhale_engine::extension_host::run_command_for_plugins(
                     &command,
                     &input,
                     app.current_session_id.as_deref(),
@@ -1921,7 +2183,16 @@ async fn apply_command_result_inner(
                             content.push_str(&format!("\n{note}"));
                         }
                         app.add_message(HistoryCell::System { content });
-                        let queued = build_queued_message(app, prompt);
+                        let Some(session_id) = app.current_session_id.clone() else {
+                            app.add_message(HistoryCell::System {
+                                content:
+                                    "Extension command prompt was not submitted: no active session"
+                                        .into(),
+                            });
+                            return Ok(false);
+                        };
+                        let mut queued = QueuedMessage::new(prompt, None);
+                        queued.extension_command = Some((command, session_id));
                         dispatch_composer_message(
                             app,
                             config,
@@ -2092,7 +2363,7 @@ async fn apply_command_result_inner(
             }
             AppAction::FetchBalance => {
                 let provider = app.api_provider;
-                if !crate::config::provider_has_balance_api(provider) {
+                if !codewhale_runtime::config::provider_has_balance_api(provider) {
                     app.add_message(HistoryCell::System {
                         content: format!(
                             "Balance check is not supported for {} yet. Check the provider dashboard for account balance details.",
@@ -2111,7 +2382,7 @@ async fn apply_command_result_inner(
                     } else {
                         let base_url = config.active_route_base_url();
                         match fetch_provider_balance(provider, &api_key, &base_url).await {
-                            Some(info) => {
+                            Ok(info) => {
                                 if let Ok(mut guard) =
                                     balance_cell_for_route(app, provider, &api_key, &base_url)
                                         .lock()
@@ -2123,7 +2394,7 @@ async fn apply_command_result_inner(
                                     content: info.report(provider.provider().display_name()),
                                 });
                             }
-                            None => {
+                            Err(reason) => {
                                 let fallback = app
                                     .balance_cell
                                     .lock()
@@ -2132,7 +2403,7 @@ async fn apply_command_result_inner(
                                     .and_then(|info| {
                                         info.chip_label().map(|amount| {
                                             format!(
-                                                "Could not refresh {} balance; last known: {amount}",
+                                                "Could not refresh {} balance ({reason}); last known: {amount}",
                                                 provider.provider().display_name()
                                             )
                                         })
@@ -2140,7 +2411,7 @@ async fn apply_command_result_inner(
                                 app.add_message(HistoryCell::System {
                                     content: fallback.unwrap_or_else(|| {
                                         format!(
-                                            "Could not fetch {} account balance. Check the provider dashboard.",
+                                            "Could not fetch {} account balance ({reason}). Check the provider dashboard.",
                                             provider.provider().display_name()
                                         )
                                     }),
@@ -2160,7 +2431,7 @@ async fn apply_command_result_inner(
                                 app.provider_identity_for_persistence(),
                                 &app.model,
                                 &models,
-                                &crate::fleet::members::fleet_models(&app.workspace),
+                                &codewhale_engine::fleet::members::fleet_models(&app.workspace),
                             ),
                         });
                         app.status_message = Some(format!("Found {} model(s)", models.len()));
@@ -2185,9 +2456,9 @@ async fn apply_command_result_inner(
             }
             AppAction::RefreshModelsDevCatalog => {
                 app.status_message = Some("Refreshing Models.dev catalog...".to_string());
-                let message = match crate::models_dev_live::refresh(true).await {
+                let message = match codewhale_engine::models_dev_live::refresh(true).await {
                     Ok(count) => {
-                        let status = crate::models_dev_live::status();
+                        let status = codewhale_engine::models_dev_live::status();
                         let source = if status.source_label.is_empty() {
                             "unknown"
                         } else {
@@ -2199,7 +2470,7 @@ async fn apply_command_result_inner(
                         )
                     }
                     Err(err) => {
-                        let status = crate::models_dev_live::status();
+                        let status = codewhale_engine::models_dev_live::status();
                         format!(
                             "Models.dev refresh failed ({err}); keeping prior/bundled rows ({} offerings, {:?})",
                             status.offering_count, status.freshness
@@ -2282,6 +2553,19 @@ async fn apply_command_result_inner(
                         return Ok(false);
                     }
                 };
+                if model.is_none()
+                    && identity.provider == ProviderKind::Ollama
+                    && identity.key.as_str() == "ollama"
+                    && app.api_provider == ProviderKind::Ollama
+                    && matches!(
+                        codewhale_runtime::config::resolve_credential_source(config, &identity)
+                            .source,
+                        codewhale_runtime::credentials::CredentialSource::KeylessRoute { .. }
+                    )
+                    && app.start_local_ollama_probe(config, true)
+                {
+                    return Ok(false);
+                }
                 switch_provider(app, engine_handle, config, identity, model).await;
                 let api_key = config.active_route_api_key().unwrap_or_default();
                 let base_url = config.active_route_base_url();
@@ -2418,11 +2702,70 @@ async fn apply_command_result_inner(
             AppAction::OpenWorktreeManager => {
                 if app.view_stack.top_kind() != Some(ModalKind::WorktreeManager) {
                     // Non-blocking: git_status caches; manager never shells on paint.
-                    crate::git_status::refresh_if_stale(&app.workspace);
+                    codewhale_engine::git_status::refresh_if_stale(&app.workspace);
                     app.view_stack
                         .push(crate::tui::worktree_manager::WorktreeManagerView::new(
                             app.workspace.clone(),
                         ));
+                }
+            }
+            AppAction::UndoLatestRequest { force } => {
+                if !app
+                    .history
+                    .iter()
+                    .any(|cell| matches!(cell, HistoryCell::User { .. }))
+                {
+                    app.status_message = Some("Nothing to undo".to_string());
+                    app.push_status_toast_record(
+                        StatusToast::new("Nothing to undo", StatusToastLevel::Info, Some(4_000))
+                            .for_command_receipt(),
+                    );
+                } else {
+                    match apply_range_undo(terminal, app, engine_handle, config, 0).await {
+                        Ok(()) => app.clear_input(),
+                        Err(error) => {
+                            let force_note = if force {
+                                " Force cannot replace missing request identity or restore receipts; use /restore for an explicit file restore."
+                            } else {
+                                ""
+                            };
+                            let message = format!("Undo failed: {error:#}{force_note}");
+                            app.add_message(HistoryCell::System {
+                                content: message.clone(),
+                            });
+                            app.push_status_toast(message, StatusToastLevel::Error, None);
+                        }
+                    }
+                }
+            }
+            AppAction::OpenUndoSelector => {
+                let total = app
+                    .history
+                    .iter()
+                    .filter(|cell| matches!(cell, HistoryCell::User { .. }))
+                    .count();
+                if total == 0 {
+                    app.status_message = Some("Nothing to undo".to_string());
+                    app.push_status_toast_record(
+                        StatusToast::new("Nothing to undo", StatusToastLevel::Info, Some(4_000))
+                            .for_command_receipt(),
+                    );
+                } else if app.is_loading
+                    || app.is_compacting
+                    || app.dispatch_in_flight
+                    || app.remote_control.runtime_chat_blocks_local_dispatch()
+                {
+                    app.push_status_toast(
+                        "Wait for the active turn to finish before undoing files.",
+                        StatusToastLevel::Error,
+                        None,
+                    );
+                } else {
+                    app.backtrack.phase = crate::tui::backtrack::BacktrackPhase::Selecting {
+                        selected_idx: 0,
+                        total,
+                    };
+                    open_undo_overlay(app);
                 }
             }
             AppAction::OpenModelPicker => {
@@ -2477,13 +2820,13 @@ async fn apply_command_result_inner(
                     run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
             }
             AppAction::StartClaudeLogin => {
-                let _ = run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
+                app.pending_claude_login = Some(false);
             }
             AppAction::StartClaudeRevoke => {
                 let path = app.config_path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::oauth::revoke_owned_login(
-                        crate::oauth::OAuthProvider::Claude,
+                    codewhale_runtime::oauth::revoke_owned_login(
+                        codewhale_runtime::oauth::OAuthProvider::Claude,
                         path.as_deref(),
                         None,
                     )
@@ -2667,7 +3010,7 @@ async fn apply_command_result_inner(
                     .or_else(|| fleet_catalog_rejection(locale, &provider, &model));
                 let content = match rejection {
                     Some(rejection) => rejection,
-                    None => match crate::fleet::members::add_fleet_model(
+                    None => match codewhale_engine::fleet::members::add_fleet_model(
                         &app.workspace,
                         &provider,
                         &model,
@@ -2676,11 +3019,11 @@ async fn apply_command_result_inner(
                         Ok(change) => {
                             if !matches!(
                                 change,
-                                crate::fleet::members::FleetModelChange::Unchanged { .. }
+                                codewhale_engine::fleet::members::FleetModelChange::Unchanged { .. }
                             ) {
                                 app.fleet_roster_stale = true;
                             }
-                            crate::fleet::members::change_receipt(
+                            codewhale_engine::fleet::members::change_receipt(
                                 locale, &provider, &model, &change,
                             )
                         }
@@ -2692,14 +3035,16 @@ async fn apply_command_result_inner(
             }
             AppAction::FleetRemoveModel { provider, model } => {
                 let locale = app.ui_locale;
-                let content = match crate::fleet::members::remove_fleet_model(
+                let content = match codewhale_engine::fleet::members::remove_fleet_model(
                     &app.workspace,
                     &provider,
                     &model,
                 ) {
                     Ok(change) => {
                         app.fleet_roster_stale = true;
-                        crate::fleet::members::change_receipt(locale, &provider, &model, &change)
+                        codewhale_engine::fleet::members::change_receipt(
+                            locale, &provider, &model, &change,
+                        )
                     }
                     Err(error) => tr(locale, MessageId::FleetRemoveFailed)
                         .replace("{error}", &error.message(locale)),
@@ -2731,7 +3076,7 @@ async fn apply_command_result_inner(
             AppAction::OpenConstitutionManager { review } => {
                 let profile = config.account_profile.clone();
                 let account = tokio::task::spawn_blocking(move || {
-                    crate::profile_constitution::account_is_present(profile.as_deref())
+                    codewhale_engine::profile_constitution::account_is_present(profile.as_deref())
                         .map_err(|error| error.to_string())
                 })
                 .await
@@ -2779,8 +3124,9 @@ async fn apply_command_result_inner(
                     .current_session_id
                     .clone()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                app.current_session_id = Some(owner_session_id.clone());
+                app.set_current_session_id(Some(owner_session_id.clone()));
                 let request = NewTaskRequest {
+                    destination_thread_id: None,
                     prompt: prompt.clone(),
                     name: None,
                     model: Some(app.model.clone()),
@@ -2795,7 +3141,8 @@ async fn apply_command_result_inner(
                     // the posture this session is in, not under whatever a
                     // legacy bit happens to mean today.
                     permission_posture: Some(
-                        crate::runtime_policy::approval_wire(app.approval_mode).to_string(),
+                        codewhale_runtime::runtime_policy::approval_wire(app.approval_mode)
+                            .to_string(),
                     ),
                     owner_session_id: Some(owner_session_id),
                 };
@@ -2913,7 +3260,11 @@ async fn apply_command_result_inner(
             }
             AppAction::SwitchProfile { profile } => {
                 let previous_profile = app.config_profile.clone();
-                match Config::load(app.config_path.clone(), Some(&profile)).and_then(|new_config| {
+                match codewhale_plugins::providers::load_config(
+                    app.config_path.clone(),
+                    Some(&profile),
+                )
+                .and_then(|new_config| {
                     validated_profile_default_route(&new_config)
                         .map(|validated_route| (new_config, validated_route))
                 }) {
@@ -2926,14 +3277,13 @@ async fn apply_command_result_inner(
                             new_config,
                             &validated_route,
                         );
-                        crate::config::initialize_cloud_facts(config);
+                        codewhale_runtime::config::initialize_cloud_facts(config);
                         // Rebuild the engine with the new config so API key/model/base URL take effect.
-                        let _ = engine_handle.send(Op::Shutdown).await;
-                        let engine_config = build_engine_config(app, config);
-                        *engine_handle = spawn_tui_engine(engine_config, config);
+                        replace_tui_engine(app, config, engine_handle).await;
                         if !app.api_messages.is_empty() {
                             let _ = engine_handle
                                 .send(Op::SyncSession {
+                                    control: app.session_sync_control(),
                                     session_id: app.current_session_id.clone(),
                                     messages: app.api_messages.as_ref().clone(),
                                     system_prompt: app.system_prompt.clone(),
@@ -2990,20 +3340,20 @@ fn apply_validated_profile_config(
     config: &mut Config,
     profile: &str,
     next_config: Config,
-    route: &crate::route_runtime::ValidatedRuntimeRoute,
+    route: &codewhale_engine::route_runtime::ValidatedRuntimeRoute,
 ) {
     *config = next_config;
     app.config_profile = Some(profile.to_string());
     app.configured_models = config.custom_models.clone().unwrap_or_default();
     app.refresh_notification_settings(config);
     app.set_provider_identity_record(route.identity.clone());
-    app.billing_presentation = crate::route_billing::for_route(config, &route.identity);
+    app.billing_presentation = codewhale_engine::route_billing::for_route(config, &route.identity);
     app.set_model_selection(route.model.clone());
     app.set_active_context_window_override(config, &route.identity);
     app.set_active_route_resolution(
         route.candidate.endpoint().base_url.clone(),
         route.candidate.limits(),
-        route.context_window.source,
+        route.context_window,
     );
     app.update_model_compaction_budget();
     app.session.last_prompt_tokens = None;
@@ -3022,7 +3372,7 @@ fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config
     let path = app.workspace.join(".codewhale").join("hooks.toml");
     // A link in `.codewhale` or at hooks.toml is never created through, and the
     // editor is not pointed at one: the file must really live in the workspace.
-    if let Err(error) = crate::fleet::files::reject_linked_path(&app.workspace, &path) {
+    if let Err(error) = codewhale_util::files::reject_linked_path(&app.workspace, &path) {
         app.push_status_toast(
             format!("Could not use {}: {error}", path.display()),
             StatusToastLevel::Warning,
@@ -3031,10 +3381,10 @@ fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config
         return;
     }
     if !path.exists()
-        && let Err(error) = crate::fs_confined::write(
+        && let Err(error) = codewhale_util::fs_confined::write(
             &app.workspace,
             &path,
-            crate::hooks::PROJECT_HOOKS_TEMPLATE.as_bytes(),
+            codewhale_engine::hooks::PROJECT_HOOKS_TEMPLATE.as_bytes(),
         )
     {
         app.push_status_toast(
@@ -3059,7 +3409,7 @@ fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config
     match outcome {
         Ok(crate::tui::external_editor::EditorOutcome::Edited(_)) => {
             app.hooks = app.hooks.rebind(
-                crate::hooks::HooksConfig::load_with_project_and_plugins(
+                codewhale_engine::hooks::config::load_with_project_and_plugins(
                     config.hooks_config(),
                     &app.workspace,
                     Some(app.plugin_registry.as_ref()),
@@ -3076,7 +3426,7 @@ fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config
             // Project hooks are executable repository configuration; an
             // untrusted workspace parses them and then ignores them, which is
             // a silent no-op unless it is said out loud.
-            if !crate::hooks::workspace_allows_project_hooks(&app.workspace) {
+            if !codewhale_engine::hooks::workspace_allows_project_hooks(&app.workspace) {
                 content.push_str(
                     " Project hooks are not approved for these exact contents. Use /hooks review, \
                      then /hooks approve <digest> after reviewing the commands.",
@@ -3130,7 +3480,7 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
         .diagnostics()
         .iter()
         .filter(|diagnostic| {
-            diagnostic.level == crate::plugins::types::PluginDiagnosticLevel::Error
+            diagnostic.level == codewhale_plugins::types::PluginDiagnosticLevel::Error
         })
         .count();
     if plugin_load_errors > 0 {
@@ -3145,7 +3495,7 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
     // Switching workspace reloads the hook set (project hooks are per-repo)
     // but stays inside the same TUI session, so the session id is preserved.
     app.hooks = app.hooks.rebind(
-        crate::hooks::HooksConfig::load_with_project_and_plugins(
+        codewhale_engine::hooks::config::load_with_project_and_plugins(
             config.hooks_config(),
             &workspace,
             Some(app.plugin_registry.as_ref()),
@@ -3153,8 +3503,7 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
         workspace.clone(),
     );
     app.skills_dir = crate::tui::app::resolve_skills_dir(&workspace, &config.skills_dir(), config);
-    app.skills_discovery_mode =
-        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
+    app.skills_config = std::sync::Arc::new(config.skills_config());
     app.project_context_pack_enabled = config.project_context_pack_enabled();
     app.refresh_skill_cache();
     app.workspace_context = None;
@@ -3165,7 +3514,7 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
     app.workspace_context_refreshed_at = None;
     app.file_tree = None;
 
-    let shell_manager = crate::tools::shell::new_shared_shell_manager(workspace);
+    let shell_manager = codewhale_engine::tools::shell::new_shared_shell_manager(workspace);
     app.runtime_services.shell_manager = Some(shell_manager);
     app.runtime_services.hook_executor = Some(std::sync::Arc::new(app.hooks.clone()));
 }
@@ -3175,8 +3524,10 @@ pub(crate) fn apply_hotbar_setup_saved(
     config: &mut Config,
     bindings: Vec<codewhale_config::HotbarBindingToml>,
 ) {
-    match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &bindings)
-    {
+    match codewhale_runtime::config_persistence::persist_hotbar_bindings(
+        app.config_path.as_deref(),
+        &bindings,
+    ) {
         Ok(path) => {
             config.hotbar = Some(bindings);
             app.status_message = Some(format!("Hotbar bindings saved to {}", path.display()));
@@ -3213,7 +3564,7 @@ pub(crate) fn settle_pending_human_requests(app: &mut App) {
     // A completed/cancelled parent turn cannot still await an approval.
     // Children own their separate lifecycle and may legitimately remain live.
     for id in app.view_stack.tool_decision_request_ids() {
-        if !crate::tools::subagent::SubAgentManager::is_child_approval_id(&id) {
+        if !codewhale_engine::tools::subagent::SubAgentManager::is_child_approval_id(&id) {
             crate::tui::pending_requests::retire(app, &id);
             app.retire_action_notices(Some(&id));
         }
@@ -3225,6 +3576,9 @@ pub(crate) fn settle_pending_human_requests(app: &mut App) {
 /// completion cannot settle a different, inner request id.
 pub(crate) fn observe_human_request_settlement(app: &mut App, event: &EngineEvent) {
     match event {
+        EngineEvent::UserInputClosed { id, .. } => {
+            settle_user_input_request(app, id);
+        }
         EngineEvent::ToolCallComplete { id, .. } => {
             settle_user_input_request(app, id);
             crate::tui::pending_requests::retire(app, id);
@@ -3239,6 +3593,7 @@ pub(crate) fn observe_human_request_settlement(app: &mut App, event: &EngineEven
 }
 
 pub(crate) fn note_human_decision_delivered(app: &mut App, tool_id: &str) {
+    crate::tui::tool_routing::start_exec_card(app, tool_id);
     if (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
         && !app.suppress_stream_events_until_turn_complete
         && !crate::tui::pending_requests::is_foreign_child_request(app, tool_id)
@@ -3264,7 +3619,8 @@ pub(crate) fn apply_user_input_submission_result(app: &mut App, tool_id: &str, r
                 .filter(|(id, _)| id == tool_id)
                 .cloned()
             {
-                app.view_stack.push(UserInputView::new(id, request));
+                app.view_stack
+                    .push(UserInputView::new(id, request, app.ui_locale));
             }
             app.push_status_toast_record(
                 StatusToast::new(
@@ -3291,7 +3647,7 @@ pub(crate) async fn apply_approval_decision(
         // tool — approving one shell command must not approve every shell
         // command for the session (ops R2). The tool name is recorded as
         // audit evidence, not as a grant.
-        crate::audit::log_sensitive_event(
+        codewhale_runtime::audit::log_sensitive_event(
             "tool.approval.session_grant",
             serde_json::json!({
                 "tool_name": event.tool_name,
@@ -3320,7 +3676,9 @@ pub(crate) async fn apply_approval_decision(
     match event.decision {
         // A child's card never stops the parent's turn (approvals C1).
         ReviewDecision::Abort
-            if crate::tools::subagent::SubAgentManager::is_child_approval_id(&event.tool_id) => {}
+            if codewhale_engine::tools::subagent::SubAgentManager::is_child_approval_id(
+                &event.tool_id,
+            ) => {}
         ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
             // Mirror mode: clear the shared-approval gate so a late web
             // decision acks "no longer pending" instead of double-answering.
@@ -3406,7 +3764,7 @@ pub(crate) fn apply_setup_runtime_preset(
     // this save nor be reverted by the rollback.
     // Every durable write happens inside this closure, so the settings lock is
     // released before live state moves below.
-    crate::settings::with_settings_transaction(|settings_transaction| {
+    codewhale_runtime::settings::with_settings_transaction(|settings_transaction| {
         let mut settings = settings_transaction
             .load()
             .context("failed to load settings")?;
@@ -3417,38 +3775,41 @@ pub(crate) fn apply_setup_runtime_preset(
         // explicit env target remains authoritative for both reads and writes;
         // an invalid target fails here instead of selecting a different file.
         let selected_config_path =
-            crate::config::resolve_load_config_path(app.config_path.clone())?
+            codewhale_runtime::config::resolve_load_config_path(app.config_path.clone())?
                 .or_else(|| app.config_path.clone());
-        let config_path =
-            crate::config_persistence::config_toml_path(selected_config_path.as_deref())
-                .context("failed to resolve config path")?;
+        let config_path = codewhale_runtime::config_persistence::config_toml_path(
+            selected_config_path.as_deref(),
+        )
+        .context("failed to resolve config path")?;
         let config_snapshot = RuntimePresetFileSnapshot::capture(config_path.clone())?;
-        if let Err(error) =
-            crate::config_persistence::mutate_config_document(&config_path, |document| {
+        if let Err(error) = codewhale_runtime::config_persistence::mutate_config_document(
+            &config_path,
+            |document| {
                 if let Some(policy) = preset.approval_policy() {
-                    crate::config_persistence::set_document_value(
+                    codewhale_runtime::config_persistence::set_document_value(
                         document,
                         &["approval_policy"],
                         policy,
                     )?;
                 } else {
-                    crate::config_persistence::unset_document_value(
+                    codewhale_runtime::config_persistence::unset_document_value(
                         document,
                         &["approval_policy"],
                     )?;
                 }
-                crate::config_persistence::set_document_value(
+                codewhale_runtime::config_persistence::set_document_value(
                     document,
                     &["allow_shell"],
                     preset.allow_shell(),
                 )?;
-                crate::config_persistence::set_document_value(
+                codewhale_runtime::config_persistence::set_document_value(
                     document,
                     &["sandbox_mode"],
                     preset.sandbox_mode(),
                 )
-            })
-            .context("failed to persist runtime posture")
+            },
+        )
+        .context("failed to persist runtime posture")
         {
             return Err(runtime_preset_error_with_rollback(
                 error,
@@ -3527,18 +3888,6 @@ pub(crate) fn apply_backtrack(app: &mut App, depth: usize) {
     // `App::truncate_history_to`.
     app.truncate_history_to(history_idx);
 
-    // Trim the API-message log at the matching user PROMPT. `depth` counts
-    // visible `HistoryCell::User` cells (real prompts), but a naive
-    // `role == "user"` walk over `api_messages` over-counts: tool results are
-    // stored as `role == "user"` messages too, so in any turn with tool calls
-    // the cut would land mid-turn on a tool_result — leaving a dangling
-    // assistant tool_use with no matching result and a transcript the provider
-    // rejects. Count only messages that actually yield a User cell, the same
-    // predicate `apply_loaded_session` uses.
-    if let Some(idx) = backtrack_api_cut_index(&app.api_messages, depth) {
-        app.truncate_api_messages(idx);
-    }
-
     // Hand the dropped text back to the user so they can edit + resend.
     app.input = user_text;
     app.cursor_position = app.input.chars().count();
@@ -3548,9 +3897,8 @@ pub(crate) fn apply_backtrack(app: &mut App, depth: usize) {
         app.view_stack.pop();
     }
     // Backtrack rewinds the conversation only. State the file fact first,
-    // and name the command that puts the files back.
-    app.status_message =
-        Some("Files not changed. /undo puts them back. Conversation rewound.".to_string());
+    // and name the command that rolls the files back.
+    app.status_message = Some("Files not changed. Use /restore. Conversation rewound.".to_string());
     app.scroll_to_bottom();
     app.mark_history_updated();
     app.needs_redraw = true;
@@ -3565,7 +3913,7 @@ pub(crate) async fn apply_provider_picker_custom_provider(
     model: Option<String>,
     api_key_env: Option<String>,
 ) -> bool {
-    let written = match crate::config_persistence::persist_custom_provider(
+    let written = match codewhale_runtime::config_persistence::persist_custom_provider(
         app.config_path.as_deref(),
         &provider_id,
         &base_url,
@@ -3591,7 +3939,7 @@ pub(crate) async fn apply_provider_picker_custom_provider(
         .or_default();
     entry.kind = Some("openai-compatible".to_string());
     entry.base_url = Some(base_url.trim().trim_end_matches('/').to_string());
-    if provider_id == "ds4" && crate::config::base_url_uses_local_host(&base_url) {
+    if provider_id == "ds4" && codewhale_runtime::config::base_url_uses_local_host(&base_url) {
         entry.context_window = Some(100_000);
     }
     entry.model = model.clone().and_then(|value| {
@@ -3602,7 +3950,7 @@ pub(crate) async fn apply_provider_picker_custom_provider(
         && api_key_env
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
-        && crate::config::base_url_uses_local_host(&base_url);
+        && codewhale_runtime::config::base_url_uses_local_host(&base_url);
     entry.api_key_env = api_key_env.and_then(|value| {
         let value = value.trim().to_string();
         (!value.is_empty()).then_some(value)
@@ -3660,7 +4008,7 @@ pub(crate) async fn apply_provider_picker_test_connection(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    identity: crate::config::ProviderIdentity,
+    identity: codewhale_runtime::config::ProviderIdentity,
     catalog_view: bool,
 ) {
     apply_provider_picker_test_connection_with_verifier(
@@ -3678,7 +4026,7 @@ pub(crate) async fn apply_provider_picker_test_connection(
 /// step, in place of the provider's raw reply (#6566). Only a failure with no
 /// plain reading keeps a sanitized, bounded excerpt of that reply.
 fn plain_key_verification_error(app: &App, reason: &str, api_key: &str) -> String {
-    use crate::error_taxonomy::ErrorCategory;
+    use codewhale_error_taxonomy::ErrorCategory;
     match provider_verification_error_category(reason) {
         ErrorCategory::Authentication => app.tr(MessageId::ProviderKeyRejected).into_owned(),
         ErrorCategory::Authorization => app.tr(MessageId::ProviderKeyForbidden).into_owned(),
@@ -3697,20 +4045,20 @@ fn sanitize_probe_status(reason: &str, api_key: &str) -> String {
         && let Some((code, body)) = rest.split_once(':')
         && let Ok(status) = code.trim().parse::<u16>()
     {
-        text = crate::llm_client::sanitize_http_error_body(None, status, body.trim());
+        text = codewhale_engine::llm_client::sanitize_http_error_body(None, status, body.trim());
     }
     let secret = api_key.trim();
     if !secret.is_empty() {
         text = text.replace(secret, "***");
     }
-    crate::utils::truncate_with_ellipsis(text.trim(), 120, "…")
+    codewhale_util::utils::truncate_with_ellipsis(text.trim(), 120, "…")
 }
 
 pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    identity: crate::config::ProviderIdentity,
+    identity: codewhale_runtime::config::ProviderIdentity,
     catalog_view: bool,
     verifier: &dyn ProviderKeyVerifier,
 ) {
@@ -3725,7 +4073,10 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
         return;
     }
     let selected_id = Some(identity.key.to_string());
-    if !crate::client::provider_api_key_verification_is_observed(provider) {
+    let base_url = scoped_config.active_route_base_url();
+    if !codewhale_engine::client::provider_api_key_verification_is_observed_for_route(
+        provider, &base_url,
+    ) {
         app.push_status_toast(
             app.tr(MessageId::ProviderTestConnectionNoEndpoint)
                 .replace("{provider}", identity.key.as_str()),
@@ -3749,7 +4100,6 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
             return;
         }
     };
-    let base_url = scoped_config.active_route_base_url();
     let model = scoped_config.default_model();
     let outcome = verifier.verify(provider, &api_key, &base_url).await;
     if let Err(reason) = config.verify_provider_identity(&identity) {
@@ -3763,7 +4113,7 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
                 &scoped_config,
                 &identity,
                 &model,
-                crate::route_receipt::CredentialGeneration::derive(
+                codewhale_config::credentials::CredentialGeneration::derive(
                     &base_url,
                     &codewhale_secrets::normalize_api_key(&api_key),
                 ),
@@ -3780,7 +4130,7 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
                 &scoped_config,
                 &identity,
                 &model,
-                crate::route_receipt::CredentialGeneration::derive(
+                codewhale_config::credentials::CredentialGeneration::derive(
                     &base_url,
                     &codewhale_secrets::normalize_api_key(&api_key),
                 ),
@@ -3803,7 +4153,7 @@ pub(crate) async fn apply_provider_picker_api_key(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    identity: crate::config::ProviderIdentity,
+    identity: codewhale_runtime::config::ProviderIdentity,
     api_key: String,
     base_url: Option<String>,
 ) {
@@ -3823,7 +4173,7 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    identity: crate::config::ProviderIdentity,
+    identity: codewhale_runtime::config::ProviderIdentity,
     api_key: String,
     base_url_override: Option<String>,
     verifier: &dyn ProviderKeyVerifier,
@@ -3870,13 +4220,15 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
             // so record a distinct connection-checked state rather than
             // claiming the model is ready. Providers without a real `/models`
             // probe remain unchecked.
-            if crate::client::provider_api_key_verification_is_observed(provider) {
+            if codewhale_engine::client::provider_api_key_verification_is_observed_for_route(
+                provider, &base_url,
+            ) {
                 let verified_model = scoped_config.default_model();
                 app.provider_health.record_models_probe_success(
                     &scoped_config,
                     &identity,
                     &verified_model,
-                    crate::route_receipt::CredentialGeneration::derive(
+                    codewhale_config::credentials::CredentialGeneration::derive(
                         &base_url,
                         &codewhale_secrets::normalize_api_key(&api_key),
                     ),
@@ -3924,7 +4276,7 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
             // reply (often truncated JSON) is not the message: say what went
             // wrong and what to do next in plain words (#6566).
             let plain = plain_key_verification_error(app, &reason, &api_key);
-            let reason = match crate::llm_client::base_url_authority(&base_url) {
+            let reason = match codewhale_engine::llm_client::base_url_authority(&base_url) {
                 Some(authority) => format!("{plain} ({authority})"),
                 None => plain.clone(),
             };
@@ -3961,13 +4313,13 @@ pub(crate) async fn apply_provider_picker_setup_confirmed(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    identity: crate::config::ProviderIdentity,
+    identity: codewhale_runtime::config::ProviderIdentity,
     api_key: String,
     model: String,
     context_window: Option<u32>,
     base_url: Option<String>,
 ) -> bool {
-    use crate::config::{
+    use codewhale_runtime::config::{
         save_api_key_for_identity, save_provider_base_url_for_identity,
         save_provider_context_window_for_identity, save_provider_model_for_identity,
     };
@@ -4100,14 +4452,14 @@ pub(crate) async fn apply_codewhale_owned_login(
     engine_handle: &mut EngineHandle,
     config: &mut Config,
     provider: ProviderKind,
-    pending: crate::oauth::PendingOAuthLogin,
+    pending: codewhale_runtime::oauth::PendingOAuthLogin,
     status_prefix: &str,
     login_kind: &str,
 ) -> bool {
     let path = app.config_path.clone();
     let mut live = config.clone();
     let activation = tokio::task::spawn_blocking(move || {
-        crate::oauth::activate_login(pending, path.as_deref(), Some(&mut live))
+        codewhale_runtime::oauth::activate_login(pending, path.as_deref(), Some(&mut live))
             .map(|activation| (activation, live))
     })
     .await
@@ -4145,7 +4497,7 @@ pub(crate) async fn apply_codewhale_owned_login(
     if provider == ProviderKind::OpenaiCodex {
         let mut selected = config.clone();
         selected.provider = Some(provider.as_str().to_string());
-        if crate::codex_model_cache::update_from_chatgpt(&selected)
+        if codewhale_engine::codex_model_cache::update_from_chatgpt(&selected)
             .await
             .is_err()
         {
@@ -4174,7 +4526,7 @@ pub(crate) async fn apply_codewhale_owned_xai_login(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    pending: crate::oauth::PendingOAuthLogin,
+    pending: codewhale_runtime::oauth::PendingOAuthLogin,
     status_prefix: &str,
 ) -> bool {
     apply_codewhale_owned_login(
@@ -4193,7 +4545,7 @@ pub(crate) async fn apply_codewhale_owned_chatgpt_login(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
-    pending: crate::oauth::PendingOAuthLogin,
+    pending: codewhale_runtime::oauth::PendingOAuthLogin,
     status_prefix: &str,
 ) -> bool {
     apply_codewhale_owned_login(
@@ -4215,8 +4567,8 @@ pub(crate) async fn apply_codewhale_owned_chatgpt_login(
 pub(crate) async fn run_chatgpt_revoke_from_tui(app: &mut App, config: &mut Config) {
     let config_path = app.config_path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::oauth::revoke_owned_login(
-            crate::oauth::OAuthProvider::Chatgpt,
+        codewhale_runtime::oauth::revoke_owned_login(
+            codewhale_runtime::oauth::OAuthProvider::Chatgpt,
             config_path.as_deref(),
             None,
         )
@@ -4254,7 +4606,7 @@ pub(crate) async fn run_orcarouter_revoke_from_tui(app: &mut App, config: &mut C
     let provider = ProviderKind::Orcarouter;
     let provider_name = provider.as_str().to_string();
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::config::clear_active_provider_api_key(&provider_name)
+        codewhale_runtime::config::clear_active_provider_api_key(&provider_name)
     })
     .await
     .map_err(|err| anyhow::anyhow!("OrcaRouter revoke task was lost: {err}"))
@@ -4299,7 +4651,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     app: &mut App,
     config: &mut Config,
     mut session: SavedSession,
-    goal: Option<&crate::session_manager::SessionGoalState>,
+    goal: Option<&codewhale_engine::session_manager::SessionGoalState>,
 ) -> Result<(), String> {
     let mut recovered_binding = None;
     if let Some(binding) = session.metadata.runtime_store.as_ref()
@@ -4326,7 +4678,9 @@ pub(crate) fn apply_loaded_session_with_goal(
         if refusal.is_none() {
             recovered_binding = tasks.session_store_binding();
         }
-        if let Some(crate::runtime_threads::StoreAdoptionRefusal::HeldByLiveProcess) = refusal {
+        if let Some(codewhale_engine::runtime_threads::StoreAdoptionRefusal::HeldByLiveProcess) =
+            refusal
+        {
             // A fresh `codewhale resume` would meet the same live holder, so
             // name the step that actually frees the store (#6418).
             return Err(format!(
@@ -4367,10 +4721,17 @@ pub(crate) fn apply_loaded_session_with_goal(
         goal.validate()
             .map_err(|error| format!("saved session goal is invalid: {error}"))?;
     }
-    let provider_identity = config.resolve_persisted_provider_identity(
-        Some(&session.metadata.model_provider),
-        session.metadata.model_provider_id.as_deref(),
-    )?;
+    let provider_identity = config
+        .resolve_persisted_provider_identity(
+            Some(&session.metadata.model_provider),
+            session.metadata.model_provider_id.as_deref(),
+        )
+        .map_err(|reason| {
+            format!(
+                "{reason}. {}",
+                codewhale_engine::session_export::export_recovery_hint(&session.metadata.id)
+            )
+        })?;
     let restored_route = resolve_runtime_route_for_identity(
         config,
         &provider_identity,
@@ -4393,18 +4754,22 @@ pub(crate) fn apply_loaded_session_with_goal(
         // is contended, the current conversation stays intact and a retry can
         // use this durably repaired binding to the same host.
         let mut recovered = session.clone();
+        recovered
+            .capture_publication(codewhale_engine::session_manager::SessionWriteOwner::control())
+            .map_err(|error| error.to_string())?;
         let abandoned = recovered.metadata.runtime_store.replace(binding.clone());
         let manager = SessionManager::default_location()
             .map_err(|error| format!("Session recovery could not be saved: {error}"))?;
-        manager
-            .save_session(&recovered)
+        let publication = manager
+            .publish_session(&recovered)
             .map_err(|error| format!("Session recovery could not be saved: {error}"))?;
+        session.adopt_publication(&publication);
         // The conversation now lives in this host's store. The empty store it
         // left is set aside here, where it is abandoned, unless another
         // document still binds it (#6144 P1a) — otherwise it stayed on disk
         // with nothing pointing at it.
         if let Some(abandoned) = abandoned {
-            crate::session_reconcile::retire_unbound_store_in_background(
+            codewhale_engine::session_reconcile::retire_unbound_store_in_background(
                 manager,
                 abandoned.data_dir,
                 "conversation rebound to another host's store",
@@ -4420,7 +4785,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     // All fallible preflight is complete. Retire the old session's background
     // accounting atomically before mutating live state; any late old-scope
     // provider response is rejected by `cost_status::report`.
-    let _settled_old_cost_scope = crate::cost_status::close_current_scope();
+    let _settled_old_cost_scope = codewhale_engine::cost_status::close_current_scope();
     *config = *restored_route.config;
     app.refresh_notification_settings(config);
     app.restore_api_messages_from_owned(&mut session);
@@ -4430,8 +4795,8 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.active_cell = None;
     app.active_tool_details.clear();
     app.active_tool_entry_completed_at.clear();
+    app.bump_details_epoch();
     app.active_cell_revision = app.active_cell_revision.wrapping_add(1);
-    app.exploring_cell = None;
     app.exploring_entries.clear();
     app.ignored_tool_calls.clear();
     app.pending_tool_uses.clear();
@@ -4447,7 +4812,7 @@ pub(crate) fn apply_loaded_session_with_goal(
         {
             app.extend_history(std::iter::once(HistoryCell::Error {
                 message: outcome.error.clone(),
-                severity: crate::error_taxonomy::ErrorSeverity::Error,
+                severity: codewhale_error_taxonomy::ErrorSeverity::Error,
             }));
         }
     };
@@ -4474,10 +4839,9 @@ pub(crate) fn apply_loaded_session_with_goal(
         {
             message_to_cell.insert(message_index, base + offset);
         }
-        app.extend_history(cells);
+        app.extend_restored_history(msg, cells);
         replay_outcomes_through(app, message_index + 1, message_index + 1 == messages.len());
     }
-    app.rebuild_completed_assistant_outputs_from_restored_history();
     app.sync_context_references_from_session(&session.context_references, &message_to_cell);
     app.mark_history_updated();
     app.viewport.transcript_selection.clear();
@@ -4505,6 +4869,17 @@ pub(crate) fn apply_loaded_session_with_goal(
         app.last_effective_provider_identity = Some(saved.provider_identity.clone());
         app.last_effective_model = Some(saved.model.clone());
         app.last_auto_route_receipt = Some(saved.receipt.clone());
+        app.last_effective_budget =
+            saved
+                .context_window
+                .map(|window| crate::tui::app::AutoRouteBudget {
+                    provider: saved.provider,
+                    provider_identity: saved.provider_identity.clone(),
+                    model: saved.model.clone(),
+                    limits: None,
+                    window,
+                    restored: true,
+                });
         app.last_effective_reasoning_effort = saved.effective_reasoning_effort.map(Into::into);
     }
     resolve_loaded_session_route(app, config);
@@ -4512,8 +4887,12 @@ pub(crate) fn apply_loaded_session_with_goal(
         let requested = app
             .reasoning_effort_preference
             .unwrap_or(app.reasoning_effort);
-        app.reasoning_effort =
-            requested.normalize_for_route(app.api_provider, &app.active_route_base_url, &app.model);
+        app.reasoning_effort = requested.normalize_for_route_identity(
+            app.api_provider,
+            app.provider_identity_for_persistence(),
+            &app.active_route_base_url,
+            &app.model,
+        );
     }
     app.provider_models.insert(
         app.provider_identity_for_persistence().to_string(),
@@ -4526,12 +4905,12 @@ pub(crate) fn apply_loaded_session_with_goal(
     }
     app.session.total_tokens = u32::try_from(session.metadata.total_tokens).unwrap_or(u32::MAX);
     app.session.total_conversation_tokens = app.session.total_tokens;
-    let restored_parent = crate::pricing::CostEstimate {
+    let restored_parent = codewhale_engine::pricing::CostEstimate {
         usd: session.metadata.cost.session_cost_usd,
         cny: session.metadata.cost.session_cost_cny,
     }
     .sanitized();
-    let restored_background = crate::pricing::CostEstimate {
+    let restored_background = codewhale_engine::pricing::CostEstimate {
         usd: session.metadata.cost.subagent_cost_usd,
         cny: session.metadata.cost.subagent_cost_cny,
     }
@@ -4550,7 +4929,7 @@ pub(crate) fn apply_loaded_session_with_goal(
         .iter()
         .cloned()
         .collect();
-    crate::cost_status::restore_usage_source_ledger(
+    codewhale_engine::cost_status::restore_usage_source_ledger(
         session
             .metadata
             .cost
@@ -4591,7 +4970,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     // the restored total with no regression.
     let total_restored_usd = session.metadata.cost.total_usd();
     let total_restored_cny = session.metadata.cost.total_cny();
-    let restored_high_water = crate::pricing::CostEstimate {
+    let restored_high_water = codewhale_engine::pricing::CostEstimate {
         usd: session.metadata.cost.displayed_cost_high_water_usd,
         cny: session.metadata.cost.displayed_cost_high_water_cny,
     }
@@ -4613,7 +4992,12 @@ pub(crate) fn apply_loaded_session_with_goal(
     // persists across session restarts (#2038).
     app.cumulative_turn_duration =
         std::time::Duration::from_secs(session.metadata.cumulative_turn_secs);
-    app.current_session_id = Some(session.metadata.id.clone());
+    app.set_current_session_id(Some(session.metadata.id.clone()));
+    app.session_write_receipt = session.write_receipt.clone();
+    app.session_write_owner = session
+        .write_receipt
+        .as_ref()
+        .map(|_| codewhale_engine::session_manager::SessionWriteOwner::control());
     app.session_title = Some(session.metadata.title.clone());
     app.current_session_metadata = Some(session.metadata);
     reset_approval_scope_for_new_conversation(app);
@@ -4630,6 +5014,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.session_artifacts = session.artifacts;
     app.session_turn_outcomes = session.turn_outcomes;
     app.window_title = session.window_title;
+    app.composer_color = session.composer_color;
     app.workspace_context = None;
     app.workspace_is_linked_worktree = false;
     app.workspace_context_refreshed_at = None;
@@ -4674,7 +5059,7 @@ pub(crate) fn apply_loaded_session_config_snapshot(
         );
     *config = next_config;
     app.configured_models = config.custom_models.clone().unwrap_or_default();
-    crate::config::initialize_cloud_facts(config);
+    codewhale_runtime::config::initialize_cloud_facts(config);
     app.refresh_notification_settings(config);
     Ok(respawn)
 }
@@ -4718,7 +5103,7 @@ mod profile_snapshot_tests {
                 let route = validated_profile_default_route(&next).unwrap();
                 assert_eq!(
                     route.context_window.source,
-                    crate::route_runtime::ContextWindowSource::UserDeclared,
+                    codewhale_engine::route_runtime::ContextWindowSource::UserDeclared,
                 );
                 let expected_models = next.custom_models.clone().unwrap();
                 apply_validated_profile_config(&mut app, &mut config, "new", next, &route);
@@ -4754,7 +5139,7 @@ mod profile_snapshot_tests {
                 );
                 assert_ne!(
                     app.active_context_window_source,
-                    crate::route_runtime::ContextWindowSource::UserDeclared,
+                    codewhale_engine::route_runtime::ContextWindowSource::UserDeclared,
                 );
             })
             .unwrap()

@@ -59,16 +59,17 @@ nested assignment.
 
 ## The cutover rule
 
-If a detached `agent` child can fail on a one-off provider timeout with no
-retry while an equivalent Runtime worker would retry and preserve ledger
-evidence, then the cutover is incomplete. Treat that as a Codewhale Runtime
-gap, not as normal "sub-agent behavior".
+Detached `agent` children and Runtime workers must preserve the same request
+evidence and recovery state. A timeout after possible dispatch is an unknown
+outcome on both paths and cannot authorize automatic inference replay.
 
-The compatibility `agent` runtime now retries transient provider header,
-stream, and timeout failures with backoff before marking a worker interrupted;
-when retries are exhausted it preserves a checkpoint and returns a continuation
-handle. The remaining convergence work is to keep that lifecycle durable across
-process restarts, remote execution, and full Runtime-ledger scheduling.
+The compatibility `agent` runtime retries ordinary rate limits and proven
+transient connection failures before dispatch. A header timeout, interrupted
+stream or other uncertain outcome preserves a checkpoint and returns a
+continuation handle without automatically sending another inference request.
+Reported usage stays attached to the original request; missing usage remains
+unknown. Restart, remote execution and Runtime-ledger scheduling retain their
+own durability requirements.
 
 The target rule is:
 
@@ -120,24 +121,19 @@ A worker runs at `spawn_depth = 0` and may spawn children while
 delegation levels. Sub-agents and fleet-selected Runtime workers share **one**
 axis, sourced from `codewhale_config`:
 
-- `DEFAULT_SPAWN_DEPTH = 3` — the default budget for both standalone sub-agents
-  and fleet-selected Runtime workers (so they cannot drift into "two moving
-  targets");
-- `MAX_SPAWN_DEPTH_CEILING = 8` — the opt-in cap that every configured Runtime
-  value, including fleet execution `max_spawn_depth`, clamps to.
+Runtime delegation has no default product depth cap. Explicit owner depth
+settings still apply to descendants and cannot be widened by a child. Zero
+blocks child delegation while leaving the root worker available. The internal
+`u32` representation rejects overflow; it is not a suggested work budget.
 
-The model-facing `agent` schema intentionally omits `max_depth`. The parser
-still accepts `max_depth`, `maxDepth`, and `max_spawn_depth` for saved
-transcripts, ACP/MCP clients, and internal compatibility callers, and rejects
-values above 8. Current model-authored calls inherit the Runtime configuration
-instead of negotiating recursion depth in the tool schema.
+The model-facing `agent` schema omits depth controls. Legacy `max_depth`,
+`maxDepth` and `max_spawn_depth` inputs are parsed for compatibility but ignored
+when a model requests a child; receipts identify that choice. Exact Fleet and
+saved-runtime authority remains enforced.
 
-Workflow IR has a separate default structural validation limit of five nested nodes.
-That limit constrains the orchestration document's shape; it does not grant or
-consume Runtime child-delegation depth.
-
-The root worker always runs even at budget 0; the budget gates *child*
-delegation. The default affords at least three nested levels.
+Workflow IR structure is independent of child delegation. Its `max_depth`
+default is zero (uncapped); positive operator values are honored. Parser and
+VM stack/memory boundaries still validate documents before execution.
 
 ## Event vocabulary
 
@@ -145,8 +141,9 @@ The Runtime execution ledger persists the worker's own event stream rather than
 a separate, simulated taxonomy. Compatibility APIs and types still expose this
 through the `Fleet...` prefix. `codewhale exec --output-format stream-json`
 emits
-`{"type": "content" | "tool_use" | "tool_result" | "sandbox_denied" |
-"workflow_event" | "session_capture" | "turn_usage" | "metadata" | "done" |
+`{"type": "content" | "tool_use" | "tool_result" | "agent_spawned" |
+"sandbox_denied" | "workflow_event" | "session_capture" | "service_released" |
+"turn_usage" | "metadata" | "status" | "request_image_window" | "done" |
 "error"}` lines, which map onto the Runtime ledger's compatibility type
 `FleetWorkerEventPayload` (`RunningTool`, `WorkflowEvent`, `Running`,
 `Completed`, `Failed`, …). `workflow_event` carries the typed
@@ -212,6 +209,8 @@ request (turn-step) when the provider reported usage for that call:
   `completion_tokens_details` / Responses `output_tokens_details`; Anthropic
   does not report a thinking-token count). `reasoning_replay_tokens` is a
   client-side estimate for DeepSeek V4 interleaved-thinking replays.
+- `finish_reason` is the provider's stop reason for that step (for example
+  `stop`, `tool_calls`, or `length`), omitted when the provider reported none.
 - When a provider reports no usage at all for a call, the whole event is
   skipped for that call. Latency/convergence analysis should sum
   `turn_usage` events instead of inferring per-step tokens from wall time;

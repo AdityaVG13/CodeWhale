@@ -165,9 +165,14 @@ pub fn backend_for(record: &LaneRecord) -> Box<dyn RuntimeBackend> {
 }
 
 fn append_log_event(log_path: &Path, event: serde_json::Value) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(log_path)
         .with_context(|| format!("open lane log {}", log_path.display()))?;
     let mut encoded = serde_json::to_vec(&event).context("serialize lane log event")?;

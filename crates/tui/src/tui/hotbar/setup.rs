@@ -9,7 +9,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 
-use crate::config::Config;
 use crate::tui::app::App;
 use crate::tui::views::{
     ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
@@ -17,6 +16,7 @@ use crate::tui::views::{
 };
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+use codewhale_runtime::config::Config;
 
 #[cfg(test)]
 use super::actions::HotbarRecommendation;
@@ -483,7 +483,7 @@ impl HotbarSetupView {
         };
 
         for (idx, row) in self.actions_for_source(source).iter().enumerate() {
-            lines.push(self.action_row_line(source, idx, row, 80));
+            lines.push(self.action_row_line(source, idx, row, 80, true));
         }
 
         lines.push(Line::from(""));
@@ -606,9 +606,10 @@ impl HotbarSetupView {
         idx: usize,
         row: &HotbarSetupActionRow,
         max_width: u16,
+        show_description: bool,
     ) -> Line<'static> {
         let selected = idx == self.selected_action_idx(source);
-        let marker = crate::tui::glyphs::selection_marker(selected);
+        let marker = codewhale_tui_kit::glyphs::selection_marker(selected);
         let checked = if self
             .draft_bindings
             .values()
@@ -634,9 +635,14 @@ impl HotbarSetupView {
         } else {
             String::new()
         };
-        let text = crate::tui::ui_text::semantic_truncate_with_affixes(
-            &prefix,
-            &row.metadata.description,
+        let (prefix, description) = if show_description {
+            (prefix.as_str(), row.metadata.description.as_str())
+        } else {
+            (prefix.trim_end(), "")
+        };
+        let text = codewhale_tui_kit::ui_text::semantic_truncate_with_affixes(
+            prefix,
+            description,
             &suffix,
             usize::from(max_width),
         );
@@ -663,7 +669,7 @@ impl HotbarSetupView {
             .render(area, buf);
     }
 
-    fn render_action_list(&self, area: Rect, buf: &mut Buffer) {
+    fn render_action_list(&self, area: Rect, buf: &mut Buffer, show_descriptions: bool) {
         let Some(source) = self.selected_source() else {
             EmptyState::new("No actions", "No hotbar action sources are available.")
                 .render(area, buf);
@@ -693,7 +699,7 @@ impl HotbarSetupView {
         let visible_range =
             action_list_visible_range(self.selected_action_idx(source), rows.len(), visible_rows);
         for idx in visible_range {
-            lines.push(self.action_row_line(source, idx, rows[idx], area.width));
+            lines.push(self.action_row_line(source, idx, rows[idx], area.width, show_descriptions));
         }
         Paragraph::new(lines)
             .style(Style::default().fg(palette::TEXT_PRIMARY))
@@ -972,7 +978,7 @@ impl ModalView for HotbarSetupView {
             height: content.height.saturating_sub(header_height),
         };
         let layout = ListDetailLayout::split(body, 34);
-        self.render_action_list(layout.list, buf);
+        self.render_action_list(layout.list, buf, layout.stacked);
         self.render_action_detail(layout.detail, buf);
     }
 
@@ -1051,16 +1057,17 @@ fn preview_line(row: &HotbarSetupActionRow) -> String {
 
 fn compact_action_id(action_id: &str) -> String {
     let suffix = action_id.rsplit('.').next().unwrap_or(action_id);
-    crate::tui::ui_text::truncate_line_to_width(suffix, 7)
+    codewhale_tui_kit::ui_text::truncate_line_to_width(suffix, 7)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ProviderKind};
     use crate::tui::app::TuiOptions;
     use crate::tui::hotbar::HotbarActionRegistry;
+    use codewhale_config::ProviderKind;
     use codewhale_localization::{Locale, MessageId, tr};
+    use codewhale_runtime::config::Config;
     use crossterm::event::KeyModifiers;
     use std::path::PathBuf;
 
@@ -1149,11 +1156,11 @@ mod tests {
         let mut app = test_app();
         let mut registry = HotbarActionRegistry::with_builtins();
         registry.register_skills(&[("demo".to_string(), "Demo skill".to_string())]);
-        registry.replace_mcp_tools(Some(&crate::mcp::McpManagerSnapshot {
+        registry.replace_mcp_tools(Some(&codewhale_engine::mcp::McpManagerSnapshot {
             config_path: PathBuf::from("mcp.json"),
             config_exists: true,
             reload_required: false,
-            servers: vec![crate::mcp::McpServerSnapshot {
+            servers: vec![codewhale_engine::mcp::McpServerSnapshot {
                 name: "search".to_string(),
                 enabled: true,
                 required: false,
@@ -1165,8 +1172,9 @@ mod tests {
                 connected: true,
                 error: None,
                 auth_required: false,
-                capability_metadata: crate::mcp::McpServerCapabilityMetadata::LegacyFallback,
-                tools: vec![crate::mcp::McpDiscoveredItem {
+                capability_metadata:
+                    codewhale_engine::mcp::McpServerCapabilityMetadata::LegacyFallback,
+                tools: vec![codewhale_engine::mcp::McpDiscoveredItem {
                     name: "web_search".to_string(),
                     model_name: "mcp_search_web_search".to_string(),
                     description: Some("Search the web".to_string()),
@@ -1521,18 +1529,20 @@ mod tests {
         };
 
         let text = view
-            .action_row_line(HotbarActionCategory::App, 0, &row, 58)
+            .action_row_line(HotbarActionCategory::App, 0, &row, 58, true)
             .to_string();
-        assert!(crate::tui::ui_text::text_display_width(&text) <= 58);
+        assert!(codewhale_tui_kit::ui_text::text_display_width(&text) <= 58);
         assert!(text.contains("Open a detailed…"), "{text:?}");
         assert!(!text.contains("Open a detailed s"), "{text:?}");
     }
 
     #[test]
     fn keyboard_controls_navigate_source_action_and_slot() {
-        let mut config = Config {
-            provider: Some(ProviderKind::Deepseek.as_str().to_string()),
-            ..Config::default()
+        let mut config = {
+            let __cw_config_init_0_0 = Some(ProviderKind::Deepseek.as_str().to_string());
+            let mut __cw_config_init_0_value: Config = Config::default();
+            __cw_config_init_0_value.provider = __cw_config_init_0_0;
+            __cw_config_init_0_value
         };
         config
             .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Openrouter))
@@ -1577,7 +1587,7 @@ mod tests {
         assert_ne!(selected.metadata.id, "slash.export");
 
         let rendered = rendered_text_at(&view, 80, 24);
-        let marker = crate::tui::glyphs::selection_marker(true);
+        let marker = codewhale_tui_kit::glyphs::selection_marker(true);
         assert!(
             rendered.lines().any(|line| {
                 line.contains(marker) && line.contains(&selected.metadata.display_name)

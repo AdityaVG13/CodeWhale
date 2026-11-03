@@ -1,6 +1,6 @@
 ---
 name: cw-land
-description: "Use when turning verified Codewhale work into commits, branches, or a merge: choosing direct-main vs. worktree vs. integration branch, preserving contributor credit, and honoring the gate artifact before merging."
+description: "Use when turning verified Codewhale work into commits on main and pushing them, or merging a contributor PR: staging only your paths, the pre-push drift checks, preserving contributor credit, and honoring the gate artifact before merging."
 ---
 
 # cw-land
@@ -24,38 +24,82 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
 
 ## Workflow
 
-1. **Choose the landing shape.**
-   - **The checkout that already exists** is the default. Direct to `main` is
-     permitted for a small coherent change when that checkout is current and
-     owns the affected files; when several agents share it, partition by file,
-     stage only your paths, and retry a commit that fails on `index.lock`.
-     Local commit permission never implies push, merge, tag, release, or
-     deploy permission.
-   - **No maintainer PR branches** (`AGENTS.md`): verified slices land on
-     `main` directly and hosted CI runs there. PRs are for contributors.
-   - **A worktree** is for a lane that genuinely conflicts with the dirt you
-     found in [cw-orient](../cw-orient/SKILL.md), or an experiment you may
-     throw away — not for parallel agents on the same lane.
-   - **An integration branch** (`integration/<topic>-<pr>-<date>`) is for
-     resolving a contributor PR that conflicts with a moving `main` when you
-     cannot push to their fork. It leaves their branch untouched.
+1. **Land on the canonical checkout's `main`.** `AGENTS.md` owns this: no
+   maintainer PR branches, worktrees, nested clones or integration lanes.
+   Several agents share the checkout, so partition by file, check
+   `git status` before staging, stage only your paths (never `git add -A`),
+   and retry a commit that fails on `index.lock`. Push verified `main`
+   directly. A push is not a CI request: hosted CI runs once, at the final
+   release step (`docs/RELEASE_CHECKLIST.md`), and routine slice commits carry
+   `[skip ci]`. PRs are for contributors.
 
 2. **Commit narrow and build-green.** One coherent change per commit; the tree
    builds at every commit. Put the real verification in the message — actual
    pass/fail counts, not "tests pass".
 
-3. **Preserve credit mechanically, not just politely.** Commit authorship and
-   `Co-authored-by:` trailers must use the contributor's own GitHub-linked
-   address — GitHub reads neither `.github/AUTHOR_MAP` nor `.mailmap` for the
-   contribution graph; those are project conventions on top. When a
-   contributor's work lands as our commit, it carries both:
+   Before every push, run the cheap drift checks that have turned a green
+   `main` red most often. They take seconds:
+   ```bash
+   cargo fmt --all -- --check
+   bash scripts/release/check-versions.sh
+   ```
+   The runtime-contract budget checker starts a native Cargo build by default;
+   it is not a cheap drift check. Use an applicable existing measurement with
+   `--receipt`, or run a new measurement through the required build-lock and
+   SSD cache workflow when the changed contract or final validation needs it.
+   Add the one that matches what you touched: `check-tui-locale-parity.py`
+   and `check-tui-product-vocabulary.sh` (locale strings),
+   `check-dead-code-budget.py` (`#[allow(dead_code)]`),
+   `check-blocking-calls-budget.py` (async code),
+   `check-readme-translations.py` and `check-readme-locales.sh` (READMEs),
+   `node web/scripts/derive-facts.mjs && node web/scripts/check-facts.mjs`
+   (public facts). Put a new CHANGELOG entry at the **top** of
+   `[Unreleased]`. Open contributor PRs append at its end, and an entry of
+   ours there conflicts with every one of them.
+
+   **Record it in the same commit.** A user-visible `feat` or `fix` commit
+   carries its line at the top of the matching `[Unreleased]` section (Added,
+   Changed or Fixed): what changed for the user, what is still unproved,
+   `(#N)`, and for reported or contributed work
+   `Thanks [@handle](https://github.com/handle)`. Tests, refactors and docs
+   need no line. Work by someone outside the maintainers also goes on the
+   three credit surfaces in that commit: the CHANGELOG `### Contributors`
+   block, `docs/CONTRIBUTORS.md`, and `UNRELEASED_CONTRIBUTORS` in
+   `web/lib/release-credits.ts`. A contributor PR merged as itself gets that
+   commit right after the merge. Before the push:
+   ```bash
+   sh scripts/sync-changelog.sh                 # regenerates crates/tui/CHANGELOG.md
+   python3 scripts/check-contributor-credit.py  # since the last tag
+   git log --format='%h %s' "$(git log -1 --format=%H -- CHANGELOG.md)"..HEAD | grep -E '^[0-9a-f]+ (feat|fix)'
+   ```
+   The last command must print nothing for commits you are landing.
+   `check-feature-release-notes.sh` covers only issue-linked `feat` commits;
+   fixes slip past it. A catch-up "changelog: record landed work" commit is
+   the failure this step prevents, not the routine.
+
+3. **Preserve credit mechanically, not just politely.** GitHub reads neither
+   `.github/AUTHOR_MAP` nor `.mailmap` for the contribution graph, so
+   authorship must use the contributor's own GitHub-linked address; those
+   files are project conventions on top. When a contributor's work lands as
+   our commit, the contributor is its **author**
+   and it carries the harvest line (`AGENTS.md`, "Harvested contributor
+   credit"):
    ```text
+   git commit --author="Name <ID+handle@users.noreply.github.com>" ...
+
    Harvested from PR #N by @handle
 
-   Co-authored-by: Name <github-linked-email>
+   Co-authored-by: <maintainer or agent identity>
    ```
-   That trailer is what lets `auto-close-harvested.yml` close their PR with
-   credit. Canonical human identities live in `.github/AUTHOR_MAP`.
+   GitHub's contributor list counts authors only, and
+   `check-contributor-credit.py` flags a harvested handle who is not credited.
+   Resolve the address from `.github/AUTHOR_MAP`, else
+   `gh api users/<handle> --jq '"\(.id)+\(.login)@users.noreply.github.com"'`.
+   A clean cherry-pick keeps the author by itself. This step is the single
+   owner of credit mechanics; other skills link here.
+   The `Harvested from` line is what lets `auto-close-harvested.yml` close
+   their PR with credit. Canonical human identities live in
+   `.github/AUTHOR_MAP`.
 
    Whether a bot or agent also appears in a trailer no longer matters — the CI
    check that policed trailer identities was removed because it rejected
@@ -77,33 +121,30 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
      one side whole, then re-insert the other side's additions at their
      original anchor; when the conflict doesn't fit that pattern, resolve it
      however is correct and let the compiler judge.
-   - `maintainerCanModify` does not guarantee push access to the fork. When the
-     push is refused, land the resolved merge on an integration branch here.
+   - Resolve on their branch without creating a local branch. Build the merge
+     commit with `git merge-tree --write-tree origin/main <pr-head>` and
+     `git commit-tree <tree> -p <pr-head> -p origin/main`, then push it with
+     `git push <fork-url> "${sha}:refs/heads/<their-branch>"`. In zsh, write
+     `${sha}`, not `$sha:refs`, because `:r` is a history modifier.
+     `maintainerCanModify` does not guarantee that the push is accepted. When
+     the fork refuses it, ask on the PR. Harvesting is the last resort.
    - **Check the contribution gate before assuming a PR is stalled.** An
      unlisted author's workflow runs sit at `action_required` and never start,
      so the PR looks abandoned when nobody has actually looked at it. Approve
      the runs, then fix the cause: add them to `.github/APPROVED_CONTRIBUTORS`
      (`all:username`), or comment `/lgtm` (PR scope) or `/lgtmi` (issue scope).
 
-5. **Verify mergeability against the real head.** A PR that is clean against
-   `main` can still conflict with a release branch:
-   ```bash
-   git merge-tree $(git merge-base <base> <pr-head>) <base> <pr-head>
-   ```
-
-6. **Merging under a gate.** `AGENTS.md` ("Merging under a gate") owns this:
+5. **Merging under a gate.** `AGENTS.md` ("Merging under a gate") owns this:
    the artifact must literally say PASS, the review thread outranks the check
-   rollup, and ambiguity blocks the merge — never the reverse.
-
-7. **Clean up your own lane.** When a worktree you created lands on `main`,
-   remove it (`git worktree remove <path>`) and delete its merged branch.
-   Leave other writers' worktrees alone; `git worktree list` shows them.
-   Worktree sprawl was a 560 GB problem here once.
+   rollup, and ambiguity blocks the merge — never the reverse. Before you
+   merge, list the open PRs whose base is the PR's source branch
+   (`gh pr list --base <branch>`) and retarget them first. Otherwise they
+   close when that branch goes away.
 
 ## Red flags / don't
 
-- Don't push, merge, tag, create a release, or deploy without explicit
-  authorization. A local commit is not permission for any of those.
+- Don't tag, create a release, publish, or deploy without explicit
+  authorization. Pushing verified `main` is allowed; it is none of those.
 - Don't rewrite published history, retag a release, or force-push a shared ref.
 - Don't commit `AGENTS.md` / `CLAUDE.md` operator controls that live outside the
   product repository into a public repo.
@@ -117,8 +158,10 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
 
 ## Output
 
-- The landing shape you chose and why (direct main / worktree / integration).
-- Commit SHAs, branch name, and whether the branch is local-only or pushed.
+- Commit SHAs, the paths committed, the drift checks run, and the resulting
+  `origin/main` SHA.
 - The credit trailers applied and to whom.
+- The CHANGELOG line and credit-surface entries added, or why none was owed.
+- The Linear/GitHub status written after the push, or why none was owed.
 - The gate artifact's literal verdict at merge time, if a gate applies.
 - Exactly which public actions you took, and which you deliberately did not.

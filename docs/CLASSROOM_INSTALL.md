@@ -4,7 +4,7 @@ A step-by-step checklist for IT admins deploying Codewhale on lab or classroom
 machines running Windows.
 
 > **Audience**: IT staff, teaching assistants, lab managers.
-> **Prereq**: Each target machine runs Windows 10 (1809+) or Windows 11.
+> **Prereq**: For current Windows Terminal, use Windows 10 2004 (build 19041+) or Windows 11. Older x64 deployments follow the [Windows compatibility target and qualification record](ENVIRONMENTS.md#windows-support-and-release-qualification); the CLI target is 1607, with actual final-release startup/install acceptance still required.
 
 ---
 
@@ -12,7 +12,7 @@ machines running Windows.
 
 | # | Task | Done? |
 |---|------|-------|
-| 1 | Confirm Windows version: `winver` → 10 build 17763+ or 11 | ☐ |
+| 1 | Confirm OS, architecture and terminal against the [Windows support table](ENVIRONMENTS.md#windows-support-and-release-qualification). Current Windows Terminal requires build 19041+ or Windows 11. | ☐ |
 | 2 | Ensure the user account is a **standard user** (not a local admin). The installer does not require elevation. | ☐ |
 | 3 | Verify outbound HTTPS (port 443) is open to `api.openai.com` (or whichever LLM provider the course uses). | ☐ |
 | 4 | Obtain the installer: download `CodeWhaleSetup.exe` from a v0.8.50+ [release](https://github.com/codewhale-hq/CodeWhale/releases/latest) or from your department mirror. | ☐ |
@@ -22,6 +22,11 @@ machines running Windows.
 ---
 
 ## Installation
+
+The NSIS installer contains x64 runtime binaries. For native ARM64 machines, use
+the matching archive/npm route in [INSTALL.md](INSTALL.md#windows-nsis-installer).
+Import qualification and ARM64 candidate checks do not replace a clean lab
+installation or the final 1607 x64 release receipt.
 
 ### Option A — Silent install (recommended for imaging / SCCM / Intune)
 

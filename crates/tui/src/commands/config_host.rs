@@ -7,8 +7,6 @@
 //! and back for the host helpers that still return a TUI `CommandResult`.
 //!
 
-use crate::compaction::CompactionConfig;
-use crate::config::SearchProvider;
 use crate::tui::app::{AppAction, ScreenMode};
 use codewhale_command_contract::config::{
     CommandCapabilityState, CommandCompactionConfig, CommandCompletionSound,
@@ -25,6 +23,8 @@ use codewhale_config::notifications::{
     NotificationMethod, SubagentCompletionNotification,
 };
 use codewhale_config::route::CapabilityState;
+use codewhale_engine::compaction::CompactionConfig;
+use codewhale_runtime::config::SearchProvider;
 
 /// Convert a portable config action to the concrete TUI action it requests.
 pub(crate) fn config_action_to_app_action(action: ConfigAction) -> AppAction {
@@ -238,6 +238,7 @@ fn to_search_provider(provider: CommandSearchProvider) -> SearchProvider {
         CommandSearchProvider::Volcengine => SearchProvider::Volcengine,
         CommandSearchProvider::Sofya => SearchProvider::Sofya,
         CommandSearchProvider::Serply => SearchProvider::Serply,
+        CommandSearchProvider::DeepSeek => SearchProvider::DeepSeek,
     }
 }
 
@@ -254,6 +255,7 @@ fn from_search_provider(provider: SearchProvider) -> CommandSearchProvider {
         SearchProvider::Volcengine => CommandSearchProvider::Volcengine,
         SearchProvider::Sofya => CommandSearchProvider::Sofya,
         SearchProvider::Serply => CommandSearchProvider::Serply,
+        SearchProvider::DeepSeek => CommandSearchProvider::DeepSeek,
     }
 }
 

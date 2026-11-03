@@ -33,14 +33,14 @@ use super::{
     ActionHint, CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent,
     render_modal_footer,
 };
-use crate::automation_manager::{
+use crate::tui::app::App;
+use codewhale_engine::automation_manager::{
     AutomationRecord, AutomationRunRecord, AutomationRunStatus, AutomationStatus,
     SharedAutomationManager,
 };
-use crate::tui::app::App;
-use crate::tui::list_nav::wrap_index;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
+use codewhale_tui_kit::list_nav::wrap_index;
 
 mod editor;
 use editor::{AutomationEditor, EditorAction};
@@ -88,7 +88,7 @@ pub struct AutomationsView {
     problem: Option<String>,
     /// Screen rect of the list body, recorded at render for mouse parity.
     list_body: Cell<Rect>,
-    config: crate::config::Config,
+    config: codewhale_runtime::config::Config,
     workspace: std::path::PathBuf,
     editor: Option<AutomationEditor>,
     notice: Option<String>,
@@ -99,7 +99,7 @@ pub struct AutomationsView {
 impl AutomationsView {
     /// Open the room, optionally focused on one automation id.
     #[must_use]
-    pub fn new(app: &App, config: &crate::config::Config, focus: Option<&str>) -> Self {
+    pub fn new(app: &App, config: &codewhale_runtime::config::Config, focus: Option<&str>) -> Self {
         let mut view = Self {
             rows: Vec::new(),
             row: 0,
@@ -141,7 +141,7 @@ impl AutomationsView {
             last_refresh_at: Instant::now(),
             problem: None,
             list_body: Cell::new(Rect::ZERO),
-            config: crate::config::Config::default(),
+            config: codewhale_runtime::config::Config::default(),
             workspace: std::env::temp_dir(),
             editor: None,
             notice: None,
@@ -799,7 +799,11 @@ impl ModalView for AutomationsView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         Clear.render(area, buf);
         Block::default()
-            .style(Style::default().bg(palette::WHALE_BG))
+            .style(
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .bg(palette::WHALE_BG),
+            )
             .render(area, buf);
         if let Some(editor) = &self.editor {
             editor.render(area, buf);
@@ -829,7 +833,7 @@ impl ModalView for AutomationsView {
                 continue;
             }
             let text = format!("[{key} {}] ", tr(self.locale, label));
-            let width = u16::try_from(crate::tui::ui_text::text_display_width(&text))
+            let width = u16::try_from(codewhale_tui_kit::ui_text::text_display_width(&text))
                 .unwrap_or(u16::MAX)
                 .min(chunks[0].right().saturating_sub(x));
             let rect = Rect::new(
@@ -861,8 +865,9 @@ mod tests {
     fn record(id: &str, status: AutomationStatus) -> AutomationRecord {
         let at = Utc.with_ymd_and_hms(2026, 9, 4, 17, 0, 0).unwrap();
         AutomationRecord {
+            destination_thread_id: None,
             schema_version: 1,
-            execution_scope: Some(crate::task_manager::test_execution_scope("test")),
+            execution_scope: Some(codewhale_engine::task_manager::test_execution_scope("test")),
             id: id.to_string(),
             name: format!("cwc daily {id}"),
             prompt: "patrol".to_string(),
@@ -989,8 +994,10 @@ mod tests {
         let _env = crate::test_support::lock_test_env();
         let root = tempfile::tempdir().unwrap();
         let manager = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::automation_manager::AutomationManager::open_for_test(root.path().join("store"))
-                .unwrap(),
+            codewhale_engine::automation_manager::AutomationManager::open_for_test(
+                root.path().join("store"),
+            )
+            .unwrap(),
         ));
         let mut view = AutomationsView::from_rows(Vec::new(), Locale::En);
         view.workspace = root.path().to_path_buf();

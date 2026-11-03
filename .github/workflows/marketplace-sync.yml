@@ -1,19 +1,6 @@
 name: Marketplace connection
 
 on:
-  pull_request:
-    paths:
-      - 'crates/tui/assets/first-party-marketplace.json'
-      - 'scripts/sync-marketplace.py'
-      - '.github/workflows/marketplace-sync.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'crates/tui/assets/first-party-marketplace.json'
-      - 'scripts/sync-marketplace.py'
-      - '.github/workflows/marketplace-sync.yml'
-  schedule:
-    - cron: '23 10 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -36,7 +23,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os, re
-          snapshot = json.load(open('crates/tui/assets/first-party-marketplace.json'))
+          snapshot = json.load(open('crates/plugins/assets/first-party-marketplace.json'))
           revision = snapshot['revision']
           assert re.fullmatch(r'[0-9a-f]{40}', revision), 'Invalid marketplace revision'
           if os.environ['EVENT_NAME'] in ('schedule', 'workflow_dispatch'):
@@ -50,7 +37,7 @@ jobs:
           ref: ${{ steps.source.outputs.revision }}
           path: marketplace
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           package-manager-cache: false
@@ -58,11 +45,10 @@ jobs:
         run: node marketplace/scripts/check-marketplace.mjs
       - name: Check bundled catalog snapshot
         run: python3 core/scripts/sync-marketplace.py --marketplace marketplace --check
-      - name: Check current skill and Computer Use mirrors
+      - name: Check current skill mirrors
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           node marketplace/scripts/check-marketplace.mjs --core core
-          node marketplace/scripts/check-cu-sync.mjs --core core
       - name: Explain a drift failure
         if: failure()
         run: |

@@ -1,6 +1,6 @@
 //! Native worktree manager UI (list / create / switch / compare).
 //!
-//! Data lives in [`crate::git_status`]; this module is pure presentation +
+//! Data lives in [`codewhale_engine::git_status`]; this module is pure presentation +
 //! key handling. Never blocks the render path on git subprocesses — refresh
 //! is scheduled via `git_status::refresh_if_stale` / `force_refresh` from
 //! background-friendly call sites.
@@ -17,10 +17,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::git_status::{self, GitStatusSnapshot, WorktreeEntry};
-use crate::tui::menu_style;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use codewhale_engine::git_status::{self, GitStatusSnapshot, WorktreeEntry};
 use codewhale_palette as palette;
+use codewhale_tui_kit::menu_style;
 
 /// Modes inside the worktree manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +88,22 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a == b
 }
 
+fn worktree_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("Enter a branch / path name")
+    } else if name.starts_with('-') {
+        Some("Name cannot start with '-'")
+    } else if name.contains("..") {
+        Some("Name cannot contain '..'")
+    } else if name.contains('\\') {
+        Some("Name cannot contain '\\'")
+    } else if name.chars().any(char::is_control) {
+        Some("Name cannot contain control characters")
+    } else {
+        None
+    }
+}
+
 impl ModalView for WorktreeManagerView {
     fn kind(&self) -> ModalKind {
         ModalKind::WorktreeManager
@@ -112,7 +128,11 @@ impl ModalView for WorktreeManagerView {
             .borders(Borders::ALL)
             .title(" Worktrees ")
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::SURFACE_ELEVATED))
+            .style(
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .bg(palette::SURFACE_ELEVATED),
+            )
             .render(popup, buf);
 
         let inner = Rect {
@@ -209,8 +229,8 @@ impl WorktreeManagerView {
             }
             KeyCode::Enter => {
                 let name = self.create_buffer.trim();
-                if name.is_empty() {
-                    self.status = Some("Enter a branch / path name".into());
+                if let Some(message) = worktree_name_error(name) {
+                    self.status = Some(message.into());
                     return ViewAction::None;
                 }
                 let path = self

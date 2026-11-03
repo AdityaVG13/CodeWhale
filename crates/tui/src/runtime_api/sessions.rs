@@ -7,16 +7,18 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::runtime_threads::{
-    CreateThreadRequest, RuntimeThreadManager, RuntimeTurnStatus, ThreadDetail, ThreadListFilter,
-    TurnItemLifecycleStatus,
+use codewhale_engine::runtime_threads::{
+    RuntimeTurnStatus, manager::CreateThreadRequest, manager::RuntimeThreadManager,
+    manager::ThreadDetail, manager::ThreadListFilter,
 };
-use crate::session_manager::{
+use codewhale_engine::session_manager::{
     SavedSession, SessionListFilter, SessionManager, SessionMetadata, SessionMutator,
     create_saved_session_with_id_and_mode,
 };
-use crate::session_peek::{MAX_PEEK_ENTRIES, SessionPeek, build_peek};
-use crate::session_projection::{SessionQuery, SessionSortMode, SessionSummary, project_sessions};
+use codewhale_engine::session_peek::{MAX_PEEK_ENTRIES, SessionPeek, build_peek};
+use codewhale_engine::session_projection::{
+    SessionQuery, SessionSortMode, SessionSummary, project_sessions,
+};
 use codewhale_models::{Message, Role};
 
 use super::{ApiError, RuntimeApiState, map_thread_err, truncate_text};
@@ -34,7 +36,7 @@ pub(super) struct SessionDetailResponse {
     /// Turns that ended `Failed`, with the redacted reason the transcript
     /// showed. Absent when none did.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(super) turn_outcomes: Vec<crate::session_manager::SavedTurnOutcome>,
+    pub(super) turn_outcomes: Vec<codewhale_engine::session_manager::SavedTurnOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,19 +156,23 @@ pub(super) async fn list_sessions(
     State(state): State<RuntimeApiState>,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<SessionsResponse>, ApiError> {
-    let manager = SessionManager::new(state.sessions_dir.clone())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let all = manager
-        .list_sessions()
-        .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
-    // This route keeps returning full `SessionMetadata` for compatibility;
-    // `/v1/sessions/summary` is the projected shape. Membership *and* order
-    // come from the shared projection so the two routes never disagree.
-    let sessions: Vec<SessionMetadata> = project_sessions(&all, &projection_query(&query), None)
-        .into_iter()
-        .filter_map(|summary| all.iter().find(|m| m.id == summary.id).cloned())
-        .collect();
-    Ok(Json(SessionsResponse { sessions }))
+    let projection = projection_query(&query);
+    tokio::task::spawn_blocking(move || {
+        let manager = SessionManager::new(state.sessions_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+        let all = manager.list_sessions().map_err(map_session_list_err)?;
+        // This route keeps returning full `SessionMetadata` for compatibility;
+        // `/v1/sessions/summary` is the projected shape. Membership *and* order
+        // come from the shared projection so the two routes never disagree.
+        let sessions: Vec<SessionMetadata> = project_sessions(&all, &projection, None)
+            .into_iter()
+            .filter_map(|summary| all.iter().find(|m| m.id == summary.id).cloned())
+            .collect();
+        Ok::<_, ApiError>(SessionsResponse { sessions })
+    })
+    .await
+    .map_err(|_| ApiError::internal("session listing failed"))?
+    .map(Json)
 }
 
 /// `GET /v1/sessions/summary` — the projected row shape.
@@ -178,16 +184,16 @@ pub(super) async fn list_sessions_summary(
     State(state): State<RuntimeApiState>,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
-    let manager = SessionManager::new(state.sessions_dir.clone())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let all = manager
-        .list_sessions()
-        .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
-    Ok(Json(project_sessions(
-        &all,
-        &projection_query(&query),
-        None,
-    )))
+    let projection = projection_query(&query);
+    tokio::task::spawn_blocking(move || {
+        let manager = SessionManager::new(state.sessions_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+        let all = manager.list_sessions().map_err(map_session_list_err)?;
+        Ok::<_, ApiError>(project_sessions(&all, &projection, None))
+    })
+    .await
+    .map_err(|_| ApiError::internal("session summary listing failed"))?
+    .map(Json)
 }
 
 /// `PATCH /v1/sessions/{id}` — rename and/or archive a saved session.
@@ -234,7 +240,7 @@ fn patch_session_blocking(
         // Validate the title before touching the store so a rejected title
         // reports *why* it was rejected rather than the generic "invalid
         // session id" that `map_session_err` produces for `InvalidInput`.
-        crate::session_manager::normalize_session_title(title)
+        codewhale_engine::session_manager::normalize_session_title(title)
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         metadata = manager
             .rename_session(id, title, SessionMutator::External)
@@ -268,7 +274,7 @@ async fn reserve_external_session_write(
     state: &RuntimeApiState,
     id: &str,
     action: &'static str,
-) -> Result<crate::session_manager::SessionLease, ApiError> {
+) -> Result<codewhale_engine::session_manager::SessionLease, ApiError> {
     reserve_session_write(&state.sessions_dir, id, action).await
 }
 
@@ -276,7 +282,7 @@ async fn reserve_session_write(
     sessions_dir: &std::path::Path,
     id: &str,
     action: &'static str,
-) -> Result<crate::session_manager::SessionLease, ApiError> {
+) -> Result<codewhale_engine::session_manager::SessionLease, ApiError> {
     let sessions_dir = sessions_dir.to_path_buf();
     let id = id.to_string();
     tokio::task::spawn_blocking(move || {
@@ -403,9 +409,9 @@ pub(crate) async fn resume_session_in_runtime(
         .iter()
         .filter(|message| message.role == Role::User)
     {
-        crate::image_attach::runtime_images_from_blocks(&message.content).map_err(|error| {
-            ApiError::bad_request(format!("Cannot restore session image: {error}"))
-        })?;
+        codewhale_engine::image_attach::runtime_images_from_blocks(&message.content).map_err(
+            |error| ApiError::bad_request(format!("Cannot restore session image: {error}")),
+        )?;
     }
 
     // The conversation may already be open. Answer with the thread that holds
@@ -435,6 +441,7 @@ pub(crate) async fn resume_session_in_runtime(
             .metadata
             .mode
             .clone()
+            .filter(|mode| codewhale_runtime::runtime_policy::parse_runtime_mode(mode).is_some())
             .unwrap_or_else(|| "agent".to_string())
     });
 
@@ -458,7 +465,7 @@ pub(crate) async fn resume_session_in_runtime(
             config_source.1,
         )
         .await
-        .map_err(map_resume_thread_create_err)?;
+        .map_err(|err| map_resume_thread_create_err(&session.metadata.id, err))?;
 
     let msg_count = session.messages.len();
     runtime
@@ -519,18 +526,8 @@ pub(super) async fn create_session_from_thread(
         });
     }
 
-    let messages = messages_from_thread_detail(&detail).map_err(|error| {
-        ApiError::internal(format!("Failed to reconstruct thread history: {error}"))
-    })?;
-    if messages.is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "Thread {thread_id} has no user or assistant messages to save"
-        )));
-    }
-
     let manager = SessionManager::new(state.sessions_dir.clone())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let total_tokens = total_tokens_from_thread_detail(&detail);
     // Export is idempotent (#6144). Every POST used to mint a fresh document
     // and rebind the thread to it, so each re-export left the previous
     // document unreferenced, and a crash between the save and the bind below
@@ -544,18 +541,46 @@ pub(super) async fn create_session_from_thread(
     // original saved session, often a TUI conversation, and rewriting it from
     // this thread's lossier projection would drop its images, tool work and
     // system prompt. Export leaves that document untouched.
-    let session_handle = crate::runtime_threads::thread_session_id(&detail.thread.id);
+    let session_handle = codewhale_engine::runtime_threads::thread_session_id(&detail.thread.id);
     let _lease = reserve_external_session_write(&state, &session_handle, "export").await?;
     let existing = match manager.load_session(&session_handle) {
         Ok(existing) => Some(existing),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(map_session_err(&session_handle, error, "read")),
     };
+    let control_owner = codewhale_engine::session_manager::SessionWriteOwner::control();
+    let captured_source = if let Some(existing) = existing.as_ref() {
+        existing
+            .write_receipt
+            .as_ref()
+            .ok_or_else(|| ApiError::conflict("Export target source was not admitted"))?
+            .capture(control_owner)
+    } else {
+        manager
+            .expect_absent_session(&session_handle)
+            .and_then(|source| source.capture(control_owner))
+    }
+    .map_err(|error| ApiError::conflict(error.to_string()))?;
+    let messages =
+        messages_from_thread_detail(&state.runtime_threads, &detail).map_err(|error| {
+            ApiError::internal(format!("Failed to reconstruct thread history: {error}"))
+        })?;
+    if messages.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Thread {thread_id} has no user or assistant messages to save"
+        )));
+    }
+
+    let total_tokens = total_tokens_from_thread_detail(&detail);
     let created = existing.is_none();
     let mut session = match existing {
         Some(existing) => {
-            let mut updated =
-                crate::session_manager::update_session(existing, &messages, total_tokens, None);
+            let mut updated = codewhale_engine::session_manager::update_session(
+                existing,
+                &messages,
+                total_tokens,
+                None,
+            );
             updated.metadata.model = detail.thread.model.clone();
             updated.metadata.mode = Some(detail.thread.mode.clone());
             updated
@@ -586,15 +611,18 @@ pub(super) async fn create_session_from_thread(
         session_title_override(req.title.as_deref(), detail.thread.title.as_deref())
     {
         session.metadata.title = title;
+        session.metadata.title_is_custom = true;
     }
     let title = session.metadata.title.clone();
     let message_count = session.metadata.message_count;
 
+    session.write_receipt = Some(captured_source);
     persist_thread_cost(&state.runtime_threads, thread_id, &mut session).await?;
 
-    manager
-        .save_session(&session)
-        .map_err(|e| ApiError::internal(format!("Failed to save session: {e}")))?;
+    let publication = manager
+        .publish_session(&session)
+        .map_err(|error| map_session_err(&session.metadata.id, error, "save"))?;
+    session.adopt_publication(&publication);
 
     // Link the session to the thread so that `ensure_engine_loaded` can
     // restore the full message history from the session file.
@@ -624,9 +652,9 @@ pub(super) async fn create_session_from_thread(
 }
 
 pub(super) fn stamp_session_provider_from_thread(
-    config: &crate::config::Config,
+    config: &codewhale_runtime::config::Config,
     detail: &ThreadDetail,
-    metadata: &mut crate::session_manager::SessionMetadata,
+    metadata: &mut codewhale_engine::session_manager::SessionMetadata,
 ) -> Result<(), String> {
     let thread_has_route = detail
         .thread
@@ -653,7 +681,7 @@ pub(super) fn stamp_session_provider_from_thread(
         let key = config
             .provider
             .as_deref()
-            .unwrap_or(crate::config::ProviderKind::Deepseek.as_str());
+            .unwrap_or(codewhale_config::ProviderKind::Deepseek.as_str());
         config.resolve_provider_identity(key)?
     };
     metadata.set_model_provider_route(
@@ -663,21 +691,33 @@ pub(super) fn stamp_session_provider_from_thread(
     Ok(())
 }
 
+/// Whether a thread still has work in flight, for the routes that must not
+/// read a half-written conversation.
+///
+/// The turn is the authority, and an item is not. `monitor_turn` assigns a
+/// turn's terminal status only after every item write for that turn, and crash
+/// recovery normalizes a turn a dead process left live; the item list, by
+/// contrast, is a projection that can outlive the turn which produced it (a
+/// reasoning segment whose completion frame a retried stream never sent).
+/// Reading items here made one such row — permanently `in_progress` inside a
+/// turn that had completed — refuse every later save of that thread's session,
+/// with a 409 that named an "active turn" which did not exist.
+///
+/// Items are still repaired, just not here: `get_thread_detail` closes a
+/// terminal turn's leftovers in the snapshot it already holds.
 pub(super) fn thread_detail_has_live_work(detail: &ThreadDetail) -> bool {
     detail.turns.iter().any(|turn| {
         matches!(
             turn.status,
             RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
         )
-    }) || detail.items.iter().any(|item| {
-        matches!(
-            item.status,
-            TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::InProgress
-        )
     })
 }
 
-pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> anyhow::Result<Vec<Message>> {
+pub(super) fn messages_from_thread_detail(
+    runtime: &RuntimeThreadManager,
+    detail: &ThreadDetail,
+) -> anyhow::Result<Vec<Message>> {
     let mut items_by_turn = HashMap::new();
     for item in &detail.items {
         items_by_turn
@@ -685,7 +725,7 @@ pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> anyhow::Resu
             .or_insert_with(Vec::new)
             .push(item.clone());
     }
-    RuntimeThreadManager::reconstruct_messages_from_turns_with(&detail.turns, &items_by_turn)
+    runtime.history_from_records(&detail.turns, &items_by_turn)
 }
 
 /// Merge the thread's authoritative cost into a session about to be saved.
@@ -707,7 +747,7 @@ pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> anyhow::Resu
 async fn persist_thread_cost(
     runtime: &std::sync::Arc<RuntimeThreadManager>,
     thread_id: &str,
-    session: &mut crate::session_manager::SavedSession,
+    session: &mut codewhale_engine::session_manager::SavedSession,
 ) -> Result<(), ApiError> {
     let usage = runtime
         .aggregate_usage_for_thread(thread_id)
@@ -766,7 +806,7 @@ async fn persist_thread_cost(
 /// `session_id` names the document to write. Omitted, the thread's bound
 /// document is updated, or, for a thread bound to none, a document is created
 /// under the thread's own conversation id — see
-/// [`crate::core::ops::SessionSnapshot::session_id`].
+/// [`codewhale_engine::core::ops::SessionSnapshot::session_id`].
 pub(super) async fn save_current_session(
     State(state): State<RuntimeApiState>,
     Json(req): Json<SaveSessionRequest>,
@@ -797,19 +837,19 @@ pub(crate) async fn save_session_in_runtime(
         }
     };
 
-    // Get the engine handle (loads the thread into an engine if needed),
-    // then request a session snapshot. This reuses the same code path as
-    // TUI's `build_session_snapshot`: the engine holds the authoritative
-    // messages and token usage, so we don't need to reconstruct from turns.
-    let engine = runtime
-        .get_engine(&thread_id)
+    let detail = runtime
+        .get_thread_detail(&thread_id)
         .await
-        .map_err(|e| ApiError::internal(format!("Failed to get engine for thread: {e}")))?;
-
-    let snapshot = engine
-        .get_session_snapshot()
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to get session snapshot: {e}")))?;
+        .map_err(map_thread_err)?;
+    if thread_detail_has_live_work(&detail) {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "Thread {thread_id} has a queued or active turn; wait for completion before saving the session"
+            ),
+            code: None,
+        });
+    }
 
     let manager = SessionManager::new(sessions_dir.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
@@ -844,24 +884,59 @@ pub(crate) async fn save_session_in_runtime(
     // collide with another thread's document. Snapshot ownership does not
     // depend on this binding: a thread owns the restore points recorded on
     // its turns.
-    let document_id = match req.session_id {
-        Some(named) => named,
-        None => runtime
-            .get_thread(&thread_id)
-            .await
-            .map_err(map_thread_err)?
-            .session_id
-            .unwrap_or_else(|| snapshot.session_id.clone()),
-    };
+    let document_id = req
+        .session_id
+        .clone()
+        .or_else(|| detail.thread.session_id.clone())
+        .unwrap_or_else(|| codewhale_engine::runtime_threads::thread_session_id(&thread_id));
     let _lease = reserve_session_write(sessions_dir, &document_id, "save").await?;
+    let existing = match manager.load_session_snapshot(&document_id) {
+        Ok(session) => Some(session),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(map_session_err(&document_id, error, "read")),
+    };
+    let captured_source = if detail.thread.session_id.as_deref() == Some(document_id.as_str()) {
+        let captured_runtime = std::sync::Arc::clone(runtime);
+        let id = thread_id.clone();
+        codewhale_engine::runtime_threads::manager::history::history_owner_work(move || {
+            captured_runtime.saved_session_publication_source(&id)
+        }).await.map_err(|error| ApiError::conflict(error.to_string()))?
+    } else if let Some(existing) = existing.as_ref() {
+        existing.write_receipt.clone()
+    } else {
+        Some(manager.expect_absent_session(&document_id).map_err(|error| ApiError::conflict(error.to_string()))?)
+    }.ok_or_else(|| ApiError::conflict("This Runtime history has no admitted full-document publication source; reopen its saved session before saving"))?;
+
+    let captured_source = captured_source
+        .capture(codewhale_engine::session_manager::SessionWriteOwner::control())
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    // Get the engine handle (loads the thread into an engine if needed),
+    // then request a session snapshot. This reuses the same code path as
+    // TUI's `build_session_snapshot`: the engine holds the authoritative
+    // messages and token usage, so we don't need to reconstruct from turns.
+    let engine = runtime
+        .get_engine(&thread_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to get engine for thread: {e}")))?;
+
+    let snapshot = engine
+        .get_session_snapshot()
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to get session snapshot: {e}")))?;
+
+    if snapshot.session_id != detail.thread.id || snapshot.workspace != detail.thread.workspace {
+        return Err(ApiError::conflict(
+            "Engine snapshot source changed before session publication",
+        ));
+    }
 
     // Build or update the session, mirroring TUI's `build_session_snapshot`.
     // Only `io::ErrorKind::NotFound` falls back to creating a new session;
     // other I/O errors (e.g. PermissionDenied) are propagated so callers
     // don't silently overwrite a corrupt or inaccessible session file.
-    let mut session = match manager.load_session(&document_id) {
-        Ok(existing) => {
-            let mut updated = crate::session_manager::update_session(
+    let mut session = match existing {
+        Some(existing) => {
+            let mut updated = codewhale_engine::session_manager::update_session(
                 existing,
                 &snapshot.messages,
                 snapshot.total_tokens,
@@ -875,28 +950,25 @@ pub(crate) async fn save_session_in_runtime(
             updated.metadata.mode = Some(snapshot.mode.clone());
             updated
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
-                document_id.clone(),
-                &snapshot.messages,
-                &snapshot.model,
-                &snapshot.workspace,
-                snapshot.total_tokens,
-                snapshot.system_prompt.as_ref(),
-                Some(snapshot.mode.as_str()),
-            );
+        None => {
+            let mut session =
+                codewhale_engine::session_manager::create_saved_session_with_id_and_mode(
+                    document_id.clone(),
+                    &snapshot.messages,
+                    &snapshot.model,
+                    &snapshot.workspace,
+                    snapshot.total_tokens,
+                    snapshot.system_prompt.as_ref(),
+                    Some(snapshot.mode.as_str()),
+                );
             session.metadata.set_model_provider_route(
                 &snapshot.model_provider,
                 snapshot.model_provider_id.as_deref(),
             );
             session
         }
-        Err(e) => {
-            return Err(ApiError::internal(format!(
-                "Failed to load session {document_id}: {e}"
-            )));
-        }
     };
+    session.write_receipt = Some(captured_source);
 
     persist_thread_cost(runtime, &thread_id, &mut session).await?;
 
@@ -905,9 +977,10 @@ pub(crate) async fn save_session_in_runtime(
     }
 
     // Save the session.
-    manager
-        .save_session(&session)
-        .map_err(|e| ApiError::internal(format!("Failed to save session: {e}")))?;
+    let publication = manager
+        .publish_session(&session)
+        .map_err(|error| map_session_err(&session.metadata.id, error, "save"))?;
+    session.adopt_publication(&publication);
 
     // Link the session to the thread so that `ensure_engine_loaded` can
     // restore the full message history (including thinking/tool blocks)
@@ -982,8 +1055,10 @@ pub(super) async fn delete_session(
 /// `null` when none has completed.
 pub(super) async fn get_session_repair(
     State(state): State<RuntimeApiState>,
-) -> Json<Option<crate::session_reconcile::ReconcileSummary>> {
-    Json(crate::session_reconcile::last_run(&state.sessions_dir))
+) -> Json<Option<codewhale_engine::session_reconcile::ReconcileSummary>> {
+    Json(codewhale_engine::session_reconcile::last_run(
+        &state.sessions_dir,
+    ))
 }
 
 pub(super) fn session_to_detail(session: SavedSession) -> SessionDetailResponse {
@@ -1066,9 +1141,21 @@ pub(super) fn session_to_detail(session: SavedSession) -> SessionDetailResponse 
     }
 }
 
-fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
+fn map_session_list_err(err: std::io::Error) -> ApiError {
+    if err.kind() == std::io::ErrorKind::FileTooLarge {
+        map_session_err("catalog", err, "list")
+    } else {
+        ApiError::internal(format!("Failed to list sessions: {err}"))
+    }
+}
+
+pub(super) fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
     match err.kind() {
         std::io::ErrorKind::NotFound => ApiError::not_found(format!("Session '{id}' not found")),
+        std::io::ErrorKind::FileTooLarge => ApiError {
+            code: Some("session_metadata_too_large"),
+            ..ApiError::payload_too_large(format!("Failed to {action} session '{id}': {err}"))
+        },
         std::io::ErrorKind::InvalidData => {
             ApiError::bad_request(format!("Failed to parse session '{id}': {err}"))
         }
@@ -1087,15 +1174,19 @@ fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
     }
 }
 
-fn map_resume_thread_create_err(err: anyhow::Error) -> ApiError {
+fn map_resume_thread_create_err(session_id: &str, err: anyhow::Error) -> ApiError {
     let reason = err.to_string();
     let message = format!("Failed to create thread: {reason}");
     if reason.starts_with("saved session has an empty provider identity")
         || reason.starts_with("saved session requires custom provider")
+        || reason.starts_with("persisted provider route requires exact custom provider")
         || reason.starts_with("legacy session records only the generic `custom` provider kind")
         || reason.starts_with("legacy `provider = \"custom\"`")
     {
-        ApiError::bad_request(message)
+        ApiError::bad_request(format!(
+            "{message}. {}",
+            codewhale_engine::session_export::export_recovery_hint(session_id)
+        ))
     } else {
         // Thread-store writes, event persistence, and other runtime failures
         // are server-side faults; never disguise them as a client config error.
@@ -1194,14 +1285,18 @@ mod resume_thread_error_tests {
 
     #[test]
     fn provider_config_errors_are_client_errors_but_storage_errors_stay_internal() {
-        let provider = map_resume_thread_create_err(anyhow::anyhow!(
-            "saved session requires custom provider 'lm-studio', but `[providers.lm-studio]` is missing"
-        ));
+        let provider = map_resume_thread_create_err(
+            "session-1",
+            anyhow::anyhow!(
+                "saved session requires custom provider 'lm-studio', but `[providers.lm-studio]` is missing"
+            ),
+        );
         assert_eq!(provider.status, StatusCode::BAD_REQUEST);
 
-        let storage = map_resume_thread_create_err(anyhow::anyhow!(
-            "Failed to save runtime thread: permission denied"
-        ));
+        let storage = map_resume_thread_create_err(
+            "session-1",
+            anyhow::anyhow!("Failed to save runtime thread: permission denied"),
+        );
         assert_eq!(storage.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
@@ -1219,7 +1314,7 @@ pub(super) struct SessionArtifactSummary {
     session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
-    kind: crate::artifacts::ArtifactKind,
+    kind: codewhale_runtime::artifacts::ArtifactKind,
     tool_call_id: String,
     tool_name: String,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -1254,7 +1349,9 @@ pub(super) struct SessionArtifactReadResponse {
     content: String,
 }
 
-fn artifact_summary(record: &crate::artifacts::ArtifactRecord) -> SessionArtifactSummary {
+fn artifact_summary(
+    record: &codewhale_runtime::artifacts::ArtifactRecord,
+) -> SessionArtifactSummary {
     SessionArtifactSummary {
         id: record.id.clone(),
         session_id: record.session_id.clone(),
@@ -1265,7 +1362,7 @@ fn artifact_summary(record: &crate::artifacts::ArtifactRecord) -> SessionArtifac
         created_at: record.created_at,
         byte_size: record.byte_size,
         preview: record.preview.clone(),
-        path: crate::artifacts::format_artifact_relative_path(&record.storage_path),
+        path: codewhale_runtime::artifacts::format_artifact_relative_path(&record.storage_path),
     }
 }
 
@@ -1361,7 +1458,7 @@ pub(super) fn resolve_session_artifact(
     artifact_id: &str,
     authority: ArtifactAuthority<'_>,
 ) -> Result<ResolvedSessionArtifact, ApiError> {
-    if !crate::artifacts::is_valid_session_id(id) {
+    if !codewhale_runtime::artifacts::is_valid_session_id(id) {
         return Err(ApiError::bad_request("invalid session id"));
     }
     // The reserved image namespace always requires its immutable manifest,
@@ -1385,7 +1482,7 @@ pub(super) fn resolve_session_artifact(
             }
             ArtifactAuthority::TurnRef { path, .. } => {
                 let relative = PathBuf::from(path);
-                if relative.is_absolute() || !crate::fleet::files::path_is_confined(&relative) {
+                if relative.is_absolute() || !codewhale_util::files::path_is_confined(&relative) {
                     return Err(ApiError::forbidden(
                         "artifact reference is not confined to its session",
                     ));
@@ -1413,9 +1510,9 @@ pub(super) fn resolve_session_artifact(
     if let Some(evidence) = evidence
         && (read.size != evidence.size_bytes
             || read.revision != evidence.digest
-            || crate::image_attach::sniff_media_type(&read.bytes)
+            || codewhale_engine::image_attach::sniff_media_type(&read.bytes)
                 != Some(evidence.content_type.as_str())
-            || crate::image_attach::decode_and_guard_image(&read.bytes).is_err())
+            || codewhale_engine::image_attach::decode_and_guard_image(&read.bytes).is_err())
     {
         return Err(ApiError::bad_request(
             "image evidence integrity check failed",
@@ -1453,7 +1550,7 @@ fn saved_session_summary(
     };
     let record = record.ok_or_else(|| ApiError::not_found("artifact not found"))?;
     if record.storage_path.is_absolute()
-        || !crate::fleet::files::path_is_confined(&record.storage_path)
+        || !codewhale_util::files::path_is_confined(&record.storage_path)
         || (!record.session_id.is_empty() && record.session_id != id)
     {
         return Err(ApiError::forbidden(
@@ -1475,17 +1572,18 @@ fn image_evidence_summary(
 ) -> Result<
     (
         SessionArtifactSummary,
-        crate::tools::large_output_router::EvidenceArtifact,
+        codewhale_engine::tools::large_output_router::EvidenceArtifact,
     ),
     ApiError,
 > {
-    let relative = PathBuf::from(id)
-        .join(crate::tools::large_output_router::evidence_metadata_relative_path(artifact_id));
+    let relative = PathBuf::from(id).join(
+        codewhale_engine::tools::large_output_router::evidence_metadata_relative_path(artifact_id),
+    );
     let file = super::workspace::open_confined_file_resolved(sessions_dir, &relative, false)?;
-    let evidence = crate::tools::large_output_router::read_evidence_metadata_file(&file)
+    let evidence = codewhale_engine::tools::large_output_router::read_evidence_metadata_file(&file)
         .map_err(|error| super::workspace::map_fs_error(error, "evidence metadata"))?;
-    let expected_path =
-        PathBuf::from(crate::artifacts::ARTIFACTS_DIR_NAME).join(format!("{artifact_id}.image"));
+    let expected_path = PathBuf::from(codewhale_runtime::artifacts::ARTIFACTS_DIR_NAME)
+        .join(format!("{artifact_id}.image"));
     if evidence.origin_session != id
         || evidence.handle != artifact_id
         || evidence.storage_path != expected_path
@@ -1498,14 +1596,14 @@ fn image_evidence_summary(
         ));
     }
     if evidence.redacted
-        || crate::tools::large_output_router::evidence_is_expired(
+        || codewhale_engine::tools::large_output_router::evidence_is_expired(
             &evidence,
-            crate::tools::large_output_router::unix_millis_now(),
+            codewhale_engine::tools::large_output_router::unix_millis_now(),
         )
     {
         return Err(ApiError::forbidden("image evidence is no longer available"));
     }
-    if evidence.size_bytes > crate::image_attach::MAX_IMAGE_BYTES as u64
+    if evidence.size_bytes > codewhale_engine::image_attach::MAX_IMAGE_BYTES as u64
         || !matches!(
             evidence.content_type.as_str(),
             "image/png" | "image/jpeg" | "image/gif" | "image/webp"
@@ -1521,13 +1619,13 @@ fn image_evidence_summary(
         id: artifact_id.to_owned(),
         session_id: id.to_owned(),
         content_type: Some(evidence.content_type.clone()),
-        kind: crate::artifacts::ArtifactKind::ToolOutput,
+        kind: codewhale_runtime::artifacts::ArtifactKind::ToolOutput,
         tool_call_id: evidence.call_id.clone(),
         tool_name: evidence.tool_name.clone(),
         created_at,
         byte_size: evidence.size_bytes,
         preview: String::new(),
-        path: crate::artifacts::format_artifact_relative_path(&evidence.storage_path),
+        path: codewhale_runtime::artifacts::format_artifact_relative_path(&evidence.storage_path),
     };
     Ok((summary, evidence))
 }
@@ -1535,10 +1633,10 @@ fn image_evidence_summary(
 #[cfg(test)]
 mod tool_media_artifact_tests {
     use super::*;
-    use crate::tools::large_output_router::{
+    use base64::Engine as _;
+    use codewhale_engine::tools::large_output_router::{
         EvidenceArtifact, EvidenceRetentionState, evidence_metadata_relative_path, unix_millis_now,
     };
-    use base64::Engine as _;
 
     fn fixture(root: &std::path::Path) -> EvidenceArtifact {
         let id = format!("art_image_{}", "a".repeat(64));
@@ -1551,7 +1649,7 @@ mod tool_media_artifact_tests {
         let now = unix_millis_now();
         let evidence = EvidenceArtifact {
             handle: id,
-            digest: crate::hashing::sha256_hex(&bytes),
+            digest: codewhale_runtime::hashing::sha256_hex(&bytes),
             size_bytes: bytes.len() as u64,
             content_type: "image/png".into(),
             tool_name: "screenshot".into(),
@@ -1609,7 +1707,10 @@ mod tool_media_artifact_tests {
         assert!(!rest.truncated);
         let mut bytes = decode(&first);
         bytes.extend(decode(&rest));
-        assert_eq!(crate::hashing::sha256_hex(&bytes), evidence.digest);
+        assert_eq!(
+            codewhale_runtime::hashing::sha256_hex(&bytes),
+            evidence.digest
+        );
         assert_eq!(
             read_session_artifact_window(temp.path(), "other_owner", &evidence.handle, 0, 1024)
                 .unwrap_err()
@@ -1749,6 +1850,12 @@ pub(crate) async fn initialize_empty_session(
         }
         Err(error) => return Err(map_session_err(session_id, error, "read")),
     }
+    let source = manager
+        .expect_absent_session(session_id)
+        .and_then(|source| {
+            source.capture(codewhale_engine::session_manager::SessionWriteOwner::control())
+        })
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
     let mut session = create_saved_session_with_id_and_mode(
         session_id.to_string(),
         &[],
@@ -1761,9 +1868,11 @@ pub(crate) async fn initialize_empty_session(
     stamp_session_provider_from_thread(&runtime.read_config(), &detail, &mut session.metadata)
         .map_err(ApiError::bad_request)?;
     session.metadata.runtime_store = Some(runtime.session_store_binding());
-    manager
-        .save_session(&session)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    session.write_receipt = Some(source);
+    let publication = manager
+        .publish_session(&session)
+        .map_err(|error| map_session_err(session_id, error, "initialize"))?;
+    session.adopt_publication(&publication);
     runtime
         .set_thread_session_checkpoint(thread_id, &session)
         .await

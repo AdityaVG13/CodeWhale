@@ -1,7 +1,7 @@
 //! Optional companion delivery through the existing updater's locked source.
 //! This is installation provenance, never a runtime or extension authority.
 use super::*;
-use codewhale_tui::delivery_files::GuardedFile;
+use codewhale_runtime::delivery_files::GuardedFile;
 use std::collections::HashSet;
 
 const CATALOG: &str = "codewhale-extension-hosts.json";
@@ -263,6 +263,45 @@ impl Prepared {
         }
         Ok(())
     }
+}
+
+#[cfg(any(unix, windows))]
+pub(super) fn owned_for_uninstall(directory: &Path, target: &str) -> Result<Vec<GuardedFile>> {
+    let Some(mut receipt) = GuardedFile::open_bounded(directory, RECEIPT, 64 * 1024)? else {
+        return Ok(Vec::new());
+    };
+    receipt.verify_owned()?;
+    let catalog = parse(&receipt.read_bounded(64 * 1024)?, env!("CARGO_PKG_VERSION"))?;
+    let host = catalog
+        .hosts
+        .iter()
+        .find(|host| host.target == target)
+        .context("installed compiled-host receipt has no matching target")?;
+    let mut files = Vec::new();
+    let host_name = format!("codewhale-extension-host{}", std::env::consts::EXE_SUFFIX);
+    for (name, expected) in [
+        (host_name.as_str(), host.sha256.as_str()),
+        (
+            "codewhale-extension-host.LICENSES.txt",
+            host.notices_sha256.as_str(),
+        ),
+        (
+            "codewhale-extension-host.relink-source.tar.gz",
+            host.source_sha256.as_str(),
+        ),
+    ] {
+        if let Some(file) = GuardedFile::open(directory, name)? {
+            if file.sha256() != expected {
+                bail!(
+                    "Preserved changed compiled-host file: {}",
+                    directory.join(name).display()
+                );
+            }
+            files.push(file);
+        }
+    }
+    files.push(receipt);
+    Ok(files)
 }
 
 pub(super) fn required_for(current_exe: &Path) -> Result<bool> {

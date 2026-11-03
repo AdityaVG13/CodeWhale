@@ -154,7 +154,7 @@ pub struct EvalHarnessConfig {
     /// inside this directory. The fixture file is named after the scenario
     /// (e.g. `offline-tool-loop.jsonl`). Each line follows the schema:
     /// `{ "request": <step descriptor>, "response_events": [<events>] }`.
-    /// The mock LLM client (`crate::llm_client::mock`) can replay these
+    /// The mock LLM client (`codewhale_engine::llm_client::mock`) can replay these
     /// fixtures for deterministic offline tests. See
     /// `crates/tui/tests/README.md` for the full record/replay flow.
     pub record_dir: Option<PathBuf>,
@@ -753,7 +753,7 @@ fn apply_patch(root: &Path, patch: &str) -> Result<()> {
 }
 
 fn run_bash(root: &Path, command: &str) -> Result<String> {
-    crate::shell_dispatcher::global_dispatcher().run_foreground(command, root)
+    codewhale_sandbox::shell_dispatcher::global_dispatcher().run_foreground(command, root)
 }
 
 fn truncate_output(value: &str, max_chars: usize) -> String {

@@ -14,7 +14,7 @@ message:
       {
         "source_kind": "constitution",
         "label": "Bundled constitution, language policy, and output policy",
-        "source_path": "bundled in this codewhale-tui build (BASE_PROMPT, compiled in)",
+        "source_path": "bundled in this codewhale-engine build (BASE_PROMPT, compiled in)",
         "activation_reason": "always_on",
         "estimated_tokens": 1803,
         "counting_confidence": "high",
@@ -25,11 +25,11 @@ message:
         "source_kind": "project_context",
         "label": "Project instructions",
         "source_path": null,
-        "activation_reason": "file_present",
-        "estimated_tokens": 160,
+        "activation_reason": "omitted",
+        "estimated_tokens": 0,
         "counting_confidence": "high",
         "authority_tier": 5,
-        "truncation_reason": null
+        "truncation_reason": "installed instruction receipt unavailable"
       },
       {
         "source_kind": "project_context_pack",
@@ -53,7 +53,7 @@ message:
       },
       {
         "source_kind": "context_management",
-        "label": "ACT runtime mode",
+        "label": "WORK runtime mode",
         "source_path": null,
         "activation_reason": "omitted",
         "estimated_tokens": 0,
@@ -64,7 +64,7 @@ message:
       {
         "source_kind": "compaction_relay_template",
         "label": "Session relay template",
-        "source_path": "bundled in this codewhale-tui build (COMPACT_TEMPLATE, compiled in)",
+        "source_path": "bundled in this codewhale-engine build (COMPACT_TEMPLATE, compiled in)",
         "activation_reason": "omitted",
         "estimated_tokens": 0,
         "counting_confidence": "high",
@@ -152,7 +152,7 @@ message:
         "truncation_reason": "no API messages yet"
       }
     ],
-    "total_estimated_tokens": 2367,
+    "total_estimated_tokens": 2207,
     "active_context_estimated_tokens": 48,
     "overflow_guard_estimated_tokens": 48,
     "context_window_tokens": 1000000,

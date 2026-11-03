@@ -1,14 +1,14 @@
 //! `EventMsg`-out API in `crates/protocol` (issue #5261, Phase A1 of the
 //! core/protocol extraction spec).
 //!
-//! Mirrors `crates/tui/src/core/events::Event` variant-by-variant as a
+//! Mirrors `crates/engine/src/core/events::Event` variant-by-variant as a
 //! serializable protocol. The TUI's `rx_event` / `Event` channel, the
 //! app-server's SSE stream, and the CLI's `stream-json` output all speak this
 //! one type so headless and TUI observe byte-identical event shapes for the
 //! same `Op`.
 //!
 //! Parity is compile-enforced from the engine side:
-//! `crates/tui/src/core/protocol_parity.rs` matches every engine `Event`
+//! `crates/engine/src/core/protocol_parity.rs` matches every engine `Event`
 //! variant exhaustively into an `EventMsg` (`protocol_covers_engine_events`).
 //! Adding an engine variant without a twin here fails to compile.
 //!
@@ -264,7 +264,18 @@ pub struct McpManagerSnapshot {
 /// Structured clarification request (`request_user_input`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInputRequest {
+    #[serde(default)]
+    pub require_typed_answers: bool,
     pub questions: Vec<UserInputQuestionEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserInputClosedOutcome {
+    Answered,
+    Cancelled,
+    TimedOut,
+    Unavailable,
 }
 
 /// Which permission gate produced a `ToolGateDecision`.
@@ -298,6 +309,18 @@ pub enum EventMsg {
         provider: String,
         omitted_tool_names: Vec<String>,
         omitted_tool_count: u64,
+    },
+
+    RequestImageWindow {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        provider: String,
+        model: String,
+        total: u64,
+        elided: u64,
+        cap: u64,
+        cap_source: String,
+        message: String,
     },
 
     /// Workspace snapshots (undo) are off for this workspace. `reason` is one
@@ -438,10 +461,19 @@ pub enum EventMsg {
     TurnComplete {
         thread_id: ThreadId,
         session_id: SessionId,
-        /// The engine's `TurnComplete` carries no turn id; the emitter fills
-        /// it from the envelope when it knows it.
+        /// Actual started turn; absent when a submitted operation fails
+        /// before starting.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        /// Host submission correlation, including preflight rejection. Runtime
+        /// self-starts do not carry a host token. Older producers default to
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
+        /// Manual compaction operation identity, never the surrounding host
+        /// submission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
         status: TurnOutcomeStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -457,6 +489,12 @@ pub enum EventMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
     },
+    ProviderRequestReceipt {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        receipt: Value,
+    },
+
     /// Usage for one model call within the turn.
     TurnUsage {
         #[serde(
@@ -716,6 +754,12 @@ pub enum EventMsg {
         id: String,
         request: UserInputRequest,
     },
+    UserInputClosed {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        id: String,
+        outcome: UserInputClosedOutcome,
+    },
     /// Authoritative API conversation state (`Message`s / `SystemPrompt`
     /// serialized).
     SessionUpdated {
@@ -725,6 +769,8 @@ pub enum EventMsg {
         messages: Vec<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_prompt: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instruction_assembly: Option<Value>,
         model: String,
         workspace: PathBuf,
     },
@@ -800,6 +846,7 @@ pub struct EventEnvelope {
 /// proves the list and `kind_str` agree.
 pub const EVENT_KINDS: &[&str] = &[
     "tool_projection_warning",
+    "request_image_window",
     "message_started",
     "response_delta",
     "message_complete",
@@ -843,6 +890,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "approval_required",
     "approval_withdrawn",
     "user_input_required",
+    "user_input_closed",
     "session_updated",
     "elevation_required",
     "lsp_repair_update",
@@ -856,6 +904,7 @@ impl EventMsg {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::ToolProjectionWarning { .. } => "tool_projection_warning",
+            Self::RequestImageWindow { .. } => "request_image_window",
             Self::SnapshotsDisabled { .. } => "snapshots_disabled",
             Self::MessageStarted { .. } => "message_started",
             Self::ResponseDelta { .. } => "response_delta",
@@ -874,6 +923,7 @@ impl EventMsg {
             Self::WorkspaceSnapshotTaken { .. } => "workspace_snapshot_taken",
             Self::RouteDispatched { .. } => "route_dispatched",
             Self::TurnComplete { .. } => "turn_complete",
+            Self::ProviderRequestReceipt { .. } => "provider_request_receipt",
             Self::TurnUsage { .. } => "turn_usage",
             Self::RoutedTurnUsage { .. } => "routed_turn_usage",
             Self::GoalUpdated { .. } => "goal_updated",
@@ -902,6 +952,7 @@ impl EventMsg {
             Self::ApprovalRequired { .. } => "approval_required",
             Self::ApprovalWithdrawn { .. } => "approval_withdrawn",
             Self::UserInputRequired { .. } => "user_input_required",
+            Self::UserInputClosed { .. } => "user_input_closed",
             Self::SessionUpdated { .. } => "session_updated",
             Self::ElevationRequired { .. } => "elevation_required",
             Self::LspRepairUpdate { .. } => "lsp_repair_update",
@@ -915,6 +966,7 @@ impl EventMsg {
     pub fn thread_id(&self) -> &ThreadId {
         match self {
             Self::ToolProjectionWarning { thread_id, .. }
+            | Self::RequestImageWindow { thread_id, .. }
             | Self::SnapshotsDisabled { thread_id, .. }
             | Self::MessageStarted { thread_id, .. }
             | Self::ResponseDelta { thread_id, .. }
@@ -933,6 +985,7 @@ impl EventMsg {
             | Self::WorkspaceSnapshotTaken { thread_id, .. }
             | Self::RouteDispatched { thread_id, .. }
             | Self::TurnComplete { thread_id, .. }
+            | Self::ProviderRequestReceipt { thread_id, .. }
             | Self::TurnUsage { thread_id, .. }
             | Self::RoutedTurnUsage { thread_id, .. }
             | Self::GoalUpdated { thread_id, .. }
@@ -961,6 +1014,7 @@ impl EventMsg {
             | Self::ApprovalRequired { thread_id, .. }
             | Self::ApprovalWithdrawn { thread_id, .. }
             | Self::UserInputRequired { thread_id, .. }
+            | Self::UserInputClosed { thread_id, .. }
             | Self::SessionUpdated { thread_id, .. }
             | Self::ElevationRequired { thread_id, .. }
             | Self::LspRepairUpdate { thread_id, .. }
@@ -974,6 +1028,7 @@ impl EventMsg {
     pub fn session_id(&self) -> &SessionId {
         match self {
             Self::ToolProjectionWarning { session_id, .. }
+            | Self::RequestImageWindow { session_id, .. }
             | Self::SnapshotsDisabled { session_id, .. }
             | Self::MessageStarted { session_id, .. }
             | Self::ResponseDelta { session_id, .. }
@@ -992,6 +1047,7 @@ impl EventMsg {
             | Self::WorkspaceSnapshotTaken { session_id, .. }
             | Self::RouteDispatched { session_id, .. }
             | Self::TurnComplete { session_id, .. }
+            | Self::ProviderRequestReceipt { session_id, .. }
             | Self::TurnUsage { session_id, .. }
             | Self::RoutedTurnUsage { session_id, .. }
             | Self::GoalUpdated { session_id, .. }
@@ -1020,6 +1076,7 @@ impl EventMsg {
             | Self::ApprovalRequired { session_id, .. }
             | Self::ApprovalWithdrawn { session_id, .. }
             | Self::UserInputRequired { session_id, .. }
+            | Self::UserInputClosed { session_id, .. }
             | Self::SessionUpdated { session_id, .. }
             | Self::ElevationRequired { session_id, .. }
             | Self::LspRepairUpdate { session_id, .. }
@@ -1080,6 +1137,17 @@ mod tests {
                 provider: "openai".into(),
                 omitted_tool_names: vec!["a".into()],
                 omitted_tool_count: 3,
+            },
+            EventMsg::RequestImageWindow {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                provider: "vllm".into(),
+                model: "m".into(),
+                total: 6,
+                elided: 3,
+                cap: 3,
+                cap_source: "provider_rejection".into(),
+                message: "m".into(),
             },
             EventMsg::MessageStarted {
                 thread_id: t.clone(),
@@ -1168,6 +1236,8 @@ mod tests {
                 route,
             },
             EventMsg::TurnComplete {
+                submission_id: None,
+                compaction_id: None,
                 thread_id: t.clone(),
                 session_id: s.clone(),
                 turn_id: None,
@@ -1433,15 +1503,27 @@ mod tests {
                 session_id: s.clone(),
                 id: "c2".into(),
                 request: UserInputRequest {
+                    require_typed_answers: true,
                     questions: vec![UserInputQuestionEvent {
                         header: "h".into(),
                         id: "q1".into(),
                         question: "?".into(),
+                        detail: Some("Exact detail".into()),
+                        intent: Some(crate::UserInputIntentEvent::PlanReview {
+                            approve: "Proceed".into(),
+                            call_id: Some("plan-1".into()),
+                        }),
                         options: vec![],
                         allow_free_text: true,
                         multi_select: false,
                     }],
                 },
+            },
+            EventMsg::UserInputClosed {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                id: "c2".into(),
+                outcome: UserInputClosedOutcome::TimedOut,
             },
             EventMsg::SessionUpdated {
                 thread_id: t.clone(),
@@ -1449,6 +1531,7 @@ mod tests {
                 engine_session_id: "sess".into(),
                 messages: vec![json!({"role": "user", "content": []})],
                 system_prompt: Some(json!("sys")),
+                instruction_assembly: None,
                 model: "m".into(),
                 workspace: PathBuf::from("/ws"),
             },
@@ -1557,6 +1640,8 @@ mod tests {
     #[test]
     fn event_msg_roundtrip() {
         let msg = EventMsg::TurnComplete {
+            submission_id: None,
+            compaction_id: None,
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
             turn_id: Some("turn-1".into()),
@@ -1572,6 +1657,49 @@ mod tests {
         let back: EventMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind_str(), "turn_complete");
         assert!(json.contains(r#""status":"completed""#));
+    }
+
+    #[test]
+    fn turn_complete_ownership_is_additive_and_round_trips() {
+        for (turn_id, submission_id, compaction_id) in [
+            (Some("turn-1"), Some("sub-host-1"), None),
+            (None, Some("sub-rejected"), None),
+            (Some("autonomous-turn"), None, None),
+            (None, None, Some("compact-1")),
+            (None, None, None),
+        ] {
+            let msg = EventMsg::TurnComplete {
+                thread_id: ThreadId::new(),
+                session_id: SessionId::new(),
+                turn_id: turn_id.map(str::to_string),
+                submission_id: submission_id.map(str::to_string),
+                compaction_id: compaction_id.map(str::to_string),
+                status: TurnOutcomeStatus::Failed,
+                error: Some("fixture rejection".into()),
+                usage: TokenUsage::default(),
+                parent_route_usage: None,
+                routed_usage_dropped_records: 0,
+                tool_catalog: None,
+                base_url: None,
+            };
+            let value = serde_json::to_value(&msg).unwrap();
+            for (key, expected) in [
+                ("turn_id", turn_id),
+                ("submission_id", submission_id),
+                ("compaction_id", compaction_id),
+            ] {
+                if let Some(expected) = expected {
+                    assert_eq!(value[key], expected);
+                } else {
+                    assert!(value.get(key).is_none(), "{key} must stay absent");
+                }
+            }
+            let back: EventMsg = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                back, msg,
+                "legacy absent fields and owned receipts round-trip"
+            );
+        }
     }
 
     #[test]

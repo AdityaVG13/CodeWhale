@@ -20,14 +20,14 @@ use codewhale_command_contract::facets::{
 };
 use codewhale_command_contract::handler::CommandCapabilities;
 
-use crate::config::Config;
-use crate::error_taxonomy::ErrorSeverity;
-use crate::snapshot::SnapshotRepo;
 use crate::test_support::{EnvVarGuard, TestEnvLock};
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::clipboard::ClipboardHandler;
 use crate::tui::history::HistoryCell;
+use codewhale_error_taxonomy::ErrorSeverity;
 use codewhale_models::{ContentBlock, ImageUrlContent, Message, Role, ToolCaller};
+use codewhale_runtime::config::Config;
+use codewhale_snapshot::SnapshotRepo;
 
 use crate::commands::session_export_test_support::{
     assert_only_export_facet_exposed, normalize_export_time, normalize_recorded_export,
@@ -42,6 +42,7 @@ struct ExportHarness {
     // temporary files are removed (matches ControlHarness).
     _home: EnvVarGuard,
     _codewhale_home: EnvVarGuard,
+    _ssh: [EnvVarGuard; 3],
     _env_lock: TestEnvLock,
     temp: TempDir,
 }
@@ -54,6 +55,7 @@ impl ExportHarness {
         std::fs::create_dir_all(&home).expect("home dir");
         let _home = EnvVarGuard::set("HOME", &home);
         let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+        let _ssh = ["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"].map(EnvVarGuard::remove);
         let options = TuiOptions {
             skills_dir: temp.path().join("skills"),
             memory_path: temp.path().join("memory.md"),
@@ -66,6 +68,7 @@ impl ExportHarness {
             app,
             _home,
             _codewhale_home,
+            _ssh,
             _env_lock: env_lock,
             temp,
         }
@@ -116,6 +119,7 @@ fn adapter_projects_authoritative_metadata_and_omits_hidden_payloads() {
                     thinking: "private chain of thought".to_string(),
                     signature: Some("signature-secret".to_string()),
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,
@@ -308,7 +312,7 @@ fn adapter_projects_absent_restore_points_without_creating_a_repo() {
     let workspace = harness.temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     harness.app.workspace = workspace.clone();
-    let before = crate::snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
+    let before = codewhale_snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
     assert!(!before.exists(), "precondition: no side repo yet");
 
     let projection = conversation_projection(&mut harness.app);
@@ -318,7 +322,7 @@ fn adapter_projects_absent_restore_points_without_creating_a_repo() {
         RestorePointProjection::None
     ));
     assert!(
-        !crate::snapshot::snapshot_git_dir(&workspace)
+        !codewhale_snapshot::snapshot_git_dir(&workspace)
             .expect("snapshot path")
             .exists(),
         "projection must never create the snapshot repo"
@@ -702,6 +706,7 @@ fn baseline_golden_messages() -> Vec<Message> {
                     thinking: "private chain of thought".to_string(),
                     signature: Some("signature-secret".to_string()),
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,
@@ -998,6 +1003,7 @@ fn command_clipboard_export_preserves_structure_and_redacts_secrets() {
                     thinking: "private chain of thought".to_string(),
                     signature: Some("signature-secret".to_string()),
                     state: None,
+                    redacted_data: None,
                 },
                 ContentBlock::ToolUse {
                     execution_id: None,
@@ -1042,7 +1048,7 @@ fn command_clipboard_export_preserves_structure_and_redacts_secrets() {
         let mut todos = app.todos.try_lock().expect("todos lock");
         todos.add(
             "export projection".to_string(),
-            crate::tools::todo::TodoStatus::InProgress,
+            codewhale_engine::tools::todo::TodoStatus::InProgress,
         );
     }
     app.cycle_effort();
@@ -1285,14 +1291,14 @@ fn command_export_does_not_create_a_snapshot_repo_for_a_fresh_workspace() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     let app = &mut harness.app;
     app.workspace = workspace.clone();
-    let before = crate::snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
+    let before = codewhale_snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
     assert!(!before.exists(), "precondition: no side repo yet");
 
     let result = dispatch(app, Some("clipboard"));
     assert!(!result.is_error, "{:?}", result.message);
 
     assert!(
-        !crate::snapshot::snapshot_git_dir(&workspace)
+        !codewhale_snapshot::snapshot_git_dir(&workspace)
             .expect("snapshot path")
             .exists(),
         "export must never create the side repo"

@@ -7,9 +7,9 @@
 //! table — the most-asked question once hooks start firing.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::hooks::HookEvent;
 use crate::tui::app::App;
 use crate::tui::app::AppAction;
+use codewhale_config::hooks::HookEvent;
 use codewhale_localization::MessageId;
 
 use super::CommandResult;
@@ -55,7 +55,10 @@ pub fn hooks(app: &App, arg: Option<&str>) -> CommandResult {
     }
     let sub = arg.map(str::trim).unwrap_or("list").to_ascii_lowercase();
     if let Some(digest) = sub.strip_prefix("approve ") {
-        return match crate::hooks::authority::approve_project_hooks(&app.workspace, digest.trim()) {
+        return match codewhale_engine::hooks::authority::approve_project_hooks(
+            &app.workspace,
+            digest.trim(),
+        ) {
             Ok(()) => CommandResult::message(
                 "Approved these exact project hooks. They will load on your next session. Changes require another review.",
             ),
@@ -65,20 +68,27 @@ pub fn hooks(app: &App, arg: Option<&str>) -> CommandResult {
     match sub.as_str() {
         "" | "list" | "ls" | "show" => list(app),
         "events" | "event" | "list-events" => events(),
-        "review" => match crate::hooks::authority::review_project_hooks(&app.workspace) {
-            Ok((authority, contents)) => CommandResult::message(format!(
-                "Project hooks can run shell commands, including scripts they reference. Review the file and those scripts before approval.\n\n{}\n\nTo approve these exact hooks: /hooks approve {}",
-                crate::hooks::sanitize_hook_text(&contents, contents.chars().count()),
-                authority.digest
-            )),
-            Err(error) => CommandResult::error(error),
-        },
-        "revoke" => match crate::config::save_workspace_hook_receipt(&app.workspace, "") {
-            Ok(_) => CommandResult::message(
-                "Project hook approval revoked. Pending hooks will be refused; already running commands are unaffected.",
-            ),
-            Err(_) => CommandResult::error("Could not revoke project hook approval"),
-        },
+        "review" => {
+            match codewhale_engine::hooks::authority::review_project_hooks(&app.workspace) {
+                Ok((authority, contents)) => CommandResult::message(format!(
+                    "Project hooks can run shell commands, including scripts they reference. Review the file and those scripts before approval.\n\n{}\n\nTo approve these exact hooks: /hooks approve {}",
+                    codewhale_engine::hooks::sanitize_hook_text(
+                        &contents,
+                        contents.chars().count()
+                    ),
+                    authority.digest
+                )),
+                Err(error) => CommandResult::error(error),
+            }
+        }
+        "revoke" => {
+            match codewhale_runtime::config::save_workspace_hook_receipt(&app.workspace, "") {
+                Ok(_) => CommandResult::message(
+                    "Project hook approval revoked. Pending hooks will be refused; already running commands are unaffected.",
+                ),
+                Err(_) => CommandResult::error("Could not revoke project hook approval"),
+            }
+        }
         "edit" | "add" | "new" => CommandResult::action(AppAction::EditProjectHooks),
         other => CommandResult::error(format!(
             "unknown subcommand `{other}`. Try `/hooks list`, `/hooks events`, `/hooks edit`, `/hooks review`, `/hooks approve <digest>`, or `/hooks revoke`."
@@ -117,7 +127,7 @@ fn events() -> CommandResult {
         ),
         (
             HookEvent::ModeChange,
-            "fires on Plan/Act/Operate transitions",
+            "fires on Plan/Work/Operate transitions",
         ),
         (
             HookEvent::OnError,
@@ -186,7 +196,7 @@ fn list(app: &App) -> CommandResult {
         }
     ));
 
-    let mut by_event: std::collections::BTreeMap<&str, Vec<&crate::hooks::Hook>> =
+    let mut by_event: std::collections::BTreeMap<&str, Vec<&codewhale_config::hooks::Hook>> =
         std::collections::BTreeMap::new();
     for hook in &config.hooks {
         by_event
@@ -201,7 +211,7 @@ fn list(app: &App) -> CommandResult {
             // `name` is operator-supplied and otherwise unbounded: a name made
             // of ANSI escapes would repaint this listing, and a long one would
             // push the rest of the row off screen.
-            let label = crate::hooks::sanitize_hook_label(hook.name.as_deref());
+            let label = codewhale_engine::hooks::sanitize_hook_label(hook.name.as_deref());
             // `[bg]` describes actual scheduling: `shell_env` ignores the flag
             // and always runs in the foreground, so it is not labelled.
             let bg = if hook.background && hook.event.honors_background() {
@@ -211,7 +221,7 @@ fn list(app: &App) -> CommandResult {
             };
             let timeout = render_timeout(config, hook);
             let condition = match &hook.condition {
-                None | Some(crate::hooks::HookCondition::Always) => String::new(),
+                None | Some(codewhale_config::hooks::HookCondition::Always) => String::new(),
                 Some(c) => format!(" if {}", condition_summary(c)),
             };
             let cmd_preview = preview_command(&hook.command, 60);
@@ -243,7 +253,10 @@ fn list(app: &App) -> CommandResult {
 /// (see `HooksConfig::effective_timeout_secs`). Rendering `hook.timeout_secs`
 /// unconditionally made `/hooks list` report a budget no hook would ever run
 /// with — a listing that disagrees with the runtime is worse than no listing.
-fn render_timeout(config: &crate::hooks::HooksConfig, hook: &crate::hooks::Hook) -> String {
+fn render_timeout(
+    config: &codewhale_config::hooks::HooksConfig,
+    hook: &codewhale_config::hooks::Hook,
+) -> String {
     let effective = config.effective_timeout_secs(hook);
     if config.timeout_is_overridden() {
         format!("{effective}s — `[hooks].default_timeout_secs` override")
@@ -255,10 +268,13 @@ fn render_timeout(config: &crate::hooks::HooksConfig, hook: &crate::hooks::Hook)
 /// Render load-time problems. Only the hook's own `name`, its event, and a
 /// fixed explanation are shown — never the command line, stdin payload, or
 /// any resolved filesystem path.
-fn render_problems(problems: &[crate::hooks::HookConfigProblem]) -> String {
+fn render_problems(problems: &[codewhale_config::hooks::HookConfigProblem]) -> String {
     let mut out = String::new();
     for problem in problems {
-        out.push_str(&format!("  - {}\n", problem.summary()));
+        out.push_str(&format!(
+            "  - {}\n",
+            codewhale_engine::hooks::config::problem_summary(problem)
+        ));
     }
     out
 }
@@ -267,20 +283,20 @@ fn event_label(event: HookEvent) -> &'static str {
     event.as_str()
 }
 
-fn condition_summary(condition: &crate::hooks::HookCondition) -> String {
+fn condition_summary(condition: &codewhale_config::hooks::HookCondition) -> String {
     match condition {
-        crate::hooks::HookCondition::Always => "always".to_string(),
-        crate::hooks::HookCondition::ToolName { name } => {
+        codewhale_config::hooks::HookCondition::Always => "always".to_string(),
+        codewhale_config::hooks::HookCondition::ToolName { name } => {
             format!("tool_name=`{}`", condition_value(name))
         }
-        crate::hooks::HookCondition::ToolCategory { category } => {
+        codewhale_config::hooks::HookCondition::ToolCategory { category } => {
             format!("tool_category=`{}`", condition_value(category))
         }
-        crate::hooks::HookCondition::Mode { mode } => {
+        codewhale_config::hooks::HookCondition::Mode { mode } => {
             format!("mode=`{}`", condition_value(mode))
         }
-        crate::hooks::HookCondition::ExitCode { code } => format!("exit_code={code}"),
-        crate::hooks::HookCondition::All { conditions } => format!(
+        codewhale_config::hooks::HookCondition::ExitCode { code } => format!("exit_code={code}"),
+        codewhale_config::hooks::HookCondition::All { conditions } => format!(
             "all of [{}]",
             conditions
                 .iter()
@@ -288,7 +304,7 @@ fn condition_summary(condition: &crate::hooks::HookCondition) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        crate::hooks::HookCondition::Any { conditions } => format!(
+        codewhale_config::hooks::HookCondition::Any { conditions } => format!(
             "any of [{}]",
             conditions
                 .iter()
@@ -305,7 +321,7 @@ fn condition_summary(condition: &crate::hooks::HookCondition) -> String {
 /// and can contain escape sequences, so it goes through the shared sanitizer
 /// before the cap.
 fn preview_command(command: &str, max_chars: usize) -> String {
-    let single_line = crate::hooks::sanitize_hook_line(command, usize::MAX);
+    let single_line = codewhale_engine::hooks::sanitize_hook_line(command, usize::MAX);
     if single_line.chars().count() <= max_chars {
         return single_line;
     }
@@ -322,15 +338,18 @@ fn preview_command(command: &str, max_chars: usize) -> String {
 /// `tool_name`, `tool_category`, and `mode` come from config verbatim, so the
 /// same bound-and-de-fang rule that governs hook names governs these.
 fn condition_value(value: &str) -> String {
-    crate::hooks::sanitize_hook_line(value, crate::hooks::HOOK_LABEL_MAX_CHARS)
+    codewhale_engine::hooks::sanitize_hook_line(
+        value,
+        codewhale_engine::hooks::HOOK_LABEL_MAX_CHARS,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::hooks::{Hook, HookCondition};
     use crate::tui::app::{App, TuiOptions};
+    use codewhale_config::hooks::{Hook, HookCondition};
+    use codewhale_runtime::config::Config;
     use tempfile::TempDir;
 
     fn create_test_app(tmpdir: &TempDir) -> App {
@@ -391,17 +410,23 @@ mod tests {
     #[test]
     fn hook_labels_are_bounded_and_defanged() {
         let noisy = format!("\u{1b}[31mgate\n{}", "x".repeat(500));
-        let label = crate::hooks::sanitize_hook_label(Some(&noisy));
+        let label = codewhale_engine::hooks::sanitize_hook_label(Some(&noisy));
         assert!(!label.contains('\u{1b}'), "{label}");
         assert!(!label.contains('\n'), "{label}");
         assert!(
-            label.chars().count() <= crate::hooks::HOOK_LABEL_MAX_CHARS + 16,
+            label.chars().count() <= codewhale_engine::hooks::HOOK_LABEL_MAX_CHARS + 16,
             "{} chars",
             label.chars().count()
         );
         // A name that is only whitespace, or absent, still renders something.
-        assert_eq!(crate::hooks::sanitize_hook_label(Some("   ")), "(unnamed)");
-        assert_eq!(crate::hooks::sanitize_hook_label(None), "(unnamed)");
+        assert_eq!(
+            codewhale_engine::hooks::sanitize_hook_label(Some("   ")),
+            "(unnamed)"
+        );
+        assert_eq!(
+            codewhale_engine::hooks::sanitize_hook_label(None),
+            "(unnamed)"
+        );
     }
 
     /// Condition values are config strings too, and they were being
@@ -413,7 +438,7 @@ mod tests {
         });
         assert!(!rendered.contains('\u{1b}'), "{rendered}");
         assert!(
-            rendered.chars().count() <= crate::hooks::HOOK_LABEL_MAX_CHARS + 32,
+            rendered.chars().count() <= codewhale_engine::hooks::HOOK_LABEL_MAX_CHARS + 32,
             "{} chars",
             rendered.chars().count()
         );
@@ -426,11 +451,11 @@ mod tests {
     #[test]
     fn listed_timeout_ignores_a_rejected_zero_override() {
         let hook = Hook::new(HookEvent::SessionStart, "echo hi").with_timeout(90);
-        let zeroed = crate::hooks::HooksConfig {
+        let zeroed = codewhale_config::hooks::HooksConfig {
             enabled: true,
             hooks: vec![hook.clone()],
             default_timeout_secs: Some(0),
-            ..crate::hooks::HooksConfig::default()
+            ..codewhale_config::hooks::HooksConfig::default()
         };
         assert_eq!(render_timeout(&zeroed, &hook), "90s");
 
@@ -569,7 +594,7 @@ mod tests {
         // `list(&App)` path is exercised once we hand the real
         // config in via `app.hooks.config()`; the formatter logic is
         // unit-tested standalone below.
-        let cfg = crate::hooks::HooksConfig {
+        let cfg = codewhale_config::hooks::HooksConfig {
             enabled: false,
             hooks: vec![
                 Hook::new(HookEvent::SessionStart, "echo started").with_name("greet"),
@@ -579,7 +604,7 @@ mod tests {
                     })
                     .with_name("notify"),
             ],
-            ..crate::hooks::HooksConfig::default()
+            ..codewhale_config::hooks::HooksConfig::default()
         };
 
         // Synthesize the expected sections by re-running the same
@@ -614,27 +639,30 @@ mod tests {
             .filter_map(|line| line.strip_prefix("  - `"))
             .map(|line| line.split('`').next().expect("listed event name"))
             .collect();
-        assert_eq!(names, crate::hooks::ALL_HOOK_EVENTS.map(HookEvent::as_str));
+        assert_eq!(
+            names,
+            codewhale_config::hooks::ALL_HOOK_EVENTS.map(HookEvent::as_str)
+        );
     }
 
     #[test]
     fn listed_timeout_is_the_one_the_runtime_will_apply() {
         let hook = Hook::new(HookEvent::SessionStart, "echo hi").with_timeout(90);
 
-        let per_hook = crate::hooks::HooksConfig {
+        let per_hook = codewhale_config::hooks::HooksConfig {
             enabled: true,
             hooks: vec![hook.clone()],
-            ..crate::hooks::HooksConfig::default()
+            ..codewhale_config::hooks::HooksConfig::default()
         };
         assert_eq!(render_timeout(&per_hook, &hook), "90s");
 
         // With the global override set, the runtime uses 5s — the listing must
         // say 5s, and say why.
-        let overridden = crate::hooks::HooksConfig {
+        let overridden = codewhale_config::hooks::HooksConfig {
             enabled: true,
             hooks: vec![hook.clone()],
             default_timeout_secs: Some(5),
-            ..crate::hooks::HooksConfig::default()
+            ..codewhale_config::hooks::HooksConfig::default()
         };
         let rendered = render_timeout(&overridden, &hook);
         assert!(rendered.starts_with("5s"), "{rendered}");
@@ -645,13 +673,13 @@ mod tests {
     #[test]
     fn rendered_problems_name_the_hook_without_leaking_the_command() {
         let problems = vec![
-            crate::hooks::HookConfigProblem {
+            codewhale_config::hooks::HookConfigProblem {
                 name: Some("gate".to_string()),
                 event: Some(HookEvent::SessionStart),
                 detail: "condition can never match".to_string(),
                 rejected: true,
             },
-            crate::hooks::HookConfigProblem {
+            codewhale_config::hooks::HookConfigProblem {
                 name: None,
                 event: Some(HookEvent::ShellEnv),
                 detail: "`background = true` is not honored".to_string(),

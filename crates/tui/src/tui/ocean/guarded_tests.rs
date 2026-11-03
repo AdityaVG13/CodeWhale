@@ -162,8 +162,11 @@ fn guarded_ocean_semantic_alias_reverse_unknown_ink_and_style_facts_survive_fina
                 .add_modifier(Modifier::ITALIC),
         ),
     ])];
-    let protected =
-        ocean_semantic_surfaces(&rows, area, crate::tui::ui_text::grapheme_display_width);
+    let protected = ocean_semantic_surfaces(
+        &rows,
+        area,
+        codewhale_tui_kit::ui_text::grapheme_display_width,
+    );
     assert_eq!(protected, vec![Rect::new(13, 5, 8, 1)]);
     let mut buf = ordinary(area);
     buf[(7, 6)].set_symbol("x").set_fg(Color::Reset);
@@ -175,14 +178,16 @@ fn guarded_ocean_semantic_alias_reverse_unknown_ink_and_style_facts_survive_fina
         .insert(Modifier::REVERSED | Modifier::BOLD);
     let before = buf.clone();
     col.paint_matching_native(area, &mut buf, theme.surface_bg, &theme, &protected);
-    for x in [7, 8, 10, 11] {
+    for x in [8, 10, 11] {
         assert_eq!(buf[(x, 6)], before[(x, 6)]);
     }
     // The terminal backend lifts water-coloured glyphs to visible body ink;
     // the guard projects that same adaptation before admitting the backdrop.
-    assert_eq!(buf[(9, 6)].fg, before[(9, 6)].fg);
-    assert_eq!(buf[(9, 6)].modifier, before[(9, 6)].modifier);
-    assert_eq!(buf[(9, 6)].bg, col.color_at_y(6));
+    for x in [7, 9] {
+        assert_eq!(buf[(x, 6)].fg, before[(x, 6)].fg);
+        assert_eq!(buf[(x, 6)].modifier, before[(x, 6)].modifier);
+        assert_eq!(buf[(x, 6)].bg, col.color_at_y(6));
+    }
     for x in 13..21 {
         assert_eq!(
             buf[(x, 5)],

@@ -5,7 +5,7 @@ use crate::tui::app::App;
 use crate::tui::history::summarize_tool_output;
 use crate::tui::output_rows_cache::hash_str;
 use crate::tui::subagent_routing::{active_fanout_counts, running_agent_count};
-use crate::tui::ui_text::truncate_line_to_width;
+use codewhale_tui_kit::ui_text::truncate_line_to_width;
 
 /// Seconds the current turn has gone without observable stream activity.
 pub(crate) fn provider_wait_idle_secs(app: &App) -> u64 {
@@ -39,7 +39,7 @@ pub(crate) fn maybe_log_provider_wait_incident(app: &mut App) {
     }
     let (fanout_running, fanout_total) = fanout.unwrap_or((0, 0));
     app.provider_wait_incident_logged = true;
-    crate::logging::warn(format!(
+    codewhale_runtime::logging::warn(format!(
         "provider-wait incident: provider={} model={} elapsed_secs={elapsed} \
          idle_secs={} stream_idle_budget_secs={} max_subagents={} \
          fanout_running={fanout_running} fanout_total={fanout_total} \
@@ -120,7 +120,7 @@ pub(crate) fn friendly_subagent_progress(
 
 pub(crate) fn one_line_summary(text: &str, max_width: usize) -> String {
     let mut cleaned = String::with_capacity(text.len());
-    crate::tui::osc8::strip_ansi_into(text, &mut cleaned);
+    codewhale_tui_kit::osc8::strip_ansi_into(text, &mut cleaned);
     truncate_line_to_width(
         &cleaned.split_whitespace().collect::<Vec<_>>().join(" "),
         max_width,
@@ -137,13 +137,14 @@ pub(crate) fn active_goal_chip_state(app: &App) -> Option<(String, bool)> {
         (Some(objective), _) => {
             if matches!(
                 app.goal.status,
-                crate::tools::goal::GoalStatus::Complete | crate::tools::goal::GoalStatus::Blocked
+                codewhale_engine::tools::goal::GoalStatus::Complete
+                    | codewhale_engine::tools::goal::GoalStatus::Blocked
             ) {
                 return None;
             }
             (
                 objective.clone(),
-                app.goal.status == crate::tools::goal::GoalStatus::Paused,
+                app.goal.status == codewhale_engine::tools::goal::GoalStatus::Paused,
             )
         }
         (None, Some(objective)) => (objective.clone(), true),

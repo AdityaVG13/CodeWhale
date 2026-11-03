@@ -114,6 +114,18 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
 }
 
+impl Message {
+    pub fn interrupted_assistant(text: &str) -> Self {
+        Self {
+            role: Role::InterruptedAssistant,
+            content: vec![ContentBlock::Text {
+                text: text.to_owned(),
+                cache_control: None,
+            }],
+        }
+    }
+}
+
 /// Internal role used for assistant text that was visible before a turn was interrupted.
 pub const INTERRUPTED_ASSISTANT_ROLE: &str = "assistant_interrupted";
 /// Prefix attached to interrupted assistant output when it is replayed as context.
@@ -157,6 +169,16 @@ pub enum ContentBlock {
         /// readable `thinking` text or carry it across a route/model switch.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         state: Option<OpaqueReasoningState>,
+        /// Anthropic `redacted_thinking` payload (`data`): the encrypted
+        /// replacement for a whole thinking block that the provider withheld
+        /// for safety reasons. It must be replayed byte-exact — the API
+        /// decrypts it to restore the turn's reasoning — and is mutually
+        /// exclusive with readable `thinking` text and with `signature`.
+        /// Stored on the same variant (instead of a sibling one) so existing
+        /// sessions and matches keep compiling; the serde field is absent
+        /// for every non-redacted block.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        redacted_data: Option<String>,
     },
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -261,6 +283,7 @@ impl ContentBlock {
             thinking: thinking.into(),
             signature: None,
             state: None,
+            redacted_data: None,
         }
     }
 }
@@ -305,6 +328,64 @@ pub struct Tool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn redacted_thinking_round_trips_through_persistence_serde() {
+        // Capture shape: the redacted payload rides the thinking variant and
+        // must survive the persisted-session round trip byte-exact.
+        let block = ContentBlock::Thinking {
+            thinking: String::new(),
+            signature: None,
+            state: None,
+            redacted_data: Some("ENC_REDACTED_PAYLOAD".to_string()),
+        };
+        let value = serde_json::to_value(&block).expect("thinking block serializes");
+        assert_eq!(
+            value,
+            json!({
+                "type": "thinking",
+                "thinking": "",
+                "redacted_data": "ENC_REDACTED_PAYLOAD",
+            }),
+            "the redacted payload must be on the persisted wire"
+        );
+        let round: ContentBlock =
+            serde_json::from_value(value).expect("redacted block deserializes");
+        assert_eq!(round, block, "round trip must be lossless");
+    }
+
+    #[test]
+    fn sessions_without_the_redacted_field_deserialize_unchanged() {
+        // A session persisted by an older build carries no `redacted_data`
+        // key; it must load unchanged with the field defaulting to `None`
+        // and must not gain the key on the way back out.
+        let value = json!({
+            "type": "thinking",
+            "thinking": "readable reasoning",
+            "signature": "sig-abc",
+        });
+        let block: ContentBlock =
+            serde_json::from_value(value).expect("legacy thinking block deserializes");
+        match &block {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                state,
+                redacted_data,
+            } => {
+                assert_eq!(thinking, "readable reasoning");
+                assert_eq!(signature.as_deref(), Some("sig-abc"));
+                assert!(state.is_none());
+                assert!(redacted_data.is_none());
+            }
+            other => panic!("expected thinking block, got {other:?}"),
+        }
+        let serialized = serde_json::to_value(&block).expect("re-serializes");
+        assert!(
+            serialized.get("redacted_data").is_none(),
+            "a non-redacted block must not gain the serde field: {serialized}"
+        );
+    }
 
     fn primary_turn() -> PrimaryTurnRequest {
         PrimaryTurnRequest {

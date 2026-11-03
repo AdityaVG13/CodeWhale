@@ -293,6 +293,8 @@ impl Renderable for ComposerWidget<'_> {
                 input_content_width,
                 input_rows_budget,
             );
+        let clipped =
+            wrap_input_lines_for_mouse(input_text, input_content_width).len() > input_rows_budget;
         if has_panel {
             let hint_line = if self.app.is_history_search_active() {
                 Some(Line::from(vec![
@@ -325,7 +327,13 @@ impl Renderable for ComposerWidget<'_> {
                     Style::default().fg(self.app.ui_theme.text_hint),
                 )))
             } else if !input_text.trim().is_empty() {
-                composer_submit_hint(self.app).map(|hint| {
+                composer_submit_hint(
+                    self.app,
+                    clipped
+                        && !self.app.is_history_search_active()
+                        && self.slash_menu_entries.is_empty(),
+                )
+                .map(|hint| {
                     Line::from(vec![Span::styled(
                         format!(" {} ", hint.text),
                         Style::default().fg(hint.color),
@@ -390,7 +398,12 @@ impl Renderable for ComposerWidget<'_> {
                 .border_style(Style::default().fg(self.app.ui_theme.border))
                 .style(background);
             if !input_text.trim().is_empty()
-                && let Some(hint) = composer_submit_hint(self.app)
+                && let Some(hint) = composer_submit_hint(
+                    self.app,
+                    clipped
+                        && !self.app.is_history_search_active()
+                        && self.slash_menu_entries.is_empty(),
+                )
             {
                 block = block.title(Line::from(Span::styled(
                     format!(" {} ", hint.text),
@@ -537,7 +550,7 @@ impl Renderable for ComposerWidget<'_> {
                     } else {
                         Style::default().fg(palette::TEXT_MUTED)
                     };
-                    let marker = crate::tui::glyphs::selection_marker(is_selected);
+                    let marker = codewhale_tui_kit::glyphs::selection_marker(is_selected);
                     lines.push(Line::from(vec![
                         Span::styled(" ", Style::default()),
                         Span::styled(marker, style),
@@ -585,7 +598,7 @@ impl Renderable for ComposerWidget<'_> {
                 } else {
                     Style::default().fg(palette::TEXT_MUTED)
                 };
-                let marker = crate::tui::glyphs::selection_marker(is_selected);
+                let marker = codewhale_tui_kit::glyphs::selection_marker(is_selected);
                 lines.push(Line::from(vec![
                     Span::styled(" ", Style::default()),
                     Span::styled(marker, style),
@@ -650,7 +663,7 @@ impl Renderable for ComposerWidget<'_> {
                 } else {
                     Style::default().fg(palette::TEXT_MUTED)
                 };
-                let marker = crate::tui::glyphs::selection_marker(is_selected);
+                let marker = codewhale_tui_kit::glyphs::selection_marker(is_selected);
 
                 // Name column
                 let name_style = if entry.is_skill && !is_selected {
@@ -676,7 +689,7 @@ impl Renderable for ComposerWidget<'_> {
 
                 let name_was_truncated = display_name.width() > label_width;
                 let mut name_display =
-                    crate::tui::ui_text::truncate_line_to_width(&display_name, label_width);
+                    codewhale_tui_kit::ui_text::truncate_line_to_width(&display_name, label_width);
                 while name_display.width() < label_width {
                     name_display.push(' ');
                 }
@@ -689,8 +702,10 @@ impl Renderable for ComposerWidget<'_> {
                 let prefix_display_width = 1 + 1 + skill_prefix.width() + label_width + 2;
                 let desc_capacity = content_width.saturating_sub(prefix_display_width);
                 let description_was_truncated = entry.description.width() > desc_capacity;
-                let desc_display =
-                    crate::tui::ui_text::truncate_line_to_width(&entry.description, desc_capacity);
+                let desc_display = codewhale_tui_kit::ui_text::truncate_line_to_width(
+                    &entry.description,
+                    desc_capacity,
+                );
 
                 let row_line_index = lines.len();
                 lines.push(Line::from(vec![
@@ -769,7 +784,7 @@ impl Renderable for ComposerWidget<'_> {
         composer_height(
             self.app.composer_display_input(),
             width,
-            self.max_height.min(self.max_height_cap()),
+            self.max_height,
             self.active_menu_reserved_rows(),
             self.app.composer_density,
             self.wants_enclosed_panel(),

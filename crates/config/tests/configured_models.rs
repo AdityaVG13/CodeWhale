@@ -192,6 +192,38 @@ fn invalid_limits_prices_units_and_authority_fail_closed() {
         ("input = 0.4", "input = inf"),
         ("input = 0.4", "input = 0.4, currency = 'CNY'"),
         ("input = 0.4", "input = 0.4, unit = 'per_token'"),
+        (
+            "input = 0.4",
+            "input = 0.4, tiers = [{ input = 0.8, tier = { type = 'time', size = 1000 } }]",
+        ),
+        (
+            "input = 0.4",
+            "input = 0.4, tiers = [{ input = 0.8, tiers = [{ input = 1.2, tier = { type = 'context', size = 2000 } }], tier = { type = 'context', size = 1000 } }]",
+        ),
+        (
+            "input = 0.4",
+            "input = 0.4, context_over_200k = { input = 0.8, tiers = [{ input = 1.2, tier = { type = 'context', size = 300000 } }] }",
+        ),
+        (
+            "input = 0.4",
+            "input = 0.4, tiers = [{ input = 0.8, currency = 'CNY', tier = { type = 'context', size = 1000 } }]",
+        ),
+        (
+            "input = 0.4",
+            "input = 0.4, tiers = [{ input = 0.8, unit = 'per_token', tier = { type = 'context', size = 1000 } }]",
+        ),
+        (
+            "input = 0.4",
+            "input = 0.4, tiers = [{ input = 0.8, tier = { type = 'context', size = 1000, unit = 'request' } }]",
+        ),
+        (
+            "input = 0.4",
+            "input = 0.4, context_over_200k = { input = 0.8, currency = 'CNY' }",
+        ),
+        (
+            "input = 0.4",
+            "input = 0.4, context_over_200k = { input = 0.8, unit = 'per_token' }",
+        ),
         ("future_note =", "source ="),
         ("future_note =", "canonical_model ="),
         ("future_note =", "api_key ="),
@@ -203,6 +235,15 @@ fn invalid_limits_prices_units_and_authority_fail_closed() {
             toml::from_str::<ConfigToml>(&FIXTURE.replace(before, after)).is_err(),
             "{before} -> {after}"
         );
+    }
+    for schedule in [
+        "tiers = [{ input = 0.8, output = 3.2, tier = { type = 'context', size = 1000 } }]",
+        "tiers = [{ input = 0.8, output = 3.2, tier = { size = 1000 } }]",
+        "context_over_200k = { input = 0.8, output = 3.2 }",
+    ] {
+        let valid = FIXTURE.replace("input = 0.4", &format!("input = 0.4, {schedule}"));
+        let parsed = toml::from_str::<ConfigToml>(&valid).expect("supported configured schedule");
+        validate_configured_models(parsed.custom_models.as_deref().unwrap()).unwrap();
     }
     let mut duplicate = models();
     let mut other = duplicate[0].clone();

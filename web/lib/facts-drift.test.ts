@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { isRepoFacts } from "./facts";
+import { FakeDraftClaimLock } from "./draft-claim-lock.fake";
 import { deriveFactsFromRemote, runFactsDrift } from "./facts-drift";
 
 const REVISION = "b".repeat(40);
@@ -10,7 +11,7 @@ function response(body: string, status = 200): Response {
 }
 
 const VALID_GENERATED_FACTS =
-  'export const FACTS: RepoFacts = {"toolCount":73,"models":[]};';
+  'export const FACTS: RepoFacts = {"toolCount":73,"contributorCount":390,"models":[]};';
 
 function installGitHubFixture(
   toolCountSource: string | null,
@@ -50,7 +51,7 @@ function installGitHubFixture(
           revision: "remote-reviewed", intrinsic: { "deepseek-v4-pro": { source: "exact remote fixture", context_window: 1000000, max_output: 128000, reasoning: true } },
           public_models: [{ id: "deepseek-v4-pro", label: "DeepSeek", added_at: "2026-07-01", aliases: [] }],
         } }),
-        "crates/tui/src/sandbox/mod.rs": `
+        "crates/sandbox/src/lib.rs": `
           pub const PUBLIC_SANDBOX_BACKENDS: &[&str] = &[
             "seatbelt (macOS, when available)",
             "bubblewrap (Linux, opt-in when installed)",
@@ -75,9 +76,9 @@ afterEach(() => {
 });
 
 describe("deriveFactsFromRemote", () => {
-  it("derives tool count and model rows from the same exact remote revision", async () => {
+  it("derives counts and model rows from the same exact remote revision", async () => {
     installGitHubFixture(
-      'export const FACTS: RepoFacts = {"toolCount":73,"models":[' +
+      'export const FACTS: RepoFacts = {"toolCount":73,"contributorCount":390,"models":[' +
         '{"id":"deepseek-v4-pro","provider":"DeepSeek","contextWindow":1000000,' +
         '"maxOutput":128000,"reasoning":true,"addedAt":"2026-07-01"}' +
         "]};",
@@ -88,6 +89,7 @@ describe("deriveFactsFromRemote", () => {
     expect(facts?.sourceRevision).toBe(REVISION);
     expect(facts?.version).toBe("0.9.2");
     expect(facts?.toolCount).toBe(73);
+    expect(facts?.contributorCount).toBe(390);
     expect(facts?.defaultModel).toBe("remote-model");
     expect(facts?.providers).toEqual([{ id: "deepseek", label: "Remote DeepSeek", env: "REMOTE_KEY" }]);
     expect(facts?.models).toEqual([
@@ -161,9 +163,14 @@ describe("runFactsDrift", () => {
       },
     };
 
-    const result = await runFactsDrift({ CURATED_KV: kv });
-
-    expect(result.ok).toBe(true);
+    expect((await runFactsDrift({ CURATED_KV: kv })).ok).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    const env = { CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock() };
+    const results = await Promise.all([runFactsDrift(env), runFactsDrift(env)]);
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(results.filter((result) => result.changed)).toHaveLength(1);
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith("/commits/main"))).toHaveLength(1);
+    expect(JSON.parse(store.get("facts:drift-log") ?? "[]")).toHaveLength(1);
     expect(isRepoFacts(JSON.parse(store.get("facts:current") ?? "null"))).toBe(true);
   });
 
@@ -177,7 +184,7 @@ describe("runFactsDrift", () => {
     };
     // The fixture's source commit is 2026-07-21T23:00:00Z: an overlapping,
     // slower run finishing after a newer one.
-    expect(await runFactsDrift({ CURATED_KV: kv })).toEqual({ ok: true, changed: false });
+    expect(await runFactsDrift({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock() })).toEqual({ ok: true, changed: false });
     expect(store.get("facts:current")).toBe(newer);
   });
 
@@ -197,7 +204,7 @@ describe("runFactsDrift", () => {
       },
     };
 
-    const result = await runFactsDrift({ CURATED_KV: kv });
+    const result = await runFactsDrift({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock() });
 
     expect(result).toEqual({ ok: false, reason: "remote facts failed validation" });
     expect(store.size).toBe(0);
@@ -218,7 +225,7 @@ describe("complete remote provider roster", () => {
       }
     }
     installGitHubFixture(VALID_GENERATED_FACTS, undefined, {
-      "crates/tui/src/config.rs": readFileSync(new URL("../../crates/tui/src/config.rs", import.meta.url), "utf8"),
+      "crates/runtime/src/config.rs": readFileSync(new URL("../../crates/runtime/src/config.rs", import.meta.url), "utf8"),
       "crates/config/assets/provider_descriptors.json": JSON.stringify(metadata),
     });
     const facts = await deriveFactsFromRemote();

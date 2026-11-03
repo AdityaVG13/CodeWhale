@@ -2,7 +2,7 @@
 //!
 //! One committed data file owns built-in/legacy defaults and compatible hosts.
 //! Model rosters are **not** compiled here. A descriptor names the wire, URL, env
-//! var, and whether authenticated `GET /v1/models` is the catalog authority
+//! var, and whether `GET /v1/models` is the catalog authority
 //! for that host. Offerings come from the Codewhale catalog layers and live
 //! provider `/models` refreshes.
 
@@ -143,6 +143,7 @@ include!(concat!(env!("OUT_DIR"), "/provider_descriptors.rs"));
 pub enum DescriptorDiscovery {
     /// Authenticated `GET {base_url}/models` is authoritative for this credential.
     ModelsEndpoint,
+    PublicModelsEndpoint,
     /// No live discovery; only catalog/config rows.
     None,
 }
@@ -231,7 +232,10 @@ mod tests {
             assert!(row.base_url.starts_with("https://"), "{}", row.id);
             assert!(!row.api_key_env.is_empty(), "{}", row.id);
             assert!(!row.default_model.is_empty(), "{}", row.id);
-            assert_eq!(row.discovery, DescriptorDiscovery::ModelsEndpoint);
+            assert!(matches!(
+                row.discovery,
+                DescriptorDiscovery::ModelsEndpoint | DescriptorDiscovery::PublicModelsEndpoint
+            ));
             assert_eq!(row.wire, DescriptorWire::OpenaiCompatible);
         }
         let cmd = provider_descriptor("command-code").expect("command-code");
@@ -309,6 +313,34 @@ mod tests {
         assert_eq!(
             provider_descriptor("cheaper_inference").map(|row| row.id.as_str()),
             Some("cheaperinference")
+        );
+    }
+
+    #[test]
+    fn standard_compute_is_a_descriptor_row() {
+        let row = provider_descriptor("standard-compute").expect("standardcompute");
+        assert_eq!(row.id, "standardcompute");
+        assert_eq!(row.wire, DescriptorWire::OpenaiCompatible);
+        assert_eq!(row.base_url, "https://api.stdcmpt.com/v1");
+        assert_eq!(row.api_key_env, "STANDARDCOMPUTE_API_KEY");
+        assert_eq!(row.default_model, "standardcompute");
+        assert_eq!(
+            provider_descriptor("standard_compute").map(|row| row.id.as_str()),
+            Some("standardcompute")
+        );
+    }
+
+    #[test]
+    fn opper_is_a_descriptor_row() {
+        let row = provider_descriptor("opper").expect("opper");
+        assert_eq!(row.id, "opper");
+        assert_eq!(row.wire, DescriptorWire::OpenaiCompatible);
+        assert_eq!(row.base_url, "https://api.opper.ai/v3/compat");
+        assert_eq!(row.api_key_env, "OPPER_API_KEY");
+        assert_eq!(row.default_model, "claude-sonnet-4-6");
+        assert_eq!(
+            provider_descriptor("opper_ai").map(|row| row.id.as_str()),
+            Some("opper")
         );
     }
 
@@ -404,6 +436,6 @@ mod tests {
         // reusing its name; compatible-host lookup remains separately scoped.
         assert!(provider_descriptor("openai").is_none());
         assert!(provider_descriptor("deepseek").is_none());
-        assert_eq!(bundled_provider_descriptors().len(), 10);
+        assert_eq!(bundled_provider_descriptors().len(), 13);
     }
 }

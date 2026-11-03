@@ -30,8 +30,11 @@ known limitations and publication approval. These proofs are separate.
       preserving dirty/untracked files and comparing commits with current
       `origin/main`. Keep a recoverable backup and unresolved inventory; do not
       reset away work, stash it indefinitely or create another development lane.
-- [ ] Partition files among active writers. Check status before staging and
-      stage only owned paths. Historical branches/checkouts are inventoried;
+- [ ] Uncommitted work found in the checkout is yours (founder, 2026-10-22):
+      read it, prove it, and commit it by explicit path. A file changed in the
+      last 15 minutes or held by a live session is mid-edit: ask that writer
+      to commit first. Check status before staging; never `git add -A`.
+      Historical branches/checkouts are inventoried;
       deleting them requires explicit Hunter approval even if a helper calls
       their tips safe to delete.
 
@@ -90,10 +93,14 @@ known limitations and publication approval. These proofs are separate.
 ## 3. Verify and land preparation slices
 
 - [ ] Run the existing checks appropriate to each changed surface once; batch
-      coherent Rust edits before compiling. Web changes use
-      `npm test && npm run check:web` from the repository root. Record actual
-      results and failures in commit messages; hosted CI owns exhaustive
-      workspace and platform coverage.
+      coherent Rust edits before compiling. During implementation, use the
+      smallest local check or running-product observation that proves the
+      change. After implementation and product review, freeze the candidate
+      commit and run final validation once, including
+      `npm test && npm run check:web` from the repository root. Hosted CI owns
+      exhaustive workspace and platform coverage at that final step. Rerun
+      only checks invalidated by a fix. Record actual results and failures in
+      commit messages.
 - [ ] Commit verified owned paths directly to `main` and push normally. Resolve
       push rejection with the other writer while preserving dirty work; never
       force-push. Reuse valid receipts instead of rebuilding merely to commit
@@ -146,14 +153,24 @@ known limitations and publication approval. These proofs are separate.
       A green workflow badge alone is insufficient: ordinary main-push CI can
       delegate Linux work to CNB and omit some smoke coverage. Manual full CI
       forces the release gates on Linux, macOS and Windows.
-- [ ] The candidate's Parity job succeeds, and its artifact jobs report all seven
-      targets and the complete 34-file asset inventory, including Android
-      arm64, Windows arm64, `codew`, the NSIS installer, archives, checksum
-      manifests, and seven compatibility-only `codewhale-tui-*` release
-      filenames that are not installed commands. The packed npm wrapper installs
-      against those assets and runs its delegated entrypoints. Keep run URLs and
+- [ ] The candidate's Parity job succeeds, and its artifact jobs report all eight
+      targets and the complete 38-file asset inventory, including Android
+      arm64, Windows arm64, native HarmonyOS arm64, `codew`, the NSIS installer,
+      archives, checksum manifests, and eight compatibility-only
+      `codewhale-tui-*` release filenames that are not installed commands. The
+      packed npm wrapper installs against those assets and runs its delegated
+      entrypoints. Keep run URLs and
       required evidence before the Actions artifacts expire; these are not a
       public release.
+- [ ] Windows static import receipts cover x64/ARM64 CLI, shim and compatibility
+      assets, any optional host, and the NSIS setup plus its actual embedded PE
+      plugins. Verify the selected architecture profile and its conservative
+      limits in [ENVIRONMENTS.md](ENVIRONMENTS.md#windows-support-and-release-qualification).
+      Preserve the generated candidate Uninstall.exe import/SHA receipt. Static
+      import/profile PASS does not replace final release startup/install on the
+      promised oldest x64 OS, native ARM64 package acceptance, or packaged/native
+      app owner-crash recovery. Record or explicitly resolve these remaining
+      runtime gates before tagging.
 - [ ] Complete the version-specific acceptance packet. Cross-building Android
       does not prove a real Termux/device session. Local install, actual provider
       calls and customer acceptance need separate receipts; provider spend still
@@ -203,11 +220,13 @@ known limitations and publication approval. These proofs are separate.
       switch release lanes or force-fetch a conflicting tag. If `main` advanced,
       coordinate with Hunter for a new candidate or separately authorized
       recovery plan.
-- [ ] Publish Cargo manually within the approved scope:
-      `./scripts/release/publish-crates.sh publish`. It verifies every package,
-      skips already-published versions and waits for each new dependency to
-      appear. npm normally uses Trusted Publishing; manual recovery keeps the
-      same clean-source and public-asset guards.
+- [ ] Publish Cargo manually within the approved scope with the
+      [runbook's step 5 block](RELEASE_RUNBOOK.md#rust-crates-release), which
+      runs `./scripts/release/publish-crates.sh publish` from a new, empty
+      `CARGO_HOME` and build directory with the token in `CARGO_REGISTRY_TOKEN`. It
+      verifies every package, skips already-published versions and waits for
+      each new dependency to appear. npm normally uses Trusted Publishing;
+      manual recovery keeps the same clean-source and public-asset guards.
 
 ## 7. Verify public results
 
@@ -247,8 +266,9 @@ known limitations and publication approval. These proofs are separate.
       workflows can overwrite notes and accidentally remove contributor credit.
 - [ ] Note any deferred items in the next release's tracking issue.
 - [ ] Close any issues that this release fixed.
-- [ ] Update existing tracking with evidence; agents do not post GitHub
-      issue/PR comments. Handle the existing `sync-release-record` workflow's
+- [ ] Update existing tracking with evidence and follow the current contributor
+      communication rules in [AGENTS.md](../AGENTS.md). Handle the existing
+      `sync-release-record` workflow's
       metadata proposal after publication: it currently opens a bot PR, not a
       required preparation branch. A source record does not prove deployment.
 - [ ] Report canonical path, branch, SHA, upstream state and dirty/stranded

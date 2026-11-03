@@ -1,10 +1,10 @@
-//! Historical thread recovery, canonical owner receipts, metadata and jobs.
+//! Historical thread recovery, canonical owner receipts and metadata.
 //!
 //! [`StateStore`] retains legacy conversation graphs as read-only archives.
 //! A bounded absent-only restore can admit a complete historical graph in one
 //! SQLite transaction; live transcript writes belong to Runtime's Engine and
 //! SessionManager. Canonical aliases and durable operations use this same
-//! SQLite connection. Thread metadata, jobs, dynamic tools and the session
+//! SQLite connection. Thread metadata, dynamic tools and the session
 //! index retain their existing ownership.
 
 mod runtime_aliases;
@@ -156,45 +156,6 @@ pub struct CheckpointRecord {
     pub created_at: i64,
 }
 
-/// Status of a background job.
-///
-/// Serialized as lowercase snake_case strings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum JobStateStatus {
-    /// Job is waiting to be executed.
-    Queued,
-    /// Job is currently executing.
-    Running,
-    /// Job has been temporarily paused.
-    Paused,
-    /// Job has finished successfully.
-    Completed,
-    /// Job has failed with an error.
-    Failed,
-    /// Job was cancelled before completion.
-    Cancelled,
-}
-
-/// Persisted state of a background job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobStateRecord {
-    /// Unique identifier for the job.
-    pub id: String,
-    /// Human-readable name describing the job.
-    pub name: String,
-    /// Current lifecycle status of the job.
-    pub status: JobStateStatus,
-    /// Completion progress as a percentage (0--100), if available.
-    pub progress: Option<u8>,
-    /// Optional detail message providing additional status information.
-    pub detail: Option<String>,
-    /// Unix timestamp (seconds) when the job was created.
-    pub created_at: i64,
-    /// Unix timestamp (seconds) of the most recent status update.
-    pub updated_at: i64,
-}
-
 /// Persisted lifecycle status for a thread goal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -282,7 +243,7 @@ fn session_index_compact_line_threshold() -> usize {
 /// The `user_version` the last step of `StateStore::migrate_schema` writes.
 const SCHEMA_VERSION: u32 = 7;
 
-/// Persistent storage for conversation threads, messages, checkpoints, and jobs.
+/// Persistent storage for conversation threads, messages, and checkpoints.
 ///
 /// Backed by a SQLite database and an append-only JSONL session index file.
 /// The database schema is automatically initialized and migrated on [`open`](Self::open).
@@ -1431,66 +1392,6 @@ impl StateStore {
         Ok(out)
     }
 
-    /// Insert or update a background job record.
-    pub fn upsert_job(&self, job: &JobStateRecord) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            r#"
-            INSERT INTO jobs(id, name, status, progress, detail, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                status = excluded.status,
-                progress = excluded.progress,
-                detail = excluded.detail,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at
-            "#,
-            params![
-                job.id,
-                job.name,
-                job_state_status_to_str(&job.status),
-                job.progress.map(i64::from),
-                job.detail,
-                job.created_at,
-                job.updated_at
-            ],
-        )
-        .with_context(|| format!("failed to upsert job {}", job.id))?;
-        Ok(())
-    }
-
-    /// List jobs ordered by most recently updated.
-    ///
-    /// The `limit` parameter caps the number of results and defaults to 100.
-    pub fn list_jobs(&self, limit: Option<usize>) -> Result<Vec<JobStateRecord>> {
-        let conn = self.conn()?;
-        let limit = i64::try_from(limit.unwrap_or(100)).unwrap_or(100);
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, status, progress, detail, created_at, updated_at FROM jobs ORDER BY updated_at DESC LIMIT ?1",
-            )
-            .context("failed to prepare job list query")?;
-        let mut rows = stmt
-            .query(params![limit])
-            .context("failed to query persisted jobs")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().context("failed to iterate persisted jobs")? {
-            let status_raw: String = row.get(2).context("failed to read job status")?;
-            let progress: Option<i64> = row.get(3).context("failed to read job progress")?;
-            out.push(JobStateRecord {
-                id: row.get(0).context("failed to read job id")?,
-                name: row.get(1).context("failed to read job name")?,
-                status: job_state_status_from_str(&status_raw),
-                progress: progress.and_then(|v| u8::try_from(v).ok()),
-                detail: row.get(4).context("failed to read job detail")?,
-                created_at: row.get(5).context("failed to read job created_at")?,
-                updated_at: row.get(6).context("failed to read job updated_at")?,
-            });
-        }
-        Ok(out)
-    }
-
     /// Look up the rollout file path for a thread by its ID.
     pub fn find_rollout_path_by_id(&self, id: &str) -> Result<Option<PathBuf>> {
         let conn = self.conn()?;
@@ -2021,29 +1922,6 @@ fn path_to_opt_string(path: Option<&Path>) -> Option<String> {
 
 fn parse_checkpoint_state(state_json: &str) -> Result<Value> {
     serde_json::from_str(state_json).context("failed to parse checkpoint state json")
-}
-
-fn job_state_status_to_str(status: &JobStateStatus) -> &'static str {
-    match status {
-        JobStateStatus::Queued => "queued",
-        JobStateStatus::Running => "running",
-        JobStateStatus::Paused => "paused",
-        JobStateStatus::Completed => "completed",
-        JobStateStatus::Failed => "failed",
-        JobStateStatus::Cancelled => "cancelled",
-    }
-}
-
-fn job_state_status_from_str(value: &str) -> JobStateStatus {
-    match value {
-        "queued" => JobStateStatus::Queued,
-        "running" => JobStateStatus::Running,
-        "paused" => JobStateStatus::Paused,
-        "completed" => JobStateStatus::Completed,
-        "failed" => JobStateStatus::Failed,
-        "cancelled" => JobStateStatus::Cancelled,
-        _ => JobStateStatus::Queued,
-    }
 }
 
 fn thread_goal_status_to_str(status: &ThreadGoalStatus) -> &'static str {
@@ -2605,17 +2483,13 @@ mod tests {
 
         locked_rx.recv().expect("wait for active writer");
         let (attempting_tx, attempting_rx) = mpsc::sync_channel(0);
-        let writer_b = thread::spawn(move || {
+        let writer_b = thread::spawn(move || -> Result<()> {
             attempting_tx.send(()).expect("announce second write");
-            store_b.upsert_job(&JobStateRecord {
-                id: "job-b".to_string(),
-                name: "writer-b".to_string(),
-                status: JobStateStatus::Running,
-                progress: None,
-                detail: Some("waited for writer a".to_string()),
-                created_at: 1,
-                updated_at: 1,
-            })
+            store_b.conn()?.execute(
+                "INSERT INTO jobs(id, name, status, created_at, updated_at) VALUES ('job-b', 'writer-b', 'running', 1, 1)",
+                [],
+            )?;
+            Ok(())
         });
 
         attempting_rx.recv().expect("wait for second write attempt");
@@ -2632,8 +2506,12 @@ mod tests {
             .expect("writer b should succeed after the lock is released");
 
         let store = StateStore::open(Some(db_path)).expect("reopen for verify");
-        let listed = store.list_jobs(Some(2)).expect("list jobs");
-        assert_eq!(listed.len(), 2, "both writers should persist their jobs");
+        let listed: i64 = store
+            .conn()
+            .expect("connection")
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .expect("count jobs");
+        assert_eq!(listed, 2, "both writers should persist their jobs");
 
         let _ = fs::remove_dir_all(dir);
     }

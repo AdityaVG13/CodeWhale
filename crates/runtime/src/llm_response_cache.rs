@@ -98,6 +98,11 @@ mod tests {
                 reasoning_tokens: Some(5),
                 reasoning_replay_tokens: Some(2),
                 server_tool_use: None,
+
+                input_audio_tokens: None,
+                output_audio_tokens: None,
+
+                request_usages: Vec::new(),
             },
         }
     }

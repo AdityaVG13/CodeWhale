@@ -14,18 +14,18 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `F2`                 | Toggle the typed Settings editor                              |
 | `F3`                 | Open the provider/model picker (same as `/provider`)          |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
-| `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
+| `Ctrl-C`             | Cancel current turn / dismiss modal / clear a non-empty draft (recoverable — see `Ctrl-Z`) / arm-then-confirm quit |
 | `Ctrl-B`             | Release the current shell wait so the turn can continue; foreground commands move into `/jobs`, and background tasks keep running. Use `/jobs` or `Bash` with `action: "wait"` to inspect output |
 | `Ctrl-D`             | Quit (only when the composer is empty)                         |
-| `Tab`                | When the composer is empty, cycle TUI mode: Plan → Work → Operate → Plan |
-| `Shift+Tab`          | Cycle permission posture: Ask → Auto-Review → Full Access. Live regardless of composer contents or whether a turn is running (suppressed only while a modal other than Config is open) |
+| `Tab`                | When the composer is empty, cycle TUI mode: Plan → Work → Operate → Plan. Works while a turn is running: the change applies at the agent's next step in the same turn, and the status line says so until it does |
+| `Shift+Tab`          | Cycle permission posture: Ask → Auto-Review → Full Access. Live regardless of composer contents or whether a turn is running (suppressed only while a modal other than Config is open). During a turn the change applies at the agent's next step; a call you already approved runs only if the new posture is equal or broader. Model, thinking level and provider stay locked until the turn ends |
 | `Ctrl-T`             | Cycle reasoning effort for the active model. Walks the same ladder as `/model` and `/effort` (catalog or documented route dialect). Always-thinking models omit `off`; Grok 4.6 includes `xhigh`. |
 | `Ctrl-Shift-T`       | Toggle live transcript overlay (sticky-tail auto-scroll)                       |
 | `Ctrl-R`             | Open the resume-session picker                                 |
 | `Ctrl-L`             | Compact the conversation context (status line shows progress; no-op while a compaction is already running) |
 | `Ctrl-O`             | Open the reasoning detail for the selected or current turn, regardless of composer contents |
 | `Ctrl-Alt-O`         | Open the whole-turn Turn Inspector, regardless of composer contents |
-| `Alt-V` / `Option-V` (macOS) | Open the details pager for the selected tool/sub-agent card; with nothing selected, the live inspector of the newest running shell, else the visible or most recent card; terminals that emit the legacy Option-V glyph are also handled |
+| `Alt-V` / `Option-V` (macOS) | Open the details pager for the selected tool/sub-agent card; with nothing selected, the newest visible error, else the first visible card with details, else the most recent one. Click a card first to keep Alt-V on it while newer cards arrive. Terminals that emit the legacy Option-V glyph are also handled |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | Toggle the file tree in the workbar                   |
 | `Ctrl-]` or `Ctrl-Tab` | Cycle the pet view while the pet main view is showing; otherwise cycle the work dock: TODO → Agents → Jobs → Background. `Ctrl-]` is portable; `Ctrl-Tab` requires the kitty keyboard protocol. Terminal.app uses it to switch terminal tabs |
 | `Ctrl-Shift-Tab`     | Cycle the pet view or work dock backwards where the terminal sends the kitty keyboard chord. Terminal.app uses it to switch terminal tabs |
@@ -46,9 +46,10 @@ Editing the message you're about to send.
 |-----------------------------|---------------------------------------------------------|
 | `Enter`                     | Send when idle; queue while busy; with an empty composer, send the next queued follow-up now |
 | `Shift-Enter` / `Alt-Enter` / `Ctrl-J` | Insert a newline without sending (idle or busy) |
-| `Ctrl-Enter` / `Cmd-Enter`  | Send into the current turn; send normally when idle (when the terminal reports it distinctly) |
+| `Ctrl-Enter` / `Cmd-Enter`  | Steer: send into the current turn, closing the in-flight model request at once (reasoning, text or tool call) and continuing the same turn with your message; send normally when idle (when the terminal reports it distinctly). Text already shown is kept; unfinished reasoning and partial tool calls are discarded, never run. A second `Enter` within 500 ms of queueing a message while busy steers too |
 | `Ctrl-U`                    | Clear the whole draft (recoverable — see `Ctrl-Z`)      |
 | `Ctrl-Z`                    | Restore the cleared draft (only while the composer is empty) |
+| `Ctrl-C`                    | Clear the whole draft when no turn is running (recoverable — see `Ctrl-Z`) |
 | `Ctrl-W` / `Ctrl-Backspace` / `Alt-Backspace` | Delete previous word        |
 | `Ctrl-A` / `Home`           | Move to start of input / start of line (readline convention) |
 | `Ctrl-E` / `End`            | Move to end of input / end of line                      |
@@ -84,10 +85,11 @@ Markdown source, whole cells joined with blank lines (see the Transcript
 section below), with `tui.selection_copy_markdown = false` restoring rendered
 text. Empty or oversized HTML falls back to plain text.
 
-Set `composer_multiline_mode = true` to swap the portable `Enter` and
-`Shift-Enter` behaviors: `Enter` inserts a newline and `Shift-Enter` sends.
-`Alt-Enter`, `Ctrl-J`, and supported `Ctrl-Enter` / `Cmd-Enter` behavior stays
-unchanged.
+Set `composer_multiline_mode = true` for `Enter` to insert a newline and
+`Alt-Enter` to send. `Shift-Enter` also sends when the terminal reports it
+distinctly; legacy terminals may report it as plain `Enter`. `Ctrl-J` always
+inserts a newline. Supported `Ctrl-Enter` / `Cmd-Enter` behavior stays unchanged.
+With multiline mode off, `Alt-Enter` and supported `Shift-Enter` insert newlines.
 
 ### Selection semantics
 
@@ -165,7 +167,7 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 | `Alt-G` / `Alt-Shift-G` | Jump to top / bottom                            |
 | `Ctrl-Home` / `Ctrl-End` | Jump to top / bottom (also works from the composer)  |
 | `Alt-[` / `Alt-]`    | Jump between tool output blocks                     |
-| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds). Rewinds the conversation only; files are not changed, and `/undo` puts them back |
+| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds). Rewinds the conversation only; files are not changed; `/restore` rolls the folder back (needs `/trust on` or Full Access) |
 | `Esc`                | Return focus to composer                           |
 | `Ctrl-Y`             | With an empty composer, copy the focused transcript cell |
 | `Alt-V`              | Open raw detail for the focused tool or message    |
@@ -234,6 +236,15 @@ panel and placement. `Alt-!`/`Alt-@`/`Alt-#`/`Alt-$` switch panels.
 | `↑` / `↓` / `Ctrl+P` / `Ctrl+N`| Move selection                                     |
 | `Enter` / `Tab`                | Run / complete the highlighted command             |
 | `Esc`                          | Dismiss palette                                     |
+
+## Provider and model pickers
+
+| Chord | Action |
+|---|---|
+| `F7` | View the OrcaRouter partner offer in `/provider` or `/model`, keeping the current selection |
+
+Click the OrcaRouter recommendation for the same offer. Its pager includes the
+redemption URL and referral disclosure. On Apple keyboards, hold Fn if needed.
 
 ## Session Picker (`Ctrl-R` or `/sessions`)
 

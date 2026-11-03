@@ -35,7 +35,7 @@ Run `/mode` to open the mode picker, or switch directly with `/mode work`,
 `/mode plan`, or `/mode operate`.
 
 - **Plan**: design-first prompting. The stable primitive names remain familiar, but the runtime centrally refuses file mutation and shell execution. Read-only inspection and policy-allowed research, including deferred Web search/fetch, remain available. When a Plan turn successfully finishes a nonempty response, including a prose-only plan, the TUI asks how to continue: Work (Ask), Work (Auto-Review), or keep planning. Work sends the exact approved response as a normal follow-up and preserves that turn's existing To-dos, or adds one pending plan item without replacing unrelated work.
-- **Work** (internally `agent`): ordinary multi-step execution. The first-turn toolbox includes `read`, `write`, `edit`, `bash`, `agent`, `workflow`, and `todo_write`, plus `create_goal`, `get_goal`, and `update_goal` so goal controls are available without discovery. The agent calls `create_goal` when a request is a durable objective; the host never infers a goal from wording, and the contract must not tell the model otherwise. Approval, sandbox, repository law, and managed policy decide what may execute.
+- **Work** (internally `agent`): ordinary multi-step execution. The first-turn toolbox includes `read`, `write`, `edit`, `file_search`, `bash`, `todo_write`, `load_skill`, and `task_shell_wait`, plus `create_goal` and the synthetic `tool_search`; `agent`, `workflow`, `get_goal`, and `update_goal` load through discovery (`get_goal`/`update_goal` ride eager while a goal is active). The agent calls `create_goal` when a request is a durable objective; the host never infers a goal from wording, and the contract must not tell the model otherwise. Approval, sandbox, repository law, and managed policy decide what may execute.
 - **Operate**: Work at full strength, the "ultra" mode. Same tools and authority as Work; the difference is how they are used. Each substantive request becomes a goal (`create_goal`), the plan stays visible (`todo_write`), multi-part work runs through `workflow` and parallel `agent` workers, non-trivial changes get an independent reviewer before they are called done, long commands keep running in the background, and recurring or watch-type work is offered as an `automation` (created after approval). It keeps going until the goal is verified, blocked on you, or paused.
 
 `Act` and `/mode act` remain compatibility aliases for Work. Saved settings
@@ -139,9 +139,8 @@ selection you made last is the one on disk — a burst of Tab presses cannot end
 up persisting whichever write happened to finish last — and a mode write never
 rolls back an unrelated key such as `default_model`.
 
-Two paths deliberately do **not** rewrite the startup default: restoring a saved
-session (which re-installs the mode that session was in) and a mode change
-refused because a turn is in flight. The legacy `yolo` entry point installs Work
+Restoring a saved session deliberately does **not** rewrite the startup
+default: it re-installs the mode that session was in. The legacy `yolo` entry point installs Work
 plus Full Access, and `agent` is what it persists — `yolo` is a permission
 alias, never a startup mode.
 
@@ -150,12 +149,21 @@ session the live mode and `default_mode` routinely disagree, so choosing the
 live mode again is how you make it durable; Codewhale confirms with a
 "saved as startup default" receipt rather than reporting "already in that mode".
 
-While a turn is running, every change to the live route is refused — mode,
-model, thinking level, and provider — no matter which surface you use. That
-now includes the slash surfaces (`/mode`, `/model`, `/config <key> <value>`,
-`/config preset`), which are reachable mid-turn. Press
-Esc to interrupt first. The restart-only `default_mode` key is exempt, because
-it does not touch the running turn.
+Mode and permissions can change while a turn is running, from any surface
+(Tab, Shift+Tab, `/mode`, the hotbar, `/config mode …`). The change does not
+restart a response that is already streaming. The engine applies it at its next
+step in the same turn: before the next tool batch, at every approval gate, and
+before the next model request, which carries a new mode notice. A call that was
+still waiting for approval, or that no approval covers, goes back to the model
+to retry under the new posture; a call you already approved runs only if the
+new posture is equal or broader. The status line says the change is pending
+until that step, and the engine reports `Permissions: … · <mode>` once it
+applies.
+
+Model, thinking level, and provider are still refused while a turn runs, on
+every surface (`/model`, `/provider`, `/config <key> <value>`,
+`/config preset`): they change the route the running request is on. Press Esc
+to interrupt first.
 
 Codewhale writes `settings.toml` under a lock that spans processes, and replaces
 the file atomically, so a second Codewhale instance on the same home directory
@@ -212,7 +220,13 @@ Legacy note: `/set approval_mode ...` was retired in favor of `/config`.
   High or critical risk cannot auto-run even if the model says allow. It has no
   tools, remembers no rules, and denies rather than truncates an oversized
   exact call. Exactly one reviewer request is made; incomplete or malformed
-  output, timeout, cancellation, or provider failure fails closed. Headless
+  output, timeout, cancellation, or provider failure fails closed. Repeated
+  denials stop the turn: after three guardian denials in a row, or ten among
+  the turn's last fifty reviews, the turn ends as interrupted with a status
+  line, and calls still in that batch are refused without another review.
+  Only explicit denials count (not timeouts or failures), an allowed review
+  resets the run of three, the count starts fresh with each turn, and a child
+  agent counts its own turns. Headless
   adapters use the deterministic-only tier. Repo-law
   holds that explicitly require a person block in Auto-Review rather than
   opening a hidden approval modal.
@@ -222,9 +236,9 @@ commit [`6fc6b9d6d2580d62622fc9884b5f5707f6505a5e`](https://github.com/openai/co
 Codex's [guardian entry point](https://github.com/openai/codex/blob/6fc6b9d6d2580d62622fc9884b5f5707f6505a5e/codex-rs/core/src/guardian/mod.rs)
 reconstructs conversation context and runs a dedicated review session.
 Codewhale deliberately adopts only the exact-action structured decision,
-90-second deadline, and fail-closed result. It does not copy Codex's transcript
-reconstruction, user-authorization score, reviewer tools, retries, persistent
-review session, or denial ledger.
+90-second deadline, fail-closed result, and per-turn denial circuit breaker. It
+does not copy Codex's transcript reconstruction, user-authorization score,
+reviewer tools, retries, persistent review session, or denial ledger.
 
 Kimi Code at commit
 [`1414d4602898f406e540b23342cb18db23ff9efc`](https://github.com/MoonshotAI/kimi-code/tree/1414d4602898f406e540b23342cb18db23ff9efc)
@@ -337,7 +351,8 @@ See `MCP.md`.
 Run `codewhale --help` for the canonical list. Common flags:
 
 - `-p, --prompt <TEXT>`: one-shot prompt mode (prints and exits)
-- `codewhale exec --auto --output-format stream-json <PROMPT>`: run the tool-backed non-interactive agent and emit one JSON object per line for harnesses and backend wrappers. Exit codes: `0` on success, `1` for genuine task/agent failures, `75` (`EX_TEMPFAIL`) when the turn ended on a retryable infrastructure failure (provider/transport `network`/`timeout` after all in-session retries) so harnesses can tell a retryable infra exit apart from a task failure; the terminal stream `metadata` event's `error_category` carries the same classification
+- `codewhale exec --auto --output-format stream-json <PROMPT>`: run the tool-backed non-interactive agent and emit one JSON object per line for harnesses and backend wrappers. `--auto` enables Full Access by default (no Codewhale shell sandbox, trust mode on); add `--sandbox workspace-write` to keep the shell sandbox and file-tool workspace restrictions, with trust mode off. Any `--sandbox` other than `danger-full-access` (or the equivalent `sandbox_mode` in config) keeps trust mode off; `external-sandbox` relies on your own isolation. Exec runs that offer tools are saved in every output format. Exit codes: `0` on success and `1` on failure. Network and timeout errors do not authorize a supervisor to repeat the command: its request may already have run or its user message may already be saved. The terminal stream `metadata` event retains `error_category` for diagnosis; it is not an idempotency receipt.
+- Put exec flags before the prompt. A prompt starting with `-` needs `--` first, for example `codewhale exec -- "- explain this option"`. A lone `-` is literal text. Known exec long flags (including `--flag=value`) after the prompt are rejected unless they follow an explicit `--`, which marks them as literal prompt text.
 - `codewhale exec --prompt-file <PATH>` / `cat prompt.txt | codewhale exec --prompt-file -`: read the prompt from a file or stdin instead of argv, for prompts past the OS per-argument limit (~128 KiB on Linux). Conflicts with a positional prompt, and a positional `-` is literal prompt text; `--prompt-file -` is refused with `--parent-death-watch`, which owns stdin
 - `codewhale exec --resume <ID|PREFIX> <PROMPT>` / `--session-id <ID|PREFIX>`: continue a saved session non-interactively
 - `codewhale exec --continue <PROMPT>`: continue the most recent saved session for this workspace non-interactively
@@ -347,6 +362,7 @@ Run `codewhale --help` for the canonical list. Common flags:
 - `-r, --resume <ID|PREFIX|latest>`: resume a saved session
 - `-c, --continue`: resume the most recent session in this workspace
 - `--max-subagents <N>`: clamp to `1..=128`
+- `--full-access`: start with Full Access, no approval prompts and no Codewhale sandbox; the same as `yolo = true`. `serve --acp --full-access` and `--full-access serve --acp` are equivalent.
 - `--mouse-capture` / `--no-mouse-capture`: opt in or out of internal mouse scrolling, transcript selection, right-click context actions, and transcript scrollbar dragging. Mouse capture is enabled by default on non-Windows terminals and on Windows Terminal/ConEmu/Cmder so drag selection copies only transcript text, removes visual wrap-column line breaks from paragraphs, and stays scoped to the transcript pane; hold Shift while dragging or use `--no-mouse-capture` for raw terminal selection. It defaults off on legacy Windows console (CMD without `WT_SESSION` / `ConEmuPID`) and inside JetBrains JediTerm — PyCharm/IDEA/CLion/etc. — where the terminal advertises mouse support but forwards SGR mouse events as raw text (#878, #898). Use `--mouse-capture` to opt in anywhere it's defaulted off. Raw terminal selection may cross the right workbar and include visual wraps because the terminal, not the TUI, owns the selection.
 - `--profile <NAME>`: select config profile
 - `--config <PATH>`: config file path
@@ -361,7 +377,8 @@ Codewhale has three related but intentionally separate recovery paths:
   explore a different answer path without overwriting the original session.
 - Esc-Esc backtrack rewinds the live transcript to a previous user prompt and
   restores that prompt into the composer for editing. It does not change
-  files; `/undo` afterwards puts back the files that request changed.
+  files; `/restore` rolls the folder back to a chosen restore point and needs
+  `/trust on` or Full Access.
 - `/restore` and the `revert_turn` tool restore workspace files from side-git
   snapshots. `/restore list [N]` lists more snapshot options before choosing a
   rollback point. They do not rewrite conversation history.

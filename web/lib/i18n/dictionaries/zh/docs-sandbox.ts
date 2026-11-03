@@ -80,7 +80,7 @@ prefer_bwrap = false`,
           codeTerms: true,
         },
         {
-          p: "前两种模式只有在沙箱可用时才会真正生效——在没有 bubblewrap 的 Linux 上，以及在 Windows 上，它们只是设置，背后没有操作系统沙箱。仓库自带的配置只能让模式更严格，不能更宽松。对单次无界面运行，可以给 `codewhale exec` 传 `--sandbox <mode>`；`--auto` 只会自动批准工具，绝不会放宽沙箱。",
+          p: "前两种模式只有在沙箱可用时才会真正生效——在没有 bubblewrap 的 Linux 上，以及在 Windows 上，它们只是设置，背后没有操作系统沙箱。仓库自带的配置只能让模式更严格，不能更宽松。对单次无界面运行，可以在 `codewhale exec` 的提示词前传入 `--sandbox <mode>`。`--auto` 默认启用 Full Access（完全访问）：工具无需批准即可运行，shell 命令没有 Codewhale 沙箱，信任模式允许文件工具写入工作区以外的路径。除 `danger-full-access` 外的任何 `--sandbox`（或配置中对应的 `sandbox_mode`）都会保持信任模式关闭。使用 `--sandbox workspace-write` 可在沙箱可用时启用 shell 沙箱，并保留文件工具的工作区限制；`external-sandbox` 则依赖你自行提供的隔离。",
         },
       ],
     },

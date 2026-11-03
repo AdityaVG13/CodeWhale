@@ -195,10 +195,14 @@ impl LaneRegistry {
         ));
         let written = (|| -> std::io::Result<()> {
             use std::io::Write as _;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp)?;
             file.write_all(json.as_bytes())?;
             file.sync_all()
         })();
@@ -261,7 +265,16 @@ impl LaneRegistry {
         let id = LaneRecord::new_id();
         let log_path = self.log_path_for(&id);
         // Touch the log so `lane logs` works immediately.
-        fs::write(&log_path, "").with_context(|| format!("create log {}", log_path.display()))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&log_path)
+            .with_context(|| format!("create log {}", log_path.display()))?;
         let record = LaneRecord {
             id,
             workflow,

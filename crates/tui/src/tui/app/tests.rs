@@ -1,13 +1,14 @@
 use super::*;
-use crate::config::{Config, ProviderConfig, ProviderKind, ProvidersConfig};
-use crate::settings::Settings;
 use crate::test_support::{EnvVarGuard, lock_test_env};
-use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
-use crate::tools::todo::TodoStatus;
 use crate::tui::clipboard::{ClipboardHandler, PastedImage};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
 use crate::tui::motion::MotionMode;
+use codewhale_config::ProviderKind;
+use codewhale_engine::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
+use codewhale_engine::tools::todo::TodoStatus;
 use codewhale_models::Usage;
+use codewhale_runtime::config::{Config, ProviderConfig, ProvidersConfig};
+use codewhale_runtime::settings::Settings;
 
 fn test_options(yolo: bool) -> TuiOptions {
     TuiOptions {
@@ -64,6 +65,15 @@ fn set_api_messages_installs_the_shared_snapshot_without_copying() {
     });
     assert_eq!(snapshot.len(), 1);
     assert_eq!(app.api_messages.len(), 2);
+    app.session_turn_outcomes = vec![
+        codewhale_engine::session_manager::SavedTurnOutcome::failed("shared failure", 1),
+        codewhale_engine::session_manager::SavedTurnOutcome::failed("replaced failure", 2),
+    ];
+    let replacement = Arc::new(vec![snapshot[0].clone(), snapshot[0].clone()]);
+    app.set_api_messages(Arc::clone(&replacement));
+    assert!(Arc::ptr_eq(&app.api_messages, &replacement));
+    assert_eq!(app.session_turn_outcomes.len(), 1);
+    assert_eq!(app.session_turn_outcomes[0].error, "shared failure");
 }
 
 #[test]
@@ -404,8 +414,9 @@ fn fixed_auto_reasoning_label_preserves_untiered_effective_receipt() {
     let mut app = App::new(test_options(false), &Config::default());
     app.api_provider = ProviderKind::Zai;
     app.auto_model = false;
-    app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
-    app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
+    app.model = codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_TURBO_MODEL.to_string();
+    app.active_route_base_url =
+        codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL.to_string();
     app.reasoning_effort = ReasoningEffort::Auto;
     app.last_effective_reasoning_effort =
         Some(EffectiveReasoningEffort::ThinkingEnabledGranularityUnavailable);
@@ -421,7 +432,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     let mut app = App::new(test_options(false), &Config::default());
     app.api_provider = ProviderKind::Zai;
     app.auto_model = false;
-    app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
+    app.model = codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_TURBO_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::Auto;
     app.last_effective_reasoning_effort =
         Some(EffectiveReasoningEffort::ThinkingEnabledGranularityUnavailable);
@@ -429,19 +440,21 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Zai,
-            crate::config::DEFAULT_ZAI_BASE_URL,
-            crate::config::ZAI_GLM_5_TURBO_MODEL,
+            ProviderKind::Zai.as_str(),
+            codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL,
+            codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_TURBO_MODEL,
         ),
         Some("high")
     );
 
     app.api_provider = ProviderKind::Minimax;
-    app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
+    app.model = codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_MODEL.to_string();
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Minimax,
-            crate::config::DEFAULT_MINIMAX_BASE_URL,
-            crate::config::DEFAULT_MINIMAX_MODEL,
+            ProviderKind::Minimax.as_str(),
+            codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_BASE_URL,
+            codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_MODEL,
         ),
         Some("high")
     );
@@ -450,8 +463,9 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Zai,
-            crate::config::DEFAULT_ZAI_BASE_URL,
-            crate::config::ZAI_GLM_5_TURBO_MODEL,
+            ProviderKind::Zai.as_str(),
+            codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL,
+            codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_TURBO_MODEL,
         ),
         None
     );
@@ -468,8 +482,9 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::OpenaiCodex,
-            crate::config::DEFAULT_OPENAI_CODEX_BASE_URL,
-            crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+            ProviderKind::OpenaiCodex.as_str(),
+            codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_BASE_URL,
+            codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL,
         ),
         Some("low"),
         "Codex must apply its Off-to-Low floor even when DeepSeek is configured"
@@ -479,8 +494,9 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Moonshot,
-            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
-            crate::config::KIMI_CODE_K3_MODEL,
+            ProviderKind::Moonshot.as_str(),
+            codewhale_config::descriptors::defaults::DEFAULT_KIMI_CODE_BASE_URL,
+            codewhale_config::catalog::reviewed::constants::KIMI_CODE_K3_MODEL,
         ),
         Some("medium"),
         "Kimi Code K3 must retain its exact-route Medium tier"
@@ -494,12 +510,16 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
     app.auto_model = true;
     app.last_effective_provider = Some(ProviderKind::OpenaiCodex);
     app.last_effective_provider_identity = Some(ProviderKind::OpenaiCodex.as_str().to_string());
-    app.last_effective_model = Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string());
-    app.session.last_base_url = Some(crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string());
+    app.last_effective_model =
+        Some(codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string());
+    app.session.last_base_url =
+        Some(codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_BASE_URL.to_string());
     app.push_turn_cache_record(TurnCacheRecord {
         provider: Some(ProviderKind::OpenaiCodex),
         provider_identity: Some(ProviderKind::OpenaiCodex.as_str().to_string()),
-        model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
+        model: Some(
+            codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+        ),
         auto_model: true,
         input_tokens: 1,
         output_tokens: 1,
@@ -522,10 +542,13 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
         target.provider_id.as_deref(),
         Some(ProviderKind::OpenaiCodex.as_str())
     );
-    assert_eq!(target.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
+    assert_eq!(
+        target.model,
+        codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL
+    );
     assert_eq!(
         target.base_url.as_deref(),
-        Some(crate::config::DEFAULT_OPENAI_CODEX_BASE_URL)
+        Some(codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_BASE_URL)
     );
 
     // A restored Auto session has no turn ring or raw endpoint. Once warmup
@@ -535,8 +558,9 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
     app.session.last_base_url = None;
     app.session.last_warmup_key = Some(CacheWarmupKey {
         provider: ProviderKind::OpenaiCodex.as_str().to_string(),
-        model: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
-        base_url: crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
+        model: codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+        base_url: codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_BASE_URL
+            .to_string(),
         static_prefix_hash: "static".to_string(),
         tool_catalog_hash: "tools".to_string(),
         project_pack_hash: "project".to_string(),
@@ -546,7 +570,7 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
         app.cache_replay_target()
             .and_then(|target| target.base_url)
             .as_deref(),
-        Some(crate::config::DEFAULT_OPENAI_CODEX_BASE_URL)
+        Some(codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_BASE_URL)
     );
 }
 
@@ -560,17 +584,18 @@ fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
     app.last_effective_provider = Some(ProviderKind::OpenaiCodex);
     app.last_effective_provider_identity = Some(ProviderKind::OpenaiCodex.as_str().to_string());
-    app.last_effective_model = Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string());
-    app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
-        tier: crate::model_routing::AutoRouteTier::Strong,
-        pair: crate::model_routing::AutoRoutePair {
-            strong: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+    app.last_effective_model =
+        Some(codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string());
+    app.last_auto_route_receipt = Some(codewhale_engine::model_routing::AutoRouteReceipt {
+        tier: codewhale_engine::model_routing::AutoRouteTier::Strong,
+        pair: codewhale_engine::model_routing::AutoRoutePair {
+            strong: codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
             fast: None,
         },
-        scope: crate::model_routing::AutoRouteScope::ResolvedProvider,
-        data_path: crate::model_routing::AutoRouteDataPath::LocalHeuristic,
-        reason: crate::model_routing::AutoRouteReason::LocalFallback(
-            crate::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
+        scope: codewhale_engine::model_routing::AutoRouteScope::ResolvedProvider,
+        data_path: codewhale_engine::model_routing::AutoRouteDataPath::LocalHeuristic,
+        reason: codewhale_engine::model_routing::AutoRouteReason::LocalFallback(
+            codewhale_engine::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
         ),
         decision: None,
         router_failure: None,
@@ -605,7 +630,9 @@ fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
         .work_state_snapshot()
         .expect("Work snapshot")
         .expect("effort activity creates graph state");
-    let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged { effective, .. } = work
+    let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        effective, ..
+    } = work
         .graph
         .expect("Work Graph")
         .activities
@@ -614,23 +641,24 @@ fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
         .expect("effort activity");
     assert_eq!(
         effective,
-        crate::work_graph::ReasoningEffortTier::Medium,
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Medium,
         "the activity receipt must not reuse the previous turn's effective tier"
     );
 }
 
 #[test]
-fn mode_and_thinking_are_locked_while_a_turn_is_running() {
-    // #2982: while a turn is in flight, user-initiated mode/thinking changes
-    // are refused with a concise message instead of shifting the surface the
-    // engine is acting on.
+fn thinking_is_locked_but_mode_moves_while_a_turn_is_running() {
     let mut app = App::new(test_options(false), &Config::default());
     app.mode = AppMode::Agent;
     app.reasoning_effort = ReasoningEffort::Max;
     app.is_loading = true;
 
-    app.cycle_mode();
-    assert_eq!(app.mode, AppMode::Agent, "mode must not change while busy");
+    let before_effort = app.reasoning_effort;
+    app.cycle_effort();
+    assert_eq!(
+        app.reasoning_effort, before_effort,
+        "thinking must not change while busy"
+    );
     assert!(
         app.status_message
             .as_deref()
@@ -640,17 +668,8 @@ fn mode_and_thinking_are_locked_while_a_turn_is_running() {
         app.status_message
     );
 
-    let before_effort = app.reasoning_effort;
-    app.cycle_effort();
-    assert_eq!(
-        app.reasoning_effort, before_effort,
-        "thinking must not change while busy"
-    );
-
-    // Once the turn finishes, the same gesture works again.
-    app.is_loading = false;
     app.cycle_mode();
-    assert_ne!(app.mode, AppMode::Agent, "mode should change when idle");
+    assert_ne!(app.mode, AppMode::Agent, "mode changes mid-turn");
 }
 
 #[test]
@@ -687,7 +706,7 @@ fn cycle_effort_updates_effort_status_and_compaction() {
     let graph = work.graph.expect("Work Graph");
     let activity = graph.activities.last().expect("effort activity");
     match activity {
-        crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
             requested,
             effective,
             provider_kind,
@@ -695,8 +714,14 @@ fn cycle_effort_updates_effort_status_and_compaction() {
             operation,
             ..
         } => {
-            assert_eq!(*requested, crate::work_graph::ReasoningEffortTier::Low);
-            assert_eq!(*effective, crate::work_graph::ReasoningEffortTier::Low);
+            assert_eq!(
+                *requested,
+                codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Low
+            );
+            assert_eq!(
+                *effective,
+                codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Low
+            );
             assert_eq!(*provider_kind, Some(ProviderKind::Deepseek));
             assert_eq!(provider, "deepseek");
             assert!(operation.is_none());
@@ -714,13 +739,14 @@ fn cycle_effort_updates_effort_status_and_compaction() {
 fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
     app.set_provider_identity_record(
-        crate::config::Config::default()
+        codewhale_runtime::config::Config::default()
             .resolve_provider_identity(ProviderKind::Zai.as_str())
             .expect("captured fixture provider"),
     );
     app.auto_model = false;
-    app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
-    app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
+    app.active_route_base_url =
+        codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL.to_string();
+    app.model = codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_TURBO_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::High;
 
     app.cycle_effort();
@@ -745,16 +771,19 @@ fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
         .last()
         .cloned()
         .expect("effort activity");
-    let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+    let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
         requested,
         effective,
         provider,
         ..
     } = &activity;
-    assert_eq!(*requested, crate::work_graph::ReasoningEffortTier::Max);
+    assert_eq!(
+        *requested,
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Max
+    );
     assert_eq!(
         *effective,
-        crate::work_graph::ReasoningEffortTier::ThinkingEnabledGranularityUnavailable
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::ThinkingEnabledGranularityUnavailable
     );
     assert_eq!(provider, "zai");
     assert_eq!(
@@ -767,13 +796,14 @@ fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
 fn glm_5_1_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
     app.set_provider_identity_record(
-        crate::config::Config::default()
+        codewhale_runtime::config::Config::default()
             .resolve_provider_identity(ProviderKind::Zai.as_str())
             .expect("captured fixture provider"),
     );
     app.auto_model = false;
-    app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
-    app.model = crate::config::ZAI_GLM_5_1_MODEL.to_string();
+    app.active_route_base_url =
+        codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL.to_string();
+    app.model = codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_1_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::High;
 
     app.cycle_effort();
@@ -786,7 +816,9 @@ fn glm_5_1_records_enabled_with_granularity_unavailable() {
         .work_state_snapshot()
         .expect("Work snapshot")
         .expect("effort activity creates graph state");
-    let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged { effective, .. } = work
+    let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        effective, ..
+    } = work
         .graph
         .expect("Work Graph")
         .activities
@@ -795,7 +827,7 @@ fn glm_5_1_records_enabled_with_granularity_unavailable() {
         .expect("effort activity");
     assert_eq!(
         effective,
-        crate::work_graph::ReasoningEffortTier::ThinkingEnabledGranularityUnavailable
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::ThinkingEnabledGranularityUnavailable
     );
 }
 
@@ -803,12 +835,13 @@ fn glm_5_1_records_enabled_with_granularity_unavailable() {
 fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
     app.set_provider_identity_record(
-        crate::config::Config::default()
+        codewhale_runtime::config::Config::default()
             .resolve_provider_identity(ProviderKind::Zai.as_str())
             .expect("captured fixture provider"),
     );
     app.auto_model = false;
-    app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
+    app.active_route_base_url =
+        codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = "glm-future-unknown".to_string();
     app.reasoning_effort = ReasoningEffort::High;
 
@@ -822,7 +855,9 @@ fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
         .work_state_snapshot()
         .expect("Work snapshot")
         .expect("effort activity creates graph state");
-    let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged { effective, .. } = work
+    let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        effective, ..
+    } = work
         .graph
         .expect("Work Graph")
         .activities
@@ -831,7 +866,7 @@ fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
         .expect("effort activity");
     assert_eq!(
         effective,
-        crate::work_graph::ReasoningEffortTier::Unavailable
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Unavailable
     );
 }
 
@@ -839,13 +874,13 @@ fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
 fn compatible_zai_gateway_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
     app.set_provider_identity_record(
-        crate::config::Config::default()
+        codewhale_runtime::config::Config::default()
             .resolve_provider_identity(ProviderKind::Zai.as_str())
             .expect("captured fixture provider"),
     );
     app.auto_model = false;
     app.active_route_base_url = "https://gateway.example/v1".to_string();
-    app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
+    app.model = codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_2_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::High;
 
     app.cycle_effort();
@@ -870,16 +905,19 @@ fn compatible_zai_gateway_records_effective_unavailable() {
         .last()
         .cloned()
         .expect("effort activity");
-    let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+    let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
         requested,
         effective,
         provider,
         ..
     } = &activity;
-    assert_eq!(*requested, crate::work_graph::ReasoningEffortTier::Max);
+    assert_eq!(
+        *requested,
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Max
+    );
     assert_eq!(
         *effective,
-        crate::work_graph::ReasoningEffortTier::Unavailable
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Unavailable
     );
     assert_eq!(provider, "zai");
     assert_eq!(
@@ -896,13 +934,14 @@ fn minimax_m3_high_and_max_receipts_do_not_claim_tier_granularity() {
     ] {
         let mut app = App::new(test_options(false), &Config::default());
         app.set_provider_identity_record(
-            crate::config::Config::default()
+            codewhale_runtime::config::Config::default()
                 .resolve_provider_identity(ProviderKind::Minimax.as_str())
                 .expect("captured fixture provider"),
         );
         app.auto_model = false;
-        app.active_route_base_url = crate::config::DEFAULT_MINIMAX_BASE_URL.to_string();
-        app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_BASE_URL.to_string();
+        app.model = codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_MODEL.to_string();
         app.reasoning_effort = previous;
 
         app.cycle_effort();
@@ -920,7 +959,7 @@ fn minimax_m3_high_and_max_receipts_do_not_claim_tier_granularity() {
             .last()
             .cloned()
             .expect("effort activity");
-        let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
             effective,
             endpoint_identity,
             model,
@@ -929,16 +968,19 @@ fn minimax_m3_high_and_max_receipts_do_not_claim_tier_granularity() {
         assert_eq!(
             effective,
             if requested == ReasoningEffort::Auto {
-                crate::work_graph::ReasoningEffortTier::Auto
+                codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Auto
             } else {
-                crate::work_graph::ReasoningEffortTier::Off
+                codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Off
             }
         );
         assert_eq!(
             endpoint_identity.as_deref(),
-            Some(crate::config::DEFAULT_MINIMAX_BASE_URL)
+            Some(codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_BASE_URL)
         );
-        assert_eq!(model.as_deref(), Some(crate::config::DEFAULT_MINIMAX_MODEL));
+        assert_eq!(
+            model.as_deref(),
+            Some(codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_MODEL)
+        );
     }
 }
 
@@ -950,13 +992,14 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
     ] {
         let mut app = App::new(test_options(false), &Config::default());
         app.set_provider_identity_record(
-            crate::config::Config::default()
+            codewhale_runtime::config::Config::default()
                 .resolve_provider_identity(ProviderKind::MinimaxAnthropic.as_str())
                 .expect("captured fixture provider"),
         );
         app.auto_model = false;
-        app.active_route_base_url = crate::config::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL.to_string();
-        app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL.to_string();
+        app.model = codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_MODEL.to_string();
         app.reasoning_effort = previous;
 
         app.cycle_effort();
@@ -974,7 +1017,7 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
             .last()
             .cloned()
             .expect("effort activity");
-        let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
             effective,
             provider_kind,
             provider,
@@ -985,18 +1028,21 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
         assert_eq!(
             effective,
             if requested == ReasoningEffort::Auto {
-                crate::work_graph::ReasoningEffortTier::Auto
+                codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Auto
             } else {
-                crate::work_graph::ReasoningEffortTier::Off
+                codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Off
             }
         );
         assert_eq!(provider_kind, Some(ProviderKind::MinimaxAnthropic));
         assert_eq!(provider, "minimax-anthropic");
         assert_eq!(
             endpoint_identity.as_deref(),
-            Some(crate::config::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL)
+            Some(codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL)
         );
-        assert_eq!(model.as_deref(), Some(crate::config::DEFAULT_MINIMAX_MODEL));
+        assert_eq!(
+            model.as_deref(),
+            Some(codewhale_config::descriptors::defaults::DEFAULT_MINIMAX_MODEL)
+        );
     }
 }
 
@@ -1027,7 +1073,7 @@ fn named_custom_route_displays_and_persists_effective_unavailable() {
         .last()
         .cloned()
         .expect("effort activity");
-    let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+    let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
         effective,
         provider_kind,
         provider,
@@ -1037,7 +1083,7 @@ fn named_custom_route_displays_and_persists_effective_unavailable() {
     } = activity;
     assert_eq!(
         effective,
-        crate::work_graph::ReasoningEffortTier::Unavailable
+        codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Unavailable
     );
     assert_eq!(provider_kind, Some(ProviderKind::Custom));
     assert_eq!(provider, "my-gateway");
@@ -1074,7 +1120,7 @@ fn custom_routes_named_with_builtin_slugs_retain_custom_kind_and_fail_closed() {
             .last()
             .cloned()
             .expect("effort activity");
-        let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
             effective,
             provider_kind,
             provider,
@@ -1082,7 +1128,7 @@ fn custom_routes_named_with_builtin_slugs_retain_custom_kind_and_fail_closed() {
         } = activity;
         assert_eq!(
             effective,
-            crate::work_graph::ReasoningEffortTier::Unavailable
+            codewhale_models::reasoning_effort_tier::ReasoningEffortTier::Unavailable
         );
         assert_eq!(provider_kind, Some(ProviderKind::Custom));
         assert_eq!(provider, identity);
@@ -1097,13 +1143,13 @@ fn zai_gateway_off_and_high_receipts_remain_unavailable() {
     ] {
         let mut app = App::new(test_options(false), &Config::default());
         app.set_provider_identity_record(
-            crate::config::Config::default()
+            codewhale_runtime::config::Config::default()
                 .resolve_provider_identity(ProviderKind::Zai.as_str())
                 .expect("captured fixture provider"),
         );
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
-        app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
+        app.model = codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_2_MODEL.to_string();
         app.reasoning_effort = previous;
 
         app.cycle_effort();
@@ -1124,13 +1170,14 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
     ] {
         let mut app = App::new(test_options(false), &Config::default());
         app.set_provider_identity_record(
-            crate::config::Config::default()
+            codewhale_runtime::config::Config::default()
                 .resolve_provider_identity(ProviderKind::Moonshot.as_str())
                 .expect("captured fixture provider"),
         );
         app.auto_model = false;
-        app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
-        app.model = crate::config::KIMI_CODE_K3_MODEL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_KIMI_CODE_BASE_URL.to_string();
+        app.model = codewhale_config::catalog::reviewed::constants::KIMI_CODE_K3_MODEL.to_string();
         app.reasoning_effort = previous;
 
         app.cycle_effort();
@@ -1146,7 +1193,7 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
             .last()
             .cloned()
             .unwrap();
-        let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+        let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
             effective,
             endpoint_identity,
             model,
@@ -1155,9 +1202,12 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
         assert_eq!(effective, requested.into());
         assert_eq!(
             endpoint_identity.as_deref(),
-            Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL)
+            Some(codewhale_config::descriptors::defaults::DEFAULT_KIMI_CODE_BASE_URL)
         );
-        assert_eq!(model.as_deref(), Some(crate::config::KIMI_CODE_K3_MODEL));
+        assert_eq!(
+            model.as_deref(),
+            Some(codewhale_config::catalog::reviewed::constants::KIMI_CODE_K3_MODEL)
+        );
     }
 }
 
@@ -1165,34 +1215,35 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
 fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
     let mut app = App::new(test_options(false), &Config::default());
     app.api_provider = ProviderKind::Deepseek;
-    app.active_route_base_url = crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string();
+    app.active_route_base_url =
+        codewhale_config::descriptors::defaults::DEFAULT_DEEPSEEK_BASE_URL.to_string();
     app.model = "deepseek-chat".to_string();
     app.reasoning_effort = ReasoningEffort::High;
     app.active_turn = Some(ActiveTurnMetadata {
         turn_id: "turn-zai-receipt".to_string(),
         created_at: chrono::Utc::now(),
-        route: Some(crate::core::events::TurnRoute {
+        route: Some(codewhale_engine::core::events::TurnRoute {
             provider: ProviderKind::Zai,
             provider_identity: "openai".to_string(),
             model: "mutable-wrong-model".to_string(),
             auto_model: false,
-            receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
+            receipt: Some(codewhale_engine::route_receipt::TurnRouteReceipt::new(
                 ProviderKind::Zai,
                 "zai",
-                crate::config::ZAI_GLM_5_TURBO_MODEL,
-                crate::config::DEFAULT_ZAI_BASE_URL,
+                codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_TURBO_MODEL,
+                codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL,
                 "test-secret-never-persisted",
             )),
-            billing: Some(crate::core::events::RouteBillingEnvelope {
+            billing: Some(codewhale_engine::core::events::RouteBillingEnvelope {
                 openrouter_vendor: None,
                 billing_surface: None,
                 endpoint_fingerprint: None,
                 provider_live_pricing: None,
-                billing_mode: crate::cost_status::RouteBillingMode::Unknown,
+                billing_mode: codewhale_engine::cost_status::RouteBillingMode::Unknown,
                 dispatched_at: chrono::Utc::now(),
             }),
-            base_url: crate::config::DEFAULT_ZAI_BASE_URL.to_string(),
-            billing_product: crate::route_billing::RouteProduct::Unproven,
+            base_url: codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL.to_string(),
+            billing_product: codewhale_engine::route_billing::RouteProduct::Unproven,
         }),
         auto_route_receipt: None,
         suggestion_authority: None,
@@ -1215,7 +1266,7 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
         .last()
         .cloned()
         .expect("effort activity");
-    let crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+    let codewhale_engine::work_graph::WorkActivityEvent::ReasoningEffortChanged {
         provider_kind,
         provider,
         endpoint_identity,
@@ -1226,9 +1277,12 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
     assert_eq!(provider, "zai");
     assert_eq!(
         endpoint_identity.as_deref(),
-        Some(crate::config::DEFAULT_ZAI_BASE_URL)
+        Some(codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL)
     );
-    assert_eq!(model.as_deref(), Some(crate::config::ZAI_GLM_5_TURBO_MODEL));
+    assert_eq!(
+        model.as_deref(),
+        Some(codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_TURBO_MODEL)
+    );
 }
 
 #[test]
@@ -1239,7 +1293,7 @@ fn pending_zai_route_without_endpoint_receipt_is_effective_unavailable() {
     app.reasoning_effort = ReasoningEffort::Max;
     app.pending_turn_route = Some((
         ProviderKind::Zai,
-        crate::config::ZAI_GLM_5_2_MODEL.to_string(),
+        codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_2_MODEL.to_string(),
         true,
     ));
 
@@ -1258,12 +1312,14 @@ fn reasoning_effort_scenario() {
         app.api_provider = ProviderKind::Moonshot;
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
-        app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_MOONSHOT_BASE_URL.to_string();
         app.model = "kimi-k2.5".to_string();
 
         assert_eq!(app.reasoning_effort_display_label(), "low→high");
 
-        app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_KIMI_CODE_BASE_URL.to_string();
         app.model = "k3".to_string();
         assert_eq!(app.reasoning_effort_display_label(), "low");
 
@@ -1311,8 +1367,8 @@ fn reasoning_effort_scenario() {
 
 #[test]
 fn ollama_cloud_normal_turns_preserve_the_documented_reasoning_ladder() {
-    let base_url = crate::config::DEFAULT_OLLAMA_CLOUD_BASE_URL;
-    let model = crate::config::DEFAULT_OLLAMA_CLOUD_MODEL;
+    let base_url = codewhale_config::descriptors::defaults::DEFAULT_OLLAMA_CLOUD_BASE_URL;
+    let model = codewhale_config::descriptors::defaults::DEFAULT_OLLAMA_CLOUD_MODEL;
     for effort in [
         ReasoningEffort::Off,
         ReasoningEffort::Low,
@@ -1372,14 +1428,14 @@ fn reasoning_effort_uses_one_strict_alias_table_and_legacy_fallback() {
     assert!(ReasoningEffort::parse_strict("surprise").is_err());
     assert_eq!(
         ReasoningEffort::from_setting("surprise"),
-        ReasoningEffort::Max
+        ReasoningEffort::Auto
     );
 }
 
 #[test]
 fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
-    let kimi_base = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
-    let moonshot_base = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+    let kimi_base = codewhale_config::descriptors::defaults::DEFAULT_KIMI_CODE_BASE_URL;
+    let moonshot_base = codewhale_config::descriptors::defaults::DEFAULT_MOONSHOT_BASE_URL;
     assert_eq!(
         ReasoningEffort::Off.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Low,
@@ -1415,7 +1471,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
         ReasoningEffort::Off.normalize_for_route(
             ProviderKind::Moonshot,
             moonshot_base,
-            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL,
         ),
         ReasoningEffort::Low,
         "direct K3 is always-thinking, so off becomes its lowest supported tier"
@@ -1424,7 +1480,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
         ReasoningEffort::Low.normalize_for_route(
             ProviderKind::Moonshot,
             moonshot_base,
-            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL,
         ),
         ReasoningEffort::Low
     );
@@ -1432,7 +1488,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
         ReasoningEffort::Medium.normalize_for_route(
             ProviderKind::Moonshot,
             moonshot_base,
-            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL,
         ),
         ReasoningEffort::High
     );
@@ -1440,7 +1496,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
         ReasoningEffort::Off.normalize_for_route(
             ProviderKind::Moonshot,
             "https://proxy.example/v1",
-            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL,
         ),
         ReasoningEffort::Off,
         "a neighboring gateway must not inherit direct-platform always-thinking semantics"
@@ -1455,7 +1511,7 @@ fn picker_uses_scenario() {
         let labels: Vec<&str> = crate::tui::model_picker::picker_efforts_for_route(
             ProviderKind::Xai,
             ProviderKind::Xai.provider().default_base_url(),
-            crate::config::XAI_GROK_4_6_MODEL,
+            codewhale_config::catalog::reviewed::constants::XAI_GROK_4_6_MODEL,
             false,
         )
         .iter()
@@ -1468,7 +1524,7 @@ fn picker_uses_scenario() {
         let labels: Vec<&str> = crate::tui::model_picker::picker_efforts_for_route(
             ProviderKind::Xai,
             ProviderKind::Xai.provider().default_base_url(),
-            crate::config::XAI_GROK_4_5_MODEL,
+            codewhale_config::catalog::reviewed::constants::XAI_GROK_4_5_MODEL,
             false,
         )
         .iter()
@@ -1480,8 +1536,8 @@ fn picker_uses_scenario() {
 
 #[test]
 fn reasoning_effort_preserves_grok_46_ladder_only_on_exact_xai_route() {
-    let xai = crate::config::DEFAULT_XAI_BASE_URL;
-    let model = crate::config::XAI_GROK_4_6_MODEL;
+    let xai = codewhale_config::descriptors::defaults::DEFAULT_XAI_BASE_URL;
+    let model = codewhale_config::catalog::reviewed::constants::XAI_GROK_4_6_MODEL;
     for (requested, expected) in [
         (ReasoningEffort::Off, ReasoningEffort::High),
         (ReasoningEffort::Low, ReasoningEffort::Low),
@@ -1504,30 +1560,49 @@ fn reasoning_effort_preserves_grok_46_ladder_only_on_exact_xai_route() {
             "https://gateway.example/v1",
             model,
         ),
-        ReasoningEffort::Medium,
-        "catalog effort lists are model metadata; the Chat wire still omits them on a custom endpoint"
+        ReasoningEffort::High,
+        "a custom endpoint must not inherit the official catalog effort ladder"
+    );
+    let custom = "https://gateway.example/v1";
+    assert!(ReasoningEffort::offering_for_reasoning(ProviderKind::Xai, custom, model).is_none());
+    assert!(ReasoningEffort::catalog_effort_values(ProviderKind::Xai, custom, model).is_none());
+    assert_eq!(
+        crate::tui::model_picker::picker_efforts_for_route(ProviderKind::Xai, custom, model, false),
+        vec![
+            ReasoningEffort::Auto,
+            ReasoningEffort::Off,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ]
     );
 }
 
 fn xai_grok_46_startup_config() -> Config {
-    Config {
-        provider: Some("xai".to_string()),
-        providers: Some(ProvidersConfig {
+    {
+        let __cw_config_init_0_0 = Some("xai".to_string());
+        let __cw_config_init_0_1 = Some(ProvidersConfig {
             xai: ProviderConfig {
                 api_key: Some("xai-startup-test-key".to_string()),
-                base_url: Some(crate::config::DEFAULT_XAI_BASE_URL.to_string()),
-                model: Some(crate::config::XAI_GROK_4_6_MODEL.to_string()),
+                base_url: Some(
+                    codewhale_config::descriptors::defaults::DEFAULT_XAI_BASE_URL.to_string(),
+                ),
+                model: Some(
+                    codewhale_config::catalog::reviewed::constants::XAI_GROK_4_6_MODEL.to_string(),
+                ),
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_0_value: Config = Config::default();
+        __cw_config_init_0_value.provider = __cw_config_init_0_0;
+        __cw_config_init_0_value.providers = __cw_config_init_0_1;
+        __cw_config_init_0_value
     }
 }
 
 fn xai_grok_46_startup_app(config: &Config) -> App {
     let mut options = test_options(false);
-    options.model = crate::config::XAI_GROK_4_6_MODEL.to_string();
+    options.model = codewhale_config::catalog::reviewed::constants::XAI_GROK_4_6_MODEL.to_string();
     App::new(options, config)
 }
 
@@ -1544,10 +1619,13 @@ fn app_new_scenario() {
         let app = xai_grok_46_startup_app(&config);
 
         assert_eq!(app.api_provider, ProviderKind::Xai);
-        assert_eq!(app.model, crate::config::XAI_GROK_4_6_MODEL);
+        assert_eq!(
+            app.model,
+            codewhale_config::catalog::reviewed::constants::XAI_GROK_4_6_MODEL
+        );
         assert_eq!(
             app.active_route_base_url,
-            crate::config::DEFAULT_XAI_BASE_URL
+            codewhale_config::descriptors::defaults::DEFAULT_XAI_BASE_URL
         );
         assert_eq!(app.reasoning_effort, ReasoningEffort::High);
         assert_eq!(app.reasoning_effort_display_label(), "high");
@@ -1651,10 +1729,8 @@ fn app_new_scenario() {
         let _provider_env = EnvVarGuard::remove("CODEWHALE_PROVIDER");
         let _legacy_provider_env = EnvVarGuard::remove("DEEPSEEK_PROVIDER");
 
-        let config = Config {
-            ..Config::default()
-        }
-        .with_legacy_root(Some("sk-test-onboarding-key".to_string()), None);
+        let config =
+            Config::default().with_legacy_root(Some("sk-test-onboarding-key".to_string()), None);
         let app = App::new(test_options(false), &config);
         assert!(
             !app.onboarding_needs_api_key,
@@ -1678,13 +1754,14 @@ fn cycle_effort_scenario() {
     {
         let mut app = App::new(test_options(false), &Config::default());
         app.set_provider_identity_record(
-            crate::config::Config::default()
+            codewhale_runtime::config::Config::default()
                 .resolve_provider_identity(ProviderKind::Xai.as_str())
                 .expect("captured fixture provider"),
         );
         app.auto_model = false;
-        app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
-        app.model = crate::config::XAI_GROK_4_6_MODEL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_XAI_BASE_URL.to_string();
+        app.model = codewhale_config::catalog::reviewed::constants::XAI_GROK_4_6_MODEL.to_string();
         app.reasoning_effort = ReasoningEffort::High;
 
         let expected = [
@@ -1703,13 +1780,14 @@ fn cycle_effort_scenario() {
     {
         let mut app = App::new(test_options(false), &Config::default());
         app.set_provider_identity_record(
-            crate::config::Config::default()
+            codewhale_runtime::config::Config::default()
                 .resolve_provider_identity(ProviderKind::Xai.as_str())
                 .expect("captured fixture provider"),
         );
         app.auto_model = false;
-        app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
-        app.model = crate::config::XAI_GROK_4_5_MODEL.to_string();
+        app.active_route_base_url =
+            codewhale_config::descriptors::defaults::DEFAULT_XAI_BASE_URL.to_string();
+        app.model = codewhale_config::catalog::reviewed::constants::XAI_GROK_4_5_MODEL.to_string();
         app.reasoning_effort = ReasoningEffort::High;
 
         app.cycle_effort();
@@ -1786,16 +1864,21 @@ fn app_new_normalizes_saved_codex_reasoning_effort() {
     let config_path = tmp.path().join("config.toml");
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let _token = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-startup-token");
-    let config = Config {
-        provider: Some("openai-codex".to_string()),
-        providers: Some(ProvidersConfig {
+    let config = {
+        let __cw_config_init_2_0 = Some("openai-codex".to_string());
+        let __cw_config_init_2_1 = Some(ProvidersConfig {
             openai_codex: ProviderConfig {
-                model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
+                model: Some(
+                    codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+                ),
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_2_value: Config = Config::default();
+        __cw_config_init_2_value.provider = __cw_config_init_2_0;
+        __cw_config_init_2_value.providers = __cw_config_init_2_1;
+        __cw_config_init_2_value
     };
 
     for (raw, expected, display) in [
@@ -1835,29 +1918,41 @@ fn app_new_exposes_direct_moonshot_k3_off_as_effective_low() {
         "reasoning_effort = \"off\"\n",
     )
     .expect("settings");
-    let config = Config {
-        provider: Some("moonshot".to_string()),
-        providers: Some(ProvidersConfig {
+    let config = {
+        let __cw_config_init_3_0 = Some("moonshot".to_string());
+        let __cw_config_init_3_1 = Some(ProvidersConfig {
             moonshot: ProviderConfig {
                 api_key: Some("moonshot-startup-test-key".to_string()),
-                base_url: Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
-                model: Some(crate::config::MOONSHOT_KIMI_K3_MODEL.to_string()),
+                base_url: Some(
+                    codewhale_config::descriptors::defaults::DEFAULT_MOONSHOT_BASE_URL.to_string(),
+                ),
+                model: Some(
+                    codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL
+                        .to_string(),
+                ),
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_3_value: Config = Config::default();
+        __cw_config_init_3_value.provider = __cw_config_init_3_0;
+        __cw_config_init_3_value.providers = __cw_config_init_3_1;
+        __cw_config_init_3_value
     };
 
     let mut options = test_options(false);
-    options.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
+    options.model =
+        codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL.to_string();
     let app = App::new(options, &config);
 
     assert_eq!(app.api_provider, ProviderKind::Moonshot);
-    assert_eq!(app.model, crate::config::MOONSHOT_KIMI_K3_MODEL);
+    assert_eq!(
+        app.model,
+        codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL
+    );
     assert_eq!(
         app.active_route_base_url,
-        crate::config::DEFAULT_MOONSHOT_BASE_URL
+        codewhale_config::descriptors::defaults::DEFAULT_MOONSHOT_BASE_URL
     );
     assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
     assert_eq!(app.reasoning_effort_display_label(), "low");
@@ -1874,24 +1969,29 @@ fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
     let config_path = tmp.path().join("config.toml");
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let _home = EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
-    let mut config = Config {
-        provider: Some("openai-codex".to_string()),
-        providers: Some(ProvidersConfig {
+    let mut config = {
+        let __cw_config_init_4_0 = Some("openai-codex".to_string());
+        let __cw_config_init_4_1 = Some(ProvidersConfig {
             openai_codex: ProviderConfig {
-                model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
+                model: Some(
+                    codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+                ),
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_4_value: Config = Config::default();
+        __cw_config_init_4_value.provider = __cw_config_init_4_0;
+        __cw_config_init_4_value.providers = __cw_config_init_4_1;
+        __cw_config_init_4_value
     };
 
-    crate::oauth::install_test_chatgpt_registration(&mut config)
+    codewhale_runtime::oauth::install_test_chatgpt_registration(&mut config)
         .expect("owned ChatGPT registration");
-    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+    codewhale_runtime::codex_model_roster::install_test_chatgpt_roster_with_metadata(
         &config,
-        vec![crate::codex_model_cache::CodexModelMetadata {
-            id: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+        vec![codewhale_runtime::codex_model_roster::CodexModelMetadata {
+            id: codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
             display_name: None,
             context_window: Some(128_000),
             reasoning: Some(true),
@@ -1901,7 +2001,7 @@ fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
     .expect("account-scoped roster");
 
     let mut options = test_options(false);
-    options.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
+    options.model = codewhale_config::descriptors::defaults::DEFAULT_OPENAI_CODEX_MODEL.to_string();
     let app = App::new(options, &config);
 
     assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
@@ -1911,7 +2011,7 @@ fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
         Some(128_000)
     );
     assert_eq!(
-        crate::route_budget::route_context_window_tokens(
+        codewhale_engine::route_budget::route_context_window_tokens(
             app.api_provider,
             &app.model,
             app.active_route_limits,
@@ -1934,15 +2034,17 @@ fn settings_default_provider_auth_check_uses_provider_scoped_key() {
     let _deepseek_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let _openai_key = EnvVarGuard::remove("OPENAI_API_KEY");
 
-    let config = Config {
-        providers: Some(ProvidersConfig {
+    let config = {
+        let __cw_config_init_5_0 = Some(ProvidersConfig {
             openai: ProviderConfig {
                 api_key: Some("openai-config-key".to_string()),
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_5_value: Config = Config::default();
+        __cw_config_init_5_value.providers = __cw_config_init_5_0;
+        __cw_config_init_5_value
     };
 
     let app = App::new(test_options(false), &config);
@@ -1967,9 +2069,9 @@ fn saved_startup_provider_overrides_config_file_provider() {
     .expect("settings");
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
 
-    let config = Config {
-        provider: Some("xiaomi-mimo".to_string()),
-        providers: Some(ProvidersConfig {
+    let config = {
+        let __cw_config_init_6_0 = Some("xiaomi-mimo".to_string());
+        let __cw_config_init_6_1 = Some(ProvidersConfig {
             deepseek: ProviderConfig {
                 api_key: Some("deepseek-config-key".to_string()),
                 model: Some("deepseek-v4-pro".to_string()),
@@ -1981,8 +2083,11 @@ fn saved_startup_provider_overrides_config_file_provider() {
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_6_value: Config = Config::default();
+        __cw_config_init_6_value.provider = __cw_config_init_6_0;
+        __cw_config_init_6_value.providers = __cw_config_init_6_1;
+        __cw_config_init_6_value
     };
 
     let mut options = test_options(false);
@@ -2015,12 +2120,12 @@ openrouter = "openai/gpt-5"
     .expect("settings");
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
 
-    let config = Config {
-        provider: Some("deepseek".to_string()),
-        reasoning_effort: Some("high".to_string()),
-        fleet_operator_route_applied: true,
-        fleet_operator_reasoning_applied: true,
-        providers: Some(ProvidersConfig {
+    let config = {
+        let __cw_config_init_7_0 = Some("deepseek".to_string());
+        let __cw_config_init_7_1 = Some("high".to_string());
+        let __cw_config_init_7_2 = true;
+        let __cw_config_init_7_3 = true;
+        let __cw_config_init_7_4 = Some(ProvidersConfig {
             deepseek: ProviderConfig {
                 api_key: Some("deepseek-config-key".to_string()),
                 model: Some("deepseek-v4-flash-vision-exp".to_string()),
@@ -2032,8 +2137,14 @@ openrouter = "openai/gpt-5"
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_7_value: Config = Config::default();
+        __cw_config_init_7_value.provider = __cw_config_init_7_0;
+        __cw_config_init_7_value.reasoning_effort = __cw_config_init_7_1;
+        __cw_config_init_7_value.fleet_operator_route_applied = __cw_config_init_7_2;
+        __cw_config_init_7_value.fleet_operator_reasoning_applied = __cw_config_init_7_3;
+        __cw_config_init_7_value.providers = __cw_config_init_7_4;
+        __cw_config_init_7_value
     };
 
     let mut options = test_options(false);
@@ -2059,9 +2170,9 @@ fn explicit_launch_provider_overrides_saved_startup_provider() {
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let _provider = EnvVarGuard::set("CODEWHALE_PROVIDER", "xiaomi-mimo");
 
-    let config = Config {
-        provider: Some("xiaomi-mimo".to_string()),
-        providers: Some(ProvidersConfig {
+    let config = {
+        let __cw_config_init_8_0 = Some("xiaomi-mimo".to_string());
+        let __cw_config_init_8_1 = Some(ProvidersConfig {
             deepseek: ProviderConfig {
                 api_key: Some("deepseek-config-key".to_string()),
                 model: Some("deepseek-v4-pro".to_string()),
@@ -2073,8 +2184,11 @@ fn explicit_launch_provider_overrides_saved_startup_provider() {
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
-        }),
-        ..Config::default()
+        });
+        let mut __cw_config_init_8_value: Config = Config::default();
+        __cw_config_init_8_value.provider = __cw_config_init_8_0;
+        __cw_config_init_8_value.providers = __cw_config_init_8_1;
+        __cw_config_init_8_value
     };
 
     let mut options = test_options(false);
@@ -2155,7 +2269,7 @@ fn context_pressure_toast_kind_is_not_inferred_from_display_text() {
 
     app.sticky_status = Some(StatusToast::context_pressure(
         "localized pressure warning",
-        crate::context_budget::PressureLevel::High,
+        codewhale_runtime::context_budget::PressureLevel::High,
     ));
     assert!(app.dismiss_context_pressure_warning());
     assert!(app.sticky_status.is_none());
@@ -2166,7 +2280,7 @@ fn critical_context_pressure_remains_visible_over_transient_info_toasts() {
     let mut app = App::new(test_options(false), &Config::default());
     app.sticky_status = Some(StatusToast::context_pressure(
         "Context critical: 95%",
-        crate::context_budget::PressureLevel::Critical,
+        codewhale_runtime::context_budget::PressureLevel::Critical,
     ));
     app.push_status_toast("Saved", StatusToastLevel::Info, None);
 
@@ -2231,17 +2345,19 @@ fn subscription_route_hides_stale_session_dollars_in_footer() {
     let mut app = App::new(test_options(false), &Config::default());
     app.accrue_session_cost_estimate(CostEstimate::usd_only(12.34));
     app.billing_presentation =
-        crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+        codewhale_engine::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
     // Stale unaudited dollars must never render on a plan route; the usage
     // chip carries the plan-aware line instead of money or silence.
     let chip = app.cumulative_usage_chip();
     assert!(
-        !matches!(chip, crate::route_billing::UsageChip::Money(_)),
+        !matches!(chip, codewhale_engine::route_billing::UsageChip::Money(_)),
         "{chip:?}"
     );
-    let rendered =
-        crate::route_billing::format_usage_chip(&chip, codewhale_localization::Locale::En)
-            .unwrap_or_default();
+    let rendered = codewhale_engine::route_billing::format_usage_chip(
+        &chip,
+        codewhale_localization::Locale::En,
+    )
+    .unwrap_or_default();
     assert!(!rendered.contains('$'), "{rendered}");
     assert!(rendered.contains("Codex OAuth quota"), "{rendered}");
 }
@@ -2254,7 +2370,7 @@ fn provider_switch_keeps_audited_cumulative_spend_visible() {
         output_tokens: 1_000,
         ..Default::default()
     };
-    let priced = crate::pricing::audit_turn_cost_for_provider_at(
+    let priced = codewhale_engine::pricing::audit_turn_cost_for_provider_at(
         ProviderKind::Deepseek,
         "deepseek-v4-flash",
         &usage,
@@ -2266,27 +2382,30 @@ fn provider_switch_keeps_audited_cumulative_spend_visible() {
     app.api_provider = ProviderKind::OpenaiCodex;
     app.model = "gpt-5.5".to_string();
     app.billing_presentation =
-        crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+        codewhale_engine::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
     assert!(matches!(
         app.cumulative_usage_chip(),
-        crate::route_billing::UsageChip::Money(_)
+        codewhale_engine::route_billing::UsageChip::Money(_)
     ));
     assert!(
-        crate::route_billing::format_usage_chip(&app.cumulative_usage_chip(), app.ui_locale)
-            .is_some_and(|label| !label.is_empty())
+        codewhale_engine::route_billing::format_usage_chip(
+            &app.cumulative_usage_chip(),
+            app.ui_locale
+        )
+        .is_some_and(|label| !label.is_empty())
     );
 
-    let unknown = crate::pricing::audit_turn_cost_for_route_at(
+    let unknown = codewhale_engine::pricing::audit_turn_cost_for_route_at(
         ProviderKind::Openai,
         "gpt-5.5",
-        Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE),
+        Some(codewhale_engine::pricing::UNCLASSIFIED_BILLING_SURFACE),
         &usage,
         chrono::Utc::now(),
     );
     app.record_turn_cost_audit(&unknown);
     assert!(matches!(
         app.cumulative_usage_chip(),
-        crate::route_billing::UsageChip::PricedSubtotal { legacy: false, .. }
+        codewhale_engine::route_billing::UsageChip::PricedSubtotal { legacy: false, .. }
     ));
 }
 
@@ -2915,16 +3034,15 @@ fn cached_skills_respect_codewhale_only_scan_config() {
     let mut options = test_options(false);
     options.workspace = workspace.clone();
     options.skills_dir = tmp.path().join("global-skills");
-    let app = App::new(
-        options,
-        &Config {
-            skills: Some(crate::config::SkillsConfig {
-                scan_codewhale_only: Some(true),
-                ..Default::default()
-            }),
+    let app = App::new(options, &{
+        let __cw_config_init_9_0 = Some(codewhale_runtime::config::SkillsConfig {
+            scan_codewhale_only: Some(true),
             ..Default::default()
-        },
-    );
+        });
+        let mut __cw_config_init_9_value: Config = Default::default();
+        __cw_config_init_9_value.skills = __cw_config_init_9_0;
+        __cw_config_init_9_value
+    });
 
     assert_eq!(app.skills_dir, workspace.join(".codewhale").join("skills"));
     assert!(
@@ -2955,12 +3073,14 @@ fn resolve_skills_dir_requires_codewhale_skills_to_be_directory() {
     .expect("skills file");
 
     let global_skills_dir = tmp.path().join("global-skills");
-    let config = Config {
-        skills: Some(crate::config::SkillsConfig {
+    let config = {
+        let __cw_config_init_10_0 = Some(codewhale_runtime::config::SkillsConfig {
             scan_codewhale_only: Some(true),
             ..Default::default()
-        }),
-        ..Default::default()
+        });
+        let mut __cw_config_init_10_value: Config = Default::default();
+        __cw_config_init_10_value.skills = __cw_config_init_10_0;
+        __cw_config_init_10_value
     };
 
     let resolved = resolve_skills_dir(&workspace, &global_skills_dir, &config);
@@ -2978,13 +3098,16 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
             .join(format!("ws-{}", relative.replace('/', "-")));
         let local_skills = workspace.join(relative);
         std::fs::create_dir_all(&local_skills).expect("skills dir");
-        let config = Config {
-            skills_dir: Some(global_skills_dir.to_string_lossy().into_owned()),
-            skills: Some(crate::config::SkillsConfig {
+        let config = {
+            let __cw_config_init_11_0 = Some(global_skills_dir.to_string_lossy().into_owned());
+            let __cw_config_init_11_1 = Some(codewhale_runtime::config::SkillsConfig {
                 flat_workspace_root: Some(true),
                 ..Default::default()
-            }),
-            ..Default::default()
+            });
+            let mut __cw_config_init_11_value: Config = Default::default();
+            __cw_config_init_11_value.skills_dir = __cw_config_init_11_0;
+            __cw_config_init_11_value.skills = __cw_config_init_11_1;
+            __cw_config_init_11_value
         };
 
         assert_eq!(
@@ -3018,9 +3141,11 @@ fn cached_skills_include_configured_directory() {
     let mut options = test_options(false);
     options.workspace = workspace.clone();
     options.skills_dir = configured_dir.clone();
-    let config = Config {
-        skills_dir: Some(configured_dir.to_string_lossy().into_owned()),
-        ..Default::default()
+    let config = {
+        let __cw_config_init_12_0 = Some(configured_dir.to_string_lossy().into_owned());
+        let mut __cw_config_init_12_value: Config = Default::default();
+        __cw_config_init_12_value.skills_dir = __cw_config_init_12_0;
+        __cw_config_init_12_value
     };
     let app = App::new(options, &config);
 
@@ -3063,13 +3188,16 @@ fn cached_skills_preserve_configured_directory_in_codewhale_only_scan() {
     let mut options = test_options(false);
     options.workspace = workspace.clone();
     options.skills_dir = configured_dir.clone();
-    let config = Config {
-        skills_dir: Some(configured_dir.to_string_lossy().into_owned()),
-        skills: Some(crate::config::SkillsConfig {
+    let config = {
+        let __cw_config_init_13_0 = Some(configured_dir.to_string_lossy().into_owned());
+        let __cw_config_init_13_1 = Some(codewhale_runtime::config::SkillsConfig {
             scan_codewhale_only: Some(true),
             ..Default::default()
-        }),
-        ..Default::default()
+        });
+        let mut __cw_config_init_13_value: Config = Default::default();
+        __cw_config_init_13_value.skills_dir = __cw_config_init_13_0;
+        __cw_config_init_13_value.skills = __cw_config_init_13_1;
+        __cw_config_init_13_value
     };
     let app = App::new(options, &config);
 
@@ -3113,12 +3241,14 @@ fn cached_skills_reject_codewhale_only_workspace_symlink_escape() {
     let mut options = test_options(false);
     options.workspace = workspace.clone();
     options.skills_dir = global_skills_dir.clone();
-    let config = Config {
-        skills: Some(crate::config::SkillsConfig {
+    let config = {
+        let __cw_config_init_14_0 = Some(codewhale_runtime::config::SkillsConfig {
             scan_codewhale_only: Some(true),
             ..Default::default()
-        }),
-        ..Default::default()
+        });
+        let mut __cw_config_init_14_value: Config = Default::default();
+        __cw_config_init_14_value.skills = __cw_config_init_14_0;
+        __cw_config_init_14_value
     };
     let app = App::new(options, &config);
 
@@ -3479,7 +3609,7 @@ fn work_state_snapshot_round_trips_todos_and_plan() {
 #[test]
 fn work_restore_reconciles_fleet_from_the_restored_workspace() {
     let restored_workspace = tempfile::tempdir().expect("restored workspace");
-    let ledger = crate::fleet::ledger::FleetLedger::open(restored_workspace.path())
+    let ledger = codewhale_engine::fleet::ledger::FleetLedger::open(restored_workspace.path())
         .expect("open restored Fleet ledger");
     ledger
         .enqueue(codewhale_protocol::fleet::FleetInboxEntry {
@@ -3492,14 +3622,14 @@ fn work_restore_reconciles_fleet_from_the_restored_workspace() {
         })
         .expect("enqueue restored Fleet task");
 
-    let source = crate::work_graph::new_shared_work_runtime(
-        crate::tools::todo::new_shared_todo_list(),
-        crate::tools::plan::new_shared_plan_state(),
+    let source = codewhale_engine::work_graph::new_shared_work_runtime(
+        codewhale_engine::tools::todo::new_shared_todo_list(),
+        codewhale_engine::tools::plan::new_shared_plan_state(),
     );
     source
         .register_operation(
             "restored-session",
-            crate::work_graph::OperationIntent::new(
+            codewhale_engine::work_graph::OperationIntent::new(
                 "fleet:run-restore/task-restore",
                 "restored Fleet task",
                 true,
@@ -3512,7 +3642,7 @@ fn work_restore_reconciles_fleet_from_the_restored_workspace() {
         .capture(Some("restored-session"))
         .expect("capture source Work state")
         .expect("non-empty source Work state");
-    let state = crate::session_manager::SessionWorkState {
+    let state = codewhale_engine::session_manager::SessionWorkState {
         graph: Some(captured.graph),
         todos: captured.todos,
         plan: captured.plan,
@@ -3542,7 +3672,7 @@ fn work_restore_reconciles_fleet_from_the_restored_workspace() {
         .expect("restored Fleet operation");
     assert_eq!(
         operation.state,
-        crate::work_graph::NodeState::Initializing,
+        codewhale_engine::work_graph::NodeState::Initializing,
         "the target workspace ledger must outrank the app's previous workspace"
     );
 }
@@ -3550,7 +3680,7 @@ fn work_restore_reconciles_fleet_from_the_restored_workspace() {
 #[test]
 fn failed_workspace_owner_reconcile_leaves_previous_work_state_intact() {
     let restored_workspace = tempfile::tempdir().expect("restored workspace");
-    let ledger = crate::fleet::ledger::FleetLedger::open(restored_workspace.path())
+    let ledger = codewhale_engine::fleet::ledger::FleetLedger::open(restored_workspace.path())
         .expect("open restored Fleet ledger");
     ledger
         .enqueue(codewhale_protocol::fleet::FleetInboxEntry {
@@ -3563,14 +3693,14 @@ fn failed_workspace_owner_reconcile_leaves_previous_work_state_intact() {
         })
         .expect("enqueue older Fleet owner state");
 
-    let incoming = crate::work_graph::new_shared_work_runtime(
-        crate::tools::todo::new_shared_todo_list(),
-        crate::tools::plan::new_shared_plan_state(),
+    let incoming = codewhale_engine::work_graph::new_shared_work_runtime(
+        codewhale_engine::tools::todo::new_shared_todo_list(),
+        codewhale_engine::tools::plan::new_shared_plan_state(),
     );
     incoming
         .register_operation(
             "incoming-session",
-            crate::work_graph::OperationIntent::new(
+            codewhale_engine::work_graph::OperationIntent::new(
                 "fleet:run-regress/task-regress",
                 "newer saved Fleet task",
                 true,
@@ -3582,9 +3712,9 @@ fn failed_workspace_owner_reconcile_leaves_previous_work_state_intact() {
     incoming
         .reconcile_operation(
             "incoming-session",
-            crate::work_graph::OperationOwnerSnapshot::new(
+            codewhale_engine::work_graph::OperationOwnerSnapshot::new(
                 "fleet:run-regress/task-regress",
-                crate::work_graph::OwnerState::Running,
+                codewhale_engine::work_graph::OwnerState::Running,
                 2,
                 2,
             ),
@@ -3594,7 +3724,7 @@ fn failed_workspace_owner_reconcile_leaves_previous_work_state_intact() {
         .capture(Some("incoming-session"))
         .expect("capture incoming state")
         .expect("incoming graph");
-    let incoming = crate::session_manager::SessionWorkState {
+    let incoming = codewhale_engine::session_manager::SessionWorkState {
         graph: Some(incoming.graph),
         todos: incoming.todos,
         plan: incoming.plan,
@@ -3609,7 +3739,7 @@ fn failed_workspace_owner_reconcile_leaves_previous_work_state_intact() {
         .clone();
     work.register_operation(
         "previous-session",
-        crate::work_graph::OperationIntent::new(
+        codewhale_engine::work_graph::OperationIntent::new(
             "shell:shell_previous",
             "previous operation",
             false,
@@ -3827,9 +3957,11 @@ fn set_mode_scenario() {
     }
     // from set_mode_plan_restores_previous_approval_on_agent_exit
     {
-        let config = Config {
-            approval_policy: Some("never".to_string()),
-            ..Default::default()
+        let config = {
+            let __cw_config_init_15_0 = Some("never".to_string());
+            let mut __cw_config_init_15_value: Config = Default::default();
+            __cw_config_init_15_value.approval_policy = __cw_config_init_15_0;
+            __cw_config_init_15_value
         };
         let mut options = test_options(false);
         options.start_in_agent_mode = true; // avoid coupling to settings.default_mode
@@ -4040,7 +4172,7 @@ fn plan_permission_cycle_moves_the_baseline_and_leaves_plan_read_only() {
 }
 
 #[test]
-fn busy_permission_cycle_changes_neither_runtime_nor_persistence() {
+fn busy_permission_cycle_moves_the_live_posture() {
     let _env_lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
@@ -4051,12 +4183,10 @@ fn busy_permission_cycle_changes_neither_runtime_nor_persistence() {
     let before = app.approval_mode;
     app.is_loading = true;
 
-    assert!(!app.cycle_approval_posture());
-    assert_eq!(app.approval_mode, before);
-    assert_eq!(app.mode_prefs.agent_approval_mode, before);
-    assert!(!tmp.path().join("settings.toml").exists());
+    assert!(app.cycle_approval_posture());
+    assert_ne!(app.mode_prefs.agent_approval_mode, before);
     assert!(
-        app.status_message
+        !app.status_message
             .as_deref()
             .is_some_and(|message| message.contains("locked"))
     );
@@ -4102,7 +4232,8 @@ fn shift_tab_migrates_user_root_policy_to_durable_tui_posture() {
     std::fs::write(&settings_path, "permission_posture = \"full-access\"\n").expect("settings");
     let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let _approval_env = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
-    let config = Config::load(Some(config_path.clone()), None).expect("load config");
+    let config = codewhale_plugins::providers::load_config(Some(config_path.clone()), None)
+        .expect("load config");
     let mut options = test_options(false);
     options.start_in_agent_mode = true;
     options.config_path = Some(config_path.clone());
@@ -4120,7 +4251,8 @@ fn shift_tab_migrates_user_root_policy_to_durable_tui_posture() {
     let saved_settings = std::fs::read_to_string(&settings_path).expect("saved settings");
     assert!(saved_settings.contains("permission_posture = \"auto-review\""));
 
-    let restarted_config = Config::load(Some(config_path), None).expect("reload config");
+    let restarted_config =
+        codewhale_plugins::providers::load_config(Some(config_path), None).expect("reload config");
     let restarted = App::new(options, &restarted_config);
     assert_eq!(restarted.approval_mode, ApprovalMode::Auto);
     assert!(!restarted.approval_policy_locked());
@@ -4139,7 +4271,8 @@ fn legacy_yolo_migrates_root_policy_to_agent_full_access() {
     std::fs::write(&settings_path, "default_mode = \"yolo\"\n").expect("legacy settings");
     let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let _approval_env = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
-    let config = Config::load(Some(config_path.clone()), None).expect("load config");
+    let config = codewhale_plugins::providers::load_config(Some(config_path.clone()), None)
+        .expect("load config");
     let mut options = test_options(false);
     options.start_in_agent_mode = false;
     options.workspace = workspace;
@@ -4157,7 +4290,8 @@ fn legacy_yolo_migrates_root_policy_to_agent_full_access() {
     assert!(saved_settings.contains("default_mode = \"agent\""));
     assert!(saved_settings.contains("permission_posture = \"full-access\""));
 
-    let restarted_config = Config::load(Some(config_path), None).expect("reload config");
+    let restarted_config =
+        codewhale_plugins::providers::load_config(Some(config_path), None).expect("reload config");
     let restarted = App::new(options, &restarted_config);
     assert_eq!(restarted.mode, AppMode::Agent);
     assert_eq!(restarted.approval_mode, ApprovalMode::Bypass);
@@ -4192,7 +4326,8 @@ fn legacy_yolo_honors_a_missing_explicit_config_path_without_home_fallback() {
     let _deepseek_config = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &missing_override);
     let _approval_env = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
 
-    let config = Config::load(None, None).expect("load explicit missing config");
+    let config = codewhale_plugins::providers::load_config(None, None)
+        .expect("load explicit missing config");
     assert_eq!(config.approval_policy, None);
     let mut options = test_options(false);
     options.start_in_agent_mode = false;
@@ -4234,9 +4369,11 @@ fn managed_requirements_ignore_saved_full_access_and_lock_changes() {
     )
     .expect("requirements");
     let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-    let config = Config {
-        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
-        ..Config::default()
+    let config = {
+        let __cw_config_init_16_0 = Some(requirements_path.to_string_lossy().into_owned());
+        let mut __cw_config_init_16_value: Config = Config::default();
+        __cw_config_init_16_value.requirements_path = __cw_config_init_16_0;
+        __cw_config_init_16_value
     };
 
     let mut app = App::new(test_options(false), &config);
@@ -4266,9 +4403,11 @@ fn sandbox_requirements_prevent_full_access_overrides() {
     .expect("requirements");
     let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
     let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-    let config = Config {
-        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
-        ..Config::default()
+    let config = {
+        let __cw_config_init_17_0 = Some(requirements_path.to_string_lossy().into_owned());
+        let mut __cw_config_init_17_value: Config = Config::default();
+        __cw_config_init_17_value.requirements_path = __cw_config_init_17_0;
+        __cw_config_init_17_value
     };
 
     for (settings, cli_yolo) in [
@@ -4288,14 +4427,14 @@ fn sandbox_requirements_prevent_full_access_overrides() {
         assert!(!app.cycle_approval_posture());
         assert_eq!(app.select_yolo_compat(), SettingSelection::Refused);
         assert!(matches!(
-            crate::core::authority::sandbox_policy_for_turn(
+            codewhale_engine::core::authority::sandbox_policy_for_turn(
                 app.mode,
                 app.approval_mode,
                 config.sandbox_mode.as_deref(),
                 &app.workspace,
-                crate::core::authority::SandboxNetworkAccess::Restricted,
+                codewhale_engine::core::authority::SandboxNetworkAccess::Restricted,
             ),
-            crate::sandbox::SandboxPolicy::WorkspaceWrite { .. }
+            codewhale_sandbox::SandboxPolicy::WorkspaceWrite { .. }
         ));
     }
 }
@@ -4310,9 +4449,11 @@ fn yolo_entry_points_honor_a_locked_approval_policy() {
         "allowed_approval_policies = [\"on-request\"]\n",
     )
     .expect("requirements");
-    let config = Config {
-        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
-        ..Config::default()
+    let config = {
+        let __cw_config_init_18_0 = Some(requirements_path.to_string_lossy().into_owned());
+        let mut __cw_config_init_18_value: Config = Config::default();
+        __cw_config_init_18_value.requirements_path = __cw_config_init_18_0;
+        __cw_config_init_18_value
     };
 
     let mut options = test_options(false);
@@ -4476,9 +4617,11 @@ fn leaving_yolo_after_startup_restores_baseline_policies() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
     let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-    let config = Config {
-        allow_shell: Some(false),
-        ..Default::default()
+    let config = {
+        let __cw_config_init_19_0 = Some(false);
+        let mut __cw_config_init_19_value: Config = Default::default();
+        __cw_config_init_19_value.allow_shell = __cw_config_init_19_0;
+        __cw_config_init_19_value
     };
 
     let mut options = test_options(true);
@@ -4499,9 +4642,11 @@ fn leaving_yolo_after_startup_restores_baseline_policies() {
 
 #[test]
 fn configured_approval_policy_initializes_live_approval_mode() {
-    let config = Config {
-        approval_policy: Some("never".to_string()),
-        ..Default::default()
+    let config = {
+        let __cw_config_init_20_0 = Some("never".to_string());
+        let mut __cw_config_init_20_value: Config = Default::default();
+        __cw_config_init_20_value.approval_policy = __cw_config_init_20_0;
+        __cw_config_init_20_value
     };
     let mut options = test_options(false);
     options.start_in_agent_mode = true;
@@ -4620,7 +4765,7 @@ fn expanded_tool_scenario() {
 
         app.shift_history_maps_down(3);
 
-        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([3]));
+        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([4]));
     }
     // from expanded_tool_runs_prune_when_history_is_truncated
     {
@@ -4756,20 +4901,31 @@ fn test_add_message() {
 
 #[test]
 fn test_compaction_config() {
+    let _home = crate::test_support::SealedHome::new();
     let mut app = App::new(test_options(false), &Config::default());
-    let config = app.compaction_config();
-    // Config should be valid (just checking it returns something)
-    let _ = config.enabled;
+    app.set_model_selection("auto".to_string());
+    assert_eq!(app.compaction_config().model, DEFAULT_TEXT_MODEL);
 
-    app.auto_model = true;
-    app.model = "auto".to_string();
-    app.last_effective_model = None;
-    let config = app.compaction_config();
-    assert_eq!(config.model, DEFAULT_TEXT_MODEL);
+    let budget = AutoRouteBudget {
+        provider: ProviderKind::Deepseek,
+        provider_identity: "deepseek".into(),
+        model: "deepseek-v4-flash".into(),
+        limits: None,
+        window: codewhale_engine::route_runtime::ContextWindowResolution {
+            tokens: 1_000_000,
+            source: codewhale_engine::route_runtime::ContextWindowSource::Catalog,
+        },
+        restored: false,
+    };
+    app.last_effective_model = Some(budget.model.clone());
+    assert_eq!(app.compaction_config().model, DEFAULT_TEXT_MODEL);
 
-    app.last_effective_model = Some("deepseek-v4-flash".to_string());
+    app.last_effective_provider = Some(budget.provider);
+    app.last_effective_provider_identity = Some(budget.provider_identity.clone());
+    app.last_effective_budget = Some(budget);
     let config = app.compaction_config();
     assert_eq!(config.model, "deepseek-v4-flash");
+    assert_eq!(config.effective_context_window, Some(1_000_000));
 }
 
 #[test]
@@ -4782,6 +4938,12 @@ fn test_update_model_compaction_budget() {
     app.api_provider = ProviderKind::Deepseek;
     app.active_route_limits = None;
     app.active_context_window_override = None;
+    // The installed window outranks the route limits, so a fixture that only
+    // clears the limits keeps the window `App::new` resolved for its default
+    // model and the budget is computed against the wrong one. Production
+    // clears it through `set_model_selection`; mutating `app.model` directly
+    // has to do the same.
+    app.active_context_window = None;
     app.auto_compact_threshold_percent = 80.0;
 
     // A large-context model earns a proportionally larger compaction
@@ -5104,7 +5266,7 @@ fn enter_during_active_paste_burst_appends_newline_to_buffer_not_submit() {
     assert!(app.paste_burst.is_active());
     assert!(app.input.is_empty());
 
-    let result = app.handle_composer_enter();
+    let result = app.handle_composer_enter(true);
 
     assert!(
         result.is_none(),
@@ -5136,7 +5298,7 @@ fn enter_inside_paste_burst_window_after_flush_inserts_newline_not_submit() {
         "suppression window should be open"
     );
 
-    let result = app.handle_composer_enter();
+    let result = app.handle_composer_enter(true);
 
     assert!(
         result.is_none(),
@@ -5146,6 +5308,9 @@ fn enter_inside_paste_burst_window_after_flush_inserts_newline_not_submit() {
         app.input, "hello\n",
         "newline must be inserted into the composer instead of firing a submit"
     );
+    assert!(!app.composer_enter_would_submit(true));
+    assert!(app.composer_enter_would_submit(false));
+    assert_eq!(app.handle_composer_enter(false).as_deref(), Some("hello\n"));
 }
 
 /// The absorbed Enter above must not buy the window more time. Re-arming on
@@ -5162,7 +5327,7 @@ fn enter_absorbed_after_flush_does_not_re_arm_the_suppression_window() {
     app.paste_burst.extend_window(now);
 
     assert!(
-        app.handle_composer_enter().is_none(),
+        app.handle_composer_enter(true).is_none(),
         "first Enter is absorbed as the paste's possible trailing newline"
     );
     assert_eq!(app.input, "hello\n");
@@ -5185,7 +5350,7 @@ fn enter_outside_any_paste_burst_window_submits_normally() {
     app.input = "hello world".to_string();
     app.cursor_position = "hello world".chars().count();
 
-    let result = app.handle_composer_enter();
+    let result = app.handle_composer_enter(true);
 
     assert_eq!(
         result.as_deref(),
@@ -5212,7 +5377,7 @@ fn enter_with_paste_burst_detection_disabled_submits_normally() {
     let now = Instant::now();
     app.paste_burst.extend_window(now);
 
-    let result = app.handle_composer_enter();
+    let result = app.handle_composer_enter(true);
 
     assert_eq!(result.as_deref(), Some("ship it"));
 }
@@ -6302,11 +6467,15 @@ fn app_with_fallback_chain(
         }
     }
 
-    let config = Config {
-        provider: Some(active.as_str().to_string()),
-        fallback_providers: fallbacks.to_vec(),
-        providers: Some(providers),
-        ..Default::default()
+    let config = {
+        let __cw_config_init_21_0 = Some(active.as_str().to_string());
+        let __cw_config_init_21_1 = fallbacks.to_vec();
+        let __cw_config_init_21_2 = Some(providers);
+        let mut __cw_config_init_21_value: Config = Default::default();
+        __cw_config_init_21_value.provider = __cw_config_init_21_0;
+        __cw_config_init_21_value.fallback_providers = __cw_config_init_21_1;
+        __cw_config_init_21_value.providers = __cw_config_init_21_2;
+        __cw_config_init_21_value
     };
 
     let mut options = test_options(false);
@@ -6457,13 +6626,13 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
     let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
     let _cli_source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
 
-    let config = Config {
-        provider: Some(ProviderKind::Deepseek.as_str().to_string()),
-        fallback_providers: vec![
+    let config = {
+        let __cw_config_init_22_0 = Some(ProviderKind::Deepseek.as_str().to_string());
+        let __cw_config_init_22_1 = vec![
             codewhale_config::ProviderKind::OpenaiCodex,
             codewhale_config::ProviderKind::Xai,
-        ],
-        providers: Some(ProvidersConfig {
+        ];
+        let __cw_config_init_22_2 = Some(ProvidersConfig {
             openai_codex: ProviderConfig {
                 auth_mode: Some("oauth".to_string()),
                 external_credentials: Some(
@@ -6487,23 +6656,27 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
                 ..Default::default()
             },
             ..Default::default()
-        }),
-        ..Default::default()
+        });
+        let mut __cw_config_init_22_value: Config = Default::default();
+        __cw_config_init_22_value.provider = __cw_config_init_22_0;
+        __cw_config_init_22_value.fallback_providers = __cw_config_init_22_1;
+        __cw_config_init_22_value.providers = __cw_config_init_22_2;
+        __cw_config_init_22_value
     }
     .with_legacy_root(Some("active-deepseek-key".to_string()), None);
     let mut options = test_options(false);
     options.skip_onboarding = true;
 
-    crate::external_credentials::reset_side_effect_trap();
+    codewhale_runtime::external_credentials::reset_side_effect_trap();
     let mut app = App::new(options, &config);
     assert_eq!(
-        crate::external_credentials::side_effect_trap_counts(),
+        codewhale_runtime::external_credentials::side_effect_trap_counts(),
         (0, 0),
         "startup readiness must not inspect inactive external credentials"
     );
     assert_eq!(app.advance_fallback("active route unavailable"), None);
     assert_eq!(
-        crate::external_credentials::side_effect_trap_counts(),
+        codewhale_runtime::external_credentials::side_effect_trap_counts(),
         (0, 0),
         "fallback selection must skip external-only inactive routes without inspection"
     );
@@ -6785,7 +6958,7 @@ fn reselecting_restored_live_mode_updates_the_startup_default() {
 }
 
 #[test]
-fn mode_change_refused_while_a_turn_runs_persists_nothing() {
+fn mode_change_while_a_turn_runs_is_live_and_persisted() {
     let _lock = lock_test_env();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let _env = sealed_settings_home(tmp.path());
@@ -6795,12 +6968,13 @@ fn mode_change_refused_while_a_turn_runs_persists_nothing() {
     app.select_mode(AppMode::Plan);
     app.is_loading = true;
     app.cycle_mode();
+    app.startup_defaults.flush();
 
-    assert_eq!(app.mode, AppMode::Plan, "#2982 lock still holds");
+    assert_eq!(app.mode, AppMode::Plan.next());
     assert_eq!(
         Settings::load().expect("reload").default_mode,
-        "plan",
-        "a refused change must not be persisted"
+        app.mode.as_setting(),
+        "a mid-turn change is a real selection"
     );
 }
 
@@ -6960,13 +7134,14 @@ async fn fixed_route_thinking_cycle_persists_raw_preference() {
 
     let mut app = App::new(test_options(false), &Config::default());
     app.set_provider_identity_record(
-        crate::config::Config::default()
+        codewhale_runtime::config::Config::default()
             .resolve_provider_identity(ProviderKind::Moonshot.as_str())
             .expect("captured fixture provider"),
     );
     app.auto_model = false;
-    app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
-    app.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
+    app.active_route_base_url =
+        codewhale_config::descriptors::defaults::DEFAULT_MOONSHOT_BASE_URL.to_string();
+    app.model = codewhale_config::catalog::reviewed::constants::MOONSHOT_KIMI_K3_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::Max;
 
     app.apply_reasoning_effort_cycle();
@@ -7250,7 +7425,7 @@ fn mode_cycling_in_an_unsealed_test_writes_nothing() {
 // hotbar. `/set` and `/config <key> <value>` reached the same live route through
 // a different door, and both are reachable mid-turn: the composer accepts
 // Shift+Enter and the slash menu while `is_loading`. So during a running turn a
-// slash command could swap the model, thinking level, mode, or provider out from
+// slash command could swap the model, thinking level, or provider out from
 // under the engine *and* persist it. The refusal now sits in one place, above
 // every disk write and every `App` mutation.
 
@@ -7294,7 +7469,6 @@ fn slash_config_and_set_refuse_every_live_route_key_while_a_turn_runs() {
             ("default_model", "deepseek-v4-pro"),
             ("reasoning_effort", "high"),
             ("effort", "high"),
-            ("mode", "operate"),
             ("provider", "openai"),
         ] {
             let result = crate::commands::set_config_value(&mut app, key, value, persist);
@@ -7493,15 +7667,15 @@ fn mode_selection_reports_refusal_change_and_persisted_same_distinctly() {
     );
 
     app.is_loading = true;
-    assert_eq!(app.select_mode(AppMode::Plan), SettingSelection::Refused);
+    assert_eq!(app.select_mode(AppMode::Plan), SettingSelection::Changed);
     assert!(!SettingSelection::Refused.accepted());
-    assert_eq!(app.mode, AppMode::Operate, "a refusal changes nothing");
+    assert_eq!(app.mode, AppMode::Plan, "mode is not turn-locked");
 }
 
-/// Every accepted same-live selection shows a saved receipt, and a refusal
-/// shows the lock message instead — the two must not read the same.
+/// Every accepted same-live selection shows a saved receipt, and a mid-turn
+/// switch reads as a switch — the two must not read the same.
 #[test]
-fn slash_mode_distinguishes_a_saved_startup_default_from_a_refusal() {
+fn slash_mode_distinguishes_a_saved_startup_default_from_a_switch() {
     let _lock = lock_test_env();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let _env = sealed_settings_home(tmp.path());
@@ -7527,14 +7701,13 @@ fn slash_mode_distinguishes_a_saved_startup_default_from_a_refusal() {
         "operate"
     );
 
-    // Mid-turn the same command must be refused, and say so.
     app.is_loading = true;
-    let refusal = crate::commands::switch_mode(&mut app, AppMode::Plan);
+    let switched = crate::commands::switch_mode(&mut app, AppMode::Plan);
     assert!(
-        refusal.contains("locked while a turn is running"),
-        "a refusal must not read like a save, got {refusal:?}"
+        switched.starts_with("Switched to"),
+        "mode is not turn-locked, got {switched:?}"
     );
-    assert_ne!(refusal, receipt);
+    assert_ne!(switched, receipt);
 }
 
 /// The hotbar mode rows share the receipt: dispatching a row for the live mode
@@ -7594,7 +7767,8 @@ fn an_explicit_launch_model_outranks_the_remembered_provider_model() {
     // that stickiness is what `/model` exists for.
     let _no_flag = EnvVarGuard::remove("CODEWHALE_MODEL");
     let _no_legacy_flag = EnvVarGuard::remove("DEEPSEEK_MODEL");
-    let config = Config::load(Some(config_path.clone()), None).expect("load sealed config");
+    let config = codewhale_plugins::providers::load_config(Some(config_path.clone()), None)
+        .expect("load sealed config");
     let remembered = App::new(
         TuiOptions {
             model: config.default_model(),
@@ -7609,7 +7783,8 @@ fn an_explicit_launch_model_outranks_the_remembered_provider_model() {
 
     // `--model` reaches this binary as CODEWHALE_MODEL. It must win.
     let _model_flag = EnvVarGuard::set("CODEWHALE_MODEL", "kimi-k3");
-    let config = Config::load(Some(config_path), None).expect("load explicit launch snapshot");
+    let config = codewhale_plugins::providers::load_config(Some(config_path), None)
+        .expect("load explicit launch snapshot");
     let requested = App::new(
         TuiOptions {
             model: config.default_model(),
@@ -7732,7 +7907,7 @@ fn owned_restore_moves_the_journal_and_matches_the_borrowing_restore() {
     let messages = vec![message("first"), message("second")];
     let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
     let t1 = t0 + chrono::Duration::seconds(12);
-    let saved = crate::session_manager::create_saved_session_with_id_mode_and_stamps(
+    let saved = codewhale_engine::session_manager::create_saved_session_with_id_mode_and_stamps(
         "owned-restore".to_string(),
         &messages,
         &[t0, t1],
@@ -7745,7 +7920,9 @@ fn owned_restore_moves_the_journal_and_matches_the_borrowing_restore() {
 
     let mut borrowed = App::new(test_options(false), &Config::default());
     borrowed.restore_api_messages(
-        crate::runtime_handoff::project_owned_messages_for_restore(saved.messages.clone()),
+        codewhale_engine::runtime_handoff::project_owned_messages_for_restore(
+            saved.messages.clone(),
+        ),
         &saved,
     );
 
@@ -7780,7 +7957,9 @@ fn owned_restore_moves_the_journal_and_matches_the_borrowing_restore() {
     legacy.journal = None;
     let mut legacy_borrowed = App::new(test_options(false), &Config::default());
     legacy_borrowed.restore_api_messages(
-        crate::runtime_handoff::project_owned_messages_for_restore(legacy.messages.clone()),
+        codewhale_engine::runtime_handoff::project_owned_messages_for_restore(
+            legacy.messages.clone(),
+        ),
         &legacy,
     );
     let mut legacy_owned = App::new(test_options(false), &Config::default());
@@ -7803,7 +7982,7 @@ fn assert_every_ctrl_t_press_changes_the_effective_tier(
 ) -> Vec<ReasoningEffort> {
     let mut app = App::new(test_options(false), &Config::default());
     app.set_provider_identity_record(
-        crate::config::Config::default()
+        codewhale_runtime::config::Config::default()
             .resolve_provider_identity(provider.as_str())
             .expect("captured fixture provider"),
     );
@@ -7838,28 +8017,28 @@ fn assert_every_ctrl_t_press_changes_the_effective_tier(
 fn every_ctrl_t_press_changes_the_effective_thinking_tier() {
     // #6650: Ctrl+T walked rungs that resolved to the tier already in effect,
     // so presses looked dead.
-    let _catalog = crate::provider_lake::lock_live_snapshot();
-    crate::provider_lake::clear_live_snapshot();
+    let _catalog = codewhale_engine::provider_lake::lock_live_snapshot();
+    codewhale_engine::provider_lake::clear_live_snapshot();
     for (provider, base_url, model) in [
         (
             ProviderKind::Deepseek,
-            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            codewhale_config::descriptors::defaults::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4.1-flash",
         ),
         (
             ProviderKind::Deepseek,
-            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            codewhale_config::descriptors::defaults::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4.1",
         ),
         (
             ProviderKind::Moonshot,
-            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
-            crate::config::KIMI_CODE_K3_MODEL,
+            codewhale_config::descriptors::defaults::DEFAULT_KIMI_CODE_BASE_URL,
+            codewhale_config::catalog::reviewed::constants::KIMI_CODE_K3_MODEL,
         ),
         (
             ProviderKind::Xai,
-            crate::config::DEFAULT_XAI_BASE_URL,
-            crate::config::XAI_GROK_4_6_MODEL,
+            codewhale_config::descriptors::defaults::DEFAULT_XAI_BASE_URL,
+            codewhale_config::catalog::reviewed::constants::XAI_GROK_4_6_MODEL,
         ),
     ] {
         assert_every_ctrl_t_press_changes_the_effective_tier(provider, base_url, model);
@@ -7872,8 +8051,8 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
     // sends `medium`/`xhigh` as `high`, and Z.ai GLM-5.2 sends `low`/`medium`
     // as `high`. Each Ctrl+T press must still reach a new effective tier.
     use ReasoningEffort::{Auto, High, Low, Max, Off};
-    let _catalog = crate::provider_lake::lock_live_snapshot();
-    crate::provider_lake::clear_live_snapshot();
+    let _catalog = codewhale_engine::provider_lake::lock_live_snapshot();
+    codewhale_engine::provider_lake::clear_live_snapshot();
     let fetched_at = u64::try_from(chrono::Utc::now().timestamp()).expect("timestamp");
     let offering = |provider: ProviderKind, model: &str, values: &[&str]| {
         codewhale_config::catalog::CatalogOffering {
@@ -7881,14 +8060,11 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
             wire_model_id: model.to_string(),
             endpoint_key: "chat".to_string(),
             reasoning_options: vec![serde_json::json!({ "type": "effort", "values": values })],
-            source: codewhale_config::catalog::CatalogSource::Live {
-                base_url_fingerprint: "models-dev-capabilities".to_string(),
-                fetched_at,
-            },
+            source: codewhale_config::catalog::CatalogSource::ModelsDevLive { fetched_at },
             ..Default::default()
         }
     };
-    crate::provider_lake::set_live_snapshot(
+    codewhale_engine::provider_lake::set_live_snapshot(
         codewhale_config::catalog::CatalogSnapshot {
             offerings: vec![
                 offering(
@@ -7898,25 +8074,25 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
                 ),
                 offering(
                     ProviderKind::Zai,
-                    crate::config::ZAI_GLM_5_2_MODEL,
+                    codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_2_MODEL,
                     &["off", "low", "medium", "high", "max"],
                 ),
             ],
         },
-        crate::provider_lake::LiveSource::ModelsDev,
+        codewhale_engine::provider_lake::LiveSource::ModelsDev,
     );
 
     let deepseek = assert_every_ctrl_t_press_changes_the_effective_tier(
         ProviderKind::Deepseek,
-        crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+        codewhale_config::descriptors::defaults::DEFAULT_DEEPSEEK_BASE_URL,
         "deepseek-v4.1-flash",
     );
     let zai = assert_every_ctrl_t_press_changes_the_effective_tier(
         ProviderKind::Zai,
-        crate::config::DEFAULT_ZAI_BASE_URL,
-        crate::config::ZAI_GLM_5_2_MODEL,
+        codewhale_config::descriptors::defaults::DEFAULT_ZAI_BASE_URL,
+        codewhale_config::catalog::reviewed::constants::ZAI_GLM_5_2_MODEL,
     );
-    crate::provider_lake::clear_live_snapshot();
+    codewhale_engine::provider_lake::clear_live_snapshot();
 
     assert_eq!(deepseek, vec![Auto, Low, High, Max]);
     assert_eq!(zai, vec![Auto, Off, High, Max]);
@@ -7926,11 +8102,12 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
 fn ctrl_t_moves_past_a_persisted_alias_the_ladder_dropped() {
     // DeepSeek has no `medium`; it resolves to `high`, so the next press must
     // reach `max` rather than re-select `high`.
-    let _catalog = crate::provider_lake::lock_live_snapshot();
+    let _catalog = codewhale_engine::provider_lake::lock_live_snapshot();
     let mut app = App::new(test_options(false), &Config::default());
     app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
-    app.active_route_base_url = crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string();
+    app.active_route_base_url =
+        codewhale_config::descriptors::defaults::DEFAULT_DEEPSEEK_BASE_URL.to_string();
     app.model = "deepseek-v4.1-flash".to_string();
     app.reasoning_effort = ReasoningEffort::Medium;
 
@@ -8004,7 +8181,7 @@ fn oversized_paste_is_not_written_through_a_linked_pastes_directory() {
 fn dropped_screenshot_path_becomes_an_image_attachment() {
     let dir = tempfile::tempdir().expect("tempdir");
     let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
-    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    std::fs::write(&shot, codewhale_engine::image_attach::test_support::PNG_1X1).expect("fixture");
     // Terminal.app / iTerm2 deliver a drop as a shell-escaped paste.
     let dropped = shot.display().to_string().replace(' ', "\\ ");
     let mut app = App::new(test_options(false), &Config::default());
@@ -8021,7 +8198,7 @@ fn dropped_screenshot_path_becomes_an_image_attachment() {
         app.status_message.as_deref(),
         Some(format!("Attached image: {}", shot.display()).as_str())
     );
-    let expanded = crate::image_attach::expand_attachment_blocks(&app.input);
+    let expanded = codewhale_engine::image_attach::expand_attachment_blocks(&app.input);
     assert!(expanded.notices.is_empty(), "{expanded:?}");
     assert!(
         expanded
@@ -8035,7 +8212,7 @@ fn dropped_screenshot_path_becomes_an_image_attachment() {
 fn image_path_pasted_on_a_command_line_stays_literal() {
     let dir = tempfile::tempdir().expect("tempdir");
     let shot = dir.path().join("shot.png");
-    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    std::fs::write(&shot, codewhale_engine::image_attach::test_support::PNG_1X1).expect("fixture");
     let mut app = App::new(test_options(false), &Config::default());
     app.input = "/rename ".to_string();
     app.cursor_position = app.input.chars().count();
@@ -8051,7 +8228,7 @@ fn image_path_pasted_on_a_command_line_stays_literal() {
 fn a_typed_drop_with_the_question_on_its_line_still_sends_the_image() {
     let dir = tempfile::tempdir().expect("tempdir");
     let shot = dir.path().join("Screenshot 2026-10-04 at 22.25.47.png");
-    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    std::fs::write(&shot, codewhale_engine::image_attach::test_support::PNG_1X1).expect("fixture");
     let mut app = App::new(test_options(false), &Config::default());
     // Arrived as keystrokes, so the paste-time check never saw it.
     app.input = format!(
@@ -8070,7 +8247,7 @@ fn a_typed_drop_with_the_question_on_its_line_still_sends_the_image() {
         submitted.ends_with("why does it show jobs 2?"),
         "{submitted}"
     );
-    let expanded = crate::image_attach::expand_attachment_blocks(&submitted);
+    let expanded = codewhale_engine::image_attach::expand_attachment_blocks(&submitted);
     assert!(expanded.notices.is_empty(), "{expanded:?}");
     assert!(
         expanded

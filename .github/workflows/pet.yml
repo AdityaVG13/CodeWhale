@@ -1,14 +1,6 @@
 name: Pet conformance
 
 on:
-  pull_request:
-    paths:
-      - 'pet/**'
-      - 'crates/tui/src/tui/pet_watch/**'
-      - 'crates/tui/src/tui/ambient_life/pet_*'
-      - 'crates/tui/src/tui/ambient_life/whale-points.tsv'
-      - 'npm/runtime-sdk/**'
-      - '.github/workflows/pet.yml'
   workflow_dispatch:
 
 permissions:
@@ -24,7 +16,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -61,7 +53,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm

@@ -22,7 +22,7 @@
 //!
 //! # Why trait-level (not engine-level)
 //!
-//! As of v0.6.7 the engine (`crates/tui/src/core/engine.rs`) holds a concrete
+//! As of v0.6.7 the engine (`crates/engine/src/core/engine.rs`) holds a concrete
 //! `Option<CodewhaleClient>` — the [`LlmClient`] trait is implemented but no
 //! consumer takes `Arc<dyn LlmClient>` or generic `<C: LlmClient>`. Wiring the
 //! mock into a full engine turn-loop therefore requires a separate refactor:
@@ -77,6 +77,7 @@ fn assistant_thinking(thinking: &str, text: &str) -> Message {
                 thinking: thinking.to_string(),
                 signature: None,
                 state: None,
+                redacted_data: None,
             },
             ContentBlock::Text {
                 text: text.to_string(),

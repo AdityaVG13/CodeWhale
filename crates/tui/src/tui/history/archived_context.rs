@@ -13,13 +13,7 @@ use super::{HistoryCell, TRANSCRIPT_RAIL};
 /// well-formed `<archived_context>...</archived_context>` block, or `None`
 /// if the text is regular assistant content.
 pub(super) fn parse_archived_context(text: &str) -> Option<HistoryCell> {
-    let text = text.trim();
-    if !text.starts_with("<archived_context") || !text.ends_with("</archived_context>") {
-        return None;
-    }
-
-    let tag_end = text.find('>')?;
-    let tag = &text[..tag_end];
+    let (tag, summary) = codewhale_engine::runtime_handoff::archived_context_parts(text)?;
 
     let level = archived_context_attr(tag, "level")
         .and_then(|v| v.parse::<u8>().ok())
@@ -35,10 +29,6 @@ pub(super) fn parse_archived_context(text: &str) -> Option<HistoryCell> {
 
     let timestamp = archived_context_attr(tag, "timestamp").unwrap_or_default();
 
-    let close_tag = text.rfind("</archived_context>")?;
-    let summary_start = tag_end + 1;
-    let summary = text[summary_start..close_tag].trim().to_string();
-
     Some(HistoryCell::ArchivedContext {
         level,
         range,
@@ -46,7 +36,7 @@ pub(super) fn parse_archived_context(text: &str) -> Option<HistoryCell> {
         density,
         model,
         timestamp,
-        summary,
+        summary: summary.to_string(),
     })
 }
 
@@ -62,7 +52,7 @@ fn archived_context_attr(tag: &str, name: &str) -> Option<String> {
 pub(super) fn render_archived_context(
     cell: &HistoryCell,
     width: u16,
-    _low_motion: bool,
+    palette_mode: palette::PaletteMode,
 ) -> Vec<Line<'static>> {
     let HistoryCell::ArchivedContext {
         level,
@@ -134,8 +124,17 @@ pub(super) fn render_archived_context(
         )));
     }
 
-    let rendered = crate::tui::markdown_render::render_markdown(&body, content_width, body_style);
-    for (idx, line) in rendered.into_iter().enumerate() {
+    let rendered = codewhale_tui_kit::markdown_render::render_markdown_tagged_with_palette(
+        &body,
+        content_width,
+        body_style,
+        palette_mode,
+    );
+    for (idx, line) in rendered
+        .into_iter()
+        .map(|rendered| rendered.line)
+        .enumerate()
+    {
         if idx == 0 {
             let mut spans = vec![Span::styled(
                 TRANSCRIPT_RAIL.to_string(),

@@ -27,9 +27,16 @@ Rust rendering source and controlled animation playback.
 
 ## Get started
 
+The current registry release is 0.1.2. This Engine vendor snapshot prepares
+0.2.0 and remains unpublished. Its `WorkflowRun.total` field and the total
+argument to `WorkflowRun::outcomes` use `u64`; convert existing `usize` totals
+with `as u64`. Publication requires its separate release approval. Protocol 0.10.3 must first
+be published with the shared avatar contract; the current workspace pin is local
+implementation state, not a registry publication minimum.
+
 ```toml
 [dependencies]
-codewhale-ratatui = { git = "https://github.com/Hmbown/codewhale-ratatui" }
+codewhale-ratatui = "0.1.2"
 ratatui = "0.30.2"
 ```
 
@@ -676,7 +683,7 @@ let composer = NativeComposer::new("Review the changes").focused(true);
 let workbar = Workbar::new(WorkbarPanel::Tasks, vec![
     WorkbarRow::new("task:review", "Review the changes").mark("●"),
 ]);
-let shell = TerminalShell::new(composer.desired_height(area.width, area.height))
+let shell = TerminalShell::new(composer.desired_height(area.width, area.height / 2))
     .workbar_rows(workbar.height(area.width, &theme));
 shell.paint(area, buf, &theme);
 let regions = shell.areas(area);

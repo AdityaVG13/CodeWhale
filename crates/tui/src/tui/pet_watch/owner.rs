@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{appearance::Appearance, persistence::Store};
-use crate::fleet::files::{WorkspaceFile, same_file};
+use codewhale_util::files::{WorkspaceFile, same_file};
 
 const LEASE: Duration = Duration::from_secs(2);
 const OWNER_IDLE_EXIT: Duration = Duration::from_secs(600);
@@ -48,7 +48,8 @@ pub fn directory() -> io::Result<PathBuf> {
 }
 
 pub fn descriptor(root: &Path) -> io::Result<Descriptor> {
-    let file = WorkspaceFile::open(root, Path::new("connection.json"), false)?.open_file()?;
+    let file = WorkspaceFile::open_resolved_root(root, Path::new("connection.json"), false)?
+        .open_file()?;
     let mut text = String::new();
     file.take(4097).read_to_string(&mut text)?;
     if text.len() > 4096 {
@@ -305,14 +306,26 @@ pub fn serve(root: PathBuf, requested_port: u16) -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(&root)?;
-        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        if !metadata.is_dir() {
+            anyhow::bail!("Pet directory must be a directory and cannot be a link");
+        }
+        // A mount that reports an owner of its own (HarmonyOS hmdfs) makes the
+        // uid comparison meaningless; the link refusal above still holds.
+        let ownership_proven = metadata.uid() == unsafe { libc::geteuid() }
+            || matches!(
+                codewhale_config::private_directory::mount_footing(&root),
+                codewhale_config::private_directory::PrivateFooting::Synthesised { .. }
+            );
+        if !ownership_proven {
             anyhow::bail!("Pet directory must belong to this user and cannot be a link");
         }
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        // `tighten_mode` keeps the refusal for a filesystem that stores modes
+        // and excuses only one that assigns its own.
+        codewhale_config::private_directory::tighten_mode(&root, 0o700)?;
     }
-    let lock_path = WorkspaceFile::open(&root, Path::new("owner.lock"), true)?;
+    let lock_path = WorkspaceFile::open_resolved_root(&root, Path::new("owner.lock"), true)?;
     let original = lock_path.open_update(true, false)?;
     let mut lifetime = fd_lock::RwLock::new(original.try_clone()?);
     let _guard = lifetime
@@ -360,7 +373,7 @@ pub fn serve(root: PathBuf, requested_port: u16) -> anyhow::Result<()> {
         token: saved.token.clone(),
         identity: saved.identity.clone(),
     };
-    let connection = WorkspaceFile::open(&root, Path::new("connection.json"), true)?;
+    let connection = WorkspaceFile::open_resolved_root(&root, Path::new("connection.json"), true)?;
     let epoch = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::sync_channel(128);
     let frames = Arc::new(Mutex::new(VecDeque::new()));

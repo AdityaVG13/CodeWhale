@@ -27,7 +27,7 @@
 | `Ctrl-L` | 压缩对话上下文（状态行显示进度；压缩已在运行时不执行任何操作） |
 | `Ctrl-O` | 打开所选或当前回合的思考详情，与输入框内容无关 |
 | `Ctrl-Alt-O` | 打开整个回合的 Turn Inspector，与输入框内容无关 |
-| `Alt-V` / `Option-V`（macOS） | 为所选的工具/智能体卡片打开详情分页器；未选择时，打开最新正在运行的 shell 的实时检查器，否则打开可见或最近的卡片；发出传统 Option-V 字符的终端也会被处理 |
+| `Alt-V` / `Option-V`（macOS） | 为所选的工具/智能体卡片打开详情分页器；未选择时，打开最新的可见错误，否则打开第一个有详情的可见卡片，再否则打开最近的一张。先点击某张卡片，新卡片出现时 Alt-V 仍会停留在它上面。发出传统 Option-V 字符的终端也会被处理 |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | 在任务面板（workbar）中切换文件树 |
 | `Ctrl-]` 或 `Ctrl-Tab` | Pet 主视图显示时循环切换 Pet 视图；其他时候循环切换 work dock：TODO → Agents → Jobs → Background。`Ctrl-]` 可移植；`Ctrl-Tab` 需要 kitty 键盘协议。Terminal.app 用它切换终端标签页 |
 | `Ctrl-Shift-Tab` | 终端能发送 kitty 键盘组合键时，反向循环切换 Pet 视图或 work dock。Terminal.app 用它切换终端标签页 |
@@ -78,7 +78,7 @@
 
 直接在输入框中粘贴时，HTML 剪贴板内容里的标题、列表、链接、表格和代码会被保留。纯文本保持原样，配置字段则始终粘贴为纯文本。没有转发图形显示的 SSH 会话使用终端的文本粘贴。复制整条回答时会保留其原始 Markdown，不含终端折行或装饰性边线；如何渲染由目标应用决定。默认情况下，对话记录中拖选的内容也以同样方式复制：Markdown 源码，整个单元之间用空行连接（见下文“对话记录”一节）；设置 `tui.selection_copy_markdown = false` 则恢复为复制渲染后的文本。HTML 为空或过大时会退回纯文本。
 
-设置 `composer_multiline_mode = true` 即可交换可移植的 `Enter` 与 `Shift-Enter` 行为：`Enter` 插入换行，`Shift-Enter` 发送。`Alt-Enter`、`Ctrl-J` 以及受支持的 `Ctrl-Enter` / `Cmd-Enter` 行为保持不变。
+设置 `composer_multiline_mode = true` 后，`Enter` 插入换行，`Alt-Enter` 发送。终端能够区分 `Shift-Enter` 时，它也会发送；传统终端可能将它报告为普通 `Enter`。`Ctrl-J` 始终插入换行，受支持的 `Ctrl-Enter` / `Cmd-Enter` 行为保持不变。关闭多行模式时，`Alt-Enter` 和受支持的 `Shift-Enter` 插入换行。
 
 ### 选择语义
 
@@ -142,7 +142,7 @@ Hotbar 的触发键刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 | `Alt-G` / `Alt-Shift-G` | 跳到顶部 / 底部 |
 | `Ctrl-Home` / `Ctrl-End` | 跳到顶部 / 底部（在输入框中也可用） |
 | `Alt-[` / `Alt-]` | 在工具输出块之间跳转 |
-| `Esc Esc` | 回溯到上一条用户消息（`←`/`→` 步进，`Enter` 回退）。只回退对话，不改动文件；用 `/undo` 把文件改回去 |
+| `Esc Esc` | 回溯到上一条用户消息（`←`/`→` 步进，`Enter` 回退）。只回退对话，不改动文件；`/restore` 可回滚文件夹（需要 `/trust on` 或 Full Access） |
 | `Esc` | 将焦点返回输入框 |
 | `Ctrl-Y` | 输入框为空时，复制获得焦点的对话记录单元 |
 | `Alt-V` | 为获得焦点的工具或消息打开原始详情 |
